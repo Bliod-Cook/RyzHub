@@ -1,0 +1,85 @@
+{
+  "date": "2026-09-26",
+  "rust": 29,
+  "m0": 9,
+  "m1": 8,
+  "m2_and_gvisor": [
+    7,
+    1
+  ],
+  "flutter_widgets": 5,
+  "checks": [
+    "cargo fmt --all --check",
+    "clippy --workspace --all-targets -D warnings",
+    "cargo test --workspace --locked",
+    "flutter analyze",
+    "flutter test",
+    "release Web build"
+  ],
+  "real_components": [
+    "Codex 0.154.0",
+    "containerd",
+    "runc",
+    "gVisor release-20260921.0",
+    "PostgreSQL",
+    "NATS",
+    "Chromium"
+  ],
+  "local_protocol_fixtures": [
+    "Anthropic Messages",
+    "OpenAI Responses",
+    "MCP remote",
+    "S3 SigV4 verified by botocore"
+  ],
+  "not_verified": [
+    "commercial model upstream",
+    "real cloud S3/NAS",
+    "physical multi-node scheduling",
+    "Windows/Android devices",
+    "remote CI",
+    "large workspace capacity"
+  ],
+  "native_exit_regression": "passed; pending native RPC becomes outcome_unknown without changing independent exec",
+  "verified_at": "2026-09-26T02:43:18.153535+00:00",
+  "browser": {
+    "m0": {
+      "passed": 13,
+      "page_errors": [],
+      "external_requests": []
+    },
+    "history": {
+      "passed": 4,
+      "page_errors": []
+    },
+    "m1": {
+      "passed": 9,
+      "page_errors": [],
+      "external_requests": []
+    },
+    "m2": {
+      "passed": 9,
+      "page_errors": [],
+      "external_requests": []
+    }
+  },
+  "browser_m2_cleanup": "passed; no browser audit sandbox remains running",
+  "review_fixes": {
+    "findings_fixed": 8,
+    "migration": "0008_restore_progress.sql",
+    "regressions": [
+      "parallel approvals keep requires_action until all decisions",
+      "missing blob blocks a new blank workspace",
+      "restore job reuses destination across Owner fencing",
+      "applied restore retry is idempotent",
+      "cross-turn checkpoint replay preserves unregistered events",
+      "historical usage notifications do not block resumed threads",
+      "Work questions use AnswerQuestion",
+      "Work key refresh while waiting for input",
+      "superseded keys reject new requests without interrupting accepted streams",
+      "sandbox-scoped locking and checkpoint heartbeat",
+      "225-item history pagination, cache reload and live continuation"
+    ],
+    "logs": "var/m2-review/review-fixes/",
+    "orphaned_pause": "passed on actual containerd/runc: excluded from heartbeat, thawed and killed before Stop confirmation"
+  }
+}

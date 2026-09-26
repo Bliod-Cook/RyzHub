@@ -1,0 +1,5 @@
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>RyzHub 实例配置</title>
+<style>body{font:16px system-ui;max-width:850px;margin:4rem auto;padding:1rem;background:#f6f7fa;color:#162336}input,button{padding:.7rem;margin:.3rem}pre{white-space:pre-wrap;background:white;padding:1.5rem;border-radius:12px}</style>
+<h1>RyzHub 实例配置</h1><p>使用实例管理员会话查看当前生效的配置。修改服务器 TOML 配置文件后重启服务生效。</p>
+<label>会话令牌 <input id="token" type="password" autocomplete="off"></label><button id="load">读取配置</button><pre id="result">尚未加载</pre>
+<script>document.querySelector('#load').onclick=async()=>{const r=await fetch('/admin/settings',{headers:{Authorization:'Bearer '+document.querySelector('#token').value}});document.querySelector('#result').textContent=JSON.stringify(await r.json(),null,2)}</script></html>

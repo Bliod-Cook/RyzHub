@@ -1,0 +1,22 @@
+{
+  "browser": "153.0.8010.12",
+  "environment": "Linux headless Chromium, localhost",
+  "passed": [
+    "registration through UI",
+    "Unicode streaming and Markdown",
+    "code clipboard",
+    "approval denial",
+    "second device login",
+    "approval synchronized across devices",
+    "cancel during stream",
+    "conversation create and switch",
+    "offline persisted queue and reconnect without duplicates",
+    "reload and login restore cached projection without persisted access token",
+    "390px responsive navigation",
+    "invalid password rejected without entering session",
+    "no uncaught JavaScript errors or external assets"
+  ],
+  "count": 13,
+  "page_errors": [],
+  "external_requests": []
+}

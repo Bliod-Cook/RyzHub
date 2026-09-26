@@ -1,0 +1,23 @@
+name: ryzhub-m0
+services:
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_DB: ryzhub
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: local-development-only
+    ports: ["127.0.0.1:55432:5432"]
+    volumes:
+      - postgres:/var/lib/postgresql
+      - ./scripts/init-db.sql:/docker-entrypoint-initdb.d/roles.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d ryzhub"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+  nats:
+    image: nats:2.11-alpine
+    ports: ["127.0.0.1:54222:4222"]
+volumes:
+  postgres:
+

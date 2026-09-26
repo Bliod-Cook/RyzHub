@@ -1,0 +1,153 @@
+syntax = "proto3";
+package agentplatform.v1;
+
+// Text offsets count UTF-8 bytes, never Dart UTF-16 units or Unicode characters.
+message Frame {
+  uint32 minor_version = 1;
+  string channel = 2;
+  int64 ts_ms = 3;
+  // Internal fanout fencing metadata; gateways reject delayed retired publishers.
+  uint64 writer_epoch = 4;
+  oneof body {
+    Hello hello = 10;
+    Welcome welcome = 11;
+    Ping ping = 12;
+    Pong pong = 13;
+    AuthRefresh auth_refresh = 14;
+    AuthExpiring auth_expiring = 15;
+    Subscribe subscribe = 20;
+    Unsubscribe unsubscribe = 21;
+    Snapshot snapshot = 22;
+    SubscriptionSynced subscription_synced = 23;
+    SubscriptionRevoked subscription_revoked = 24;
+    ChannelLagged channel_lagged = 25;
+    CommandEnvelope command = 30;
+    CommandAck command_ack = 31;
+    CommandRejected command_rejected = 32;
+    EventEnvelope event = 40;
+    Delta delta = 41;
+    ItemFold item_fold = 42;
+    ProtocolError protocol_error = 50;
+  }
+}
+message Hello {
+  uint32 protocol_major = 1;
+  uint32 protocol_minor = 2;
+  string device_id = 3;
+  repeated string capabilities = 4;
+  string resume_token = 5;
+}
+message Welcome {
+  string connection_id = 1;
+  string resume_token = 2;
+  uint32 heartbeat_ms = 3;
+  uint32 max_frame_bytes = 4;
+  bool resumed = 5;
+}
+message Ping { uint64 nonce = 1; }
+message Pong { uint64 nonce = 1; }
+message AuthRefresh { string token = 1; }
+message AuthExpiring { int64 expires_at_ms = 1; }
+message Subscribe { optional uint64 since_seq = 1; }
+message Unsubscribe {}
+message Snapshot {
+  uint64 head_seq = 1;
+  repeated Item items = 2;
+  repeated PendingAction pending_actions = 3;
+  repeated RunState runs = 4;
+  repeated ReadState read_states = 5;
+}
+message SubscriptionSynced { uint64 head_seq = 1; }
+message SubscriptionRevoked { string reason = 1; }
+message ChannelLagged { string reason = 1; }
+message CommandEnvelope {
+  string cid = 1;
+  oneof command {
+    SendMessage send_message = 10;
+    DecideApproval decide_approval = 11;
+    Cancel cancel = 12;
+    MarkRead mark_read = 13;
+    Steer steer = 14;
+    SideQuery side_query = 15;
+    AnswerQuestion answer_question = 16;
+    UpdateRunConfig update_run_config = 17;
+    Compact compact = 18;
+    Fork fork = 19;
+  }
+}
+message UpdateRunConfig { string config_json = 1; }
+message Compact {}
+message Fork { string item_id = 1; }
+message SendMessage { string text = 1; }
+message DecideApproval {
+  string action_id = 1;
+  uint64 run_epoch = 2;
+  string decision = 3;
+}
+message Cancel {}
+message MarkRead { uint64 read_seq = 1; }
+message Steer { string text = 1; }
+message SideQuery { string text = 1; }
+message AnswerQuestion { string action_id = 1; uint64 run_epoch = 2; string answer = 3; }
+message CommandAck {
+  string cid = 1;
+  uint64 accepted_seq = 2;
+  string result = 3;
+}
+message CommandRejected {
+  string cid = 1;
+  string code = 2;
+  bool retryable = 3;
+}
+message Item {
+  string id = 1;
+  uint64 revision = 2;
+  string kind = 3;
+  string state = 4;
+  string text = 5;
+  uint64 first_seq = 6;
+  uint64 last_seq = 7;
+  string run_id = 8;
+}
+message PendingAction {
+  string id = 1;
+  string run_id = 2;
+  uint64 run_epoch = 3;
+  string summary = 4;
+  repeated string options = 5;
+  string status = 6;
+  string resolved_device = 7;
+  int64 expires_at_ms = 8;
+}
+message EventEnvelope {
+  uint64 seq = 1;
+  string cause_cid = 2;
+  oneof event {
+    Item item_upserted = 10;
+    PendingAction pending_action_changed = 11;
+    RunState run_state_changed = 12;
+    ReadState read_state_changed = 13;
+  }
+}
+message RunState { string run_id = 1; string state = 2; uint64 exec_epoch = 3; bool read_only = 4; }
+message ReadState { string user_id = 1; uint64 read_seq = 2; string conversation_id = 3; }
+message Delta {
+  string item_id = 1;
+  string stream = 2;
+  uint32 part_index = 3;
+  uint64 offset = 4;
+  string text = 5;
+  uint64 base_seq = 6;
+  uint64 revision = 7;
+}
+message ItemFold {
+  string item_id = 1;
+  string stream = 2;
+  uint32 part_index = 3;
+  string text = 4;
+  uint64 base_seq = 5;
+  uint64 revision = 6;
+}
+message ProtocolError { string code = 1; string message = 2; }
+// Internal Owner-to-Gateway fold response, not a WebSocket body.
+message FrameBatch { repeated Frame frames = 1; }

@@ -1,0 +1,11 @@
+{
+  "browser": "153.0.8010.12",
+  "count": 4,
+  "passed": [
+    "fresh device receives latest 100 items",
+    "two older pages load all 225 without moving cursor",
+    "reload preserves complete cached history",
+    "live messages continue after pagination"
+  ],
+  "page_errors": []
+}

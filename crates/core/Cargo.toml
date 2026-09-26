@@ -1,0 +1,11 @@
+[package]
+name = "ryzhub-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ryzhub-proto.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+prost.workspace = true
+thiserror.workspace = true

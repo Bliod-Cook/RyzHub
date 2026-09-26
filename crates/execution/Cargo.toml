@@ -1,0 +1,25 @@
+[package]
+name = "ryzhub-execution"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+sha2 = "0.10"
+axum = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["stream"] }
+nix = { version = "0.30", features = ["signal", "process", "user"] }
+
+tar = "0.4"
+toml = "0.9"
+xattr = "1"
+base64 = "0.22"
+filetime = "0.2"
+zstd = "0.13"
+
+[dev-dependencies]
+tempfile = "3"

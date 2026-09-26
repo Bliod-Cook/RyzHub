@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE channels SET lease_until=clock_timestamp()+($5::bigint * interval '1 millisecond') WHERE org_id=$1 AND id=$2 AND writer_epoch=$3 AND owner_id=$4 AND lease_until>clock_timestamp()",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Int8",
+        "Uuid",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "2287746336a999158dd75d2ad37c7faa366ecca04b2893b383364dfdc1a30169"
+}

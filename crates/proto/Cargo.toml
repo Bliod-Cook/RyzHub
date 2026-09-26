@@ -1,0 +1,16 @@
+[package]
+name = "ryzhub-proto"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+prost.workspace = true
+serde.workspace = true
+
+[build-dependencies]
+prost-build = "0.14"
+protox = "0.9"
+
+
+[dev-dependencies]
+serde_json.workspace = true

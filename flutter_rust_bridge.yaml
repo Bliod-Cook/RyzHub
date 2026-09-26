@@ -1,0 +1,7 @@
+rust_input: crate::api
+rust_root: crates/bridge/
+dart_output: client/lib/rust
+rust_output: crates/bridge/src/frb_generated.rs
+dart_root: client/
+type_64bit_int: true
+default_external_library_loader_web_prefix: pkg/

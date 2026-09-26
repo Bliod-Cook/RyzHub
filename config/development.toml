@@ -1,0 +1,12 @@
+listen = "127.0.0.1:8080"
+allowed_origins = ["http://localhost:3000", "http://127.0.0.1:3000"]
+events_retention_days = 30
+owner_lease_ms = 3000
+mock_chunk_ms = 40
+
+[policy]
+models = ["mock"]
+harnesses = ["mock"]
+max_sandboxes = 2
+allow_memory = false
+

@@ -1,0 +1,76 @@
+{
+  "paints": [
+    {
+      "name": "first-paint",
+      "ms": 2689.7000000476837
+    },
+    {
+      "name": "first-contentful-paint",
+      "ms": 2689.7000000476837
+    }
+  ],
+  "resources": [
+    {
+      "name": "/flutter_bootstrap.js",
+      "bytes": 13093,
+      "duration_ms": 22.195000052452087
+    },
+    {
+      "name": "/canvaskit/chromium/canvaskit.wasm",
+      "bytes": 5428806,
+      "duration_ms": 87.25
+    },
+    {
+      "name": "/canvaskit/chromium/canvaskit.js",
+      "bytes": 86226,
+      "duration_ms": 17.225000023841858
+    },
+    {
+      "name": "/main.dart.js",
+      "bytes": 3008151,
+      "duration_ms": 93.21999990940094
+    },
+    {
+      "name": "/assets/assets/fonts/RyzHubSans.ttf",
+      "bytes": 2336468,
+      "duration_ms": 52.04000008106232
+    },
+    {
+      "name": "/assets/packages/cupertino_icons/assets/CupertinoIcons.ttf",
+      "bytes": 1472,
+      "duration_ms": 19.05999994277954
+    },
+    {
+      "name": "/assets/fonts/fallback/Roboto-Regular.ttf",
+      "bytes": 171676,
+      "duration_ms": 24.22000002861023
+    },
+    {
+      "name": "/pkg/ryzhub_bridge.js",
+      "bytes": 33262,
+      "duration_ms": 6.75
+    },
+    {
+      "name": "/pkg/ryzhub_bridge_bg.wasm",
+      "bytes": 588456,
+      "duration_ms": 9.97000002861023
+    },
+    {
+      "name": "/font-fallback/notocoloremoji/v32/Yq6P-KqIXTD0t4D9z1ESnKM3-HpFabsE4tq3luCC7p-aXxcn.7.woff2",
+      "bytes": 205180,
+      "duration_ms": 10.81000006198883
+    }
+  ],
+  "cross_origin_isolated": true,
+  "browser": "153.0.8010.12",
+  "viewport": "1280x900",
+  "environment": "Linux headless Chromium, localhost, cold browser context, uncompressed Python HTTP server",
+  "passed": [
+    "registration",
+    "Rust/Wasm protobuf stream",
+    "IndexedDB projection",
+    "approval",
+    "reconnect",
+    "no external fonts/assets"
+  ]
+}

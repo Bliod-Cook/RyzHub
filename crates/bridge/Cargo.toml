@@ -1,0 +1,23 @@
+[package]
+name = "ryzhub-bridge"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+flutter_rust_bridge = "=2.11.1"
+ryzhub-core.workspace = true
+ryzhub-proto.workspace = true
+prost.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(frb_expand)'] }
+
+[package.metadata.wasm-pack.profile.release]
+# FRB uses Wasm atomics. wasm-pack's bundled wasm-opt disables threads by default.
+# Rust release LTO still optimizes the module.
+wasm-opt = false

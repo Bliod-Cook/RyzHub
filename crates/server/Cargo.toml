@@ -1,0 +1,39 @@
+[package]
+name = "ryzhub-server"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-nats.workspace = true
+axum.workspace = true
+chrono.workspace = true
+futures-util.workspace = true
+prost.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+ryzhub-proto.workspace = true
+ryzhub-domain.workspace = true
+argon2 = "0.5"
+base64 = "0.22"
+rand = "0.9"
+sha2 = "0.10"
+toml = "0.9"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"], default-features = false }
+aes-gcm = "0.10"
+hmac = "0.12"
+tokio-stream = "0.1"
+ryzhub-execution = { path = "../execution" }
+
+[dev-dependencies]
+zstd = "0.13"
+tempfile = "3"
+ryzhub-core.workspace = true
+tokio-tungstenite.workspace = true

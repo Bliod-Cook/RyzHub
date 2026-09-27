@@ -5,9 +5,10 @@ use prost::Message;
 use ryzhub_core::Engine;
 use ryzhub_proto::{command_envelope::Command, event_envelope::Event, frame::Body, *};
 use ryzhub_server::{
-    api::{App, router},
+    app::App,
     config::Config,
-    owner,
+    http::router,
+    owner::{self, OwnerLink},
     store::{Store, append},
 };
 use serde_json::{Value, json};
@@ -55,11 +56,7 @@ impl Harness {
         let nats = async_nats::connect("nats://127.0.0.1:54222").await?;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let base = format!("http://{}", listener.local_addr()?);
-        let app = App {
-            store: store.clone(),
-            nats: nats.clone(),
-            config: Config::default(),
-        };
+        let app = App::new(store.clone(), nats.clone(), Config::default())?;
         let task = tokio::spawn(async move {
             axum::serve(listener, router(app)).await.unwrap();
         });
@@ -551,8 +548,8 @@ async fn websocket_reconnect_owner_process_restart_snapshot_and_isolation() -> a
 
 #[tokio::test]
 #[ignore = "requires PostgreSQL 18 and NATS"]
-async fn gateway_process_restart_resumes_subscription_and_revocation_clears_it()
--> anyhow::Result<()> {
+async fn gateway_process_restart_client_resubscribes_and_revocation_clears_it() -> anyhow::Result<()>
+{
     let h = Harness::new().await?;
     let user = h.user().await?;
     let conv = h.conversation(&user).await?;
@@ -601,10 +598,10 @@ async fn gateway_process_restart_resumes_subscription_and_revocation_clears_it()
         ),
     )
     .await?;
-    let Some(Body::Welcome(welcome)) = next(&mut socket).await?.body else {
-        panic!("welcome missing")
-    };
-    assert!(!welcome.resume_token.is_empty());
+    assert!(matches!(
+        next(&mut socket).await?.body,
+        Some(Body::Welcome(_))
+    ));
     subscribe(&mut socket, &channel, None).await?;
     until(&mut socket, |f| {
         matches!(f.body, Some(Body::SubscriptionSynced(_)))
@@ -622,17 +619,17 @@ async fn gateway_process_restart_resumes_subscription_and_revocation_clears_it()
             Body::Hello(Hello {
                 protocol_major: 1,
                 device_id: "stable-device".into(),
-                resume_token: welcome.resume_token,
                 ..Default::default()
             }),
         ),
     )
     .await?;
-    let Some(Body::Welcome(welcome)) = next(&mut restored).await?.body else {
-        panic!("welcome missing")
-    };
-    assert!(welcome.resumed);
-    // No Subscribe sent: the replacement Gateway restores the set from PostgreSQL.
+    assert!(matches!(
+        next(&mut restored).await?.body,
+        Some(Body::Welcome(_))
+    ));
+    // Subscriptions live in the client, which resubscribes from its own cursor.
+    subscribe(&mut restored, &channel, None).await?;
     let synced = until(&mut restored, |f| {
         matches!(f.body, Some(Body::SubscriptionSynced(_)))
     })
@@ -656,7 +653,7 @@ async fn gateway_process_restart_resumes_subscription_and_revocation_clears_it()
 
 #[tokio::test]
 #[ignore = "requires PostgreSQL 18 and NATS"]
-async fn member_removal_revokes_session_and_stops_waiting_run() -> anyhow::Result<()> {
+async fn member_removal_revokes_org_access_and_stops_waiting_run() -> anyhow::Result<()> {
     let h = Harness::new().await?;
     let admin = h.user().await?;
     let member = h.user().await?;
@@ -702,14 +699,13 @@ async fn member_removal_revokes_session_and_stops_waiting_run() -> anyhow::Resul
         matches!(f.body, Some(Body::SubscriptionRevoked(_)))
     })
     .await?;
-    assert!(
-        h.store
-            .authenticate(member["token"].as_str().unwrap())
-            .await
-            .is_err()
-    );
+    // The session survives for the member's other organizations; this one is gone.
+    h.store
+        .authenticate(member["token"].as_str().unwrap())
+        .await?;
+    assert!(h.store.context(user, org).await.is_err());
     let mut stopped = false;
-    for _ in 0..100 {
+    for _ in 0..200 {
         let state: String = sqlx::query_scalar("SELECT state FROM runs WHERE conversation_id=$1")
             .bind(conv)
             .fetch_one(&h.db)
@@ -840,13 +836,18 @@ async fn restore_failure_should_not_create_blank_workspace() -> anyhow::Result<(
     let mut restored = false;
     let stub = tokio::spawn(async move {
         loop {
-            let (mut stream, _) = listener.accept().await.unwrap();
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut stream) = stream.into_split();
+            let mut reader = tokio::io::BufReader::new(read);
             let mut line = String::new();
-            tokio::io::BufReader::new(&mut stream)
-                .read_line(&mut line)
-                .await
-                .unwrap();
+            reader.read_line(&mut line).await.unwrap();
             let command: Value = serde_json::from_str(&line).unwrap();
+            if command["kind"] == "artifact_upload" {
+                let mut body = vec![0; command["size"].as_u64().unwrap() as usize];
+                tokio::io::AsyncReadExt::read_exact(&mut reader, &mut body)
+                    .await
+                    .unwrap();
+            }
             if command["kind"] == "stop" {
                 stops
                     .lock()
@@ -903,8 +904,9 @@ async fn restore_failure_should_not_create_blank_workspace() -> anyhow::Result<(
         sqlx::query("INSERT INTO workspace_heads(org_id,conversation_id,checkpoint_id) VALUES($1,$2,$3)").bind(org).bind(conv).bind(checkpoint).execute(&h.db).await?;
         let job=Uuid::now_v7();
         sqlx::query("INSERT INTO workspace_jobs(id,org_id,conversation_id,kind) VALUES($1,$2,$3,'restore')").bind(job).bind(org).bind(conv).execute(&h.db).await?;
-        let app=App{store:h.store.clone(),nats:h.nats.clone(),config:config.clone()};
-        ryzhub_server::checkpoint::jobs(&app,&lease).await?;
+        let app=App::new(h.store.clone(),h.nats.clone(),config.clone())?;
+        let link=OwnerLink::detached();
+        ryzhub_server::workspace::jobs(&app,&lease,&link).await?;
         let state:String=sqlx::query_scalar("SELECT state FROM workspace_jobs WHERE id=$1").bind(job).fetch_one(&h.db).await?;
         ensure!(state=="failed","expected unavailable blob to fail restore");
         let cmd=message(Uuid::now_v7(),"continue after failed restore");
@@ -920,15 +922,15 @@ async fn restore_failure_should_not_create_blank_workspace() -> anyhow::Result<(
         ensure!(!created.load(std::sync::atomic::Ordering::SeqCst),"failed restore allowed creation of a new blank workspace");
         let mut headers=axum::http::HeaderMap::new();
         headers.insert("Authorization",format!("Bearer {}",user["token"].as_str().unwrap()).parse()?);
-        let retried=ryzhub_server::checkpoint::enqueue(axum::extract::State(app.clone()),headers,
-            axum::extract::Path((org,conv)),axum::Json(ryzhub_server::checkpoint::JobInput{kind:"restore".into()})).await.map_err(|e| e.0)?;
+        let retried=ryzhub_server::workspace::enqueue(axum::extract::State(app.clone()),headers,
+            axum::extract::Path((org,conv)),axum::Json(ryzhub_server::workspace::JobInput{kind:"restore".into()})).await.map_err(|e| e.0)?;
         ensure!(retried.0["id"]==job.to_string(), "retry must reuse restore destination");
-        ryzhub_server::blob::BlobStore::configured(&config.work.storage_root)?.scoped(org).put(&checksum,bytes).await?;
-        let interrupted=ryzhub_server::checkpoint::jobs(&app,&lease).await.unwrap_err();
-        ensure!(interrupted.to_string()=="FENCED");
+        ryzhub_server::workspace::blob::BlobStore::configured(&config.work.storage_root)?.scoped(org).put(&checksum,bytes).await?;
+        let interrupted=ryzhub_server::workspace::jobs(&app,&lease,&link).await.unwrap_err();
+        ensure!(ryzhub_server::error::is_fenced(&interrupted), "expected FENCED, got {interrupted:#}");
         sqlx::query("UPDATE channels SET lease_until=now()-interval '1 second' WHERE org_id=$1 AND conversation_id=$2").bind(org).bind(conv).execute(&h.db).await?;
         let successor=h.store.claim(org,conv,Uuid::now_v7(),60000).await?.unwrap();
-        ryzhub_server::checkpoint::jobs(&app,&successor).await?;
+        ryzhub_server::workspace::jobs(&app,&successor,&link).await?;
         let state:String=sqlx::query_scalar("SELECT state FROM workspace_jobs WHERE id=$1").bind(job).fetch_one(&h.db).await?;
         ensure!(state=="completed");
         ensure!(stopped.lock().unwrap().iter().all(|id| id==&sandbox.to_string()), "retry stopped destination");
@@ -936,7 +938,7 @@ async fn restore_failure_should_not_create_blank_workspace() -> anyhow::Result<(
         ensure!(generation==2, "retry incremented generation again");
         let seq:i64=sqlx::query_scalar("SELECT last_seq FROM channels WHERE org_id=$1 AND conversation_id=$2").bind(org).bind(conv).fetch_one(&h.db).await?;
         // A crash after applying but before completing the job must not append again.
-        ryzhub_server::checkpoint::restore(&app,&successor,job).await?;
+        ryzhub_server::workspace::restore(&app,&successor,job,&link).await?;
         let again:i64=sqlx::query_scalar("SELECT last_seq FROM channels WHERE org_id=$1 AND conversation_id=$2").bind(org).bind(conv).fetch_one(&h.db).await?;
         ensure!(seq==again);
         let mut tx=h.store.tx(org).await?;
@@ -977,9 +979,9 @@ async fn checkpoint_sync_should_not_ack_next_turn_without_projection() -> anyhow
             }
             let value = if command["kind"] == "replay" {
                 let events = vec![
-                    json!({"gseq":1,"op_id":"native","result":{"method":"item/completed","params":{"turnId":"new-turn","item":{"id":"new-native-item","type":"agentMessage","text":"NEW_RUN_CONTENT"}}}}),
-                    json!({"gseq":2,"op_id":"native","result":{"id":17,"method":"item/tool/requestUserInput","params":{"turnId":"new-turn","questions":[{"id":"color","question":"Which color?"}]}}}),
-                    json!({"gseq":3,"op_id":"native","result":{"method":"thread/tokenUsage/updated","params":{"turnId":"restored-historical-turn"}}}),
+                    json!({"gseq":1,"op_id":"native","result":{"type":"item","phase":"completed","turn_id":"new-turn","native_id":"new-native-item","kind":"assistant","content":{"text":"NEW_RUN_CONTENT"}}}),
+                    json!({"gseq":2,"op_id":"native","result":{"type":"question_requested","request_id":"17","turn_id":"new-turn","questions":[{"id":"color","question":"Which color?"}]}}),
+                    json!({"gseq":3,"op_id":"native","result":{"type":"turn_started","turn_id":"restored-historical-turn"}}),
                 ];
                 let events: Vec<_> = events
                     .into_iter()
@@ -1006,7 +1008,6 @@ async fn checkpoint_sync_should_not_ack_next_turn_without_projection() -> anyhow
         let mut config=Config::default();
         config.llm.enabled=true;
         config.llm.model="mock".into();
-        config.llm.signing_key_env="RYZHUB_TEST_SIGNING_KEY".into();
         config.llm.unix_socket=Some("/gateway/test.sock".into());
         config.work.model="mock".into();
         config.sandbox.enabled=true;
@@ -1023,14 +1024,16 @@ async fn checkpoint_sync_should_not_ack_next_turn_without_projection() -> anyhow
         sqlx::query("INSERT INTO sandboxes(id,org_id,conversation_id,run_id,lease_epoch,exec_epoch,state,handle,persistent) VALUES($1,$2,$3,$4,1,$5,'running','{}',true)")
             .bind(sandbox).bind(org).bind(conv).bind(new).bind(lease.epoch).execute(&h.db).await?;
         sqlx::query("UPDATE runs SET sandbox_id=$2 WHERE id=ANY($1)").bind(vec![old,new]).bind(sandbox).execute(&h.db).await?;
-        let app=App{store:h.store.clone(),nats:h.nats.clone(),config};
-        let (send,_)=tokio::sync::mpsc::channel(1);
-        ryzhub_server::work::sync(&app,&lease,old,sandbox,&send,Some(1)).await?;
+        let app=App::new(h.store.clone(),h.nats.clone(),config)?;
+        let link=OwnerLink::detached();
+        // The event's turn is not registered yet: projection waits instead of acknowledging it.
+        let waiting=tokio::time::timeout(Duration::from_millis(500),ryzhub_server::work::sync_through(&app,&lease,old,sandbox,1,&link)).await;
+        ensure!(waiting.is_err(), "sync must wait for the turn to be registered");
         let deferred:i64=sqlx::query_scalar("SELECT acked_gseq FROM sandboxes WHERE id=$1").bind(sandbox).fetch_one(&h.db).await?;
         ensure!(deferred == 0, "unregistered turn must not be acknowledged");
         sqlx::query("UPDATE runs SET native_turn_id='new-turn' WHERE id=$1").bind(new).execute(&h.db).await?;
-        ryzhub_server::work::sync(&app,&lease,old,sandbox,&send,Some(1)).await?;
-        ryzhub_server::work::sync(&app,&lease,new,sandbox,&send,None).await?;
+        ryzhub_server::work::sync_through(&app,&lease,old,sandbox,1,&link).await?;
+        ryzhub_server::work::sync_through(&app,&lease,new,sandbox,3,&link).await?;
         let ack:i64=sqlx::query_scalar("SELECT acked_gseq FROM sandboxes WHERE id=$1").bind(sandbox).fetch_one(&h.db).await?;
         let projected:i64=sqlx::query_scalar("SELECT count(*) FROM items WHERE run_id=$1 AND text='NEW_RUN_CONTENT'").bind(new).fetch_one(&h.db).await?;
         println!("checkpoint sync: acked_gseq={ack}, new-turn projected items={projected}");
@@ -1038,28 +1041,30 @@ async fn checkpoint_sync_should_not_ack_next_turn_without_projection() -> anyhow
         ensure!(projected==1,"checkpoint consumed and acknowledged a newer turn event without projecting it");
         let (action,options):(Uuid,Vec<String>)=sqlx::query_as("SELECT id,options FROM pending_actions WHERE run_id=$1").bind(new).fetch_one(&h.db).await?;
         ensure!(options==vec!["__answer__"], "Work question must render an answer field");
-        // Renewal also works while waiting for user input, without starting a new turn.
+        // Rotation also works while waiting for user input, without starting a new turn, and
+        // supersedes the previous key for new requests.
         ryzhub_server::work::refresh_key(&app,&lease,new,sandbox).await?;
         let first=tokens.lock().unwrap().last().unwrap().clone();
-        let first_claims=ryzhub_server::llm::identity::verify(&app.config.llm,&first)?;
-        sqlx::query("UPDATE virtual_keys SET expires_at=now()+interval '4 minutes' WHERE id=$1").bind(first_claims.jti).execute(&h.db).await?;
         ryzhub_server::work::refresh_key(&app,&lease,new,sandbox).await?;
         let second=tokens.lock().unwrap().last().unwrap().clone();
-        let second_claims=ryzhub_server::llm::identity::verify(&app.config.llm,&second)?;
-        ensure!(first_claims.jti != second_claims.jti);
+        ensure!(first != second);
+        let first=ryzhub_server::llm::keys::resolve(&h.store,&first).await?;
+        let second=ryzhub_server::llm::keys::resolve(&h.store,&second).await?;
         let mut tx=h.store.tx(org).await?;
-        ensure!(ryzhub_server::llm::gateway::validate(&app,&mut tx,&first_claims,"mock").await.is_err());
-        ryzhub_server::llm::gateway::validate(&app,&mut tx,&second_claims,"mock").await?;
+        ensure!(ryzhub_server::llm::gateway::validate_key(&mut tx,&first,false).await.is_err());
+        tx.rollback().await?;
+        let mut tx=h.store.tx(org).await?;
+        ryzhub_server::llm::gateway::validate_key(&mut tx,&second,false).await?;
+        // An accepted stream outlives its key's supersession.
+        ryzhub_server::llm::gateway::validate_key(&mut tx,&first,true).await?;
         tx.commit().await?;
-        ryzhub_server::work::refresh_key(&app,&lease,new,sandbox).await?;
-        ensure!(tokens.lock().unwrap().last()==Some(&second), "fresh key should be reused");
         let answer=CommandEnvelope{cid:Uuid::now_v7().to_string(),command:Some(Command::AnswerQuestion(AnswerQuestion{action_id:action.to_string(),run_epoch:lease.epoch as u64,answer:"green".into()}))};
         h.store.accept(&ctx,conv,"review",&answer).await?;
         owner::process_with_config(&h.store,&lease,&app.config).await?;
         let response=h.store.command_result(&ctx,Uuid::parse_str(&answer.cid)?).await?.unwrap();
         ensure!(matches!(response.body,Some(Body::CommandAck(_))));
         let answer:Value=sqlx::query_scalar("SELECT answer FROM native_requests WHERE action_id=$1").bind(action).fetch_one(&h.db).await?;
-        ensure!(answer["answers"]["color"]["answers"]==json!(["green"]));
+        ensure!(answer==json!({"type":"question","answers":{"color":"green"}}), "unexpected answer {answer}");
         Ok::<_,anyhow::Error>(())
     }.await;
     stub.abort();
@@ -1093,6 +1098,202 @@ async fn legacy_upgrade_preserves_native_model_and_existing_settings() -> anyhow
         }
         Ok::<_,anyhow::Error>(())
     }.await;
+    h.close().await?;
+    outcome
+}
+
+/// Every request a stub host received.
+type Recorded = std::sync::Arc<std::sync::Mutex<Vec<Value>>>;
+
+/// A host agent stub that records every request and answers each as a completed operation
+/// (with an empty model list for harness requests).
+fn recording_host(
+    socket: &std::path::Path,
+) -> anyhow::Result<(tokio::task::JoinHandle<()>, Recorded)> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    let listener = tokio::net::UnixListener::bind(socket)?;
+    let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = requests.clone();
+    let task = tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            let mut line = String::new();
+            tokio::io::BufReader::new(read)
+                .read_line(&mut line)
+                .await
+                .unwrap();
+            seen.lock()
+                .unwrap()
+                .push(serde_json::from_str::<Value>(&line).unwrap());
+            let value = json!({"state":"completed","result":{"models":[]}});
+            let reply = json!({"ok":true,"value":value,"error":null});
+            write
+                .write_all(format!("{reply}\n").as_bytes())
+                .await
+                .unwrap();
+        }
+    });
+    Ok((task, requests))
+}
+
+/// A Work configuration pointed at a stub host.
+fn work_config(socket: &std::path::Path, storage: &std::path::Path) -> Config {
+    let mut config = Config::default();
+    config.llm.enabled = true;
+    config.llm.unix_socket = Some("/gateway/test.sock".into());
+    config.work.enabled = true;
+    config.work.model = "mock".into();
+    config.work.storage_root = storage.to_str().unwrap().into();
+    config.work.secondary_root = None;
+    config.sandbox.enabled = true;
+    config.sandbox.host_socket = socket.to_str().unwrap().into();
+    config.sandbox.image = format!("review@sha256:{}", "c".repeat(64));
+    config
+}
+
+#[tokio::test]
+#[ignore = "requires local PostgreSQL and NATS"]
+async fn runs_wait_for_idle_suspension_and_models_are_discovered_once() -> anyhow::Result<()> {
+    let h = Harness::new().await?;
+    let temp = tempfile::tempdir()?;
+    let socket = temp.path().join("host.sock");
+    let (stub, requests) = recording_host(&socket)?;
+    let outcome = async {
+        let user = h.user().await?;
+        let org = id(&user, "org_id");
+        let conv = h.conversation(&user).await?;
+        sqlx::query("UPDATE conversations SET mode='work',run_config='{}' WHERE id=$1").bind(conv).execute(&h.db).await?;
+        let ctx = h.store.context(id(&user, "user_id"), org).await?;
+        let lease = h.store.claim(org, conv, Uuid::now_v7(), 60_000).await?.unwrap();
+        let config = work_config(&socket, temp.path());
+        h.store.accept(&ctx, conv, "review", &message(Uuid::now_v7(), "turn")).await?;
+        owner::process_with_config(&h.store, &lease, &config).await?;
+        let run: Uuid = sqlx::query_scalar("SELECT id FROM runs WHERE conversation_id=$1").bind(conv).fetch_one(&h.db).await?;
+        sqlx::query("INSERT INTO sandboxes(id,org_id,conversation_id,run_id,lease_epoch,exec_epoch,state,handle,persistent,node_lease_until) VALUES($1,$2,$3,$4,1,$5,'running','{}',true,now()+interval '1 hour')")
+            .bind(Uuid::now_v7()).bind(org).bind(conv).bind(run).bind(lease.epoch).execute(&h.db).await?;
+        let suspension = Uuid::now_v7();
+        sqlx::query("INSERT INTO workspace_jobs(id,org_id,conversation_id,kind,state) VALUES($1,$2,$3,'suspend','running')")
+            .bind(suspension).bind(org).bind(conv).execute(&h.db).await?;
+        let app = App::new(h.store.clone(), h.nats.clone(), config)?;
+        // The suspension is about to stop the sandbox: the new run must not start using it.
+        let waiting = tokio::time::timeout(Duration::from_millis(1500), ryzhub_server::work::ensure_work(&app, &lease, run)).await;
+        ensure!(waiting.is_err(), "a run must wait for an in-progress suspension");
+        ensure!(requests.lock().unwrap().is_empty(), "nothing may touch the sandbox while it is being suspended");
+        sqlx::query("UPDATE workspace_jobs SET state='completed' WHERE id=$1").bind(suspension).execute(&h.db).await?;
+        // Later runs reuse the recorded models: the guest forgets old results eventually.
+        ryzhub_server::work::ensure_work(&app, &lease, run).await?;
+        ryzhub_server::work::ensure_work(&app, &lease, run).await?;
+        let discoveries = requests.lock().unwrap().iter()
+            .filter(|r| r["request"]["command"]["op_id"].as_str().is_some_and(|op| op.ends_with(":models")))
+            .count();
+        ensure!(discoveries == 1, "model discovery ran {discoveries} times");
+        Ok::<_, anyhow::Error>(())
+    }.await;
+    stub.abort();
+    h.close().await?;
+    outcome
+}
+
+#[tokio::test]
+#[ignore = "requires local PostgreSQL and NATS"]
+async fn suspended_workspace_checkpoints_forks_and_archives_from_its_head() -> anyhow::Result<()> {
+    let h = Harness::new().await?;
+    let temp = tempfile::tempdir()?;
+    let socket = temp.path().join("host.sock");
+    let (stub, requests) = recording_host(&socket)?;
+    let outcome = async {
+        let user = h.user().await?;
+        let org = id(&user, "org_id");
+        let conv = h.conversation(&user).await?;
+        sqlx::query("UPDATE conversations SET mode='work',run_config='{}' WHERE id=$1").bind(conv).execute(&h.db).await?;
+        let ctx = h.store.context(id(&user, "user_id"), org).await?;
+        let lease = h.store.claim(org, conv, Uuid::now_v7(), 60_000).await?.unwrap();
+        let config = work_config(&socket, temp.path());
+        h.store.accept(&ctx, conv, "review", &message(Uuid::now_v7(), "turn")).await?;
+        owner::process_with_config(&h.store, &lease, &config).await?;
+        let run: Uuid = sqlx::query_scalar("SELECT id FROM runs WHERE conversation_id=$1").bind(conv).fetch_one(&h.db).await?;
+        sqlx::query("UPDATE runs SET state='completed',ended_at=now() WHERE id=$1").bind(run).execute(&h.db).await?;
+        let sandbox = Uuid::now_v7();
+        sqlx::query("INSERT INTO sandboxes(id,org_id,conversation_id,run_id,lease_epoch,exec_epoch,state,handle,persistent,native_thread_id) VALUES($1,$2,$3,$4,1,$5,'suspended','{}',true,'thread')")
+            .bind(sandbox).bind(org).bind(conv).bind(run).bind(lease.epoch).execute(&h.db).await?;
+        let head = Uuid::now_v7();
+        let manifest = json!({"image":config.sandbox.image,"format":1,"encoding":"tar.zst","sha256":"d".repeat(64),"thread_id":"thread"});
+        sqlx::query("INSERT INTO checkpoints(id,org_id,conversation_id,sandbox_id,manifest,channel_seq,gseq) VALUES($1,$2,$3,$4,$5,0,0)")
+            .bind(head).bind(org).bind(conv).bind(sandbox).bind(manifest).execute(&h.db).await?;
+        sqlx::query("INSERT INTO workspace_heads(org_id,conversation_id,checkpoint_id) VALUES($1,$2,$3)").bind(org).bind(conv).bind(head).execute(&h.db).await?;
+        let app = App::new(h.store.clone(), h.nats.clone(), config)?;
+        let link = OwnerLink::detached();
+        let job_state = |job: Uuid| {
+            let db = h.db.clone();
+            async move {
+                sqlx::query_scalar::<_, String>("SELECT state FROM workspace_jobs WHERE id=$1").bind(job).fetch_one(&db).await
+            }
+        };
+        // A manual checkpoint of a suspended workspace: its head is already current.
+        let checkpoint = Uuid::now_v7();
+        sqlx::query("INSERT INTO workspace_jobs(id,org_id,conversation_id,kind) VALUES($1,$2,$3,'checkpoint')").bind(checkpoint).bind(org).bind(conv).execute(&h.db).await?;
+        ryzhub_server::workspace::jobs(&app, &lease, &link).await?;
+        ensure!(job_state(checkpoint).await? == "completed", "checkpoint of a suspended workspace failed");
+        // A fork starts from that head, with a pin of its own.
+        let fork = Uuid::now_v7();
+        sqlx::query("INSERT INTO conversation_operations(id,org_id,conversation_id,kind,payload) VALUES($1,$2,$3,'fork','{\"seq\":0}')").bind(fork).bind(org).bind(conv).execute(&h.db).await?;
+        ryzhub_server::conversation_commands::jobs(&app, &lease, &link).await?;
+        let forked: String = sqlx::query_scalar("SELECT state FROM conversation_operations WHERE id=$1").bind(fork).fetch_one(&h.db).await?;
+        ensure!(forked == "completed", "fork of a suspended workspace failed");
+        let pinned: Uuid = sqlx::query_scalar("SELECT checkpoint_id FROM restore_pins WHERE id=$1").bind(fork).fetch_one(&h.db).await?;
+        ensure!(pinned == head, "the fork must pin the suspended head");
+        // Archiving needs no new checkpoint either.
+        let archive = Uuid::now_v7();
+        sqlx::query("INSERT INTO workspace_jobs(id,org_id,conversation_id,kind) VALUES($1,$2,$3,'archive')").bind(archive).bind(org).bind(conv).execute(&h.db).await?;
+        ryzhub_server::workspace::jobs(&app, &lease, &link).await?;
+        ensure!(job_state(archive).await? == "completed", "archive of a suspended workspace failed");
+        let states: (String, String) = sqlx::query_as("SELECT c.state,s.state FROM conversations c JOIN sandboxes s ON s.conversation_id=c.id WHERE c.id=$1").bind(conv).fetch_one(&h.db).await?;
+        ensure!(states == ("archived".into(), "archived".into()), "unexpected states {states:?}");
+        ensure!(requests.lock().unwrap().is_empty(), "a suspended workspace needs no execution node");
+        Ok::<_, anyhow::Error>(())
+    }.await;
+    stub.abort();
+    h.close().await?;
+    outcome
+}
+
+#[tokio::test]
+#[ignore = "requires local PostgreSQL and NATS"]
+async fn owner_discovery_applies_the_organization_idle_limit() -> anyhow::Result<()> {
+    let h = Harness::new().await?;
+    let worker = PgPool::connect(&h.worker_url).await?;
+    let outcome = async {
+        let user = h.user().await?;
+        let org = id(&user, "org_id");
+        let conv = h.conversation(&user).await?;
+        sqlx::query("UPDATE conversations SET mode='work' WHERE id=$1").bind(conv).execute(&h.db).await?;
+        // Idle for ten minutes: past a 60-second organization limit, within the global 1800.
+        let run = Uuid::now_v7();
+        sqlx::query("INSERT INTO runs(id,org_id,conversation_id,exec_epoch,state,response_text,assistant_item_id,cause_cid,ended_at) VALUES($1,$2,$3,1,'cancelled','',$4,$5,now()-interval '10 minutes')")
+            .bind(run).bind(org).bind(conv).bind(Uuid::now_v7()).bind(Uuid::now_v7()).execute(&h.db).await?;
+        sqlx::query("INSERT INTO sandboxes(id,org_id,conversation_id,run_id,lease_epoch,exec_epoch,state,handle,persistent,node_lease_until,created_at) VALUES($1,$2,$3,$4,1,1,'running','{}',true,now()+interval '1 hour',now()-interval '10 minutes')")
+            .bind(Uuid::now_v7()).bind(org).bind(conv).bind(run).execute(&h.db).await?;
+        let woken = |config: Config| {
+            let worker = worker.clone();
+            async move {
+                let active = ryzhub_server::owner::active_conversations(&worker, &config).await?;
+                Ok::<_, anyhow::Error>(active.contains(&(org, conv)))
+            }
+        };
+        let global = Config::default();
+        let mut disabled = Config::default();
+        disabled.work.idle_suspend_secs = 0;
+        ensure!(!woken(global.clone()).await?, "within the global idle limit");
+        sqlx::query("INSERT INTO org_policies(org_id,version,policy) VALUES($1,(SELECT coalesce(max(version),0)+1 FROM org_policies WHERE org_id=$1),'{\"compute_idle_ttl_secs\":60}')")
+            .bind(org).execute(&h.db).await?;
+        ensure!(woken(global).await?, "the organization's shorter limit must wake the workspace");
+        ensure!(woken(disabled.clone()).await?, "an organization limit applies without a global one");
+        sqlx::query("DELETE FROM org_policies WHERE org_id=$1").bind(org).execute(&h.db).await?;
+        ensure!(!woken(disabled).await?, "no limit at all: never suspend");
+        Ok::<_, anyhow::Error>(())
+    }.await;
+    worker.close().await;
     h.close().await?;
     outcome
 }

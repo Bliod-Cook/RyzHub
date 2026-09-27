@@ -10,6 +10,9 @@ use std::{
     path::{Component, Path},
 };
 use tar::{Archive, Builder, EntryType, Header};
+/// Paths never archived: caches and runtime state that can be rebuilt, and secrets that must
+/// not outlive the sandbox (`.env`, `.ssh`, `auth.json`). They are reported in the manifest so
+/// a restore can tell the user what to recreate.
 fn ignored(path: &Path) -> bool {
     path.components().any(|p| {
         matches!(
@@ -23,6 +26,55 @@ fn ignored(path: &Path) -> bool {
         Some("tmp" | "run" | "proc" | "dev" | "control" | "gateway")
     )
 }
+
+/// SHA-256 (hex) and size of a file, read in chunks.
+pub fn digest(path: &Path) -> anyhow::Result<(String, u64)> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut file = fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0; 1024 * 1024];
+    let mut size = 0u64;
+    loop {
+        let n = file.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buffer[..n]);
+        size += n as u64;
+    }
+    Ok((format!("{:x}", hasher.finalize()), size))
+}
+
+/// Secret files left out of an archive (caches and runtime paths are not listed), at most 50.
+pub fn excluded(root: &Path) -> anyhow::Result<Vec<String>> {
+    const SECRETS: [&str; 3] = [".env", ".ssh", "auth.json"];
+    let mut found = vec![];
+    let mut pending = vec![std::path::PathBuf::new()];
+    while let Some(rel) = pending.pop() {
+        let Ok(entries) = fs::read_dir(root.join(&rel)) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = rel.join(entry.file_name());
+            let name = entry.file_name();
+            if SECRETS
+                .iter()
+                .any(|secret| name.as_bytes() == secret.as_bytes())
+            {
+                found.push(format!("/{}", path.display()));
+                if found.len() == 50 {
+                    return Ok(found);
+                }
+            } else if !ignored(&path) && entry.file_type().is_ok_and(|t| t.is_dir()) {
+                pending.push(path);
+            }
+        }
+    }
+    found.sort();
+    Ok(found)
+}
+
 pub fn export(root: &Path, destination: &Path) -> anyhow::Result<()> {
     let encoder = zstd::Encoder::new(fs::File::create(destination)?, 3)?;
     let mut tar = Builder::new(encoder);
@@ -126,6 +178,7 @@ pub fn export(root: &Path, destination: &Path) -> anyhow::Result<()> {
     tar.into_inner()?.finish()?.sync_all()?;
     Ok(())
 }
+
 fn safe(path: &Path) -> anyhow::Result<()> {
     ensure!(
         !path.as_os_str().is_empty()
@@ -134,6 +187,7 @@ fn safe(path: &Path) -> anyhow::Result<()> {
     );
     Ok(())
 }
+
 pub fn restore(source: &Path, root: &Path) -> anyhow::Result<()> {
     fs::create_dir_all(root)?;
     ensure!(
@@ -252,6 +306,7 @@ pub fn restore(source: &Path, root: &Path) -> anyhow::Result<()> {
     fs::File::open(root)?.sync_all()?;
     Ok(())
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;

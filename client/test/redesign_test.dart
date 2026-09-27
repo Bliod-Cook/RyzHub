@@ -330,16 +330,12 @@ void main() {
       conv,
       header: false,
     ).whereType<PopupMenuItem<String>>().map((e) => e.value).toList();
-    bool enabled(String value) => conversationMenu(hub, conv, header: false)
-        .whereType<PopupMenuItem<String>>()
-        .firstWhere((e) => e.value == value)
-        .enabled;
-    // Pin is reserved: listed but disabled; delete stays hidden.
-    expect(enabled('pin'), isFalse);
+    // Pin is a button beside the menu, never an entry; delete stays hidden.
+    expect(values(), isNot(contains('pin')));
     expect(values(), isNot(contains('delete')));
     expect(() => hub.pin('a', true), throwsException);
     hub.capabilities = {'conversation_pin': true, 'conversation_delete': true};
-    expect(values(), containsAll(['pin', 'delete']));
-    expect(enabled('pin'), isTrue);
+    expect(values(), contains('delete'));
+    expect(values(), isNot(contains('pin')));
   });
 }

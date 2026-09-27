@@ -1,0 +1,31 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE channels SET owner_id=$3,writer_epoch=writer_epoch+1,\n                 lease_until=clock_timestamp()+($4::bigint * interval '1 millisecond')\n             WHERE org_id=$1 AND conversation_id=$2 AND (lease_until IS NULL OR lease_until<clock_timestamp())\n             RETURNING writer_epoch AS \"writer_epoch!\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "writer_epoch!",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "channels",
+            "name": "writer_epoch"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "ba6036fe5f8defb23a3e3ed96a13a1d67ccebd2f26e761efc9e57823babeb231"
+}

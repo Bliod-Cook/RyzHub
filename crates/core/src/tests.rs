@@ -43,6 +43,7 @@ fn engine() -> Engine {
     e.subscribe("conv:x".into());
     e
 }
+
 fn event(seq: u64, revision: u64, text: &str, state: &str) -> Frame {
     frame(
         "conv:x",
@@ -58,10 +59,12 @@ fn event(seq: u64, revision: u64, text: &str, state: &str) -> Frame {
                 first_seq: 1,
                 last_seq: seq,
                 run_id: "r".into(),
+                ..Default::default()
             })),
         }),
     )
 }
+
 fn delta(base: u64, offset: u64, text: &str) -> Frame {
     frame(
         "conv:x",
@@ -76,6 +79,7 @@ fn delta(base: u64, offset: u64, text: &str) -> Frame {
         }),
     )
 }
+
 fn fold(text: &str) -> Frame {
     frame(
         "conv:x",
@@ -89,6 +93,7 @@ fn fold(text: &str) -> Frame {
         }),
     )
 }
+
 fn content(e: &Engine) -> &str {
     &e.channels["conv:x"].items["i"].text
 }
@@ -104,6 +109,7 @@ fn duplicate_partial_overlap_and_unicode_offsets() {
     assert_eq!(e.channels["conv:x"].cursor, 1);
     assert_eq!(e.apply(delta(1, 1, "invalid")).outbound.len(), 1);
 }
+
 #[test]
 fn delta_before_item_waits_for_base_seq() {
     let mut e = engine();
@@ -112,6 +118,7 @@ fn delta_before_item_waits_for_base_seq() {
     e.apply(event(1, 1, "", "streaming"));
     assert_eq!(content(&e), "first");
 }
+
 #[test]
 fn gaps_request_resubscription_and_old_folds_never_truncate() {
     let mut e = engine();
@@ -124,6 +131,7 @@ fn gaps_request_resubscription_and_old_folds_never_truncate() {
     e.apply(fold("complete fold later"));
     assert_eq!(content(&e), "final");
 }
+
 #[test]
 fn cursor_only_advances_over_contiguous_events() {
     let mut e = engine();
@@ -136,6 +144,7 @@ fn cursor_only_advances_over_contiguous_events() {
     e.apply(event(2, 2, "two", "streaming"));
     assert_eq!(content(&e), "three");
 }
+
 #[test]
 fn lost_ack_retries_same_command_after_serialization() {
     let mut e = engine();
@@ -161,6 +170,7 @@ fn lost_ack_retries_same_command_after_serialization() {
     ));
     assert!(restored.pending_commands.is_empty());
 }
+
 #[test]
 fn snapshot_then_live_event_has_no_gap_and_old_snapshot_is_ignored() {
     let mut e = engine();
@@ -186,6 +196,7 @@ fn snapshot_then_live_event_has_no_gap_and_old_snapshot_is_ignored() {
     assert_eq!(e.channels["conv:x"].cursor, 21);
     assert_eq!(content(&e), "after snapshot");
 }
+
 #[test]
 fn revoke_clears_private_projection_and_pending_commands() {
     let mut e = engine();
@@ -206,6 +217,7 @@ fn revoke_clears_private_projection_and_pending_commands() {
     assert!(e.channels.is_empty());
     assert!(e.pending_commands.is_empty());
 }
+
 #[test]
 fn excessive_future_deltas_request_fold_without_unbounded_buffering() {
     let mut e = engine();

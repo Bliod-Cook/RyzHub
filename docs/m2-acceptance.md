@@ -64,9 +64,13 @@ model = "gpt-5.4" # 本地 fixture 使用此名称；真实部署填可用模型
 storage_root = "/srv/ryzhub/primary"
 secondary_root = "s3config:/etc/ryzhub/secondary.toml"
 checkpoint_interval_secs = 300
-checkpoint_retention_days = 0 # 默认不自动到期；设置正数才清理旧检查点
+checkpoint_retention_days = 30 # 默认 30 天；0 表示不按时间淘汰
+checkpoint_keep_last = 20      # 每个对话最多保留的检查点数；0 表示不限
 checkpoint_gc_grace_secs = 86400
+idle_suspend_secs = 1800       # 空闲沙箱先提交检查点再停止；0 表示不挂起
 ```
+
+（迁移 0012 起的默认值；当前恢复点与 restore pin 始终保留。）
 
 `secondary.toml` 只引用凭据环境变量：
 

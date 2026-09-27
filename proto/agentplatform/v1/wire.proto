@@ -109,10 +109,36 @@ message Item {
   uint64 revision = 2;
   string kind = 3;
   string state = 4;
+  // Display text. Always present; clients that do not understand `detail` render it as is.
   string text = 5;
   uint64 first_seq = 6;
   uint64 last_seq = 7;
   string run_id = 8;
+  // `text` was cut at the server's per-item size limit; the full content is not replayed.
+  bool truncated = 9;
+  // Structured content for tool and file-change items (minor version 1).
+  ItemDetail detail = 10;
+}
+message ItemDetail {
+  oneof kind {
+    ToolDetail tool = 1;
+    FileChangeDetail file_change = 2;
+  }
+}
+message ToolDetail {
+  string name = 1;
+  string arguments_json = 2;
+  // Present once the call has completed.
+  string result_json = 3;
+  // Human-readable command output, possibly truncated.
+  string output = 4;
+}
+message FileChangeDetail { repeated FileChange changes = 1; }
+message FileChange {
+  string path = 1;
+  // add, update or delete.
+  string change = 2;
+  string diff = 3;
 }
 message PendingAction {
   string id = 1;
@@ -123,6 +149,8 @@ message PendingAction {
   string status = 6;
   string resolved_device = 7;
   int64 expires_at_ms = 8;
+  // approval or question. Replaces the `options == ["__answer__"]` convention (minor version 1).
+  string kind = 9;
 }
 message EventEnvelope {
   uint64 seq = 1;

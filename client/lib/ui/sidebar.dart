@@ -324,6 +324,19 @@ class _ConversationRowState extends State<ConversationRow> {
                   ),
                 ),
               ),
+              Reveal(
+                visible: hovered || selected,
+                child: SizedBox(
+                  width: 30,
+                  height: 32,
+                  child: PinButton(
+                    hub: hub,
+                    conv: conversation,
+                    run: run,
+                    compact: true,
+                  ),
+                ),
+              ),
               const SizedBox(width: 2),
             ],
           ),

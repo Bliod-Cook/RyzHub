@@ -8,12 +8,7 @@ use axum::{
     routing::post,
 };
 use ryzhub_proto::{command_envelope::Command, *};
-use ryzhub_server::{
-    api::{App, router},
-    config::Config,
-    llm::gateway,
-    store::Store,
-};
+use ryzhub_server::{app::App, config::Config, http::router, llm::gateway, store::Store};
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use std::{
@@ -199,7 +194,6 @@ impl Harness {
         config.llm.upstream_url = format!("http://{}", upstream_listener.local_addr()?);
         config.llm.gateway_url = format!("http://{}", gateway_listener.local_addr()?);
         config.llm.platform_key_env = "RYZHUB_TEST_UPSTREAM_KEY".into();
-        config.llm.signing_key_env = "RYZHUB_TEST_SIGNING_KEY".into();
         config.llm.vault_key_env = "RYZHUB_TEST_VAULT_KEY".into();
         config.sandbox.enabled = true;
         config.sandbox.memory_bytes = 1024 * 1024 * 1024;
@@ -228,11 +222,7 @@ impl Harness {
         let mut config_file = tempfile::NamedTempFile::new()?;
         config_file.write_all(toml::to_string(&config)?.as_bytes())?;
         let base = format!("http://{}", api_listener.local_addr()?);
-        let app = App {
-            store,
-            nats,
-            config,
-        };
+        let app = App::new(store, nats, config)?;
         let requests = Requests::default();
         let capture = requests.clone();
         let a = app.clone();
@@ -269,7 +259,7 @@ impl Harness {
         let heartbeat_app = app.clone();
         let heartbeat_db = PgPool::connect(&worker_url).await?;
         tasks.push(tokio::spawn(async move {
-            let _ = ryzhub_server::checkpoint::heartbeat(heartbeat_app, heartbeat_db).await;
+            let _ = ryzhub_server::sandbox::heartbeat(heartbeat_app, heartbeat_db).await;
         }));
         Ok(Self {
             name,
@@ -523,8 +513,14 @@ async fn guest_exec(
             return Ok(result);
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
-        result =
-            ryzhub_execution::call(host, &call(GuestCommand::Poll { op_id: op.into() })).await?;
+        result = ryzhub_execution::call(
+            host,
+            &call(GuestCommand::Poll {
+                op_id: op.into(),
+                wait_ms: 0,
+            }),
+        )
+        .await?;
     }
     anyhow::bail!("EXEC_TIMEOUT")
 }

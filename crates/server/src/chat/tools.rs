@@ -1,31 +1,119 @@
-use super::{commands, committed_item, guard};
-use crate::{
-    api::App,
-    sandbox,
-    store::{ActionRow, Lease, append},
-};
+//! Chat tool execution. Each call moves planned → started → completed; a call that may have
+//! reached the sandbox before a crash stays `started` and is resolved from the guest's durable
+//! operation record, never re-run.
 use anyhow::{Context, ensure};
 use ryzhub_execution::{ExecSpec, GuestCommand};
-use ryzhub_proto::{RunState, event_envelope::Event};
+use ryzhub_proto::{Item, ItemDetail, ToolDetail, item_detail};
 use serde_json::{Value, json};
 use sqlx::Row;
 use uuid::Uuid;
 
+use crate::{
+    app::App,
+    error::{Code, code_of, is_fenced},
+    owner::OwnerLink,
+    runs::{new_action, request_action},
+    sandbox,
+    store::{Lease, Tx, load_item, upsert_item},
+};
+
+/// How long one guest poll may wait for a running command to finish.
+const EXEC_POLL_MS: u64 = 5000;
+
+/// The Chat engine's tools, in the model's tool-definition format.
 pub fn definitions() -> Value {
+    let string = || json!({"type": "string"});
     json!([
-        {"name":"project_file_search","description":"Search text in the current project knowledge files. Read only, returns file names and line numbers.","input_schema":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}},
-        {"name":"exec","description":"Execute a shell command in the sandbox. User approval is required. Only /workspace persists; installed system packages may be discarded. Full output is saved on the execution node. PTY is unsupported.","input_schema":{"type":"object","properties":{"cmd":{"type":"string"},"cwd":{"type":"string"},"timeout_ms":{"type":"integer"},"background":{"type":"boolean"},"env":{"type":"object","additionalProperties":{"type":"string"}}},"required":["cmd"]}},
-        {"name":"exec_poll","description":"Read the status of a background execution handle without changing it.","input_schema":{"type":"object","properties":{"handle":{"type":"string"}},"required":["handle"]}},
-        {"name":"exec_write","description":"Write to the stdin of a running job. User approval is required.","input_schema":{"type":"object","properties":{"handle":{"type":"string"},"data":{"type":"string"}},"required":["handle","data"]}},
-        {"name":"exec_kill","description":"Stop a running job. User approval is required.","input_schema":{"type":"object","properties":{"handle":{"type":"string"}},"required":["handle"]}},
-        {"name":"ask_user","description":"Ask the user a question and wait for a persisted response.","input_schema":{"type":"object","properties":{"question":{"type":"string"},"options":{"type":"array","items":{"type":"string"}}},"required":["question"]}}
+        tool(
+            "project_file_search",
+            "Search text in the current project knowledge files. Read only, returns file names and line numbers.",
+            json!({"query": string()}),
+            &["query"],
+        ),
+        tool(
+            "exec",
+            "Execute a shell command in the sandbox. User approval is required. Only /workspace persists; \
+             installed system packages may be discarded. Full output is saved on the execution node. \
+             PTY is unsupported.",
+            json!({
+                "cmd": string(),
+                "cwd": string(),
+                "timeout_ms": {"type": "integer"},
+                "background": {"type": "boolean"},
+                "env": {"type": "object", "additionalProperties": string()},
+            }),
+            &["cmd"],
+        ),
+        tool(
+            "exec_poll",
+            "Read the status of a background execution handle without changing it.",
+            json!({"handle": string()}),
+            &["handle"],
+        ),
+        tool(
+            "exec_write",
+            "Write to the stdin of a running job. User approval is required.",
+            json!({"handle": string(), "data": string()}),
+            &["handle", "data"],
+        ),
+        tool(
+            "exec_kill",
+            "Stop a running job. User approval is required.",
+            json!({"handle": string()}),
+            &["handle"],
+        ),
+        tool(
+            "ask_user",
+            "Ask the user a question and wait for a persisted response.",
+            json!({"question": string(), "options": {"type": "array", "items": string()}}),
+            &["question"],
+        ),
     ])
 }
-pub async fn advance(app: &App, lease: &Lease, run: Uuid) -> anyhow::Result<bool> {
+
+fn tool(name: &str, description: &str, properties: Value, required: &[&str]) -> Value {
+    json!({
+        "name": name,
+        "description": description,
+        "input_schema": {"type": "object", "properties": properties, "required": required},
+    })
+}
+
+const KNOWN: [&str; 6] = [
+    "exec",
+    "exec_poll",
+    "exec_write",
+    "exec_kill",
+    "ask_user",
+    "project_file_search",
+];
+/// Read-only tools never need approval.
+fn needs_approval(name: &str, full_auto: bool) -> bool {
+    match name {
+        "exec_poll" | "project_file_search" => false,
+        "ask_user" => true,
+        _ => !full_auto,
+    }
+}
+
+/// Execute every unfinished tool call of the run, in order. Returns false when a call waits
+/// for the user; the Owner restarts the loop once the action is resolved.
+pub async fn advance(
+    app: &App,
+    lease: &Lease,
+    run: Uuid,
+    link: &OwnerLink,
+) -> anyhow::Result<bool> {
     loop {
-        let mut tx = app.store.tx(lease.org_id).await?;
-        guard(&mut tx, lease, run).await?;
-        let row=sqlx::query("SELECT call_id,name,arguments,status,action_id,item_id,sandbox_id FROM tool_calls WHERE org_id=$1 AND run_id=$2 AND status<>'completed' ORDER BY step_no,call_id LIMIT 1").bind(lease.org_id).bind(run).fetch_optional(&mut *tx).await?;
+        let mut tx = crate::runs::guarded(&app.store, lease, run).await?;
+        let row = sqlx::query(
+            "SELECT call_id,name,arguments,status,action_id FROM tool_calls
+             WHERE org_id=$1 AND run_id=$2 AND status<>'completed' ORDER BY step_no,call_id LIMIT 1",
+        )
+        .bind(lease.org_id)
+        .bind(run)
+        .fetch_optional(&mut *tx)
+        .await?;
         let Some(row) = row else {
             tx.commit().await?;
             return Ok(true);
@@ -34,14 +122,17 @@ pub async fn advance(app: &App, lease: &Lease, run: Uuid) -> anyhow::Result<bool
         let name: String = row.get("name");
         let args: Value = row.get("arguments");
         let status: String = row.get("status");
-        let action: Option<Uuid> = row.get("action_id");
-        let known = matches!(
-            name.as_str(),
-            "exec" | "exec_poll" | "exec_write" | "exec_kill" | "ask_user" | "project_file_search"
-        );
-        if !known {
+        if !KNOWN.contains(&name.as_str()) {
             tx.commit().await?;
-            record(app, lease, run, &call, json!({"error":"unknown_tool"})).await?;
+            record(
+                app,
+                lease,
+                run,
+                &call,
+                json!({"error":"unknown_tool"}),
+                link,
+            )
+            .await?;
             continue;
         }
         let settings: Value =
@@ -50,100 +141,100 @@ pub async fn advance(app: &App, lease: &Lease, run: Uuid) -> anyhow::Result<bool
                 .bind(run)
                 .fetch_one(&mut *tx)
                 .await?;
-        let auto = settings["approval"] == "full_auto" && name != "ask_user";
-        if !matches!(name.as_str(), "exec_poll" | "project_file_search")
-            && !auto
-            && status == "planned"
-        {
-            if let Some(action) = action {
-                let decision: String = sqlx::query_scalar(
-                    "SELECT status FROM pending_actions WHERE org_id=$1 AND id=$2",
-                )
-                .bind(lease.org_id)
-                .bind(action)
-                .fetch_one(&mut *tx)
-                .await?;
-                if decision == "deny" {
-                    tx.commit().await?;
-                    record(app, lease, run, &call, json!({"error":"user_denied"})).await?;
-                    continue;
-                }
-                ensure!(
-                    decision == "allow" || decision == "answered",
-                    "ACTION_NOT_RESOLVED"
-                );
-            } else {
-                let question = name == "ask_user";
-                let options = if question {
-                    vec!["__answer__".to_owned()]
-                } else {
-                    vec!["allow".into(), "deny".into()]
-                };
-                let summary = if question {
-                    format!(
-                        "问题：{}",
-                        args["question"].as_str().unwrap_or("请提供更多信息")
+        if status == "planned" && needs_approval(&name, settings["approval"] == "full_auto") {
+            match row.get::<Option<Uuid>, _>("action_id") {
+                Some(action) => {
+                    let decision: String = sqlx::query_scalar(
+                        "SELECT status FROM pending_actions WHERE org_id=$1 AND id=$2",
                     )
-                } else {
-                    format!("允许执行 {name}？\n{args}")
-                };
-                ensure!(summary.len() <= 65536, "TOOL_REQUEST_TOO_LARGE");
-                let action:ActionRow=sqlx::query_as("INSERT INTO pending_actions(id,org_id,run_id,run_epoch,kind,summary,options,expires_at) VALUES($1,$2,$3,$4,$5,$6,$7,now()+interval '24 hours') RETURNING id,run_id,run_epoch,summary,options,status,resolved_device,expires_at").bind(Uuid::now_v7()).bind(lease.org_id).bind(run).bind(lease.epoch).bind(if question{"question"}else{"approval"}).bind(summary).bind(options).fetch_one(&mut *tx).await?;
-                sqlx::query("UPDATE tool_calls SET action_id=$4 WHERE org_id=$1 AND run_id=$2 AND call_id=$3").bind(lease.org_id).bind(run).bind(&call).bind(action.id).execute(&mut *tx).await?;
-                sqlx::query("UPDATE runs SET state='requires_action' WHERE org_id=$1 AND id=$2")
                     .bind(lease.org_id)
-                    .bind(run)
-                    .execute(&mut *tx)
+                    .bind(action)
+                    .fetch_one(&mut *tx)
                     .await?;
-                append(
-                    &mut tx,
-                    lease.org_id,
-                    &lease.channel(),
-                    Some(lease),
-                    "",
-                    Event::PendingActionChanged(action.into()),
-                )
-                .await?;
-                append(
-                    &mut tx,
-                    lease.org_id,
-                    &lease.channel(),
-                    Some(lease),
-                    "",
-                    Event::RunStateChanged(RunState {
-                        read_only: false,
-                        run_id: run.to_string(),
-                        state: "requires_action".into(),
-                        exec_epoch: lease.epoch as u64,
-                    }),
-                )
-                .await?;
-                tx.commit().await?;
-                return Ok(false);
+                    if decision == "deny" {
+                        tx.commit().await?;
+                        record(app, lease, run, &call, json!({"error":"user_denied"}), link)
+                            .await?;
+                        continue;
+                    }
+                    if decision != "allow" && decision != "answered" {
+                        // Still pending (or invalidated): nothing to do until it changes.
+                        tx.commit().await?;
+                        return Ok(false);
+                    }
+                }
+                None => {
+                    ask(app, &mut tx, lease, run, &call, &name, &args).await?;
+                    tx.commit().await?;
+                    link.committed().await;
+                    return Ok(false);
+                }
             }
         }
         if status == "planned" {
-            sqlx::query("UPDATE tool_calls SET status='started',started_at=now() WHERE org_id=$1 AND run_id=$2 AND call_id=$3").bind(lease.org_id).bind(run).bind(&call).execute(&mut *tx).await?;
+            sqlx::query(
+                "UPDATE tool_calls SET status='started',started_at=now() WHERE org_id=$1 AND run_id=$2 AND call_id=$3",
+            )
+            .bind(lease.org_id)
+            .bind(run)
+            .bind(&call)
+            .execute(&mut *tx)
+            .await?;
         }
         tx.commit().await?;
-        let result = dispatch(app, lease, run, &call, &name, args).await;
-        match result {
-            Ok(value) => record(app, lease, run, &call, value).await?,
-            Err(error) if error.to_string() == "FENCED" => return Err(error),
-            Err(error) => {
-                // Dispatch may have reached the guest. Preserve started state on connectivity
-                // failure so the next Owner queries the durable op_id, never inventing success.
-                if !matches!(
-                    error.to_string().as_str(),
-                    "SANDBOX_DISABLED" | "INVALID_TOOL_ARGUMENTS" | "PTY_UNSUPPORTED"
-                ) {
-                    return Err(error);
-                }
-                record(app, lease, run, &call, json!({"error":error.to_string()})).await?;
-            }
+        match dispatch(app, lease, run, &call, &name, args, link).await {
+            Ok(value) => record(app, lease, run, &call, value, link).await?,
+            Err(error) if is_fenced(&error) => return Err(error),
+            // Argument and capability errors are answers the model can act on. Anything else
+            // may have reached the guest: keep `started` so the next attempt asks the guest.
+            Err(error) => match code_of(&error) {
+                Some(
+                    code @ (Code::SandboxDisabled
+                    | Code::InvalidToolArguments
+                    | Code::PtyUnsupported),
+                ) => record(app, lease, run, &call, json!({"error":code.as_str()}), link).await?,
+                _ => return Err(error),
+            },
         }
     }
 }
+
+/// Create the approval or question for a planned call and pause the run.
+async fn ask(
+    app: &App,
+    tx: &mut Tx<'_>,
+    lease: &Lease,
+    run: Uuid,
+    call: &str,
+    name: &str,
+    args: &Value,
+) -> anyhow::Result<()> {
+    let question = name == "ask_user";
+    let summary = if question {
+        format!(
+            "问题：{}",
+            args["question"].as_str().unwrap_or("请提供更多信息")
+        )
+    } else {
+        format!("允许执行 {name}？\n{args}")
+    };
+    ensure!(summary.len() <= 65_536, Code::InvalidToolArguments);
+    let (kind, options): (&str, &[&str]) = if question {
+        ("question", &["__answer__"])
+    } else {
+        ("approval", &["allow", "deny"])
+    };
+    let action = new_action(tx, lease, run, kind, &summary, options, &app.config).await?;
+    sqlx::query("UPDATE tool_calls SET action_id=$4 WHERE org_id=$1 AND run_id=$2 AND call_id=$3")
+        .bind(lease.org_id)
+        .bind(run)
+        .bind(call)
+        .bind(action.id)
+        .execute(&mut **tx)
+        .await?;
+    request_action(tx, lease, run, action).await
+}
+
 async fn dispatch(
     app: &App,
     lease: &Lease,
@@ -151,76 +242,78 @@ async fn dispatch(
     call: &str,
     name: &str,
     args: Value,
+    link: &OwnerLink,
 ) -> anyhow::Result<Value> {
     if name == "project_file_search" {
-        let mut tx = app.store.tx(lease.org_id).await?;
-        guard(&mut tx, lease, run).await?;
-        return crate::projects::search(
-            &mut tx,
-            lease.org_id,
-            run,
-            args["query"].as_str().context("INVALID_TOOL_ARGUMENTS")?,
-        )
-        .await;
+        let query = args["query"].as_str().context(Code::InvalidToolArguments)?;
+        let mut tx = crate::runs::guarded(&app.store, lease, run).await?;
+        return crate::projects::search(&mut tx, lease.org_id, run, query).await;
     }
-    let id = sandbox::ensure_sandbox(app, lease, run).await?;
-    let mut tx = app.store.tx(lease.org_id).await?;
-    guard(&mut tx, lease, run).await?;
-    sqlx::query("UPDATE tool_calls SET sandbox_id=$4 WHERE org_id=$1 AND run_id=$2 AND call_id=$3")
+    let sandbox = sandbox::ensure_sandbox(app, lease, run, link).await?;
+    let (status, recorded): (String, Option<Value>) = {
+        let mut tx = crate::runs::guarded(&app.store, lease, run).await?;
+        let row = sqlx::query_as(
+            "UPDATE tool_calls SET sandbox_id=$4 WHERE org_id=$1 AND run_id=$2 AND call_id=$3
+             RETURNING status,result",
+        )
         .bind(lease.org_id)
         .bind(run)
         .bind(call)
-        .bind(id)
-        .execute(&mut *tx)
+        .bind(sandbox)
+        .fetch_one(&mut *tx)
         .await?;
-    tx.commit().await?;
+        tx.commit().await?;
+        row
+    };
+    // The sandbox sync may just have recorded this call: it finished before a crash.
+    if status == "completed" {
+        return Ok(recorded.unwrap_or_default());
+    }
     let op = format!("{run}:{call}");
     let value = match name {
         "exec" => {
-            let spec: ExecSpec = serde_json::from_value(args).context("INVALID_TOOL_ARGUMENTS")?;
+            let spec: ExecSpec =
+                serde_json::from_value(args).context(Code::InvalidToolArguments)?;
             let background = spec.background;
-            let mut result = sandbox::guest(
-                app,
-                lease,
-                id,
-                GuestCommand::Exec {
-                    op_id: op.clone(),
-                    spec,
-                },
-            )
-            .await?;
+            let command = GuestCommand::Exec {
+                op_id: op.clone(),
+                spec,
+            };
+            let mut result = sandbox::guest(app, lease, sandbox, command).await?;
             if !background {
                 while result["state"] == "running" {
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                    let mut tx = app.store.tx(lease.org_id).await?;
-                    guard(&mut tx, lease, run).await?;
+                    let tx = crate::runs::guarded(&app.store, lease, run).await?;
                     tx.commit().await?;
-                    sandbox::sync_events(app, lease, run, id).await?;
-                    result =
-                        sandbox::guest(app, lease, id, GuestCommand::Poll { op_id: op.clone() })
-                            .await?;
+                    let poll = GuestCommand::Poll {
+                        op_id: op.clone(),
+                        wait_ms: EXEC_POLL_MS,
+                    };
+                    result = sandbox::guest(app, lease, sandbox, poll).await?;
                 }
-                sandbox::sync_events(app, lease, run, id).await?;
+                sandbox::sync_events(app, lease, run, sandbox, link).await?;
             }
             result
         }
         "exec_poll" | "exec_write" | "exec_kill" => {
             let handle = args["handle"]
                 .as_str()
-                .context("INVALID_TOOL_ARGUMENTS")?
+                .context(Code::InvalidToolArguments)?
                 .to_owned();
             ensure!(
                 handle.starts_with(&format!("{run}:")),
-                "INVALID_TOOL_ARGUMENTS"
+                Code::InvalidToolArguments
             );
             let command = match name {
-                "exec_poll" => GuestCommand::Poll { op_id: handle },
+                "exec_poll" => GuestCommand::Poll {
+                    op_id: handle,
+                    wait_ms: 0,
+                },
                 "exec_write" => GuestCommand::Write {
                     op_id: handle,
                     request_id: op.clone(),
                     data: args["data"]
                         .as_str()
-                        .context("INVALID_TOOL_ARGUMENTS")?
+                        .context(Code::InvalidToolArguments)?
                         .into(),
                 },
                 _ => GuestCommand::Kill {
@@ -228,33 +321,97 @@ async fn dispatch(
                     request_id: op.clone(),
                 },
             };
-            sandbox::guest(app, lease, id, command).await?
+            sandbox::guest(app, lease, sandbox, command).await?
         }
-        _ => anyhow::bail!("INVALID_TOOL_ARGUMENTS"),
+        _ => anyhow::bail!(Code::InvalidToolArguments),
     };
-    if value["state"] == "outcome_unknown" {
-        Ok(json!({"error":"outcome_unknown","details":value}))
+    Ok(if value["state"] == "outcome_unknown" {
+        json!({"error":"outcome_unknown","details":value})
     } else {
-        Ok(value)
-    }
+        value
+    })
 }
+
+/// Tool detail with the call's result attached.
+pub fn with_result(mut item: Item, result: &Value) -> Item {
+    let mut tool = match item.detail.take().and_then(|d| d.kind) {
+        Some(item_detail::Kind::Tool(tool)) => tool,
+        _ => ToolDetail::default(),
+    };
+    tool.result_json = result.to_string();
+    let output = [&result["stdout_head"], &result["stdout_tail"]]
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect::<Vec<_>>()
+        .join("");
+    if !output.is_empty() {
+        tool.output = output;
+    }
+    item.detail = Some(ItemDetail {
+        kind: Some(item_detail::Kind::Tool(tool)),
+    });
+    item
+}
+
+/// Complete a call once; later duplicates are ignored.
 async fn record(
     app: &App,
     lease: &Lease,
     run: Uuid,
     call: &str,
     result: Value,
+    link: &OwnerLink,
 ) -> anyhow::Result<()> {
-    let mut tx = app.store.tx(lease.org_id).await?;
-    guard(&mut tx, lease, run).await?;
-    let item:Option<Uuid>=sqlx::query_scalar("UPDATE tool_calls SET status='completed',result=$4,completed_at=now() WHERE org_id=$1 AND run_id=$2 AND call_id=$3 AND status<>'completed' RETURNING item_id").bind(lease.org_id).bind(run).bind(call).bind(&result).fetch_optional(&mut *tx).await?;
+    let mut tx = crate::runs::guarded(&app.store, lease, run).await?;
+    let item: Option<Uuid> = sqlx::query_scalar(
+        "UPDATE tool_calls SET status='completed',result=$4,completed_at=now()
+         WHERE org_id=$1 AND run_id=$2 AND call_id=$3 AND status<>'completed' RETURNING item_id",
+    )
+    .bind(lease.org_id)
+    .bind(run)
+    .bind(call)
+    .bind(&result)
+    .fetch_optional(&mut *tx)
+    .await?;
     if let Some(item) = item {
-        let mut item = commands::item(&mut tx, lease.org_id, item).await?;
-        item.revision += 1;
-        item.state = "completed".into();
-        item.text = result.to_string();
-        committed_item(&mut tx, lease, item).await?;
+        complete_item(&mut tx, lease, item, &result).await?;
     }
     tx.commit().await?;
+    link.committed().await;
     Ok(())
+}
+
+/// Finalize a tool item with its result. `text` keeps the v1 rendering (the result JSON).
+pub async fn complete_item(
+    tx: &mut Tx<'_>,
+    lease: &Lease,
+    item: Uuid,
+    result: &Value,
+) -> anyhow::Result<()> {
+    let mut item = load_item(tx, lease.org_id, item).await?;
+    item.revision += 1;
+    item.state = "completed".into();
+    item.text = result.to_string();
+    upsert_item(tx, lease, with_result(item, result)).await?;
+    Ok(())
+}
+
+/// The user's answer is the result of the `ask_user` call that asked it.
+pub async fn answer_question(
+    tx: &mut Tx<'_>,
+    lease: &Lease,
+    action: Uuid,
+    answer: &str,
+) -> anyhow::Result<()> {
+    let result = json!({"answer":answer});
+    let item: Uuid = sqlx::query_scalar(
+        "UPDATE tool_calls SET result=$3,status='completed',completed_at=now()
+         WHERE org_id=$1 AND action_id=$2 RETURNING item_id",
+    )
+    .bind(lease.org_id)
+    .bind(action)
+    .bind(&result)
+    .fetch_one(&mut **tx)
+    .await?;
+    complete_item(tx, lease, item, &result).await
 }

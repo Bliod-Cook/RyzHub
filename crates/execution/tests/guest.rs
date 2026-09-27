@@ -47,6 +47,7 @@ async fn durable_exec_deduplication_fencing_replay_and_restart() -> anyhow::Resu
                 2,
                 GuestCommand::Poll {
                     op_id: "turn:call".into(),
+                    wait_ms: 0,
                 },
             ))
             .await?;
@@ -61,7 +62,14 @@ async fn durable_exec_deduplication_fencing_replay_and_restart() -> anyhow::Resu
         "once"
     );
     let replay = guest
-        .handle(request(2, GuestCommand::Replay { after: 0 }))
+        .handle(request(
+            2,
+            GuestCommand::Replay {
+                after: 0,
+                wait_ms: 0,
+                folds_seen: 0,
+            },
+        ))
         .await?;
     assert_eq!(replay["events"].as_array().unwrap().len(), 1);
     assert_eq!(replay["events"][0]["gseq"], 1);
@@ -70,26 +78,47 @@ async fn durable_exec_deduplication_fencing_replay_and_restart() -> anyhow::Resu
     assert_eq!(restarted.handle(request(2, command)).await?, final_result);
     assert_eq!(
         restarted
-            .handle(request(2, GuestCommand::Replay { after: 0 }))
+            .handle(request(
+                2,
+                GuestCommand::Replay {
+                    after: 0,
+                    wait_ms: 0,
+                    folds_seen: 0
+                }
+            ))
             .await?,
         replay
     );
     restarted
         .handle(request(2, GuestCommand::Ack { through: 1 }))
         .await?;
+    // A replay from behind the acknowledged position (a concurrent Owner task acknowledged
+    // first) returns only what is new; a replay from beyond the head is an error.
+    for after in [0, 1] {
+        let replay = restarted
+            .handle(request(
+                2,
+                GuestCommand::Replay {
+                    after,
+                    wait_ms: 0,
+                    folds_seen: 0,
+                },
+            ))
+            .await?;
+        assert!(replay["events"].as_array().unwrap().is_empty());
+    }
     assert!(
         restarted
-            .handle(request(2, GuestCommand::Replay { after: 0 }))
+            .handle(request(
+                2,
+                GuestCommand::Replay {
+                    after: 2,
+                    wait_ms: 0,
+                    folds_seen: 0
+                }
+            ))
             .await
             .is_err()
-    );
-    assert!(
-        restarted
-            .handle(request(2, GuestCommand::Replay { after: 1 }))
-            .await?["events"]
-            .as_array()
-            .unwrap()
-            .is_empty()
     );
     Ok(())
 }
@@ -119,6 +148,7 @@ async fn exec_timeout_and_output_are_bounded() -> anyhow::Result<()> {
         let result = guest
             .handle(call(GuestCommand::Poll {
                 op_id: "timeout".into(),
+                wait_ms: 1000,
             }))
             .await?;
         if result["state"] == "completed" {

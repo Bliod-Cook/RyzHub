@@ -78,6 +78,54 @@ Future<bool> confirmDialog(
       false;
 }
 
+/// Pins or unpins a conversation, beside the header and sidebar row menus.
+/// Reserved: disabled until the server advertises `conversation_pin`.
+class PinButton extends StatelessWidget {
+  final HubController hub;
+  final Map<String, dynamic> conv;
+  final RunAction run;
+
+  /// Sidebar rows: a smaller glyph and no highlight of its own, since the
+  /// row already highlights.
+  final bool compact;
+  const PinButton({
+    super.key,
+    required this.hub,
+    required this.conv,
+    required this.run,
+    this.compact = false,
+  });
+  @override
+  Widget build(BuildContext context) {
+    final c = HubColors.of(context);
+    final pinned = conv['pinned'] == true;
+    final size = compact ? 17.0 : 20.0;
+    return IconButton(
+      tooltip: !hub.canPin
+          ? tr('置顶（即将支持）', 'Pin (coming soon)')
+          : pinned
+          ? tr('取消置顶', 'Unpin')
+          : tr('置顶', 'Pin'),
+      isSelected: pinned,
+      onPressed: hub.canPin
+          ? () => run(() => hub.pin(conv['id'], !pinned))
+          : null,
+      padding: compact ? EdgeInsets.zero : null,
+      style: compact
+          ? const ButtonStyle(
+              overlayColor: WidgetStatePropertyAll(Colors.transparent),
+            )
+          : null,
+      icon: Icon(
+        Icons.push_pin_outlined,
+        size: size,
+        color: compact ? (hub.canPin ? c.muted : c.subtle) : null,
+      ),
+      selectedIcon: Icon(Icons.push_pin, size: size, color: c.accent),
+    );
+  }
+}
+
 /// Entries shared by the header `对话命令` menu and the sidebar row menu.
 List<PopupMenuEntry<String>> conversationMenu(
   HubController hub,
@@ -122,18 +170,6 @@ List<PopupMenuEntry<String>> conversationMenu(
         enabled: !running,
       ),
     item('rename', Icons.edit_outlined, tr('重命名', 'Rename')),
-    // Reserved: visible but disabled until the server supports pinning.
-    if (!hub.canPin)
-      item(
-        'pin',
-        Icons.push_pin_outlined,
-        tr('置顶（即将支持）', 'Pin (coming soon)'),
-        enabled: false,
-      )
-    else if (conv['pinned'] == true)
-      item('unpin', Icons.push_pin, tr('取消置顶', 'Unpin'))
-    else
-      item('pin', Icons.push_pin_outlined, tr('置顶', 'Pin')),
     if (!archived)
       item(
         'archive',
@@ -191,8 +227,6 @@ Future<void> conversationAction(
       if (title != null && title.trim().isNotEmpty) {
         await hub.rename(id, title.trim());
       }
-    case 'pin' || 'unpin':
-      await hub.pin(id, value == 'pin');
     case 'archive':
       await hub.archive(id);
     case 'unarchive':

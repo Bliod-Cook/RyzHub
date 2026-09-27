@@ -7,7 +7,11 @@ use std::{
     path::PathBuf,
     sync::{Arc, Weak},
 };
-use tokio::{net::UnixListener, sync::Mutex};
+use tokio::{
+    io::{AsyncBufReadExt, AsyncWriteExt},
+    net::UnixListener,
+    sync::Mutex,
+};
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -18,30 +22,71 @@ pub struct Config {
     pub allowed_uid: u32,
     pub runsc_config: Option<PathBuf>,
 }
+
 #[derive(Clone, Serialize, Deserialize)]
 struct Entry {
     spec: SandboxSpec,
     epoch: u64,
     state: String,
 }
+
 #[derive(Default, Serialize, Deserialize)]
 struct State {
     sandboxes: BTreeMap<Uuid, Entry>,
     #[serde(default)]
     deleted_workspaces: BTreeSet<(Uuid, Uuid)>,
 }
+
 pub struct Host {
     config: Config,
     state: Mutex<State>,
     operations: Mutex<BTreeMap<Uuid, Weak<Mutex<()>>>>,
     checkpointing: std::sync::Mutex<BTreeSet<Uuid>>,
+    /// Asynchronous checkpoint and restore jobs by artifact id: None while running.
+    jobs: std::sync::Mutex<Jobs>,
     _lock: std::fs::File,
+}
+
+/// The reported state of an asynchronous job.
+type Jobs = BTreeMap<Uuid, Option<Result<Value, String>>>;
+
+/// The state of `artifact`'s job, if one is known. A failure is reported once and then
+/// forgotten, so the caller's retry with the same artifact starts the job again instead of
+/// replaying a failure whose cause may be gone.
+fn poll_job(jobs: &mut Jobs, artifact: Uuid) -> Option<Value> {
+    match jobs.get(&artifact)? {
+        Some(Err(_)) => jobs.remove(&artifact).map(|job| job_state(&job)),
+        job => Some(job_state(job)),
+    }
+}
+
+/// Register `artifact`'s job as running unless it is already known (then its state). Checked
+/// and claimed under one lock, so concurrent requests start the job once.
+fn claim_job(jobs: &mut Jobs, artifact: Uuid) -> Option<Value> {
+    let state = poll_job(jobs, artifact);
+    if state.is_none() {
+        jobs.insert(artifact, None);
+    }
+    state
+}
+
+fn job_state(result: &Option<Result<Value, String>>) -> Value {
+    match result {
+        None => json!({"state":"running"}),
+        Some(Ok(value)) => {
+            let mut value = value.clone();
+            value["state"] = json!("completed");
+            value
+        }
+        Some(Err(error)) => json!({"state":"failed","error":error}),
+    }
 }
 
 struct CheckpointActivity<'a> {
     active: &'a std::sync::Mutex<BTreeSet<Uuid>>,
     id: Uuid,
 }
+
 impl Drop for CheckpointActivity<'_> {
     fn drop(&mut self) {
         self.active.lock().unwrap().remove(&self.id);
@@ -65,6 +110,7 @@ pub trait SandboxBackend {
         epoch: u64,
     ) -> impl std::future::Future<Output = anyhow::Result<Value>> + Send;
 }
+
 impl Host {
     pub async fn open(config: Config) -> anyhow::Result<Arc<Self>> {
         ensure!(
@@ -84,11 +130,13 @@ impl Host {
             state: Mutex::new(state),
             operations: Mutex::new(BTreeMap::new()),
             checkpointing: std::sync::Mutex::new(BTreeSet::new()),
+            jobs: std::sync::Mutex::new(BTreeMap::new()),
             _lock: process_lock,
         });
         let _ = host.ctr(&["namespaces", "create", "ryzhub"]).await;
         Ok(host)
     }
+
     async fn ctr(&self, args: &[&str]) -> anyhow::Result<String> {
         let mut all = vec![
             "--address",
@@ -99,9 +147,11 @@ impl Host {
         all.extend_from_slice(args);
         run("ctr", &all).await
     }
+
     fn dir(&self, id: Uuid) -> PathBuf {
         self.config.root.join("sandboxes").join(id.to_string())
     }
+
     async fn operation(&self, id: Uuid) -> tokio::sync::OwnedMutexGuard<()> {
         let lock = {
             let mut operations = self.operations.lock().await;
@@ -117,8 +167,14 @@ impl Host {
         };
         lock.lock_owned().await
     }
+
     async fn forward(&self, request: GuestRequest) -> anyhow::Result<Value> {
-        let _operation = self.operation(request.sandbox_id).await;
+        // Reads (including long polls) never wait behind, or block, other operations.
+        let _operation = if request.command.read_only() {
+            None
+        } else {
+            Some(self.operation(request.sandbox_id).await)
+        };
         let mut state = self.state.lock().await;
         let entry = state
             .sandboxes
@@ -129,8 +185,10 @@ impl Host {
             "FENCED"
         );
         if matches!(request.command, GuestCommand::Fence) {
-            entry.epoch = request.exec_epoch;
-            journal::save(&self.config.root.join("host.json"), &*state)?;
+            if entry.epoch != request.exec_epoch {
+                entry.epoch = request.exec_epoch;
+                journal::save(&self.config.root.join("host.json"), &*state)?;
+            }
         } else {
             ensure!(request.exec_epoch == entry.epoch, "FENCE_REQUIRED");
         }
@@ -142,7 +200,8 @@ impl Host {
         )
         .await
     }
-    pub async fn handle(&self, command: HostCommand) -> anyhow::Result<Value> {
+
+    pub async fn handle(self: &Arc<Self>, command: HostCommand) -> anyhow::Result<Value> {
         match command {
             HostCommand::Project {
                 sandbox_id,
@@ -196,74 +255,32 @@ impl Host {
                 sandbox_id,
                 exec_epoch,
                 artifact,
-            } => self.checkpoint(sandbox_id, exec_epoch, artifact).await,
-            HostCommand::ReadArtifact { artifact, offset } => {
-                use base64::Engine;
-                use std::io::{Read, Seek};
-                let mut file = std::fs::File::open(self.artifact(artifact))?;
-                file.seek(std::io::SeekFrom::Start(offset))?;
-                let mut bytes = vec![0; 256 * 1024];
-                let n = file.read(&mut bytes)?;
-                bytes.truncate(n);
-                Ok(
-                    json!({"data":base64::engine::general_purpose::STANDARD.encode(bytes),"eof":n==0}),
-                )
-            }
-            HostCommand::WriteArtifact {
-                artifact,
-                offset,
-                data,
             } => {
-                use base64::Engine;
-                use std::io::{Read, Seek, Write};
-                let bytes = base64::engine::general_purpose::STANDARD.decode(data)?;
-                ensure!(bytes.len() <= 256 * 1024, "CHUNK_TOO_LARGE");
-                std::fs::create_dir_all(self.config.root.join("artifacts"))?;
-                let mut file = std::fs::OpenOptions::new()
-                    .create(true)
-                    .truncate(false)
-                    .read(true)
-                    .write(true)
-                    .open(self.artifact(artifact))?;
-                let len = file.metadata()?.len();
-                ensure!(
-                    offset <= len && len <= 8 * 1024 * 1024 * 1024,
-                    "INVALID_OFFSET"
-                );
-                file.seek(std::io::SeekFrom::Start(offset))?;
-                if offset < len {
-                    let mut old = vec![0; bytes.len()];
-                    file.read_exact(&mut old)?;
-                    ensure!(old == bytes, "ARTIFACT_ID_REUSED");
-                } else {
-                    file.write_all(&bytes)?;
-                    file.sync_all()?;
-                }
-                Ok(json!({"written":bytes.len()}))
+                self.start_checkpoint(sandbox_id, exec_epoch, artifact)
+                    .await
             }
             HostCommand::Restore {
                 spec,
                 artifact,
                 sha256,
-            } => {
-                let _operation = self.operation(spec.id).await;
-                use sha2::Digest;
-                let data = std::fs::read(self.artifact(artifact))?;
-                ensure!(
-                    format!("{:x}", sha2::Sha256::digest(&data)) == sha256,
-                    "CHECKSUM_MISMATCH"
-                );
-                ensure!(spec.persistent, "WORK_ONLY");
-                let dir = self.dir(spec.id);
-                std::fs::create_dir_all(&dir)?;
-                if !dir.join("restored.json").exists() {
-                    crate::archive::restore(&self.artifact(artifact), &dir.join("upper"))?;
-                    journal::save(
-                        &dir.join("restored.json"),
-                        &json!({"artifact":artifact,"sha256":sha256}),
-                    )?;
+            } => self.start_restore(spec, artifact, sha256),
+            HostCommand::ArtifactDownload { .. } | HostCommand::ArtifactUpload { .. } => {
+                anyhow::bail!("artifact streams need a dedicated connection")
+            }
+            HostCommand::DeleteArtifact { artifact } => {
+                for path in [
+                    self.artifact(artifact),
+                    self.artifact(artifact).with_extension("json"),
+                    self.artifact(artifact).with_extension("part"),
+                ] {
+                    match tokio::fs::remove_file(path).await {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => return Err(e.into()),
+                    }
                 }
-                self.create_inner(spec).await
+                self.jobs.lock().unwrap().remove(&artifact);
+                Ok(json!({"deleted":true}))
             }
             HostCommand::Guest { request } => self.forward(request).await,
             HostCommand::Stop {
@@ -317,11 +334,19 @@ impl Host {
             }
         }
     }
+
     fn artifact(&self, id: Uuid) -> PathBuf {
         self.config.root.join("artifacts").join(format!("{id}.tar"))
     }
-    async fn checkpoint(&self, id: Uuid, epoch: u64, artifact: Uuid) -> anyhow::Result<Value> {
-        let _operation = self.operation(id).await;
+
+    /// Report on `artifact`'s checkpoint, starting it on first request. The sandbox is frozen
+    /// only for the local copy; encoding runs after it resumes.
+    async fn start_checkpoint(
+        self: &Arc<Self>,
+        id: Uuid,
+        epoch: u64,
+        artifact: Uuid,
+    ) -> anyhow::Result<Value> {
         let manifest = self.artifact(artifact).with_extension("json");
         if manifest.exists() {
             let value: Value = serde_json::from_slice(&std::fs::read(&manifest)?)?;
@@ -330,19 +355,50 @@ impl Host {
                     && value["epoch"].as_u64().is_some_and(|old| old <= epoch),
                 "ARTIFACT_ID_REUSED"
             );
-            return Ok(value);
+            return Ok(job_state(&Some(Ok(value))));
         }
-        let state = self.state.lock().await;
-        let entry = state.sandboxes.get(&id).context("UNKNOWN_SANDBOX")?;
-        ensure!(
-            entry.epoch == epoch && entry.state == "running" && entry.spec.persistent,
-            "FENCED"
-        );
-        let image = entry.spec.image.clone();
-        drop(state);
+        if let Some(state) = poll_job(&mut self.jobs.lock().unwrap(), artifact) {
+            return Ok(state);
+        }
+        {
+            let state = self.state.lock().await;
+            let entry = state.sandboxes.get(&id).context("UNKNOWN_SANDBOX")?;
+            ensure!(
+                entry.epoch == epoch && entry.state == "running" && entry.spec.persistent,
+                "FENCED"
+            );
+        }
+        if let Some(state) = claim_job(&mut self.jobs.lock().unwrap(), artifact) {
+            return Ok(state);
+        }
+        let this = self.clone();
+        tokio::spawn(async move {
+            let result = this.checkpoint(id, epoch, artifact).await;
+            this.jobs
+                .lock()
+                .unwrap()
+                .insert(artifact, Some(result.map_err(|e| e.to_string())));
+        });
+        Ok(job_state(&None))
+    }
+
+    async fn checkpoint(&self, id: Uuid, epoch: u64, artifact: Uuid) -> anyhow::Result<Value> {
+        let _operation = self.operation(id).await;
+        let image = {
+            let state = self.state.lock().await;
+            let entry = state.sandboxes.get(&id).context("UNKNOWN_SANDBOX")?;
+            ensure!(
+                entry.epoch == epoch && entry.state == "running" && entry.spec.persistent,
+                "FENCED"
+            );
+            entry.spec.image.clone()
+        };
         std::fs::create_dir_all(self.config.root.join("artifacts"))?;
         let dir = self.dir(id);
         let local = self.artifact(artifact).with_extension("upper");
+        if local.exists() {
+            std::fs::remove_dir_all(&local)?;
+        }
         let captured_at_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_millis() as u64;
@@ -354,20 +410,20 @@ impl Host {
         self.ctr(&["tasks", "pause", &id.to_string()]).await?;
         let frozen = async {
             run("sync", &["-f", dir.join("merged").to_str().unwrap()]).await?;
-            // Freeze ends after a local copy; tar encoding and uploads happen after thaw.
             std::fs::create_dir_all(&local)?;
+            // Reflinks make the frozen window independent of the upper's size where supported.
             run(
                 "cp",
                 &[
                     "-a",
+                    "--reflink=auto",
                     &format!("{}/.", dir.join("upper").display()),
                     local.to_str().unwrap(),
                 ],
             )
             .await?;
-            let journal: Value =
-                serde_json::from_slice(&std::fs::read(dir.join("control/journal.json"))?)?;
-            journal["head"].as_u64().context("MISSING_GSEQ")
+            // The watermark: every guest event up to here is reflected in the copied files.
+            crate::guest::journal_head(&dir.join("control"))
         }
         .await;
         let thaw = self.ctr(&["tasks", "resume", &id.to_string()]).await;
@@ -377,14 +433,119 @@ impl Host {
         let archive = self.artifact(artifact);
         let source = local.clone();
         let path = archive.clone();
-        tokio::task::spawn_blocking(move || crate::archive::export(&source, &path)).await??;
-        use sha2::Digest;
-        let data = std::fs::read(&archive)?;
-        let value = json!({"format":1,"encoding":"tar.zst","captured_at_ms":captured_at_ms,"sandbox_id":id,"epoch":epoch,"image":image,"gseq":gseq,"sha256":format!("{:x}",sha2::Sha256::digest(&data)),"size":data.len()});
-        journal::save(&manifest, &value)?;
+        let (sha256, size) = tokio::task::spawn_blocking(move || {
+            crate::archive::export(&source, &path)?;
+            crate::archive::digest(&path)
+        })
+        .await??;
+        let excluded = crate::archive::excluded(&local)?;
+        let value = json!({"format":1,"encoding":"tar.zst","captured_at_ms":captured_at_ms,"sandbox_id":id,
+            "epoch":epoch,"image":image,"gseq":gseq,"sha256":sha256,"size":size,"excluded":excluded});
+        journal::save(&self.artifact(artifact).with_extension("json"), &value)?;
         std::fs::remove_dir_all(local)?;
         Ok(value)
     }
+
+    /// Report on `artifact`'s restore, starting it on first request.
+    fn start_restore(
+        self: &Arc<Self>,
+        spec: SandboxSpec,
+        artifact: Uuid,
+        sha256: String,
+    ) -> anyhow::Result<Value> {
+        ensure!(spec.persistent, "WORK_ONLY");
+        if let Some(state) = claim_job(&mut self.jobs.lock().unwrap(), artifact) {
+            return Ok(state);
+        }
+        let this = self.clone();
+        tokio::spawn(async move {
+            let result = this.restore(spec, artifact, sha256).await;
+            this.jobs
+                .lock()
+                .unwrap()
+                .insert(artifact, Some(result.map_err(|e| e.to_string())));
+        });
+        Ok(job_state(&None))
+    }
+
+    async fn restore(
+        &self,
+        spec: SandboxSpec,
+        artifact: Uuid,
+        sha256: String,
+    ) -> anyhow::Result<Value> {
+        let _operation = self.operation(spec.id).await;
+        let path = self.artifact(artifact);
+        let digest_path = path.clone();
+        let (actual, _) =
+            tokio::task::spawn_blocking(move || crate::archive::digest(&digest_path)).await??;
+        ensure!(actual == sha256, "CHECKSUM_MISMATCH");
+        let dir = self.dir(spec.id);
+        std::fs::create_dir_all(&dir)?;
+        if !dir.join("restored.json").exists() {
+            let upper = dir.join("upper");
+            tokio::task::spawn_blocking(move || crate::archive::restore(&path, &upper)).await??;
+            journal::save(
+                &dir.join("restored.json"),
+                &json!({"artifact":artifact,"sha256":sha256}),
+            )?;
+        }
+        self.create_inner(spec).await
+    }
+
+    /// Stream an artifact to the caller after a `{"size":n}` header.
+    async fn download(
+        &self,
+        artifact: Uuid,
+        write: &mut tokio::net::unix::OwnedWriteHalf,
+    ) -> anyhow::Result<()> {
+        let path = self.artifact(artifact);
+        let file = match tokio::fs::File::open(&path).await {
+            Ok(file) => file,
+            Err(error) => {
+                write
+                    .write_all(&Reply::from(Err(error.into())).line())
+                    .await?;
+                return Ok(());
+            }
+        };
+        let size = file.metadata().await?.len();
+        write
+            .write_all(&Reply::from(Ok(json!({"size":size}))).line())
+            .await?;
+        copy_exact(file, write, size).await?;
+        write.flush().await?;
+        Ok(())
+    }
+
+    /// Receive `size` bytes into the artifact, verifying the digest before it becomes visible.
+    async fn upload(
+        &self,
+        artifact: Uuid,
+        size: u64,
+        sha256: &str,
+        body: impl tokio::io::AsyncRead + Unpin,
+    ) -> anyhow::Result<Value> {
+        ensure!(size <= 64 * 1024 * 1024 * 1024, "ARTIFACT_TOO_LARGE");
+        std::fs::create_dir_all(self.config.root.join("artifacts"))?;
+        let path = self.artifact(artifact);
+        let partial = path.with_extension("part");
+        let mut file = tokio::fs::File::create(&partial).await?;
+        let copied = copy_exact(body, &mut file, size).await?;
+        ensure!(
+            copied == size,
+            "artifact ended after {copied} of {size} bytes"
+        );
+        file.sync_all().await?;
+        drop(file);
+        let check = partial.clone();
+        let (actual, _) =
+            tokio::task::spawn_blocking(move || crate::archive::digest(&check)).await??;
+        ensure!(actual == sha256, "CHECKSUM_MISMATCH");
+        tokio::fs::rename(&partial, &path).await?;
+        Ok(json!({"size":size}))
+    }
+
     pub async fn serve(self: Arc<Self>, socket: PathBuf) -> anyhow::Result<()> {
         if socket.exists() {
             std::fs::remove_file(&socket)?;
@@ -410,55 +571,61 @@ impl Host {
             let this = self.clone();
             tokio::spawn(async move {
                 let (read, mut write) = stream.into_split();
-                let mut reader = BufReader::new(read).take(4 * 1024 * 1024 + 1);
+                let mut reader = BufReader::new(read);
                 let mut line = String::new();
-                let result = async {
+                let request = async {
+                    let mut limited = (&mut reader).take(MAX_MESSAGE as u64 + 1);
                     tokio::time::timeout(
                         std::time::Duration::from_secs(5),
-                        reader.read_line(&mut line),
+                        limited.read_line(&mut line),
                     )
                     .await??;
-                    ensure!(line.len() <= 4 * 1024 * 1024, "REQUEST_TOO_LARGE");
-                    this.handle(serde_json::from_str(&line)?).await
+                    ensure!(line.len() <= MAX_MESSAGE, "REQUEST_TOO_LARGE");
+                    Ok::<HostCommand, anyhow::Error>(serde_json::from_str(&line)?)
                 }
                 .await;
-                let reply = match result {
-                    Ok(value) => Reply {
-                        ok: true,
-                        value,
-                        error: None,
-                    },
-                    Err(e) => Reply {
-                        ok: false,
-                        value: Value::Null,
-                        error: Some(e.to_string()),
-                    },
+                let reply = match request {
+                    Ok(HostCommand::ArtifactDownload { artifact }) => {
+                        if let Err(error) = this.download(artifact, &mut write).await {
+                            eprintln!("artifact {artifact} download failed: {error:#}");
+                        }
+                        return;
+                    }
+                    Ok(HostCommand::ArtifactUpload {
+                        artifact,
+                        size,
+                        sha256,
+                    }) => Reply::from(this.upload(artifact, size, &sha256, &mut reader).await),
+                    Ok(command) => Reply::from(this.handle(command).await),
+                    Err(error) => Reply::from(Err(error)),
                 };
-                if let Ok(mut bytes) = serde_json::to_vec(&reply) {
-                    bytes.push(b'\n');
-                    let _ = write.write_all(&bytes).await;
-                }
+                let _ = write.write_all(&reply.line()).await;
             });
         }
     }
 }
+
 impl SandboxBackend for Host {
     fn capabilities(&self) -> Value {
         json!({"backend":"containerd","runtimes":["runc","runsc"],"memory_snapshot":false,"gpu":false,"network":"none","pty":false})
     }
+
     async fn create(&self, spec: SandboxSpec) -> anyhow::Result<Value> {
         let _operation = self.operation(spec.id).await;
         self.create_inner(spec).await
     }
+
     async fn stop(&self, id: Uuid, epoch: u64) -> anyhow::Result<Value> {
         let _operation = self.operation(id).await;
         self.stop_inner(id, epoch).await
     }
+
     async fn destroy(&self, id: Uuid, epoch: u64) -> anyhow::Result<Value> {
         let _operation = self.operation(id).await;
         self.destroy_inner(id, epoch).await
     }
 }
+
 impl Host {
     async fn create_inner(&self, spec: SandboxSpec) -> anyhow::Result<Value> {
         validate_spec(&spec, self.config.multi_tenant)?;
@@ -579,7 +746,7 @@ impl Host {
         if spec.persistent {
             std::fs::create_dir_all(merged.join("workspace"))?;
             std::fs::create_dir_all(merged.join("home/agent/.codex"))?;
-            config["mounts"].as_array_mut().unwrap().retain(|m| {
+            mounts(&mut config).retain(|m| {
                 !matches!(
                     m["destination"].as_str(),
                     Some("/workspace" | "/home/agent")
@@ -587,15 +754,19 @@ impl Host {
             });
             let codex = self.config.root.join("bin/codex");
             ensure!(codex.is_file(), "CODEX_BINARY_REQUIRED");
-            config["mounts"].as_array_mut().unwrap().push(json!({"destination":"/codex","type":"bind","source":codex,"options":["bind","ro"]}));
+            mounts(&mut config).push(bind("/codex", &codex, &["bind", "ro"]));
         }
         let project = dir.join("project");
         std::fs::create_dir_all(&project)?;
-        config["mounts"].as_array_mut().unwrap().push(json!({"destination":"/project","type":"bind","source":project,"options":["bind","ro","nosuid","nodev","noexec"]}));
+        mounts(&mut config).push(bind(
+            "/project",
+            &project,
+            &["bind", "ro", "nosuid", "nodev", "noexec"],
+        ));
         let config_path = dir.join("config.json");
         let gateway_socket = self.config.root.join("gateway");
         if gateway_socket.exists() {
-            config["mounts"].as_array_mut().unwrap().push(json!({"destination":"/gateway","type":"bind","source":gateway_socket,"options":["rbind","ro"]}));
+            mounts(&mut config).push(bind("/gateway", &gateway_socket, &["rbind", "ro"]));
         }
         journal::save(&config_path, &config)?;
         let id = spec.id.to_string();
@@ -661,6 +832,7 @@ impl Host {
             json!({"id":spec.id,"state":"running","isolation_level":if spec.runtime=="runsc"{"user_kernel"}else{"container"},"network":"none"}),
         )
     }
+
     async fn stop_inner(&self, id: Uuid, epoch: u64) -> anyhow::Result<Value> {
         let mut state = self.state.lock().await;
         let entry = state.sandboxes.get_mut(&id).context("UNKNOWN_SANDBOX")?;
@@ -705,6 +877,7 @@ impl Host {
         journal::save(&self.config.root.join("host.json"), &*state)?;
         Ok(json!({"stopped":true}))
     }
+
     async fn destroy_inner(&self, id: Uuid, epoch: u64) -> anyhow::Result<Value> {
         if !self.state.lock().await.sandboxes.contains_key(&id) {
             return Ok(json!({"destroyed":true}));
@@ -727,13 +900,16 @@ impl Host {
         Ok(json!({"destroyed":true}))
     }
 }
+
 fn task_alive(line: &str, id: &str) -> bool {
     let mut fields = line.split_whitespace();
     fields.next() == Some(id) && matches!(fields.nth(1), Some("RUNNING" | "PAUSED" | "PAUSING"))
 }
+
 fn task_heartbeat(line: &str, id: &str, checkpointing: bool) -> bool {
     task_alive(line, id) && (checkpointing || line.split_whitespace().nth(2) == Some("RUNNING"))
 }
+
 pub fn validate_spec(spec: &SandboxSpec, multi_tenant: bool) -> anyhow::Result<()> {
     let digest = spec
         .image
@@ -757,6 +933,7 @@ pub fn validate_spec(spec: &SandboxSpec, multi_tenant: bool) -> anyhow::Result<(
     );
     Ok(())
 }
+
 pub fn validate_overlay(
     options: &str,
     redirect_default: &str,
@@ -780,6 +957,7 @@ pub fn validate_overlay(
     }
     Ok(())
 }
+
 fn mount_options(path: &Path) -> anyhow::Result<Option<String>> {
     let path = path.to_str().context("INVALID_PATH")?;
     for line in std::fs::read_to_string("/proc/self/mountinfo")?.lines() {
@@ -790,6 +968,7 @@ fn mount_options(path: &Path) -> anyhow::Result<Option<String>> {
     }
     Ok(None)
 }
+
 async fn run(program: &str, args: &[&str]) -> anyhow::Result<String> {
     let output = tokio::time::timeout(
         std::time::Duration::from_secs(60),
@@ -810,6 +989,7 @@ async fn run(program: &str, args: &[&str]) -> anyhow::Result<String> {
     );
     Ok(String::from_utf8(output.stdout)?)
 }
+
 fn oci_spec(
     spec: &SandboxSpec,
     root: &Path,
@@ -826,16 +1006,86 @@ fn oci_spec(
         "CAP_SYS_CHROOT",
         "CAP_KILL",
     ];
-    json!({"ociVersion":"1.0.2","root":{"path":root,"readonly":false},"hostname":"ryzhub","process":{"terminal":false,"user":{"uid":0,"gid":0},"args":["/ryzhub-guest",spec.id.to_string(),"/control","/control/guest.sock"],"env":["PATH=/usr/local/bin:/usr/bin:/bin","HOME=/home/agent"],"cwd":"/workspace","noNewPrivileges":true,"capabilities":{"bounding":capabilities,"effective":capabilities,"permitted":capabilities}},"mounts":[{"destination":"/proc","type":"proc","source":"proc","options":["nosuid","noexec","nodev"]},{"destination":"/dev","type":"tmpfs","source":"tmpfs","options":["nosuid","strictatime","mode=755","size=65536k"]},{"destination":"/tmp","type":"tmpfs","source":"tmpfs","options":["nosuid","nodev","size=67108864"]},{"destination":"/home/agent","type":"tmpfs","source":"tmpfs","options":["nosuid","nodev","size=67108864"]},{"destination":"/workspace","type":"bind","source":workspace,"options":["rbind","rw","nosuid","nodev"]},{"destination":"/control","type":"bind","source":control,"options":["rbind","rw","nosuid","nodev"]},{"destination":"/ryzhub-guest","type":"bind","source":guest,"options":["bind","ro"]}],"linux":{"namespaces":[{"type":"pid"},{"type":"network"},{"type":"ipc"},{"type":"uts"},{"type":"mount"},{"type":"cgroup"}],"resources":{"memory":{"limit":spec.memory_bytes},"pids":{"limit":spec.pids_limit},"cpu":{"quota":200000,"period":100000}},"maskedPaths":["/proc/kcore","/proc/keys","/proc/timer_list","/sys/firmware"],"readonlyPaths":["/proc/sys","/proc/sysrq-trigger","/proc/irq","/proc/bus"]}})
+    let tmpfs = |destination: &str, options: &[&str]| json!({"destination": destination, "type": "tmpfs", "source": "tmpfs", "options": options});
+    json!({
+        "ociVersion": "1.0.2",
+        "root": {"path": root, "readonly": false},
+        "hostname": "ryzhub",
+        "process": {
+            "terminal": false,
+            "user": {"uid": 0, "gid": 0},
+            "args": ["/ryzhub-guest", spec.id.to_string(), "/control", "/control/guest.sock"],
+            "env": ["PATH=/usr/local/bin:/usr/bin:/bin", "HOME=/home/agent"],
+            "cwd": "/workspace",
+            "noNewPrivileges": true,
+            "capabilities": {
+                "bounding": capabilities,
+                "effective": capabilities,
+                "permitted": capabilities,
+            },
+        },
+        "mounts": [
+            {"destination": "/proc", "type": "proc", "source": "proc", "options": ["nosuid", "noexec", "nodev"]},
+            tmpfs("/dev", &["nosuid", "strictatime", "mode=755", "size=65536k"]),
+            tmpfs("/tmp", &["nosuid", "nodev", "size=67108864"]),
+            tmpfs("/home/agent", &["nosuid", "nodev", "size=67108864"]),
+            bind("/workspace", workspace, &["rbind", "rw", "nosuid", "nodev"]),
+            bind("/control", control, &["rbind", "rw", "nosuid", "nodev"]),
+            bind("/ryzhub-guest", guest, &["bind", "ro"]),
+        ],
+        "linux": {
+            "namespaces": [
+                {"type": "pid"},
+                {"type": "network"},
+                {"type": "ipc"},
+                {"type": "uts"},
+                {"type": "mount"},
+                {"type": "cgroup"},
+            ],
+            "resources": {
+                "memory": {"limit": spec.memory_bytes},
+                "pids": {"limit": spec.pids_limit},
+                "cpu": {"quota": 200000, "period": 100000},
+            },
+            "maskedPaths": ["/proc/kcore", "/proc/keys", "/proc/timer_list", "/sys/firmware"],
+            "readonlyPaths": ["/proc/sys", "/proc/sysrq-trigger", "/proc/irq", "/proc/bus"],
+        },
+    })
+}
+
+fn mounts(config: &mut Value) -> &mut Vec<Value> {
+    config["mounts"]
+        .as_array_mut()
+        .expect("OCI spec has mounts")
+}
+
+/// A bind mount in OCI form.
+fn bind(destination: &str, source: &Path, options: &[&str]) -> Value {
+    json!({"destination": destination, "type": "bind", "source": source, "options": options})
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_failed_job_is_reported_once_then_retried() {
+        let (failed, done) = (Uuid::now_v7(), Uuid::now_v7());
+        let mut jobs = Jobs::new();
+        jobs.insert(failed, Some(Err("CHECKSUM_MISMATCH".into())));
+        jobs.insert(done, Some(Ok(json!({"size": 1}))));
+        assert_eq!(poll_job(&mut jobs, failed).unwrap()["state"], "failed");
+        // The next request with the same artifact starts the job afresh.
+        assert!(poll_job(&mut jobs, failed).is_none());
+        // Completed jobs keep answering.
+        assert_eq!(poll_job(&mut jobs, done).unwrap()["state"], "completed");
+        assert_eq!(poll_job(&mut jobs, done).unwrap()["state"], "completed");
+    }
+
     #[tokio::test]
     async fn workspace_purge_is_scoped_idempotent_and_prevents_recreation() -> anyhow::Result<()> {
         let root = tempfile::tempdir()?;
-        let host = Host {
+        let host = Arc::new(Host {
             config: Config {
                 root: root.path().to_path_buf(),
                 containerd: String::new(),
@@ -847,8 +1097,9 @@ mod tests {
             state: Mutex::new(State::default()),
             operations: Mutex::new(BTreeMap::new()),
             checkpointing: std::sync::Mutex::new(BTreeSet::new()),
+            jobs: std::sync::Mutex::new(BTreeMap::new()),
             _lock: std::fs::File::create(root.path().join("host.lock"))?,
-        };
+        });
         let org = Uuid::now_v7();
         let workspace = Uuid::now_v7();
         let other = Uuid::now_v7();
@@ -892,6 +1143,7 @@ mod tests {
         assert_eq!(err.to_string(), "WORKSPACE_DELETED");
         Ok(())
     }
+
     #[tokio::test]
     async fn blocked_guest_keeps_host_state_and_other_sandboxes_available() -> anyhow::Result<()> {
         let root = tempfile::tempdir()?;
@@ -908,6 +1160,7 @@ mod tests {
             state: Mutex::new(State::default()),
             operations: Mutex::new(BTreeMap::new()),
             checkpointing: std::sync::Mutex::new(BTreeSet::new()),
+            jobs: std::sync::Mutex::new(BTreeMap::new()),
             _lock: std::fs::File::create(root.path().join("host.lock"))?,
         });
         host.state.lock().await.sandboxes.insert(
@@ -957,6 +1210,7 @@ mod tests {
         let _ = forwarding.await;
         Ok(())
     }
+
     #[test]
     fn checkpoint_pauses_remain_live_for_heartbeats_and_stop_confirmation() {
         assert!(task_alive("box 42 RUNNING", "box"));
@@ -976,6 +1230,7 @@ mod tests {
         }
         assert!(active.lock().unwrap().is_empty());
     }
+
     #[test]
     fn reject_unsafe_overlay_and_runc_multitenancy() {
         assert!(

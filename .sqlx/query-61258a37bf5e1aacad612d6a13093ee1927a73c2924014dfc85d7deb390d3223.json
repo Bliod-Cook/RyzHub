@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT m.role FROM memberships m\n         JOIN organizations o ON o.id=m.org_id JOIN users u ON u.id=m.user_id\n         WHERE m.org_id=$1 AND m.user_id=$2 AND o.state='active' AND u.status='active'",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "role",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memberships",
+            "name": "role"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "61258a37bf5e1aacad612d6a13093ee1927a73c2924014dfc85d7deb390d3223"
+}

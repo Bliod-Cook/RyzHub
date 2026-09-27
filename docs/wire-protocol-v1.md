@@ -1,4 +1,4 @@
-# 平台线协议 v1.0（M0 / M1）
+# 平台线协议 v1.1
 
 唯一 schema 为 `proto/agentplatform/v1/wire.proto`；`prost + protox` 构建不依赖系统 protoc。WebSocket 子协议为 `ryzhub.v1.protobuf`，每个 binary message 对应一个 Frame。M0 支持 `text/part_index=0`，未宣告多流、压缩或真实 harness 能力。
 
@@ -6,9 +6,9 @@
 
 原生连接使用 Authorization Bearer；浏览器先 POST `/auth/ticket`，再连接 `/ws?ticket=...`。ticket 哈希落库、30 秒有效，兑换使用 DELETE RETURNING，只能用一次。跨域 Origin 必须在配置白名单内。M0 HTTP/WS 由本地服务提供，部署时由反向代理终止 HTTPS/WSS。
 
-10 秒内发送 Hello，必须包含 major=1 和稳定 device_id。Welcome 返回连接 ID、3 分钟的 resume_token、22 秒心跳和 1 MiB 帧限制。resume_token 在数据库中只存哈希，与会话及设备绑定；兑换后轮换，Gateway 重启仍能恢复原订阅集合。客户端仍主动按本地连续游标重订阅，服务器保存的订阅游标只作保守重放起点，不把“已发送”当“客户端已应用”。
+10 秒内发送 Hello，必须包含 major=1 和稳定 device_id。Welcome 返回连接 ID、协议版本、22 秒心跳和 1 MiB 帧限制。服务端不保存订阅集合：`resume_token` 恒为空、`resumed` 恒为 false（字段保留以兼容旧客户端）。重连后客户端按本地连续游标重新订阅；只有客户端知道自己真正应用到了哪里。
 
-服务端 Ping 需回 Pong；超过 55 秒未收到任何客户端帧会关闭连接。AuthRefresh 仅允许同一用户的新有效会话，并触发订阅重建。注销、移除成员和到期都会撤销连接，不能依靠 resume_token 绕过鉴权。
+服务端 Ping 需回 Pong；超过 55 秒未收到任何客户端帧会关闭连接。AuthRefresh 仅允许同一用户的新有效会话，并触发订阅重新鉴权。注销和会话到期撤销该连接的全部订阅；移除成员撤销其在该组织的订阅，会话本身对其他组织仍然有效。撤销由数据库触发器通知、各进程单一监听连接即时推送，另有每 15 秒一次的兜底复核。
 
 ## 频道与订阅
 
@@ -18,7 +18,7 @@
 
 Subscribe 的 `since_seq` 是 optional：缺失表示首次快照，0 是有效的重放起点。Gateway 先建立并 flush NATS 订阅，再在 REPEATABLE READ 事务内读取投影和 head_seq；缓冲中的旧事件会去重。已过期的游标或超前游标转快照。快照提供最近 100 个 Item，历史由 REST `items?before_seq=` 分页，每页 100 个，响应为 `{items, has_more}`，`has_more` 表示是否还有更早的 Item。Flutter 在时间线顶端进入视野时自动加载下一页，`has_more` 为 false 后停止；Rust core 按 Item revision 合并历史，不覆盖同 revision 的流式文本，不推进 live cursor，并将结果持久化到同一缓存。
 
-订阅数据顺序是：快照或事件重放 → 当前流 ItemFold → SubscriptionSynced → 实时帧。Fold 请求失败时后续 Delta 缺口会触发再次订阅，最终内容仍由持久 ItemUpserted 修复。NATS 丢失尾部事件也会由每秒一次的数据库校对补齐。
+订阅数据顺序是：快照或事件重放 → 当前流 ItemFold → SubscriptionSynced → 实时帧。Fold 请求失败时后续 Delta 缺口会触发再次订阅，最终内容仍由持久 ItemUpserted 修复。每个 Gateway 进程对每个频道只建立一个 NATS 订阅，由该进程内的订阅者共享；它每 5 秒对照数据库 head 校对尾部，NATS 丢失的持久事件从数据库补齐。
 
 ## 持久事件与流
 
@@ -47,9 +47,17 @@ RunState 支持 `running/requires_action/completed/cancelled/failed`，`read_onl
 
 cid 必须是 UUID；同一用户内全局唯一。重复请求必须有相同的目标对话和 protobuf payload，返回第一次保存的完整结果；复用 cid 携带不同内容返回 CID_REUSED。两个设备重发同一个 cid 不改变原始执行设备归因。
 
-命令先持久排队，Owner 排序执行。命令结果、投影、事件和 seq 在同一事务提交后才返回 Ack。Ack 仅代表平台接收/应用了命令，实际完成通过事件体现。Owner 不可达时返回可重试拒绝，保留原 cid。客户端每 5 秒重试未确认队列，重连也使用相同 cid。
+命令先持久排队并唤醒持有该对话的 Owner，Owner 排序执行。命令结果、投影、事件和 seq 在同一事务提交后才返回 Ack；结果经 NATS 推回等待的 Gateway，不依赖轮询。Ack 仅代表平台接收/应用了命令，实际完成通过事件体现。Owner 不可达时返回可重试拒绝，保留原 cid。客户端每 5 秒重试未确认队列，重连也使用相同 cid。
 
 审批要求 action_id、run_epoch、选项、未决状态与过期时间全部匹配，CAS 只允许一个决议。接管会更新待审批项的执行代次并再次发布请求；旧设备的旧代次决议被拒。取消、到期和成员撤销会使待审批失效。
+
+## v1.1 新增字段
+
+`Welcome.minor_version` 为 1。新增字段均为可选，旧客户端忽略即可：
+
+- `Item.truncated`：显示文本超过 256 KiB 时在字符边界截断并置 true。
+- `Item.detail`：工具与文件变更的结构化内容。`ToolDetail` 含工具名、参数 JSON、结果 JSON（完成后出现）和命令输出；`FileChangeDetail` 列出每个文件的路径、变更类型（add/update/delete）和 diff。每个字段各自限制在 64 KiB。`Item.text` 保留 v1.0 的渲染，供不认识 detail 的客户端使用。
+- `PendingAction.kind`：`approval` 或 `question`。v1.0 的 `options=["__answer__"]` 约定继续保留。
 
 ## 背压与存储
 

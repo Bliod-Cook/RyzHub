@@ -1,9 +1,10 @@
 //! Validated per-conversation settings. Each run receives an immutable snapshot.
-use crate::{config::Config, store::Tx};
 use anyhow::ensure;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use uuid::Uuid;
+
+use crate::{config::Config, error::Code, store::Tx};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -15,6 +16,7 @@ pub struct RunConfig {
     pub approval: String,
     pub plan: bool,
 }
+
 impl Default for RunConfig {
     fn default() -> Self {
         Self {
@@ -28,6 +30,7 @@ impl Default for RunConfig {
         }
     }
 }
+
 impl RunConfig {
     pub fn resolve(value: Value, mode: &str, config: &Config) -> anyhow::Result<Self> {
         let mut c: Self = serde_json::from_value(value)?;
@@ -69,11 +72,11 @@ impl RunConfig {
                 (mode, c.harness.as_str()),
                 ("chat", "chat") | ("work", "codex" | "claude")
             ),
-            "INVALID_HARNESS"
+            Code::InvalidHarness
         );
         ensure!(
             matches!(c.protocol.as_str(), "anthropic" | "responses"),
-            "INVALID_PROTOCOL"
+            Code::InvalidProtocol
         );
         if c.harness == "codex" {
             c.protocol = "responses".into();
@@ -83,22 +86,23 @@ impl RunConfig {
         }
         ensure!(
             matches!(c.approval.as_str(), "ask" | "allow_edits" | "full_auto"),
-            "INVALID_APPROVAL_MODE"
+            Code::InvalidApprovalMode
         );
         ensure!(
             matches!(
                 c.reasoning.as_str(),
                 "low" | "medium" | "high" | "xhigh" | "max"
             ),
-            "INVALID_REASONING"
+            Code::InvalidReasoning
         );
-        ensure!(!c.plan || mode == "work", "PLAN_UNSUPPORTED");
+        ensure!(!c.plan || mode == "work", Code::PlanUnsupported);
         ensure!(
             !(c.harness == "codex" && c.reasoning == "max"),
-            "INVALID_REASONING"
+            Code::InvalidReasoning
         );
         Ok(c)
     }
+
     pub async fn validate(
         &self,
         tx: &mut Tx<'_>,
@@ -119,18 +123,19 @@ impl RunConfig {
                 && p.harnesses
                     .as_ref()
                     .is_none_or(|h| h.contains(&self.harness)),
-            "POLICY_DENIED"
+            Code::PolicyDenied
         );
         ensure!(
             self.approval != "full_auto" || p.allow_full_auto != Some(false),
-            "POLICY_DENIED"
+            Code::PolicyDenied
         );
         // Catalog entries are explicit routes. Legacy default models remain routable.
         let routes = models(config, &self.harness, &self.protocol);
-        ensure!(routes.contains(&self.model), "MODEL_NOT_ROUTABLE");
+        ensure!(routes.contains(&self.model), Code::ModelNotRoutable);
         Ok(())
     }
 }
+
 pub fn models(config: &Config, harness: &str, protocol: &str) -> Vec<String> {
     if !config.llm.enabled {
         return vec!["mock".into()];
@@ -153,6 +158,7 @@ pub fn models(config: &Config, harness: &str, protocol: &str) -> Vec<String> {
     }
     models
 }
+
 /// A routable model: explicit `llm.models` routes plus the per-path defaults.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ModelEntry {
@@ -228,8 +234,28 @@ pub fn reasoning_levels(harness: &str, protocol: &str) -> Vec<&'static str> {
     }
 }
 
+/// Feature support by harness and protocol, as clients render it: `native`, `emulated` or
+/// `unsupported`.
 pub fn capabilities(harness: &str, protocol: &str) -> Value {
-    let mut c = json!({"steer":"native","interrupt":"native","approval_granularity":"native","ask_user":"native","resume":"native","fork":"native","compact":"native","plan_mode":"native","model_switch":"native","thought_level":"native","commands_list":"native","todo":"unsupported","diff":"unsupported","terminal_stream":"unsupported","subagent":"unsupported","durable_pause":"emulated","side_query":"emulated"});
+    let mut c = json!({
+        "steer": "native",
+        "interrupt": "native",
+        "approval_granularity": "native",
+        "ask_user": "native",
+        "resume": "native",
+        "fork": "native",
+        "compact": "native",
+        "plan_mode": "native",
+        "model_switch": "native",
+        "thought_level": "native",
+        "commands_list": "native",
+        "todo": "unsupported",
+        "diff": "unsupported",
+        "terminal_stream": "unsupported",
+        "subagent": "unsupported",
+        "durable_pause": "emulated",
+        "side_query": "emulated",
+    });
     if harness == "claude" {
         c["steer"] = json!("emulated");
         c["todo"] = json!("native");
@@ -338,6 +364,24 @@ mod tests {
         let r = RunConfig::resolve(json!({"model":"unknown"}), "chat", &c).unwrap();
         assert_eq!(r.protocol, "anthropic");
         assert!(!models(&c, &r.harness, &r.protocol).contains(&r.model));
+    }
+
+    #[test]
+    fn invalid_settings_are_rejected_with_stable_codes() {
+        let c = config();
+        let code = |v, mode| crate::error::code_of(&RunConfig::resolve(v, mode, &c).unwrap_err());
+        assert_eq!(
+            code(json!({"harness":"codex"}), "chat"),
+            Some(Code::InvalidHarness)
+        );
+        assert_eq!(
+            code(json!({"approval":"yolo"}), "chat"),
+            Some(Code::InvalidApprovalMode)
+        );
+        assert_eq!(
+            code(json!({"plan":true}), "chat"),
+            Some(Code::PlanUnsupported)
+        );
     }
 
     #[test]

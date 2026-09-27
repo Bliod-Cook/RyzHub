@@ -58,6 +58,7 @@ impl Engine {
         }
         changed
     }
+
     pub fn subscribe(&mut self, channel: String) -> Frame {
         let state = self.channels.entry(channel.clone()).or_default();
         state.subscribed = true;
@@ -68,12 +69,14 @@ impl Engine {
             }),
         )
     }
+
     pub fn unsubscribe(&mut self, channel: String) -> Frame {
         if let Some(state) = self.channels.get_mut(&channel) {
             state.subscribed = false;
         }
         frame(channel, Body::Unsubscribe(Unsubscribe {}))
     }
+
     pub fn reconnect(&mut self) -> Vec<Frame> {
         // Drop ephemeral buffers: replay + ItemFold rebuild them.
         for state in self.channels.values_mut() {
@@ -96,6 +99,7 @@ impl Engine {
         frames.extend(self.pending_commands.values().cloned());
         frames
     }
+
     pub fn enqueue(&mut self, channel: String, command: CommandEnvelope) -> Frame {
         if let Some(existing) = self.pending_commands.get(&command.cid) {
             return existing.clone();
@@ -105,6 +109,7 @@ impl Engine {
         self.pending_commands.insert(cid, command.clone());
         command
     }
+
     pub fn apply(&mut self, input: Frame) -> Effects {
         let mut effects = Effects::default();
         let Some(body) = input.body else {
@@ -259,6 +264,7 @@ fn apply_event(state: &mut Channel, event: EventEnvelope) {
         None => {}
     }
 }
+
 fn drain_events(state: &mut Channel) {
     while let Some(event) = state
         .waiting_events
@@ -267,12 +273,14 @@ fn drain_events(state: &mut Channel) {
         apply_event(state, event);
     }
 }
+
 enum StreamResult {
     Applied,
     Future,
     Gap,
     Ignored,
 }
+
 fn apply_stream(state: &mut Channel, body: &Body) -> StreamResult {
     let (id, stream, part, base, revision, text, offset) = match body {
         Body::Delta(d) => (
@@ -336,6 +344,7 @@ fn apply_stream(state: &mut Channel, body: &Body) -> StreamResult {
     item.text.push_str(&text[overlap..]);
     StreamResult::Applied
 }
+
 fn body_bytes(body: &Body) -> usize {
     match body {
         Body::Delta(d) => d.text.len(),
@@ -343,6 +352,7 @@ fn body_bytes(body: &Body) -> usize {
         _ => 0,
     }
 }
+
 fn buffered_bytes(state: &Channel) -> usize {
     state.waiting_streams.iter().map(body_bytes).sum()
 }

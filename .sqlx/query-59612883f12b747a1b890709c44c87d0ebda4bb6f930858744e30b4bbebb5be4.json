@@ -1,0 +1,43 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT last_seq,published_seq FROM channels WHERE org_id=$1 AND id=$2\n         AND (($3::bigint IS NULL AND writer_epoch IS NULL)\n              OR (writer_epoch=$3 AND owner_id=$4 AND lease_until>clock_timestamp())) FOR UPDATE",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "last_seq",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "channels",
+            "name": "last_seq"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "published_seq",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "channels",
+            "name": "published_seq"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Int8",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "59612883f12b747a1b890709c44c87d0ebda4bb6f930858744e30b4bbebb5be4"
+}

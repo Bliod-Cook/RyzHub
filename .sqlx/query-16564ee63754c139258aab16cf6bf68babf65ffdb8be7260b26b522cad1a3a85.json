@@ -1,0 +1,30 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT result FROM commands WHERE org_id=$1 AND user_id=$2 AND cid=$3",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "result",
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "commands",
+            "name": "result"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "16564ee63754c139258aab16cf6bf68babf65ffdb8be7260b26b522cad1a3a85"
+}

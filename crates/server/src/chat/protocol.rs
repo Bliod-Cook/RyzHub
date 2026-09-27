@@ -2,6 +2,8 @@
 use anyhow::{Context, ensure};
 use serde_json::{Value, json};
 
+use crate::error::Code;
+
 pub fn continue_with(
     protocol: &str,
     messages: &mut Value,
@@ -50,11 +52,23 @@ pub fn continue_with(
             target.push(json!({"role":"assistant","content":content}));
         }
         if !results.is_empty() {
-            target.push(json!({"role":"user","content":results.iter().map(|(id,result)|json!({"type":"tool_result","tool_use_id":id,"is_error":result.get("error").is_some(),"content":result.to_string()})).collect::<Vec<_>>()}));
+            let results: Vec<Value> = results
+                .iter()
+                .map(|(id, result)| {
+                    json!({
+                        "type": "tool_result",
+                        "tool_use_id": id,
+                        "is_error": result.get("error").is_some(),
+                        "content": result.to_string(),
+                    })
+                })
+                .collect();
+            target.push(json!({"role": "user", "content": results}));
         }
     }
     Ok(())
 }
+
 pub fn visible_and_tools(protocol: &str, response: &Value) -> anyhow::Result<(String, Vec<Value>)> {
     if protocol == "responses" {
         let output = response["output"]
@@ -102,19 +116,21 @@ pub fn visible_and_tools(protocol: &str, response: &Value) -> anyhow::Result<(St
         ))
     }
 }
+
 #[derive(Default)]
 pub struct NativeResponse {
     response: Option<Value>,
     items: std::collections::BTreeMap<u64, Value>,
     bytes: usize,
 }
+
 impl NativeResponse {
     pub fn apply(&mut self, event: &Value) -> anyhow::Result<Option<String>> {
         match event["type"].as_str().unwrap_or("") {
             "response.output_text.delta" => {
                 let text = event["delta"].as_str().context("INVALID_RESPONSE_DELTA")?;
                 self.bytes += text.len();
-                ensure!(self.bytes <= 16 * 1024 * 1024, "CONTENT_TOO_LARGE");
+                ensure!(self.bytes <= 16 * 1024 * 1024, Code::ContentTooLarge);
                 return Ok(Some(text.into()));
             }
             "response.output_item.done" => {
@@ -137,16 +153,18 @@ impl NativeResponse {
                 self.response = Some(r);
             }
             "response.incomplete" | "response.failed" | "error" => {
-                anyhow::bail!("UPSTREAM_STREAM_ERROR")
+                anyhow::bail!(Code::UpstreamStreamError)
             }
             _ => {}
         }
         Ok(None)
     }
+
     pub fn finish(self) -> anyhow::Result<Value> {
-        self.response.context("UPSTREAM_STREAM_INTERRUPTED")
+        self.response.context(Code::UpstreamStreamInterrupted)
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;

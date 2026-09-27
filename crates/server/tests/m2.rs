@@ -9,9 +9,10 @@ use axum::{
 };
 use ryzhub_proto::{command_envelope::Command, *};
 use ryzhub_server::{
-    api::{App, router},
+    app::App,
     config::Config,
-    llm::{gateway, identity},
+    http::router,
+    llm::{gateway, keys},
     owner,
     store::Store,
 };
@@ -152,7 +153,6 @@ impl Harness {
         config.llm.upstream_url = format!("http://{}", upstream_listener.local_addr()?);
         config.llm.gateway_url = format!("http://{}", gateway_listener.local_addr()?);
         config.llm.platform_key_env = "RYZHUB_TEST_UPSTREAM_KEY".into();
-        config.llm.signing_key_env = "RYZHUB_TEST_SIGNING_KEY".into();
         config.llm.vault_key_env = "RYZHUB_TEST_VAULT_KEY".into();
         config.sandbox.enabled = true;
         config.sandbox.memory_bytes = 1024 * 1024 * 1024;
@@ -182,11 +182,7 @@ impl Harness {
         config_file.write_all(toml::to_string(&config)?.as_bytes())?;
         let gateway = config.llm.gateway_url.clone();
         let base = format!("http://{}", api_listener.local_addr()?);
-        let app = App {
-            store,
-            nats,
-            config,
-        };
+        let app = App::new(store, nats, config)?;
         let requests = Requests::default();
         let capture = requests.clone();
         let a = app.clone();
@@ -222,7 +218,7 @@ impl Harness {
         let heartbeat_app = app.clone();
         let heartbeat_db = PgPool::connect(&worker_url).await?;
         tasks.push(tokio::spawn(async move {
-            let _ = ryzhub_server::checkpoint::heartbeat(heartbeat_app, heartbeat_db).await;
+            let _ = ryzhub_server::sandbox::heartbeat(heartbeat_app, heartbeat_db).await;
         }));
         Ok(Self {
             name,
@@ -699,8 +695,14 @@ async fn guest_exec(
             return Ok(result);
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
-        result =
-            ryzhub_execution::call(host, &call(GuestCommand::Poll { op_id: op.into() })).await?;
+        result = ryzhub_execution::call(
+            host,
+            &call(GuestCommand::Poll {
+                op_id: op.into(),
+                wait_ms: 0,
+            }),
+        )
+        .await?;
     }
     anyhow::bail!("EXEC_TIMEOUT")
 }
@@ -724,16 +726,26 @@ async fn bypassing_harness_still_requires_one_use_mcp_approval() -> anyhow::Resu
         .fetch_one(&h.db)
         .await?;
     let sandbox = ryzhub_server::work::ensure_work(&h.app, &lease, run).await?;
-    let (jti,exp,epoch):(Uuid,i64,i64)=sqlx::query_as("SELECT id,extract(epoch FROM expires_at)::bigint,lease_epoch FROM virtual_keys WHERE sandbox_id=$1 AND superseded_at IS NULL").bind(sandbox).fetch_one(&h.db).await?;
-    let mut claims = identity::loop_identity(&lease, id(&user, "user_id"), run, &h.app.config.llm);
-    claims.kind = "sandbox".into();
-    claims.exec_epoch = None;
-    claims.sandbox_id = Some(sandbox);
-    claims.lease_epoch = Some(epoch);
-    claims.jti = jti;
-    claims.exp = exp;
-    claims.models = vec![h.app.config.work.model.clone()];
-    let token = identity::sign(&h.app.config.llm, &claims)?;
+    // The same kind of key the guest holds, issued directly: the caller bypasses the harness.
+    let epoch: i64 = sqlx::query_scalar("SELECT lease_epoch FROM sandboxes WHERE id=$1")
+        .bind(sandbox)
+        .fetch_one(&h.db)
+        .await?;
+    let token = keys::issue_sandbox_key(
+        &h.app.store,
+        keys::SandboxKeyRequest {
+            org_id: org,
+            user_id: id(&user, "user_id"),
+            conversation_id: conv,
+            run_id: run,
+            sandbox_id: sandbox,
+            lease_epoch: epoch,
+            models: vec![h.app.config.work.model.clone()],
+            credential_id: None,
+        },
+    )
+    .await?
+    .token;
     let request = json!({"jsonrpc":"2.0","id":"once","method":"tools/call","params":{"name":"write_note","arguments":{"text":"approved parameters"}}});
     let url = format!("{}/mcp", h.gateway);
     let client = reqwest::Client::new();
@@ -872,9 +884,9 @@ async fn restore_pin_blocks_expired_checkpoint_gc_and_secondary_repairs_primary(
     use sha2::{Digest, Sha256};
     let bytes = b"immutable archive fixture";
     let key = format!("{:x}", Sha256::digest(bytes));
-    let p =
-        ryzhub_server::blob::BlobStore::configured(&h.app.config.work.storage_root)?.scoped(org);
-    let s = ryzhub_server::blob::BlobStore::configured(
+    let p = ryzhub_server::workspace::blob::BlobStore::configured(&h.app.config.work.storage_root)?
+        .scoped(org);
+    let s = ryzhub_server::workspace::blob::BlobStore::configured(
         h.app.config.work.secondary_root.as_deref().unwrap(),
     )?
     .scoped(org);
@@ -891,7 +903,7 @@ async fn restore_pin_blocks_expired_checkpoint_gc_and_secondary_repairs_primary(
         .await?;
     let gc_app = h.app.clone();
     let mut collecting =
-        tokio::spawn(async move { ryzhub_server::checkpoint::gc(&gc_app, org, checkpoint).await });
+        tokio::spawn(async move { ryzhub_server::workspace::gc(&gc_app, org, checkpoint).await });
     assert!(
         tokio::time::timeout(Duration::from_millis(150), &mut collecting)
             .await
@@ -931,9 +943,11 @@ async fn restore_pin_blocks_expired_checkpoint_gc_and_secondary_repairs_primary(
     .execute(&h.db)
     .await?;
     let mut app = h.app.clone();
-    app.config.work.checkpoint_retention_days = 30;
-    app.config.work.checkpoint_gc_grace_secs = 60;
-    ryzhub_server::checkpoint::collect_org(&app, org).await?;
+    Arc::make_mut(&mut app.config)
+        .work
+        .checkpoint_retention_days = 30;
+    Arc::make_mut(&mut app.config).work.checkpoint_gc_grace_secs = 60;
+    ryzhub_server::workspace::collect_org(&app, org).await?;
     let states: Vec<(Uuid, String)> =
         sqlx::query_as("SELECT id,state FROM checkpoints WHERE org_id=$1")
             .bind(org)
@@ -948,7 +962,7 @@ async fn restore_pin_blocks_expired_checkpoint_gc_and_secondary_repairs_primary(
         "the shared blob and current head survive GC"
     );
     assert!(
-        !ryzhub_server::checkpoint::gc(&app, org, superseded).await?,
+        !ryzhub_server::workspace::gc(&app, org, superseded).await?,
         "grace period is recoverable"
     );
     sqlx::query("UPDATE checkpoints SET delete_after=now()-interval '1 second' WHERE id=$1")
@@ -975,15 +989,16 @@ async fn restore_pin_blocks_expired_checkpoint_gc_and_secondary_repairs_primary(
         state, "deleted",
         "the production collector must run in the Owner role"
     );
-    let unrelated = ryzhub_server::blob::BlobStore::configured(&app.config.work.storage_root)?
-        .scoped(Uuid::now_v7());
+    let unrelated =
+        ryzhub_server::workspace::blob::BlobStore::configured(&app.config.work.storage_root)?
+            .scoped(Uuid::now_v7());
     unrelated.put(&key, bytes).await?;
     sqlx::query("DELETE FROM workspace_heads WHERE org_id=$1")
         .bind(org)
         .execute(&h.db)
         .await?;
-    app.config.work.checkpoint_gc_grace_secs = 0;
-    ryzhub_server::checkpoint::collect_org(&app, org).await?;
+    Arc::make_mut(&mut app.config).work.checkpoint_gc_grace_secs = 0;
+    ryzhub_server::workspace::collect_org(&app, org).await?;
     assert!(p.get(&key).await.is_err());
     assert!(s.get(&key).await.is_err());
     assert_eq!(
@@ -1090,7 +1105,7 @@ async fn s3_sigv4_storage_roundtrip_and_authentication() -> anyhow::Result<()> {
         config,
         "endpoint = \"{s3_url}\"\nbucket = \"ryzhub-test\"\nregion = \"us-east-1\"\naccess_env = \"RYZHUB_TEST_S3_ACCESS\"\nsecret_env = \"RYZHUB_TEST_S3_SECRET\"\n"
     )?;
-    let store = ryzhub_server::blob::BlobStore::configured(&format!(
+    let store = ryzhub_server::workspace::blob::BlobStore::configured(&format!(
         "s3config:{}",
         config.path().display()
     ))?
@@ -1102,6 +1117,12 @@ async fn s3_sigv4_storage_roundtrip_and_authentication() -> anyhow::Result<()> {
     assert_eq!(store.get(&key).await?, body.as_bytes());
     store.delete(&key).await?;
     assert!(store.get(&key).await.is_err());
+    // Objects larger than one part go up as a multipart upload.
+    let large: Vec<u8> = (0..16 * 1024 * 1024 + 1).map(|i| (i % 251) as u8).collect();
+    let large_key = format!("{:x}", Sha256::digest(&large));
+    store.put(&large_key, &large).await?;
+    assert_eq!(store.get(&large_key).await?, large);
+    store.delete(&large_key).await?;
     config.as_file_mut().set_len(0)?;
     use std::io::{Seek, SeekFrom};
     config.as_file_mut().seek(SeekFrom::Start(0))?;
@@ -1109,7 +1130,7 @@ async fn s3_sigv4_storage_roundtrip_and_authentication() -> anyhow::Result<()> {
         config,
         "endpoint = \"{s3_url}\"\nbucket = \"ryzhub-test\"\nregion = \"us-east-1\"\naccess_env = \"RYZHUB_TEST_S3_ACCESS\"\nsecret_env = \"RYZHUB_TEST_UPSTREAM_KEY\"\n"
     )?;
-    let bad = ryzhub_server::blob::BlobStore::configured(&format!(
+    let bad = ryzhub_server::workspace::blob::BlobStore::configured(&format!(
         "s3config:{}",
         config.path().display()
     ))?;

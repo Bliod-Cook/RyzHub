@@ -19,7 +19,7 @@ REST/WS：`http://127.0.0.1:8080`，实例配置页：`/admin`。首次在客户
 
 管理员设置在 `config/development.toml`：监听地址、Origin、事件保留期、租约时长、模型/harness 白名单、组织并发上限等。修改后重启对应角色。实例管理员与组织 owner 分开；管理员可通过数据库运维会话设置 `users.is_instance_admin`，再用其登录 token 在 `/admin` 查看生效配置。
 
-每日以迁移账号运行 `ryzhub-server maintain`：提前建立周/月分区、按默认 30 天清理整周 events 分区，并清理过期 ticket/resume。整周清理意味着实际事件保留期可能多出不到 7 天；items 不随事件清理。
+以迁移账号常驻运行 `ryzhub-server maintain --loop`（每 24 小时一次；也可由外部调度每日运行一次 `maintain`）：提前建立周/月分区，把落入 DEFAULT 分区的行迁回正式分区，按 `events_retention_days`（默认 30 天）删除整周 events 分区、按 `retention.audit_days`（默认 400 天）删除整月审计分区，并清理过期 ticket。维护中断时写入落入 DEFAULT 分区，不会失败。整周清理意味着实际事件保留期可能多出不到 7 天；items 不随事件清理。已处理命令、已确认的 guest 事件、失效网关密钥和（可选的）用量记录由 Owner 角色按 `[retention]` 配置分批删除。
 
 ## M1 本地协议联调
 
@@ -33,7 +33,7 @@ REST/WS：`http://127.0.0.1:8080`，实例配置页：`/admin`。首次在客户
 
 Web 客户端发“执行沙箱验收”会请求执行审批，允许后在实际容器中执行命令；“请向我提问”会出现回答卡片；“slow 慢速响应”可用于测试运行中的补充输入。“只读旁问”只读最近提交的主线前缀，不提供工具或写回主线；它和审批模式暂时不在输入框中提供，计划后续以命令方式调整。
 
-本地配置在 `var/m1/config.toml`，随机签名密钥与 vault 主密钥在权限 0600 的 `var/m1/secrets.env`，均已忽略。vault 主密钥需要保留，替换后旧 BYOK 密文无法解密。`/capabilities` 与 `/admin/settings` 反映生效模式；`llm.enabled=false` 时保留 M0 模拟模式。
+本地配置在 `var/m1/config.toml`，vault 主密钥在权限 0600 的 `var/m1/secrets.env`，均已忽略。vault 主密钥需要保留；轮换时把旧密钥所在的环境变量名登记到 `llm.vault_retired_keys`（以旧 `vault_key_id` 为键），新密钥放入 `vault_key_env` 并递增 `llm.vault_key_id`，旧 BYOK 密文仍可解密。网关密钥是随机不透明令牌，数据库只存其 SHA-256，无需签名密钥；撤销立即生效。`/capabilities` 与 `/admin/settings` 反映生效模式；`llm.enabled=false` 时保留 M0 模拟模式。
 
 配置真实上游时，在运行环境设置可用的 `RYZHUB_MODEL`，并配置 `ANTHROPIC_API_KEY` 或使用下述 BYOK API，再运行 `./scripts/dev-m1.sh`。可用 `RYZHUB_UPSTREAM_URL` 指定兼容的 Anthropic Messages 基础 URL；不要把 `/v1/messages` 后缀放入该值。此路径本轮未调用真实上游。
 
@@ -65,7 +65,7 @@ Web 客户端发“执行沙箱验收”会请求执行审批，允许后在实�
 
 Work 支持原生流式输出、补充输入、停止、审批、提问与会话恢复。界面提供保存检查点、归档和恢复；归档前需结束当前运行。恢复保留历史，将检查点水位之后的操作标记失效。`side_query`、fork 和 PTY 尚不支持，`/capabilities` 明确返回能力。
 
-每轮完成后自动保存检查点，运行中默认每 300 秒保存；归档也先提交检查点。RPO 取决于最后一个成功提交的检查点，上传失败保留旧恢复点。主存储与可选二级存储都支持本地/NAS 目录或 S3 兼容接口。保留期默认关闭；配置 `[work] checkpoint_retention_days = 30` 后，旧检查点先进入默认 86400 秒的延迟回收期，Owner 每 60 秒清理。最新恢复点与所有 restore pin 始终受到保护。
+每轮完成后自动保存检查点，运行中默认每 300 秒保存；归档也先提交检查点。RPO 取决于最后一个成功提交的检查点，上传失败保留旧恢复点。检查点以流式方式在执行节点、Server 与存储之间传输（S3 使用分段上传），不整体读入内存。主存储与可选二级存储都支持本地/NAS 目录或 S3 兼容接口。默认保留 30 天、每个对话最多 20 个检查点（`[work] checkpoint_retention_days`、`checkpoint_keep_last`，设为 0 关闭对应限制）；被淘汰的检查点先进入默认 86400 秒的延迟回收期，Owner 每 60 秒清理。最新恢复点与所有 restore pin 始终受到保护。空闲超过 `idle_suspend_secs`（默认 1800 秒，组织策略可收紧）的 Work 沙箱会先提交检查点再停止，下一条消息从该检查点恢复。
 
 运行配置在 `var/m2/config.toml`，开发密钥复用 `var/m1/secrets.env`，都被忽略。`dev-m2.sh` 每次生成本地 fixture 配置；接真实上游时复制该文件，设置 `llm.responses_url`（例如 `https://api.openai.com`）、`llm.responses_key_env`（默认 `OPENAI_API_KEY`）、`work.model` 与模型白名单，保留密钥环境后通过 `RYZHUB_CONFIG=/absolute/config.toml target/debug/ryzhub-server all` 启动。BYOK 创建请求增加 `"provider":"openai"`；Anthropic 凭据不会用于 Responses 请求。真实模型调用本轮未验证。
 
@@ -101,9 +101,25 @@ python3 scripts/serve-web.py --directory var/demo/web
 
 前端只让用户选模型：输入框的“模型”选择器中，Chat 按提供方列出模型，Work 在 Codex / Claude Code 子菜单里选模型；上游格式（Anthropic Messages 或 OpenAI Responses）由服务端按模型所属提供方推断。对话开始后只能切换同一提供方（Work 为同一执行器）的模型，选择其他模型会用它打开新对话。在侧栏“项目”中管理项目指令和文本知识文件，在模型菜单中切换推理强度，Work 中切换计划模式，在消息上分叉，并通过对话菜单执行压缩、重命名、归档和导出。设置与项目内容在下一轮生效，设置变更不写入时间线，发送消息时会携带尚未确认的设置。Claude 的运行中补充会排入下一轮；界面分别显示“等待注入点”和“已转交执行器”，不声称模型已采纳。
 
-升级先运行迁移 0009–0011，再更新 Server、Host/Guest、M3 镜像和 Web。已有 Work 工作区固定其镜像；新工作区使用新镜像。保留 `var/m1/secrets.env` 中的 vault 主密钥。项目删除可在 30 天内恢复，到期由 Owner 侧 collector 清理内容、工作区和未被引用的检查点；分支恢复 pin 仍受保护。
+升级先运行迁移 0009–0012，再更新 Server、Host/Guest、M3 镜像和 Web。已有 Work 工作区固定其镜像；新工作区使用新镜像。保留 `var/m1/secrets.env` 中的 vault 主密钥。项目删除可在 30 天内恢复，到期由 Owner 侧 collector 清理内容、工作区和未被引用的检查点；分支恢复 pin 仍受保护。
 
 项目 API：`/orgs/{org}/projects`，`/{project}/files`、`/{project}/restore`；会话的 `/project` 用于移动，`/commands` 返回能力和配置，`/settings` 管理标题/归档，`/export` 导出。所有接口使用原有认证和租户边界。模型路由在 `llm.models` 中声明 `id/protocol/harnesses`，同时受组织策略限制。`GET /orgs/{org}/models` 按组织策略列出可选模型（Chat 列表，Work 按 harness 分组，含提供方、默认模型和推理等级）；创建对话、项目默认值或 `UpdateRunConfig` 只传 `model` 时，服务端从路由推断 protocol，Work 未指定 harness 时一并推断。完整配置和验收边界见 [M3 验收](docs/m3-acceptance.md)。
+
+## 从 0011 升级到 0012
+
+0012 把运行时改为事件驱动，并收紧了几处数据模型。升级顺序：
+
+1. 停止所有 `owner` 与 `llm-gateway` 进程（`gateway` 可继续服务读请求）。
+2. `ryzhub-server migrate`。迁移会把 runs 上的项目快照改写为按内容去重的 `project_revisions`，删除 `ws_resumes`，并为 events/audit_logs 建立 DEFAULT 分区。
+3. 更新执行节点的 `ryzhub-host` 与 `ryzhub-guest`，并停止节点上现有的沙箱容器。guest 是沙箱的 init 进程，已在运行的沙箱会继续使用旧 guest；而 guest 日志格式、统一 harness 事件协议和流式检查点传输都已改变，新旧 Server/guest 不能混用。升级前让运行中的任务结束：每轮结束会自动提交检查点。
+4. 启动新版 Server 各角色，并以迁移账号常驻 `maintain --loop`。节点租约过期后，Owner 会从最新检查点恢复每个 Work 工作区（检查点之后的操作按 RPO 规则标记失效）；Chat 沙箱是一次性的，下次使用时重建。
+5. 客户端无需同时升级：线协议只做了向后兼容的新增（见[线协议](docs/wire-protocol-v1.md) v1.1）。
+
+行为变化：
+- 已签发的旧版 JWT 网关密钥全部失效。Chat 每次模型调用都会签发新密钥；Work 沙箱在恢复或下一轮开始时换发。配置中的 `llm.signing_key_env` 与 `RYZHUB_SIGNING_KEY` 可以删除。
+- WebSocket 不再在服务端保存订阅集合；`Welcome.resume_token` 恒为空，客户端按本地游标重新订阅（现有客户端本来就这样做）。
+- 移除组织成员只撤销其在该组织的访问（订阅、网关密钥、运行中的任务），不再注销其全部会话。
+- 新增配置：`approval_ttl_secs`（默认 24 小时）、`[retention]`、`[work] checkpoint_keep_last` / `idle_suspend_secs`、`llm.vault_key_id` / `vault_retired_keys`。检查点保留期默认从「不清理」改为 30 天。
 
 ## 运行 Flutter 客户端
 
@@ -147,7 +163,7 @@ flutter test
 
 集成测试标记为 ignored，必须执行脚本才会运行。它们在独立临时数据库里验证，成功后删除测试数据库；测试不会删除开发数据。测试需要有 CREATE DATABASE 权限的本地管理员，以及 `scripts/init-db.sql` 中的角色。CI 显式运行集成测试。
 
-关键租约和 seq SQL 使用 SQLx 编译期检查，`.sqlx` 提供离线元数据；其余参数化 SQL 用真实数据库集成测试验证。修改 schema/关键 SQL 后，用迁移后的数据库运行 `DATABASE_URL=... ./scripts/prepare-sql.sh`。
+承载一致性保证的 SQL（租约接管/续期/fencing、seq 分配、发布、命令幂等、成员关系、run 守卫与网关密钥查找）使用 SQLx 编译期检查，`.sqlx` 提供离线元数据；其余参数化 SQL 用真实数据库集成测试验证。修改 schema 或这些查询后，对一个迁移后的数据库运行 `DATABASE_URL=... ./scripts/prepare-sql.sh` 并提交 `.sqlx` 的变化。
 
 [M0 验收](docs/m0-acceptance.md) · [M1 与完整回归记录](docs/m1-acceptance.md) · [M2 验收](docs/m2-acceptance.md) · [M3 验收](docs/m3-acceptance.md) · [线协议](docs/wire-protocol-v1.md)
 
@@ -157,8 +173,8 @@ flutter test
 |---|---|
 | `proto/`、`crates/proto` | Protobuf schema、构建与编解码 |
 | `crates/domain` | 共享 RBAC/资源归属检查、三层策略收紧、三条生命周期 |
-| `crates/server` | REST/WS、RLS、Owner/outbox、LLM Gateway、密钥库、Chat loop、Codex Work、检查点/恢复、MCP Gateway、维护 |
-| `crates/execution` | containerd host、overlay 校验、guest journal、exec、Codex 原生进程、upper tar.zst 与本地凭据代理 |
+| `crates/server` | REST/WS（`http`、`ws`）、RLS 存储（`store`）、Owner actor 与发布（`owner`）、run 生命周期（`runs`）、Chat loop（`chat`）、原生 harness 驱动（`work`）、LLM/MCP Gateway（`llm`、`mcp`）、执行节点访问（`sandbox`）、检查点/恢复（`workspace`）、撤销推送（`revocation`）、保留与维护 |
+| `crates/execution` | containerd host、overlay 校验、guest journal（快照 + 追加日志）、exec、统一 harness 协议与 Codex/Claude 适配、upper tar.zst 流式归档与本地凭据代理 |
 | `crates/core` | sans-IO seq/Delta/Fold 状态机、订阅集合、离线命令、重连退避 |
 | `crates/driver-native` | tokio WebSocket + SQLite 驱动，支持网络变化输入 |
 | `crates/bridge`、`client/lib/rust` | flutter_rust_bridge 与批量 UI diff |

@@ -6,7 +6,7 @@ mkdir -p var/m1 var/m2
 if [[ ! -f var/m1/secrets.env ]]; then
  (umask 077; python3 - <<'PYKEY' > var/m1/secrets.env
 import secrets,base64
-for name in ['RYZHUB_SIGNING_KEY','RYZHUB_VAULT_KEY']:
+for name in ['RYZHUB_VAULT_KEY']:
  print(name+'='+base64.urlsafe_b64encode(secrets.token_bytes(32)).decode().rstrip('='))
 PYKEY
  )

@@ -9,11 +9,12 @@ use axum::{
 };
 use ryzhub_proto::{command_envelope::Command, *};
 use ryzhub_server::{
-    api::{App, router},
+    app::App,
     config::Config,
-    llm::{gateway, identity},
+    http::router,
+    llm::{gateway, keys},
     owner,
-    store::Store,
+    store::{Lease, Store, hash_token},
 };
 use serde_json::{Value, json};
 use sqlx::{PgPool, Row};
@@ -139,7 +140,6 @@ impl Harness {
         config.llm.upstream_url = format!("http://{}", upstream_listener.local_addr()?);
         config.llm.gateway_url = format!("http://{}", gateway_listener.local_addr()?);
         config.llm.platform_key_env = "RYZHUB_TEST_UPSTREAM_KEY".into();
-        config.llm.signing_key_env = "RYZHUB_TEST_SIGNING_KEY".into();
         config.llm.vault_key_env = "RYZHUB_TEST_VAULT_KEY".into();
         config.sandbox.enabled = true;
         let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -167,11 +167,7 @@ impl Harness {
         config_file.write_all(toml::to_string(&config)?.as_bytes())?;
         let gateway = config.llm.gateway_url.clone();
         let base = format!("http://{}", api_listener.local_addr()?);
-        let app = App {
-            store,
-            nats,
-            config,
-        };
+        let app = App::new(store, nats, config)?;
         let requests = Requests::default();
         let capture = requests.clone();
         let a = app.clone();
@@ -291,6 +287,17 @@ impl Harness {
         .fetch_one(&self.db)
         .await?)
     }
+    /// A gateway key for one Owner model call, as the chat engine issues it.
+    async fn loop_key(&self, lease: &Lease, user: Uuid, run: Uuid) -> anyhow::Result<String> {
+        keys::issue_loop_key(
+            &self.app.store,
+            lease,
+            user,
+            run,
+            vec![self.app.config.llm.model.clone()],
+        )
+        .await
+    }
     async fn close(self) -> anyhow::Result<()> {
         if let Some(path) = &self.app.config.llm.unix_socket {
             let _ = std::fs::remove_file(path);
@@ -341,8 +348,7 @@ async fn gateway_native_protocol_byok_usage_and_execution_fencing() -> anyhow::R
         .bind(conv)
         .fetch_one(&h.db)
         .await?;
-    let claims = identity::loop_identity(&lease, uid, run, &h.app.config.llm);
-    let token = identity::sign(&h.app.config.llm, &claims)?;
+    let token = h.loop_key(&lease, uid, run).await?;
     let client = reqwest::Client::new();
     let body = json!({"model":"fixture-model","max_tokens":32,"stream":true,"messages":[{"role":"user","content":"hello"}],"system":[{"type":"text","text":"native","cache_control":{"type":"ephemeral"}}]});
     let response = client
@@ -624,11 +630,12 @@ async fn tool_completed_before_owner_crash_replays_once_after_host_restart() -> 
         .fetch_one(&h.db)
         .await?;
     assert_eq!(result["stdout_head"], "真实沙箱结果");
-    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM guest_events WHERE sandbox_id=$1")
-        .bind(sandbox)
-        .fetch_one(&h.db)
-        .await?;
-    assert_eq!(count, 1);
+    let events: Vec<Value> =
+        sqlx::query_scalar("SELECT payload FROM guest_events WHERE sandbox_id=$1 ORDER BY gseq")
+            .bind(sandbox)
+            .fetch_all(&h.db)
+            .await?;
+    assert_eq!(events.len(), 1, "{events:#?}");
     let marker = format!(
         "/state/org/{}/workspaces/{conv}/marker",
         user["org_id"].as_str().unwrap()
@@ -667,11 +674,19 @@ async fn virtual_key_lease_rotation_policy_rate_limit_and_interrupted_usage() ->
         .await?;
     let sandbox = Uuid::now_v7();
     sqlx::query("INSERT INTO sandboxes(id,org_id,conversation_id,run_id,lease_epoch,exec_epoch,state,handle) VALUES($1,$2,$3,$4,7,1,'running','{}')").bind(sandbox).bind(org).bind(conv).bind(run).execute(&h.db).await?;
-    let mut claims = identity::loop_identity(&lease, id(&user, "user_id"), run, &h.app.config.llm);
-    claims.kind = "sandbox".into();
-    claims.sandbox_id = Some(sandbox);
-    claims.lease_epoch = Some(7);
-    let token = gateway::issue_sandbox_key(&h.app, &mut claims).await?;
+    let request = |lease_epoch| keys::SandboxKeyRequest {
+        org_id: org,
+        user_id: id(&user, "user_id"),
+        conversation_id: conv,
+        run_id: run,
+        sandbox_id: sandbox,
+        lease_epoch,
+        models: vec!["fixture-model".into()],
+        credential_id: None,
+    };
+    let token = keys::issue_sandbox_key(&h.app.store, request(7))
+        .await?
+        .token;
     let client = reqwest::Client::new();
     let body = json!({"model":"fixture-model","max_tokens":32,"stream":true,"messages":[{"role":"user","content":"hello"}]});
     let send = |token: String, body: Value| {
@@ -702,7 +717,9 @@ async fn virtual_key_lease_rotation_policy_rate_limit_and_interrupted_usage() ->
         .await
         .context("missing first chunk")??
         .to_vec();
-    let rotated = gateway::issue_sandbox_key(&h.app, &mut claims).await?;
+    let rotated = keys::issue_sandbox_key(&h.app.store, request(7))
+        .await?
+        .token;
     assert_eq!(send(token, body.clone()).await?.status(), 401);
     while let Some(chunk) = active_stream.next().await {
         received.extend_from_slice(&chunk?);
@@ -720,8 +737,9 @@ async fn virtual_key_lease_rotation_policy_rate_limit_and_interrupted_usage() ->
         .await?;
     let usage:(bool,String)=sqlx::query_as("SELECT estimated,status FROM usage_records WHERE run_id=$1 ORDER BY created_at DESC LIMIT 1").bind(run).fetch_one(&h.db).await?;
     assert_eq!(usage, (true, "interrupted".into()));
-    let mut limited = h.app.clone();
-    limited.config.llm.requests_per_minute_key = 4;
+    let mut config = (*h.app.config).clone();
+    config.llm.requests_per_minute_key = 4;
+    let limited = App::new(h.app.store.clone(), h.app.nats.clone(), config)?;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let url = format!("http://{}/v1/messages", listener.local_addr()?);
     let task = tokio::spawn(async move {
@@ -729,7 +747,7 @@ async fn virtual_key_lease_rotation_policy_rate_limit_and_interrupted_usage() ->
             .await
             .unwrap();
     });
-    // Rotated key has one accepted request so far; a fresh signed JWT cannot reset its DB scope.
+    // Rotated key has one accepted request so far; the limit is kept per key in the database.
     for _ in 0..3 {
         client
             .post(&url)
@@ -766,13 +784,14 @@ async fn virtual_key_lease_rotation_policy_rate_limit_and_interrupted_usage() ->
         .execute(&h.db)
         .await?;
     assert_eq!(send(rotated, body.clone()).await?.status(), 401);
-    claims.exp = 1;
-    assert_eq!(
-        send(identity::sign(&h.app.config.llm, &claims)?, body)
-            .await?
-            .status(),
-        401
-    );
+    let expired = keys::issue_sandbox_key(&h.app.store, request(8))
+        .await?
+        .token;
+    sqlx::query("UPDATE virtual_keys SET expires_at=now()-interval '1 second' WHERE token_hash=$1")
+        .bind(hash_token(&expired))
+        .execute(&h.db)
+        .await?;
+    assert_eq!(send(expired, body).await?.status(), 401);
     h.close().await
 }
 
@@ -933,8 +952,7 @@ async fn explicit_credential_selection_revocation_and_tenant_boundary() -> anyho
             .fetch_one(&h.db)
             .await?;
     assert_eq!(credential, Some(id(&selected, "id")));
-    let claims = identity::loop_identity(&lease, id(&user, "user_id"), run, &h.app.config.llm);
-    let virtual_token = identity::sign(&h.app.config.llm, &claims)?;
+    let virtual_token = h.loop_key(&lease, id(&user, "user_id"), run).await?;
     let body = json!({"model":"fixture-model","stream":true,"max_tokens":32,"messages":[{"role":"user","content":"hello"}]});
     client
         .post(format!("{}/v1/messages", h.gateway))
@@ -1040,10 +1058,7 @@ async fn removing_member_revokes_an_inflight_model_stream() -> anyhow::Result<()
         .bind(conv)
         .fetch_one(&h.db)
         .await?;
-    let token = identity::sign(
-        &h.app.config.llm,
-        &identity::loop_identity(&lease, uid, run, &h.app.config.llm),
-    )?;
+    let token = h.loop_key(&lease, uid, run).await?;
     let response=reqwest::Client::new().post(format!("{}/v1/messages",h.gateway)).bearer_auth(token).json(&json!({"model":"fixture-model","max_tokens":32,"stream":true,"messages":[{"role":"user","content":"slow"}]})).send().await?.error_for_status()?;
     let mut stream = response.bytes_stream();
     assert!(stream.next().await.context("no stream")?.is_ok());
@@ -1059,12 +1074,18 @@ async fn removing_member_revokes_an_inflight_model_stream() -> anyhow::Result<()
         }
     }
     assert!(!complete);
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    let usage: (String, bool) =
-        sqlx::query_as("SELECT status,estimated FROM usage_records WHERE run_id=$1")
+    // The record is finalized right after the stream is cut.
+    let mut usage = (String::new(), false);
+    for _ in 0..100 {
+        usage = sqlx::query_as("SELECT status,estimated FROM usage_records WHERE run_id=$1")
             .bind(run)
             .fetch_one(&h.db)
             .await?;
+        if usage.0 != "started" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     assert_eq!(usage, ("interrupted".into(), true));
     h.close().await
 }

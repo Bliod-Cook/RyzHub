@@ -3,20 +3,31 @@ use anyhow::{Context, ensure};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
+use crate::error::Code;
+
 const MAX_EVENT: usize = 4 * 1024 * 1024;
+
+/// Splits a server-sent event stream into the JSON payloads of its `data:` fields.
 #[derive(Default)]
 pub struct SseDecoder {
     pending: Vec<u8>,
+    /// Bytes of `pending` already known to hold no newline.
+    scanned: usize,
     data: Vec<String>,
     event_bytes: usize,
 }
+
 impl SseDecoder {
     pub fn push(&mut self, bytes: &[u8]) -> anyhow::Result<Vec<Value>> {
         self.pending.extend_from_slice(bytes);
         ensure!(self.pending.len() <= MAX_EVENT, "SSE_EVENT_TOO_LARGE");
         let mut events = Vec::new();
-        while let Some(end) = self.pending.iter().position(|b| *b == b'\n') {
-            let raw: Vec<_> = self.pending.drain(..=end).collect();
+        while let Some(offset) = self.pending[self.scanned..]
+            .iter()
+            .position(|b| *b == b'\n')
+        {
+            let raw: Vec<_> = self.pending.drain(..=self.scanned + offset).collect();
+            self.scanned = 0;
             let line = std::str::from_utf8(&raw)?.trim_end_matches(['\r', '\n']);
             if line.is_empty() {
                 if !self.data.is_empty() {
@@ -34,10 +45,12 @@ impl SseDecoder {
                     .push(data.strip_prefix(' ').unwrap_or(data).to_owned());
             }
         }
+        self.scanned = self.pending.len();
         Ok(events)
     }
 }
 
+/// Reassembles a streamed Anthropic message, including blocks the UI never shows.
 #[derive(Default)]
 pub struct NativeMessage {
     pub response: Value,
@@ -46,6 +59,7 @@ pub struct NativeMessage {
     blocks: BTreeMap<usize, Value>,
     json_fragments: BTreeMap<usize, String>,
 }
+
 impl NativeMessage {
     /// Returns visible text only; thinking and opaque data never become UI text.
     pub fn apply(&mut self, event: &Value) -> anyhow::Result<Option<String>> {
@@ -91,10 +105,13 @@ impl NativeMessage {
                     }
                 };
                 let chunk = delta[value].as_str().context("INVALID_CONTENT_DELTA")?;
-                let mut text = block[field].as_str().unwrap_or("").to_owned();
-                text.push_str(chunk);
-                ensure!(text.len() <= 16 * MAX_EVENT, "CONTENT_TOO_LARGE");
-                block[field] = Value::String(text);
+                // Appended in place: rebuilding the string per delta is quadratic in its length.
+                match &mut block[field] {
+                    Value::String(text) => text.push_str(chunk),
+                    other => *other = Value::String(chunk.to_owned()),
+                }
+                let length = block[field].as_str().map_or(0, str::len);
+                ensure!(length <= 16 * MAX_EVENT, Code::ContentTooLarge);
                 if field == "text" {
                     self.text_bytes += chunk.len();
                     return Ok(Some(chunk.to_owned()));
@@ -134,14 +151,38 @@ impl NativeMessage {
                 self.response["content"] = Value::Array(self.blocks.values().cloned().collect());
                 self.stopped = true;
             }
-            "error" => anyhow::bail!("UPSTREAM_STREAM_ERROR"),
+            "error" => anyhow::bail!(Code::UpstreamStreamError),
             _ => {} // ping and future metadata events pass through the gateway.
         }
         Ok(None)
     }
+
     pub fn finish(self) -> anyhow::Result<Value> {
-        ensure!(self.stopped, "UPSTREAM_STREAM_INTERRUPTED");
+        ensure!(self.stopped, Code::UpstreamStreamInterrupted);
         Ok(self.response)
+    }
+}
+
+/// Observes native Responses SSE without reconstructing or rewriting its payload.
+#[derive(Default)]
+pub struct ResponsesUsage {
+    pub usage: Value,
+    pub finished: bool,
+    pub failed: bool,
+}
+
+impl ResponsesUsage {
+    pub fn apply(&mut self, event: &Value) -> anyhow::Result<()> {
+        match event["type"].as_str().unwrap_or("") {
+            "response.completed" | "response.incomplete" | "response.failed" => {
+                self.usage = event["response"]["usage"].clone();
+                self.finished = self.usage.is_object();
+                self.failed = event["type"] != "response.completed";
+            }
+            "error" => anyhow::bail!(Code::UpstreamStreamError),
+            _ => {}
+        }
+        Ok(())
     }
 }
 
@@ -196,6 +237,7 @@ mod tests {
         assert_eq!(response["usage"]["output_tokens"], 8);
         assert_eq!(response["usage"]["cache_read_input_tokens"], 12);
     }
+
     #[test]
     fn interrupted_or_oversized_stream_cannot_become_a_completed_checkpoint() {
         assert!(NativeMessage::default().finish().is_err());
@@ -205,33 +247,7 @@ mod tests {
                 .is_err()
         );
     }
-}
 
-/// Observes native Responses SSE without reconstructing or rewriting its payload.
-#[derive(Default)]
-pub struct ResponsesUsage {
-    pub usage: Value,
-    pub finished: bool,
-    pub failed: bool,
-}
-impl ResponsesUsage {
-    pub fn apply(&mut self, event: &Value) -> anyhow::Result<()> {
-        match event["type"].as_str().unwrap_or("") {
-            "response.completed" | "response.incomplete" | "response.failed" => {
-                self.usage = event["response"]["usage"].clone();
-                self.finished = self.usage.is_object();
-                self.failed = event["type"] != "response.completed";
-            }
-            "error" => anyhow::bail!("UPSTREAM_STREAM_ERROR"),
-            _ => {}
-        }
-        Ok(())
-    }
-}
-
-#[cfg(test)]
-mod responses_tests {
-    use super::*;
     #[test]
     fn terminal_usage_does_not_turn_failure_into_success() {
         for kind in [

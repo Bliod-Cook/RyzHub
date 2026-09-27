@@ -301,29 +301,8 @@ class _HubPageState extends State<HubPage>
                           color: c.accent,
                         ),
                       ),
-                    // Reserved like the menu entry: enabled once the server
-                    // advertises `conversation_pin`.
                     if (!hub.isDraft)
-                      IconButton(
-                        tooltip: !hub.canPin
-                            ? tr('置顶（即将支持）', 'Pin (coming soon)')
-                            : conv['pinned'] == true
-                            ? tr('取消置顶', 'Unpin')
-                            : tr('置顶', 'Pin'),
-                        isSelected: conv['pinned'] == true,
-                        onPressed: hub.canPin
-                            ? () => action(
-                                () =>
-                                    hub.pin(conv['id'], conv['pinned'] != true),
-                              )
-                            : null,
-                        icon: const Icon(Icons.push_pin_outlined, size: 20),
-                        selectedIcon: Icon(
-                          Icons.push_pin,
-                          size: 20,
-                          color: c.accent,
-                        ),
-                      ),
+                      PinButton(hub: hub, conv: conv, run: action),
                     if (!hub.isDraft)
                       PopupMenuButton<String>(
                         tooltip: tr('对话命令', 'Chat commands'),

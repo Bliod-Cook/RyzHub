@@ -1,65 +1,220 @@
-//! Run daily with the migration role; runtime and worker roles cannot perform DDL.
+//! Partition maintenance, run with the migration role (runtime roles cannot perform DDL).
+//!
+//! Weekly `events` and monthly `audit_logs` partitions are created ahead of time. Each table
+//! also has a DEFAULT partition, so writes never fail when maintenance lapses; rows that land
+//! there are moved into their proper partition before it is attached.
 use anyhow::ensure;
 use chrono::{Datelike, Duration, Months, NaiveDate, Utc, Weekday};
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, Transaction};
 
-pub async fn maintain(pool: &PgPool, retention_days: u32) -> anyhow::Result<()> {
-    ensure!(retention_days >= 7, "retention must be at least seven days");
+use crate::config::Config;
+
+/// Partitions created ahead of today.
+const WEEKS_AHEAD: i64 = 2;
+const MONTHS_AHEAD: u32 = 2;
+
+struct Partitioned {
+    table: &'static str,
+    default: &'static str,
+}
+
+const EVENTS: Partitioned = Partitioned {
+    table: "events",
+    default: "events_default",
+};
+const AUDIT: Partitioned = Partitioned {
+    table: "audit_logs",
+    default: "audit_logs_default",
+};
+
+fn week_name(start: NaiveDate) -> String {
+    format!(
+        "events_{}_{:02}",
+        start.iso_week().year(),
+        start.iso_week().week()
+    )
+}
+
+fn month_name(start: NaiveDate) -> String {
+    format!("audit_logs_{}_{:02}", start.year(), start.month())
+}
+
+fn monday(day: NaiveDate) -> NaiveDate {
+    day - Duration::days(day.weekday().num_days_from_monday() as i64)
+}
+
+fn first_of_month(day: NaiveDate) -> NaiveDate {
+    NaiveDate::from_ymd_opt(day.year(), day.month(), 1).expect("valid month")
+}
+
+/// Ensure `[start, end)` has its own partition, moving any rows the DEFAULT partition holds
+/// for that range. All identifiers are generated from dates, never from input.
+async fn ensure_partition(
+    tx: &mut Transaction<'_, Postgres>,
+    parent: &Partitioned,
+    name: &str,
+    start: NaiveDate,
+    end: NaiveDate,
+) -> anyhow::Result<()> {
+    let exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
+        .bind(name)
+        .fetch_one(&mut **tx)
+        .await?;
+    if !exists {
+        let (table, default) = (parent.table, parent.default);
+        let range = format!("created_at>='{start}' AND created_at<'{end}'");
+        let stranded: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT EXISTS(SELECT 1 FROM {default} WHERE {range})"
+        )))
+        .fetch_one(&mut **tx)
+        .await?;
+        if stranded {
+            for statement in [
+                format!(
+                    "CREATE TABLE {name} (LIKE {table} INCLUDING DEFAULTS INCLUDING CONSTRAINTS)"
+                ),
+                format!("INSERT INTO {name} SELECT * FROM {default} WHERE {range}"),
+                format!("DELETE FROM {default} WHERE {range}"),
+                format!(
+                    "ALTER TABLE {table} ATTACH PARTITION {name} FOR VALUES FROM ('{start}') TO ('{end}')"
+                ),
+            ] {
+                sqlx::query(sqlx::AssertSqlSafe(statement))
+                    .execute(&mut **tx)
+                    .await?;
+            }
+        } else {
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "CREATE TABLE {name} PARTITION OF {table} FOR VALUES FROM ('{start}') TO ('{end}')"
+            )))
+            .execute(&mut **tx)
+            .await?;
+        }
+    }
+    // Parent-table RLS is the only access path; leaf partitions are never granted.
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "REVOKE ALL ON {name} FROM ryzhub_app,ryzhub_worker"
+    )))
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Partition names and their first day, by parsing `<prefix>_<year>_<nn>`.
+async fn partitions(
+    tx: &mut Transaction<'_, Postgres>,
+    parent: &str,
+) -> anyhow::Result<Vec<String>> {
+    Ok(sqlx::query_scalar(
+        "SELECT child.relname::text FROM pg_inherits i JOIN pg_class child ON child.oid=i.inhrelid
+         WHERE i.inhparent=$1::regclass",
+    )
+    .bind(parent)
+    .fetch_all(&mut **tx)
+    .await?)
+}
+
+pub async fn maintain(pool: &PgPool, config: &Config) -> anyhow::Result<()> {
+    ensure!(
+        config.events_retention_days >= 7,
+        "retention must be at least seven days"
+    );
     let mut tx = pool.begin().await?;
     sqlx::query("SELECT pg_advisory_xact_lock(724998201)")
         .execute(&mut *tx)
         .await?;
     let today = Utc::now().date_naive();
-    let monday = today - Duration::days(today.weekday().num_days_from_monday() as i64);
-    for n in 0..=2 {
-        let start = monday + Duration::weeks(n);
-        let end = start + Duration::weeks(1);
-        let name = format!(
-            "events_{}_{:02}",
-            start.iso_week().year(),
-            start.iso_week().week()
-        );
-        // All interpolated identifiers and literals below are generated dates, never user text.
-        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE TABLE IF NOT EXISTS {name} PARTITION OF events FOR VALUES FROM ('{start}') TO ('{end}')"))).execute(&mut *tx).await?;
-        sqlx::query(sqlx::AssertSqlSafe(format!(
-            "REVOKE ALL ON {name} FROM ryzhub_app,ryzhub_worker"
-        )))
-        .execute(&mut *tx)
+
+    // Weekly events: upcoming weeks plus any week with rows stranded in the default.
+    let mut weeks: Vec<NaiveDate> = (0..=WEEKS_AHEAD)
+        .map(|n| monday(today) + Duration::weeks(n))
+        .collect();
+    let stranded: Vec<NaiveDate> = sqlx::query_scalar(
+        "SELECT DISTINCT date_trunc('week',created_at)::date FROM events_default",
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    weeks.extend(stranded);
+    weeks.sort();
+    weeks.dedup();
+    for start in weeks {
+        ensure_partition(
+            &mut tx,
+            &EVENTS,
+            &week_name(start),
+            start,
+            start + Duration::weeks(1),
+        )
         .await?;
     }
-    let month = NaiveDate::from_ymd_opt(today.year(), today.month(), 1).unwrap();
-    for n in 0..=2 {
-        let start = month.checked_add_months(Months::new(n)).unwrap();
-        let end = start.checked_add_months(Months::new(1)).unwrap();
-        let name = format!("audit_logs_{}_{:02}", start.year(), start.month());
-        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE TABLE IF NOT EXISTS {name} PARTITION OF audit_logs FOR VALUES FROM ('{start}') TO ('{end}')"))).execute(&mut *tx).await?;
-        sqlx::query(sqlx::AssertSqlSafe(format!(
-            "REVOKE ALL ON {name} FROM ryzhub_app,ryzhub_worker"
-        )))
-        .execute(&mut *tx)
-        .await?;
+
+    // Monthly audit logs, likewise.
+    let mut months: Vec<NaiveDate> = (0..=MONTHS_AHEAD)
+        .filter_map(|n| first_of_month(today).checked_add_months(Months::new(n)))
+        .collect();
+    let stranded: Vec<NaiveDate> = sqlx::query_scalar(
+        "SELECT DISTINCT date_trunc('month',created_at)::date FROM audit_logs_default",
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    months.extend(stranded);
+    months.sort();
+    months.dedup();
+    for start in months {
+        let end = start
+            .checked_add_months(Months::new(1))
+            .expect("valid month");
+        ensure_partition(&mut tx, &AUDIT, &month_name(start), start, end).await?;
     }
-    let names:Vec<String>=sqlx::query_scalar("SELECT child.relname FROM pg_inherits i JOIN pg_class child ON child.oid=i.inhrelid JOIN pg_class parent ON parent.oid=i.inhparent WHERE parent.oid='events'::regclass").fetch_all(&mut *tx).await?;
-    for name in names {
+
+    // Retention drops whole partitions: events keep up to a week beyond the setting.
+    let cutoff = today - Duration::days(config.events_retention_days as i64);
+    for name in partitions(&mut tx, "events").await? {
         let parts: Vec<_> = name.split('_').collect();
         if let ["events", year, week] = parts.as_slice()
             && let (Ok(year), Ok(week)) = (year.parse::<i32>(), week.parse::<u32>())
             && let Some(start) = NaiveDate::from_isoywd_opt(year, week, Weekday::Mon)
-            && start + Duration::weeks(1) <= today - Duration::days(retention_days as i64)
+            && start + Duration::weeks(1) <= cutoff
         {
-            let safe_name = format!("events_{year}_{week:02}");
-            ensure!(safe_name == name, "noncanonical partition name");
-            sqlx::query(sqlx::AssertSqlSafe(format!("DROP TABLE {safe_name}")))
+            ensure!(week_name(start) == name, "noncanonical partition name");
+            sqlx::query(sqlx::AssertSqlSafe(format!("DROP TABLE {name}")))
                 .execute(&mut *tx)
                 .await?;
+        }
+    }
+    if config.retention.audit_days > 0 {
+        let cutoff = today - Duration::days(config.retention.audit_days as i64);
+        for name in partitions(&mut tx, "audit_logs").await? {
+            let parts: Vec<_> = name.split('_').collect();
+            if let ["audit", "logs", year, month] = parts.as_slice()
+                && let (Ok(year), Ok(month)) = (year.parse::<i32>(), month.parse::<u32>())
+                && let Some(start) = NaiveDate::from_ymd_opt(year, month, 1)
+                && start
+                    .checked_add_months(Months::new(1))
+                    .is_some_and(|end| end <= cutoff)
+            {
+                ensure!(month_name(start) == name, "noncanonical partition name");
+                sqlx::query(sqlx::AssertSqlSafe(format!("DROP TABLE {name}")))
+                    .execute(&mut *tx)
+                    .await?;
+            }
         }
     }
     sqlx::query("DELETE FROM ws_tickets WHERE expires_at<now()")
         .execute(&mut *tx)
         .await?;
-    sqlx::query("DELETE FROM ws_resumes WHERE expires_at<now()")
-        .execute(&mut *tx)
-        .await?;
     tx.commit().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn partition_names_follow_iso_weeks_and_months() {
+        let day = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+        assert_eq!(week_name(monday(day)), "events_2026_01");
+        assert_eq!(month_name(first_of_month(day)), "audit_logs_2026_01");
+    }
 }

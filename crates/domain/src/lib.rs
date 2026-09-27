@@ -144,6 +144,7 @@ fn intersection(
         _ => None,
     }
 }
+
 fn cap<T: Ord + Copy>(a: Option<T>, b: Option<T>) -> Option<T> {
     match (a, b) {
         (Some(a), Some(b)) => Some(a.min(b)),
@@ -180,38 +181,10 @@ impl Policy {
             project_file_bytes: cap(self.project_file_bytes, lower.project_file_bytes),
         }
     }
+
     pub fn effective(instance: &Self, org: &Self, user: &Self) -> Self {
         instance.restrict(org).restrict(user)
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ConversationState {
-    Active,
-    Archived,
-    DeletionPending,
-    Deleted,
-}
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RuntimeState {
-    Absent,
-    Provisioning,
-    Running,
-    Idle,
-    Stopping,
-    Failed,
-}
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum StorageState {
-    Hot,
-    Archiving,
-    Cold,
-    Restoring,
-    Purging,
-    Deleted,
 }
 
 #[cfg(test)]
@@ -239,6 +212,7 @@ mod tests {
         resource.owner_user_id = Some(Uuid::now_v7());
         assert!(authorize(&principal, Action::UseConversation, &resource).is_err());
     }
+
     #[test]
     fn lower_policy_cannot_broaden_upper_policy() {
         let instance = Policy {
@@ -271,6 +245,7 @@ mod tests {
             Some(BTreeSet::new())
         );
     }
+
     #[test]
     fn admin_cannot_modify_owner_and_key_cannot_subscribe() {
         let org = Uuid::now_v7();

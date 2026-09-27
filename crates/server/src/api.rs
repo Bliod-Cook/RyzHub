@@ -101,6 +101,7 @@ pub fn router(app: App) -> Router {
             axum::routing::delete(remove_member),
         )
         .route("/orgs/{org}/policy", get(policy))
+        .route("/orgs/{org}/models", get(models))
         .route("/orgs/{org}/audit", get(audit_log))
         .route(
             "/orgs/{org}/credentials",
@@ -364,14 +365,15 @@ async fn history(
     headers: HeaderMap,
     Path((org, conv)): Path<(Uuid, Uuid)>,
     Query(query): Query<HistoryQuery>,
-) -> ApiResult<Json<Vec<ryzhub_proto::Item>>> {
+) -> ApiResult<Json<Value>> {
     let auth = authenticate(&app, &headers).await?;
     let ctx = app.store.context(auth.user_id, org).await?;
-    Ok(Json(
-        app.store
-            .history(&ctx, conv, query.before_seq.unwrap_or(i64::MAX))
-            .await?,
-    ))
+    let (items, more) = app
+        .store
+        .history(&ctx, conv, query.before_seq.unwrap_or(i64::MAX))
+        .await?;
+    // `has_more` lets clients stop paging without guessing from page size.
+    Ok(Json(json!({"items":items,"has_more":more})))
 }
 async fn policy(
     State(app): State<App>,
@@ -391,6 +393,71 @@ async fn policy(
     Ok(Json(app.config.policy.restrict(&serde_json::from_value(
         policy.unwrap_or(json!({})),
     )?)))
+}
+/// Models a member may start a conversation with, grouped the way clients pick
+/// them: Chat by model, Work by harness and then model. The wire protocol stays
+/// server-side; it follows each model's provider.
+async fn models(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Path(org): Path<Uuid>,
+) -> ApiResult<Json<Value>> {
+    let auth = authenticate(&app, &headers).await?;
+    let ctx = app.store.context(auth.user_id, org).await?;
+    let mut tx = app.store.tx(ctx.org_id).await?;
+    let policy = crate::llm::gateway::effective_policy(&app, &mut tx, org).await?;
+    tx.commit().await?;
+    let config = &app.config;
+    let catalog = crate::run_config::catalog(config);
+    let list = |harness: &str| -> Vec<Value> {
+        let default = match harness {
+            _ if !config.llm.enabled => "mock",
+            "codex" => config.work.model.as_str(),
+            "claude" => config.work.claude_model.as_str(),
+            _ => config.llm.model.as_str(),
+        };
+        let mut models: Vec<&crate::run_config::ModelEntry> = catalog
+            .iter()
+            .filter(|m| m.harnesses.iter().any(|h| h == harness))
+            .filter(|m| {
+                policy.models.as_ref().is_none_or(|p| p.contains(&m.id))
+                    && policy
+                        .harnesses
+                        .as_ref()
+                        .is_none_or(|p| p.contains(harness))
+            })
+            .collect();
+        // Stable sort: the default leads, so pickers open on it.
+        models.sort_by_key(|m| m.id != default);
+        models
+            .into_iter()
+            .map(|m| {
+                let (provider, levels) = if config.llm.enabled {
+                    (
+                        crate::run_config::provider(&m.protocol),
+                        crate::run_config::reasoning_levels(harness, &m.protocol),
+                    )
+                } else {
+                    ("mock", vec![])
+                };
+                json!({"id":m.id,"provider":provider,"default":m.id==default,"reasoning_levels":levels})
+            })
+            .collect()
+    };
+    let harnesses: &[&str] = if !config.llm.enabled {
+        &["codex"]
+    } else if config.work.enabled {
+        &["codex", "claude"]
+    } else {
+        &[]
+    };
+    let work: Vec<Value> = harnesses
+        .iter()
+        .map(|h| (h, list(h)))
+        .filter(|(_, models)| !models.is_empty())
+        .map(|(h, models)| json!({"harness":h,"models":models}))
+        .collect();
+    Ok(Json(json!({"chat":list("chat"),"work":work})))
 }
 async fn audit_log(
     State(app): State<App>,

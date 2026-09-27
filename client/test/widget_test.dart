@@ -7,6 +7,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:ryzhub/main.dart';
 
 void main() {
+  setUpAll(() => prefs.language = 'zh');
   testWidgets('Chinese composition is not submitted by Ctrl+Enter', (
     tester,
   ) async {

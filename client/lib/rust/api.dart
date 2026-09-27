@@ -50,7 +50,13 @@ abstract class ClientCore implements RustOpaqueInterface {
 
   List<Uint8List> retryPending();
 
-  Update sendText({required String channel, required String text});
+  /// `config_json` carries settings not yet confirmed by the server, so they
+  /// apply to this message's run regardless of command ordering.
+  Update sendText({
+    required String channel,
+    required String text,
+    String? configJson,
+  });
 
   Update sideQuery({required String channel, required String text});
 

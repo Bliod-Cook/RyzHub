@@ -145,6 +145,7 @@ fn lost_ack_retries_same_command_after_serialization() {
             cid: "stable-cid".into(),
             command: Some(command_envelope::Command::SendMessage(SendMessage {
                 text: "hi".into(),
+                ..Default::default()
             })),
         },
     );

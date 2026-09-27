@@ -140,6 +140,7 @@ abstract class RustLibApi extends BaseApi {
     required ClientCore that,
     required String channel,
     required String text,
+    String? configJson,
   });
 
   Update crateApiClientCoreSideQuery({
@@ -547,6 +548,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     required ClientCore that,
     required String channel,
     required String text,
+    String? configJson,
   }) {
     return handler.executeSync(
       SyncTask(
@@ -558,6 +560,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           );
           sse_encode_String(channel, serializer);
           sse_encode_String(text, serializer);
+          sse_encode_opt_String(configJson, serializer);
           return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 12)!;
         },
         codec: SseCodec(
@@ -565,7 +568,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           decodeErrorData: null,
         ),
         constMeta: kCrateApiClientCoreSendTextConstMeta,
-        argValues: [that, channel, text],
+        argValues: [that, channel, text, configJson],
         apiImpl: this,
       ),
     );
@@ -573,7 +576,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
 
   TaskConstMeta get kCrateApiClientCoreSendTextConstMeta => const TaskConstMeta(
     debugName: "ClientCore_send_text",
-    argNames: ["that", "channel", "text"],
+    argNames: ["that", "channel", "text", "configJson"],
   );
 
   @override
@@ -1195,10 +1198,18 @@ class ClientCoreImpl extends RustOpaque implements ClientCore {
   List<Uint8List> retryPending() =>
       RustLib.instance.api.crateApiClientCoreRetryPending(that: this);
 
-  Update sendText({required String channel, required String text}) => RustLib
-      .instance
-      .api
-      .crateApiClientCoreSendText(that: this, channel: channel, text: text);
+  /// `config_json` carries settings not yet confirmed by the server, so they
+  /// apply to this message's run regardless of command ordering.
+  Update sendText({
+    required String channel,
+    required String text,
+    String? configJson,
+  }) => RustLib.instance.api.crateApiClientCoreSendText(
+    that: this,
+    channel: channel,
+    text: text,
+    configJson: configJson,
+  );
 
   Update sideQuery({required String channel, required String text}) => RustLib
       .instance

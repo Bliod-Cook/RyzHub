@@ -18,8 +18,7 @@ pub async fn execute(
 ) -> anyhow::Result<Body> {
     match cmd.command.as_ref().context("INVALID_COMMAND")? {
         Command::UpdateRunConfig(input) => {
-            crate::conversation_commands::configure(tx, lease, &input.config_json, config, &cmd.cid)
-                .await?
+            crate::conversation_commands::configure(tx, lease, &input.config_json, config).await?
         }
         Command::Compact(_) => {
             let (mode, value): (String, Value) = sqlx::query_as(
@@ -41,7 +40,15 @@ pub async fn execute(
         Command::Fork(input) => {
             crate::conversation_commands::enqueue_fork(tx, lease, &input.item_id, &cmd.cid).await?
         }
-        Command::SendMessage(input) => create(tx, lease, cmd, &input.text, false, config).await?,
+        Command::SendMessage(input) => {
+            // Settings travelling with the message apply before its run, so a
+            // separately sent UpdateRunConfig cannot land after it.
+            if !input.config_json.is_empty() {
+                crate::conversation_commands::configure(tx, lease, &input.config_json, config)
+                    .await?;
+            }
+            create(tx, lease, cmd, &input.text, false, config).await?
+        }
         Command::SideQuery(input) => create(tx, lease, cmd, &input.text, true, config).await?,
         Command::Steer(input) => {
             valid_text(&input.text)?;

@@ -9,14 +9,17 @@
     "second device login",
     "approval synchronized across devices",
     "cancel during stream",
-    "conversation create and switch",
+    "draft conversation create and switch",
     "offline persisted queue and reconnect without duplicates",
     "reload and login restore cached projection without persisted access token",
     "390px responsive navigation",
+    "logout revokes the session and keeps the device cache",
+    "English locale detected; language switch persists on the client",
+    "unsupported locale falls back to English",
     "invalid password rejected without entering session",
     "no uncaught JavaScript errors or external assets"
   ],
-  "count": 13,
+  "count": 16,
   "page_errors": [],
   "external_requests": []
 }

@@ -7,6 +7,7 @@
     "compact command with completion event",
     "rename platform command",
     "export visible conversation",
+    "another provider opens a new chat with that model",
     "Claude capability and emulated steer disclosure",
     "queued Claude steer waits then starts the next turn",
     "actual SDK Bash approval and execution",
@@ -16,7 +17,7 @@
     "desktop and mobile layouts",
     "browser sandbox archived after acceptance"
   ],
-  "count": 15,
+  "count": 16,
   "page_errors": [],
   "external_requests": []
 }

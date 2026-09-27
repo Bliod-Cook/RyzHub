@@ -126,7 +126,10 @@ fn id(user: &Value, key: &str) -> Uuid {
 fn message(cid: Uuid, text: &str) -> CommandEnvelope {
     CommandEnvelope {
         cid: cid.to_string(),
-        command: Some(Command::SendMessage(SendMessage { text: text.into() })),
+        command: Some(Command::SendMessage(SendMessage {
+            text: text.into(),
+            ..Default::default()
+        })),
     }
 }
 async fn connect(base: &str, user: &Value, device: &str) -> anyhow::Result<Socket> {

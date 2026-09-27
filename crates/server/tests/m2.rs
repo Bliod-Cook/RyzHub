@@ -350,7 +350,10 @@ fn id(value: &Value, key: &str) -> Uuid {
     Uuid::parse_str(value[key].as_str().unwrap()).unwrap()
 }
 fn message(text: &str) -> Command {
-    Command::SendMessage(SendMessage { text: text.into() })
+    Command::SendMessage(SendMessage {
+        text: text.into(),
+        ..Default::default()
+    })
 }
 
 async fn responses(

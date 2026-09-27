@@ -87,8 +87,16 @@ impl ClientCore {
         }
     }
     #[frb(sync)]
-    pub fn send_text(&self, channel: String, text: String) -> Update {
-        self.command(channel, Command::SendMessage(SendMessage { text }))
+    /// `config_json` carries settings not yet confirmed by the server, so they
+    /// apply to this message's run regardless of command ordering.
+    pub fn send_text(&self, channel: String, text: String, config_json: Option<String>) -> Update {
+        self.command(
+            channel,
+            Command::SendMessage(SendMessage {
+                text,
+                config_json: config_json.unwrap_or_default(),
+            }),
+        )
     }
     #[frb(sync)]
     pub fn decide(

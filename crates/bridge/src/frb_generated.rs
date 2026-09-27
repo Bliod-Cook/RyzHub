@@ -614,6 +614,7 @@ fn wire__crate__api__ClientCore_send_text_impl(
             >>::sse_decode(&mut deserializer);
             let api_channel = <String>::sse_decode(&mut deserializer);
             let api_text = <String>::sse_decode(&mut deserializer);
+            let api_config_json = <Option<String>>::sse_decode(&mut deserializer);
             deserializer.end();
             transform_result_sse::<_, ()>((move || {
                 let mut api_that_guard = None;
@@ -634,6 +635,7 @@ fn wire__crate__api__ClientCore_send_text_impl(
                     &*api_that_guard,
                     api_channel,
                     api_text,
+                    api_config_json,
                 ))?;
                 Ok(output_ok)
             })())

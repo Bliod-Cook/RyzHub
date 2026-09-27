@@ -16,7 +16,7 @@
 - `user:<org_uuid>:<user_uuid>`：组织内该用户的会话摘要和已读。
 - `org:<org_uuid>`：仅当前成员可订阅；M0 保留组织变更扩展点。
 
-Subscribe 的 `since_seq` 是 optional：缺失表示首次快照，0 是有效的重放起点。Gateway 先建立并 flush NATS 订阅，再在 REPEATABLE READ 事务内读取投影和 head_seq；缓冲中的旧事件会去重。已过期的游标或超前游标转快照。快照提供最近 100 个 Item，历史由 REST `items?before_seq=` 分页，每页 100 个。 Flutter 提供“加载更早消息”；Rust core 按 Item revision 合并历史，不覆盖同 revision 的流式文本，不推进 live cursor，并将结果持久化到同一缓存。
+Subscribe 的 `since_seq` 是 optional：缺失表示首次快照，0 是有效的重放起点。Gateway 先建立并 flush NATS 订阅，再在 REPEATABLE READ 事务内读取投影和 head_seq；缓冲中的旧事件会去重。已过期的游标或超前游标转快照。快照提供最近 100 个 Item，历史由 REST `items?before_seq=` 分页，每页 100 个，响应为 `{items, has_more}`，`has_more` 表示是否还有更早的 Item。Flutter 在时间线顶端进入视野时自动加载下一页，`has_more` 为 false 后停止；Rust core 按 Item revision 合并历史，不覆盖同 revision 的流式文本，不推进 live cursor，并将结果持久化到同一缓存。
 
 订阅数据顺序是：快照或事件重放 → 当前流 ItemFold → SubscriptionSynced → 实时帧。Fold 请求失败时后续 Delta 缺口会触发再次订阅，最终内容仍由持久 ItemUpserted 修复。NATS 丢失尾部事件也会由每秒一次的数据库校对补齐。
 
@@ -63,7 +63,7 @@ M0 不协商 permessage-deflate/zstd、JSON 子协议、SSE 降级或 RFC 8441�
 
 ## M3 命令与状态
 
-新增 `UpdateRunConfig(config_json)`、`Compact`、`Fork(item_id)`，沿用 CID 幂等、Owner fencing 和提交后 ACK。模型/推理/审批/计划设置保存到对话，下一轮复制到 run；已有运行记录后 harness/protocol 不可变。fork 是持久化后台作业，`GET /conversations/{id}/commands` 可查询结果。
+新增 `UpdateRunConfig(config_json)`、`Compact`、`Fork(item_id)`，沿用 CID 幂等、Owner fencing 和提交后 ACK。模型/推理/审批/计划设置保存到对话，下一轮复制到 run；已有运行记录（或分叉带来的上下文种子）后 harness/protocol 不可变。设置变更不再写入时间线通知；`SendMessage.config_json` 可携带客户端尚未确认的设置，服务端在同一事务内先应用再创建 run，避免与单独的 UpdateRunConfig 乱序。客户端只传 `model` 时，服务端按模型路由推断 protocol，Work 未给 harness 时一并推断；切换到另一提供方或执行器的模型返回 `HARNESS_PROTOCOL_IMMUTABLE`，客户端改为新建对话。fork 是持久化后台作业，`GET /conversations/{id}/commands` 可查询结果。
 
 补充输入区分 accepted/waiting/handed；handed 只代表转交。Claude 在当前原生轮结束后启动下一轮，仍属于同一平台 run；所有原生 turn ID 持久映射，迟到事件按原始 turn 路由。
 

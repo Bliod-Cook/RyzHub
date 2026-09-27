@@ -12,7 +12,7 @@ spec.loader.exec_module(r)
 
 with sync_playwright() as p:
     browser=p.chromium.launch(headless=True)
-    context=browser.new_context(viewport={'width':1280,'height':900})
+    context=browser.new_context(viewport={'width':1280,'height':900},locale='zh-CN');r.track_sockets(context)
     errors=[]
     external=[]
     context.on('request',lambda request:external.append(request.url) if not request.url.startswith((r.BASE,r.API,'blob:','data:')) else None)
@@ -40,22 +40,17 @@ with sync_playwright() as p:
     r.wait_state(page,lambda s:any(i['kind']=='steer' and i['state']=='handed' for i in r.items(s)))
     r.wait_state(page,lambda s:all(run['state'] not in ('running','requires_action') for c in s['channels'].values() for run in c['runs'].values()))
     passed.append('steer consumed at model boundary')
-    page.get_by_role('checkbox',name='只读旁问',exact=True).click()
-    r.send(page,'slow 旁问测试')
-    r.wait_state(page,lambda s:any(run['state']=='running' and run.get('read_only') for c in s['channels'].values() for run in c['runs'].values()))
-    page.get_by_role('checkbox',name='只读旁问',exact=True).click()
-    r.send(page,'旁问期间的新主线')
-    r.wait_state(page,lambda s:any(i['kind']=='assistant' and i['state']=='completed' and '旁问期间的新主线' in i['text'] for i in r.items(s)))
-    passed.append('new mainline while only side query is running')
-    r.wait_state(page,lambda s:any(i['kind']=='side_query' and i['state']=='completed' and '旁问测试' in i['text'] for i in r.items(s)))
-    passed.append('read-only side query')
-    page.get_by_role('button',name='重新连接',exact=True).click()
+    # Side questions left the composer; they are meant to return as a command.
+    r.send(page,'后续主线消息')
+    r.wait_state(page,lambda s:any(i['kind']=='assistant' and i['state']=='completed' and '后续主线消息' in i['text'] for i in r.items(s)))
+    passed.append('follow-up message after steer')
+    r.force_reconnect(page)
     page.wait_for_timeout(1000)
     state=r.cache(page)
     assert not state['pending_commands']
     passed.append('reconnect with no pending commands')
     usage=context.request.get(f'{r.API}/orgs/{auth["org_id"]}/usage',headers={'Authorization':'Bearer '+auth['token']})
-    assert usage.status==200 and len(usage.json())>=7
+    assert usage.status==200 and len(usage.json())>=6
     assert all(u['status']=='completed' and not u['estimated'] for u in usage.json())
     passed.append('usage attribution for browser-triggered model requests')
     page.screenshot(path=str(r.ROOT/'docs/browser-m1-desktop.png'))

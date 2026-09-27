@@ -78,7 +78,12 @@ message CommandEnvelope {
 message UpdateRunConfig { string config_json = 1; }
 message Compact {}
 message Fork { string item_id = 1; }
-message SendMessage { string text = 1; }
+// config_json optionally carries settings chosen since the last UpdateRunConfig
+// was confirmed; they apply before this message's run, in the same transaction.
+message SendMessage {
+  string text = 1;
+  string config_json = 2;
+}
 message DecideApproval {
   string action_id = 1;
   uint64 run_epoch = 2;

@@ -221,8 +221,25 @@ impl Store {
                 resolved_mode = defaults["mode"].as_str().unwrap_or("chat").into();
             }
             let mut merged = defaults.as_object().context("INVALID_DEFAULTS")?.clone();
-            merged.remove("mode");
-            for (k, v) in settings.as_object().context("INVALID_CONFIG")? {
+            let default_mode = merged.remove("mode");
+            let request = settings.as_object().context("INVALID_CONFIG")?;
+            // Defaults describe one path. A different mode, harness or model
+            // replaces the parts of that path it implies instead of mixing them.
+            let other_mode = !mode.is_empty()
+                && default_mode
+                    .as_ref()
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("chat")
+                    != mode;
+            if other_mode || request.contains_key("harness") {
+                merged.remove("harness");
+                merged.remove("model");
+                merged.remove("protocol");
+            }
+            if request.contains_key("model") {
+                merged.remove("protocol");
+            }
+            for (k, v) in request {
                 merged.insert(k.clone(), v.clone());
             }
             settings = serde_json::Value::Object(merged);
@@ -472,13 +489,17 @@ impl Store {
         ctx: &OrgContext,
         conv: Uuid,
         before: i64,
-    ) -> anyhow::Result<Vec<Item>> {
+    ) -> anyhow::Result<(Vec<Item>, bool)> {
+        const PAGE: usize = 100;
         self.conversation(ctx, conv).await?;
         let mut tx = self.tx(ctx.org_id).await?;
-        let items:Vec<ItemRow>=sqlx::query_as("SELECT id,revision,kind,state,text,first_seq,last_seq,run_id FROM items WHERE org_id=$1 AND conversation_id=$2 AND first_seq<$3 ORDER BY first_seq DESC LIMIT 100")
-            .bind(ctx.org_id).bind(conv).bind(before).fetch_all(&mut *tx).await?;
+        // One extra row tells whether anything older remains.
+        let mut items:Vec<ItemRow>=sqlx::query_as("SELECT id,revision,kind,state,text,first_seq,last_seq,run_id FROM items WHERE org_id=$1 AND conversation_id=$2 AND first_seq<$3 ORDER BY first_seq DESC LIMIT $4")
+            .bind(ctx.org_id).bind(conv).bind(before).bind(PAGE as i64 + 1).fetch_all(&mut *tx).await?;
         tx.commit().await?;
-        Ok(items.into_iter().map(Into::into).collect())
+        let more = items.len() > PAGE;
+        items.truncate(PAGE);
+        Ok((items.into_iter().map(Into::into).collect(), more))
     }
     pub async fn claim(
         &self,

@@ -1,6 +1,8 @@
 # Bundled fonts
 
-`RyzHubSans.ttf` is a weight-400, renamed subset of Noto Sans SC under the accompanying OFL license. Source: https://github.com/google/fonts/tree/main/ofl/notosanssc (retrieved 2026-09-25). It covers GB2312, ASCII, CJK punctuation and full-width punctuation (7,726 requested codepoints), keeping the initial Chinese font to about 2.3 MiB. Font family is overridden as `RyzHub Sans` in pubspec.
+`RyzHubSans.ttf` is a weight-400, renamed subset of Noto Sans SC under the accompanying OFL license. Source: https://github.com/google/fonts/tree/main/ofl/notosanssc (retrieved 2026-09-25). It covers GB2312, ASCII, CJK punctuation and full-width punctuation (7,726 requested codepoints), keeping the initial Chinese font to about 2.3 MiB. Its vertical metrics (hhea and OS/2 win ascent/descent) are re-centred to +1094/−354 by `scripts/subset-font.py`: same line height, but the line box centres on the glyphs instead of sitting them low. Font family is overridden as `RyzHub Sans` in pubspec.
+
+`0xProto-Regular-NL.ttf` is the unmodified no-ligature Regular face of [0xProto](https://github.com/0xType/0xProto) 2.502 (release archive `0xProto_2_502.zip`, SHA256 `402d046b6056111ae5b974892fe2d6d921c66a64681980ec81db051de05851e7`, retrieved 2026-09-26) under the SIL OFL 1.1 in `0xProto-OFL.txt`. It sets model identifiers and reasoning levels in the composer; the no-ligature cut keeps hyphenated IDs literal, and CJK text falls back to `RyzHub Sans`.
 
 `web/font-fallback/notocoloremoji/v32` hosts the Google Fonts Noto Color Emoji shards used by the mock agent's crab character and SDK response symbols; its license is `web/font-fallback/NOTO-EMOJI-OFL.txt`. Flutter's fallback base points to this local directory so the client does not make runtime font requests to gstatic. Additional writing systems or uncommon glyphs require additional licensed shards; this PoC is not a complete Unicode font distribution.
 

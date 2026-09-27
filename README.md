@@ -31,7 +31,7 @@ REST/WS：`http://127.0.0.1:8080`，实例配置页：`/admin`。首次在客户
 
 脚本启动 PostgreSQL/NATS、独立 containerd 执行节点、localhost:9081 协议 fixture、8080 API/WS 和 8081 LLM Gateway，自动迁移数据库。执行节点为名为 `ryzhub-m1-execution` 的 privileged 开发容器，只挂载本项目执行状态和二进制，不挂载 Docker socket；需要 Linux、Docker 及可用的 overlay/cgroup。默认镜像运行时为 runc，镜像按 digest 交给 host。
 
-Web 客户端发“执行沙箱验收”会请求执行审批，允许后在实际容器中执行命令；“请向我提问”会出现回答卡片；“slow 慢速响应”可用于测试运行中的补充输入。“只读旁问”只读最近提交的主线前缀，不提供工具或写回主线。
+Web 客户端发“执行沙箱验收”会请求执行审批，允许后在实际容器中执行命令；“请向我提问”会出现回答卡片；“slow 慢速响应”可用于测试运行中的补充输入。“只读旁问”只读最近提交的主线前缀，不提供工具或写回主线；它和审批模式暂时不在输入框中提供，计划后续以命令方式调整。
 
 本地配置在 `var/m1/config.toml`，随机签名密钥与 vault 主密钥在权限 0600 的 `var/m1/secrets.env`，均已忽略。vault 主密钥需要保留，替换后旧 BYOK 密文无法解密。`/capabilities` 与 `/admin/settings` 反映生效模式；`llm.enabled=false` 时保留 M0 模拟模式。
 
@@ -61,7 +61,7 @@ Web 客户端发“执行沙箱验收”会请求执行审批，允许后在实�
 ./scripts/dev-m2.sh
 ```
 
-脚本准备执行节点及固定版本 gVisor、启动 PostgreSQL/NATS，执行迁移，启动本地 Anthropic/Responses fixture。API/WS 是 **8180**，LLM Gateway 是 8181。客户端服务器地址填 `http://127.0.0.1:8180`，切到 Work 后新建对话即可使用实际 Codex。默认沙箱 runtime 为 runc。
+脚本准备执行节点及固定版本 gVisor、启动 PostgreSQL/NATS，执行迁移，启动本地 Anthropic/Responses fixture。API/WS 是 **8180**，LLM Gateway 是 8181。客户端服务器地址填 `http://127.0.0.1:8180`，在顶部切到 Work 后发送第一条消息即可创建对话并使用实际 Codex。默认沙箱 runtime 为 runc。
 
 Work 支持原生流式输出、补充输入、停止、审批、提问与会话恢复。界面提供保存检查点、归档和恢复；归档前需结束当前运行。恢复保留历史，将检查点水位之后的操作标记失效。`side_query`、fork 和 PTY 尚不支持，`/capabilities` 明确返回能力。
 
@@ -90,11 +90,20 @@ S3 配置、MCP catalog、故障场景、验证范围和部署限制见 [M2 验�
 
 `prepare-m2.sh` 要求 Codex 0.154.0，可用 `RYZHUB_CODEX_BINARY` 指定二进制路径。M3 镜像锁定 Claude Agent SDK 0.3.283，并记录不可变镜像 digest。API/WS 为 `http://127.0.0.1:8280`，Gateway 为 8281，本地 Anthropic/Responses fixture 为 9181/9182。客户端连接地址填写 8280。脚本使用独立 `ryzhub_m3` 数据库，保留已有开发库。
 
-前端可以选择 Chat Anthropic/Responses 或 Work Codex/Claude，管理项目指令和文本知识文件，切换模型、推理强度、审批及计划模式，并执行压缩、分叉、重命名、归档和导出。设置与项目内容在下一轮生效。Claude 的运行中补充会排入下一轮；界面分别显示“等待注入点”和“已转交执行器”，不声称模型已采纳。
+本机 demo 在另一个终端构建并启动，默认连接 M3 后端：
+
+```sh
+./scripts/build-web.sh --dart-define=RYZHUB_SERVER_URL=http://127.0.0.1:8280 --output=../var/demo/web
+python3 scripts/serve-web.py --directory var/demo/web
+```
+
+访问 [http://127.0.0.1:3000](http://127.0.0.1:3000)，填写测试邮箱和至少 8 位密码注册即可。Chat 中发送普通文字可测试流式响应，发送“执行”或“提问”可测试工具审批与用户回答。当前回复由本地协议 fixture 生成，尚未接入真实模型；项目、会话、审批和沙箱执行链路实际运行。
+
+前端只让用户选模型：输入框的“模型”选择器中，Chat 按提供方列出模型，Work 在 Codex / Claude Code 子菜单里选模型；上游格式（Anthropic Messages 或 OpenAI Responses）由服务端按模型所属提供方推断。对话开始后只能切换同一提供方（Work 为同一执行器）的模型，选择其他模型会用它打开新对话。在侧栏“项目”中管理项目指令和文本知识文件，在模型菜单中切换推理强度，Work 中切换计划模式，在消息上分叉，并通过对话菜单执行压缩、重命名、归档和导出。设置与项目内容在下一轮生效，设置变更不写入时间线，发送消息时会携带尚未确认的设置。Claude 的运行中补充会排入下一轮；界面分别显示“等待注入点”和“已转交执行器”，不声称模型已采纳。
 
 升级先运行迁移 0009–0011，再更新 Server、Host/Guest、M3 镜像和 Web。已有 Work 工作区固定其镜像；新工作区使用新镜像。保留 `var/m1/secrets.env` 中的 vault 主密钥。项目删除可在 30 天内恢复，到期由 Owner 侧 collector 清理内容、工作区和未被引用的检查点；分支恢复 pin 仍受保护。
 
-项目 API：`/orgs/{org}/projects`，`/{project}/files`、`/{project}/restore`；会话的 `/project` 用于移动，`/commands` 返回能力和配置，`/settings` 管理标题/归档，`/export` 导出。所有接口使用原有认证和租户边界。模型路由在 `llm.models` 中声明 `id/protocol/harnesses`，同时受组织策略限制。完整配置和验收边界见 [M3 验收](docs/m3-acceptance.md)。
+项目 API：`/orgs/{org}/projects`，`/{project}/files`、`/{project}/restore`；会话的 `/project` 用于移动，`/commands` 返回能力和配置，`/settings` 管理标题/归档，`/export` 导出。所有接口使用原有认证和租户边界。模型路由在 `llm.models` 中声明 `id/protocol/harnesses`，同时受组织策略限制。`GET /orgs/{org}/models` 按组织策略列出可选模型（Chat 列表，Work 按 harness 分组，含提供方、默认模型和推理等级）；创建对话、项目默认值或 `UpdateRunConfig` 只传 `model` 时，服务端从路由推断 protocol，Work 未指定 harness 时一并推断。完整配置和验收边界见 [M3 验收](docs/m3-acceptance.md)。
 
 ## 运行 Flutter 客户端
 
@@ -110,13 +119,15 @@ rustup toolchain install nightly-2026-09-25 --profile minimal --component rust-s
 python3 scripts/serve-web.py
 ```
 
-打开 `http://127.0.0.1:3000`。静态服务器必须发送 COOP `same-origin` 和 COEP `require-corp`，FRB 的共享 Wasm 内存需要 `crossOriginIsolated`。脚本提供这些头，并将 CanvasKit 与字体保存在本站。Rust 内核产物在 `client/web/pkg`，可重建、不提交二进制。
+打开 `http://127.0.0.1:3000`。界面参照 ChatGPT 网页版：侧栏包含新建对话、已归档、项目和最近对话，底部账户菜单进入设置；顶部切换 Chat/Work；“新建对话”只是草稿，发送第一条消息时才在服务端创建对话并以其作为标题。设置页提供语言、外观（浅色/深色/强调色）、新对话默认值、快捷键、账户与退出登录、用量、已归档对话、模型凭据和服务器策略。界面支持中文和英文：首次进入按浏览器或设备语言选择，识别不到时使用英文，选择只保存在本机（Web 为 IndexedDB `ryzhub-prefs`）。置顶、删除和临时对话（右上角按钮）只预留了界面，服务端在 `/capabilities` 声明 `conversation_pin` / `conversation_delete` / `conversation_temporary` 后才会启用；临时对话创建时发送 `temporary: true`，列表中带该标记的对话不显示。输入框右侧显示所选模型及其推理强度（0xProto 字体），点击后在同一菜单中切换。
+
+静态服务器必须发送 COOP `same-origin` 和 COEP `require-corp`，FRB 的共享 Wasm 内存需要 `crossOriginIsolated`。脚本提供这些头，并将 CanvasKit 与字体保存在本站。Rust 内核产物在 `client/web/pkg`，可重建、不提交二进制。
 
 - Windows：在装有 Visual Studio C++ 工具链的 Windows 上运行 `scripts/build-windows.ps1`，它编译并复制 Rust DLL 到 Flutter 输出目录。
 - Android：安装 SDK/NDK、`cargo-ndk` 和三个 Rust Android target 后运行 `scripts/build-android.sh`。Debug manifest 允许本地 HTTP；release 使用 HTTPS。
 - 原生开发时可用 `--dart-define=RYZHUB_RUST_LIBRARY=<Rust 动态库绝对路径>` 显式指定库。Flutter 外壳通过 Dart 注入传输和平台缓存；独立 `driver-native` crate 提供 tokio/tungstenite + SQLite 驱动。两者使用相同 Rust 协议与状态机。
 
-M0 模式输入 `/approve 任意内容` 会打开模拟审批，可用两个浏览器窗口登录同一账号竞争决议。普通消息流式输出；重新连接按钮、网络变化和应用恢复前台都会触发按游标补齐。Ctrl+Enter 发送；IME 组字期间不会误发送。
+M0 模式输入 `/approve 任意内容` 会打开模拟审批，可用两个浏览器窗口登录同一账号竞争决议。普通消息流式输出；侧栏顶部的连接状态在异常（黄色）时可点击重连，网络变化和应用恢复前台也会触发按游标补齐。Ctrl+Enter 发送（可在设置中改为 Enter 发送）；IME 组字期间不会误发送。浏览器测试脚本以 `zh-CN` locale 运行。
 
 ## 验证
 

@@ -21,7 +21,7 @@ database = os.environ['RYZHUB_HISTORY_TEST_DB']
 assert re.fullmatch(r'ryzhub_test_[a-z0-9_]+', database), 'requires an isolated test database'
 with sync_playwright() as p:
     browser = p.chromium.launch(headless=True)
-    context = browser.new_context(viewport={'width': 1280, 'height': 1000})
+    context = browser.new_context(viewport={'width': 1280, 'height': 1000}, locale='zh-CN')
     email, password = f'history-{time.time_ns()}@example.test', 'history-test-password'
     auth = context.request.post(f'{r.API}/auth/register', data={
         'email': email, 'password': password,
@@ -44,23 +44,34 @@ with sync_playwright() as p:
     page = r.start(context)
     page.on('pageerror', lambda error: errors.append(str(error)))
     r.login(page, email, password)
+    r.open_conversation(page, '分页回归')
     channel = f'conv:{conv}'
     state = r.wait_state(page, lambda s: len(s.get('channels', {}).get(channel, {}).get('items', {})) == 100)
     assert state['channels'][channel]['cursor'] == 225
     assert min(i['first_seq'] for i in state['channels'][channel]['items'].values()) == 126
-    page.get_by_role('button', name='加载更早消息', exact=True).click()
-    state = r.wait_state(page, lambda s: len(s['channels'][channel]['items']) == 200)
+    # The timeline is newest-first; older pages load on their own as its top
+    # scrolls into view, and the server's has_more ends the paging.
+    def scroll_up_until(count):
+        page.mouse.move(770, 400)
+        deadline = time.monotonic() + 30
+        while len(r.cache(page)['channels'][channel]['items']) < count:
+            assert time.monotonic() < deadline, f'history did not reach {count}'
+            page.mouse.wheel(0, -4000)
+            page.wait_for_timeout(150)
+        return r.cache(page)
+    state = scroll_up_until(200)
     assert state['channels'][channel]['cursor'] == 225
-    page.get_by_role('button', name='加载更早消息', exact=True).click()
-    state = r.wait_state(page, lambda s: len(s['channels'][channel]['items']) == 225)
+    state = scroll_up_until(225)
     assert sorted(i['first_seq'] for i in state['channels'][channel]['items'].values()) == list(range(1,226))
-    expect(page.get_by_role('button', name='已显示全部消息', exact=True)).to_be_disabled()
+    page.mouse.wheel(0, -4000)
+    expect(page.get_by_text('正在加载更早的消息', exact=True)).to_have_count(0)
     page.reload()
     page.locator('flt-semantics-placeholder').wait_for()
     page.locator('flt-semantics-placeholder').evaluate('(e) => e.click()')
     r.login(page, email, password)
     state = r.wait_state(page, lambda s: len(s['channels'][channel]['items']) == 225)
     assert state['channels'][channel]['cursor'] == 225
+    r.open_conversation(page, '分页回归')
     r.send(page, '分页后继续对话')
     r.wait_state(page, lambda s: any(i['kind']=='assistant' and i['state']=='completed' and '分页后继续对话' in i['text'] for i in r.items(s)))
     assert not errors, errors

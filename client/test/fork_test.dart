@@ -4,6 +4,7 @@ import 'package:ryzhub/controller.dart';
 import 'package:ryzhub/main.dart';
 
 void main() {
+  setUpAll(() => prefs.language = 'zh');
   testWidgets('Codex exposes only server-confirmed fork boundaries', (
     tester,
   ) async {

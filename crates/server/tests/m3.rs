@@ -384,7 +384,10 @@ fn id(value: &Value, key: &str) -> Uuid {
     Uuid::parse_str(value[key].as_str().unwrap()).unwrap()
 }
 fn message(text: &str) -> Command {
-    Command::SendMessage(SendMessage { text: text.into() })
+    Command::SendMessage(SendMessage {
+        text: text.into(),
+        ..Default::default()
+    })
 }
 
 async fn responses(
@@ -680,6 +683,111 @@ async fn responses_native_history_projects_and_commands() -> anyhow::Result<()> 
 
  Ok::<_,anyhow::Error>(())
  }.await;
+    owner.kill().await?;
+    h.close().await?;
+    outcome
+}
+#[tokio::test]
+#[ignore = "requires local PostgreSQL, NATS and containerd"]
+async fn models_catalog_and_provider_inference() -> anyhow::Result<()> {
+    let h = Harness::new().await?;
+    let user = h.user().await?;
+    let org = id(&user, "org_id");
+    let mut owner = h.owner()?;
+    let outcome = async {
+        let catalog: Value = reqwest::Client::new()
+            .get(format!("{}/orgs/{org}/models", h.base))
+            .bearer_auth(user["token"].as_str().unwrap())
+            .send()
+            .await?
+            .json()
+            .await?;
+        let chat = catalog["chat"].as_array().context("chat models")?;
+        let find = |id: &str| chat.iter().find(|m| m["id"] == id);
+        ensure!(find("gpt-5.4").is_some_and(|m| m["provider"] == "openai"), "{catalog}");
+        ensure!(find("claude-opus-4-6").is_some_and(|m| m["provider"] == "anthropic"));
+        ensure!(find("fixture-model").is_some_and(|m| m["default"] == true));
+        ensure!(find("gpt-5.2").is_none(), "Codex-only routes stay out of Chat");
+        let claude = catalog["work"]
+            .as_array()
+            .context("work groups")?
+            .iter()
+            .find(|g| g["harness"] == "claude")
+            .context("claude group")?;
+        ensure!(claude["models"].as_array().unwrap().iter().any(|m| {
+            m["id"] == "claude-sonnet-4-6"
+                && m["default"] == true
+                && m["reasoning_levels"].as_array().unwrap().last() == Some(&json!("max"))
+        }));
+
+        // Clients send only the model; the server derives the wire protocol.
+        let conversations = format!("/orgs/{org}/conversations");
+        let create = |run_config: Value, project: Option<Uuid>| {
+            h.json(
+                &user,
+                &conversations,
+                reqwest::Method::POST,
+                json!({"title":"Model first","mode":"chat","project_id":project,"run_config":run_config}),
+            )
+        };
+        let openai = create(json!({"model":"gpt-5.4"}), None).await?;
+        ensure!(openai["run_config"]["protocol"] == "responses", "{openai}");
+        let conv = id(&openai, "id");
+        h.submit(&user, conv, message("hello by model")).await?;
+        h.wait_state(conv, "completed").await?;
+        let cross = h
+            .submit(
+                &user,
+                conv,
+                Command::UpdateRunConfig(UpdateRunConfig {
+                    config_json: json!({"model":"claude-opus-4-6"}).to_string(),
+                }),
+            )
+            .await;
+        ensure!(
+            cross
+                .unwrap_err()
+                .to_string()
+                .contains("HARNESS_PROTOCOL_IMMUTABLE"),
+            "a started chat keeps its provider"
+        );
+
+        let anthropic = create(json!({"model":"claude-opus-4-6"}), None).await?;
+        ensure!(anthropic["run_config"]["protocol"] == "anthropic", "{anthropic}");
+        let conv = id(&anthropic, "id");
+        h.submit(&user, conv, message("hello anthropic")).await?;
+        h.wait_state(conv, "completed").await?;
+        h.submit(
+            &user,
+            conv,
+            Command::UpdateRunConfig(UpdateRunConfig {
+                config_json: json!({"model":"fixture-model"}).to_string(),
+            }),
+        )
+        .await?;
+        let stored: Value = sqlx::query_scalar("SELECT run_config FROM conversations WHERE id=$1")
+            .bind(conv)
+            .fetch_one(&h.db)
+            .await?;
+        ensure!(stored["model"] == "fixture-model" && stored["protocol"] == "anthropic");
+
+        // A project default written by an older client does not fight the chosen model.
+        let project = h
+            .json(
+                &user,
+                &format!("/orgs/{org}/projects"),
+                reqwest::Method::POST,
+                json!({"name":"Legacy defaults","defaults":{"mode":"chat","protocol":"responses"}}),
+            )
+            .await?;
+        let project = id(&project, "id");
+        let inherited = create(json!({}), Some(project)).await?;
+        ensure!(inherited["run_config"]["protocol"] == "responses", "{inherited}");
+        let chosen = create(json!({"model":"claude-opus-4-6"}), Some(project)).await?;
+        ensure!(chosen["run_config"]["protocol"] == "anthropic", "{chosen}");
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
     owner.kill().await?;
     h.close().await?;
     outcome

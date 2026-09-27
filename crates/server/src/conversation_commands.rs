@@ -21,7 +21,6 @@ pub async fn configure(
     lease: &Lease,
     input: &str,
     config: &crate::config::Config,
-    cid: &str,
 ) -> anyhow::Result<()> {
     ensure!(input.len() <= 4096, "INVALID_CONFIG");
     let (mode, mut old): (String, Value) =
@@ -32,12 +31,21 @@ pub async fn configure(
             .await?;
     let previous = RunConfig::resolve(old.clone(), &mode, config)?;
     let patch: Value = serde_json::from_str(input)?;
-    for (k, v) in patch.as_object().context("INVALID_CONFIG")? {
+    let patch = patch.as_object().context("INVALID_CONFIG")?;
+    // A model switch re-derives the wire protocol from the new model's provider.
+    if patch.contains_key("model")
+        && !patch.contains_key("protocol")
+        && let Some(stored) = old.as_object_mut()
+    {
+        stored.remove("protocol");
+    }
+    for (k, v) in patch {
         old[k] = v.clone();
     }
     let current = RunConfig::resolve(old, &mode, config)?;
+    // A fork's context seed is provider-native history, so it pins the protocol too.
     let has_runs: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM runs WHERE org_id=$1 AND conversation_id=$2)",
+        "SELECT EXISTS(SELECT 1 FROM runs WHERE org_id=$1 AND conversation_id=$2) OR EXISTS(SELECT 1 FROM conversations WHERE org_id=$1 AND id=$2 AND context_seed IS NOT NULL)",
     )
     .bind(lease.org_id)
     .bind(lease.conversation_id)
@@ -73,28 +81,7 @@ pub async fn configure(
         .bind(serde_json::to_value(&current)?)
         .execute(&mut **tx)
         .await?;
-    append(
-        tx,
-        lease.org_id,
-        &lease.channel(),
-        Some(lease),
-        cid,
-        Event::ItemUpserted(Item {
-            id: Uuid::now_v7().to_string(),
-            revision: 1,
-            kind: "notice".into(),
-            state: "completed".into(),
-            text: format!(
-                "设置已保存，下一轮生效：{} · {} · {}{}",
-                current.model,
-                current.reasoning,
-                current.approval,
-                if current.plan { " · 计划模式" } else { "" }
-            ),
-            ..Default::default()
-        }),
-    )
-    .await?;
+    // Settings changes are silent; the next run simply uses them.
     Ok(())
 }
 pub async fn enqueue_fork(
@@ -176,11 +163,12 @@ pub async fn catalog(
     {
         models.retain(|m| list.iter().any(|n| n["model"] == *m || n["id"] == *m));
     }
-    let mut reasoning = if settings.harness == "claude" {
-        vec!["low", "medium", "high", "xhigh", "max"]
-    } else {
-        vec!["low", "medium", "high", "xhigh"]
-    };
+    // Chat over Anthropic keeps the full list; clients gate it on `thought_level`.
+    let mut reasoning =
+        match crate::run_config::reasoning_levels(&settings.harness, &settings.protocol) {
+            levels if levels.is_empty() => vec!["low", "medium", "high", "xhigh"],
+            levels => levels,
+        };
     if settings.harness == "codex"
         && let Some((caps, _)) = &native
         && let Some(model) = caps["models"].as_array().and_then(|l| {
@@ -200,7 +188,7 @@ pub async fn catalog(
     };
     tx.commit().await?;
     Ok(Json(
-        json!({"settings":settings,"capabilities":crate::run_config::capabilities(&settings.harness,&settings.protocol),"models":models,"reasoning_levels":reasoning,"approval_modes":if policy.allow_full_auto==Some(false){vec!["ask","allow_edits"]}else{vec!["ask","allow_edits","full_auto"]},"effective":"next_turn","harness_commands":native.map(|(_,commands)|commands).unwrap_or(json!([])),"operations":operations,"fork_points":fork_points}),
+        json!({"provider":crate::run_config::provider(&settings.protocol),"settings":settings,"capabilities":crate::run_config::capabilities(&settings.harness,&settings.protocol),"models":models,"reasoning_levels":reasoning,"approval_modes":if policy.allow_full_auto==Some(false){vec!["ask","allow_edits"]}else{vec!["ask","allow_edits","full_auto"]},"effective":"next_turn","harness_commands":native.map(|(_,commands)|commands).unwrap_or(json!([])),"operations":operations,"fork_points":fork_points}),
     ))
 }
 #[derive(Deserialize)]

@@ -739,18 +739,27 @@ impl Guest {
 
 /// Write the project instructions and make both harnesses' memory files import them.
 fn install_project_instructions(text: &str) -> anyhow::Result<()> {
-    ensure!(text.len() <= 70000, "INVALID_PROJECT_INSTRUCTIONS");
+    ensure!(text.len() <= 600_000, "INVALID_PROJECT_INSTRUCTIONS");
     let dir = std::path::Path::new("/workspace/.platform");
     std::fs::create_dir_all(dir)?;
-    journal::atomic_bytes(&dir.join("project.md"), text.as_bytes())?;
+    let (project, memory) = text
+        .rfind("\n<memory>\n<notice>")
+        .map_or((text, ""), |at| text.split_at(at));
+    journal::atomic_bytes(&dir.join("project.md"), project.as_bytes())?;
+    journal::atomic_bytes(&dir.join("memory.md"), memory.as_bytes())?;
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(
+        dir.join("memory.md"),
+        std::fs::Permissions::from_mode(0o444),
+    )?;
     for (name, import) in [
         (
             "AGENTS.md",
-            "\n\n<!-- RyzHub project -->\nRead .platform/project.md for the current project instructions. Knowledge files are read-only in /project.\n",
+            "\n\n<!-- RyzHub project -->\nRead .platform/project.md for the current project instructions and .platform/memory.md for memory data. Knowledge files are read-only in /project.\n",
         ),
         (
             "CLAUDE.md",
-            "\n\n<!-- RyzHub project -->\n@.platform/project.md\n",
+            "\n\n<!-- RyzHub project -->\n@.platform/project.md\n@.platform/memory.md\n",
         ),
     ] {
         let path = std::path::Path::new("/workspace").join(name);

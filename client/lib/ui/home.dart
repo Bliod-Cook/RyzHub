@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:math';
 
 import 'package:flutter/material.dart';
@@ -127,8 +128,8 @@ class _HubPageState extends State<HubPage>
     switch (result) {
       case SearchNewChat():
         newChat();
-      case SearchConversation(:final id):
-        openConversation(id);
+      case SearchConversation(:final id, :final itemId, :final seq):
+        action(() => hub.selectSearch(id, itemId, seq));
       case SearchProject(:final id):
         openProject(id);
       case null:
@@ -608,7 +609,13 @@ class _HubPageState extends State<HubPage>
 
   Widget conversationView() {
     final c = HubColors.of(context);
-    final items = hub.items;
+    final items = hub.items
+        .where(
+          (i) =>
+              hub.searchFocusSeq == null ||
+              (i['first_seq'] as int) <= hub.searchFocusSeq!,
+        )
+        .toList();
     Widget centered(Widget child, {Key? key}) => Center(
       key: key,
       child: ConstrainedBox(
@@ -648,6 +655,41 @@ class _HubPageState extends State<HubPage>
                         MessageCard(
                           item: item,
                           agentLabel: hub.agentLabel,
+                          onMemoryRead: item['kind'] == 'memory_context'
+                              ? () async {
+                                  final result = await hub.request(
+                                    '/orgs/${hub.org}/conversations/${hub.selected}/memory-context/${item['id']}',
+                                  );
+                                  return result['items'] as List<dynamic>;
+                                }
+                              : null,
+                          onSource: (href) {
+                            final uri = Uri.tryParse(href);
+                            final parts = uri?.pathSegments ?? [];
+                            if (parts.length >= 4 &&
+                                parts[0] == 'orgs' &&
+                                parts[1] == hub.org &&
+                                parts[2] == 'conversations') {
+                              action(
+                                () => hub.selectSearch(
+                                  parts[3],
+                                  uri?.queryParameters['item'],
+                                  int.tryParse(
+                                    uri?.queryParameters['seq'] ?? '',
+                                  ),
+                                ),
+                              );
+                            }
+                          },
+                          onMemoryUndo: item['kind'] == 'memory_notice'
+                              ? () => action(() async {
+                                  final notice = jsonDecode(item['text']);
+                                  await hub.request(
+                                    '/orgs/${hub.org}/memory-events/${notice['event_id']}/undo',
+                                    body: {},
+                                  );
+                                })
+                              : null,
                           onFork: hub.canFork(item)
                               ? () => action(() => hub.fork(item['id']))
                               : null,
@@ -657,6 +699,12 @@ class _HubPageState extends State<HubPage>
                   ),
                 ),
         ),
+        if (hub.searchFocusSeq != null)
+          TextButton.icon(
+            onPressed: hub.clearSearchFocus,
+            icon: const Icon(Icons.arrow_downward),
+            label: Text(tr('回到最新消息', 'Back to latest messages')),
+          ),
         for (final approval in hub.actions)
           Padding(
             padding: const EdgeInsets.fromLTRB(16, 4, 16, 4),

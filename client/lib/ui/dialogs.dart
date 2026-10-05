@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -237,18 +238,45 @@ Future<void> conversationAction(
         ClipboardData(text: const JsonEncoder.withIndent('  ').convert(data)),
       );
     case 'delete':
-      if (context.mounted &&
-          await confirmDialog(
-            context,
-            title: tr('删除对话？', 'Delete conversation?'),
-            message: tr(
-              '将删除“${conv['title']}”。',
-              'This will delete "${conv['title']}".',
+      var related = false;
+      if (!context.mounted) return;
+      final confirmed = await showDialog<bool>(
+        context: context,
+        builder: (context) => StatefulBuilder(
+          builder: (context, setState) => AlertDialog(
+            title: Text(tr('删除对话？', 'Delete conversation?')),
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(
+                  tr(
+                    '将删除“${conv['title']}”。',
+                    'This will delete "${conv['title']}".',
+                  ),
+                ),
+                CheckboxListTile(
+                  title: Text(tr('同时删除相关记忆', 'Also delete related memories')),
+                  value: related,
+                  onChanged: (value) =>
+                      setState(() => related = value ?? false),
+                ),
+              ],
             ),
-            confirm: tr('删除', 'Delete'),
-            danger: true,
-          )) {
-        await hub.deleteConversation(id);
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(context, false),
+                child: Text(tr('取消', 'Cancel')),
+              ),
+              FilledButton(
+                onPressed: () => Navigator.pop(context, true),
+                child: Text(tr('删除', 'Delete')),
+              ),
+            ],
+          ),
+        ),
+      );
+      if (confirmed == true) {
+        await hub.deleteConversation(id, deleteMemories: related);
       }
     case 'refresh':
       await hub.refreshCommands();
@@ -266,7 +294,9 @@ class SearchNewChat extends SearchResult {}
 
 class SearchConversation extends SearchResult {
   final String id;
-  SearchConversation(this.id);
+  final String? itemId;
+  final int? seq;
+  SearchConversation(this.id, {this.itemId, this.seq});
 }
 
 class SearchProject extends SearchResult {
@@ -283,13 +313,91 @@ class SearchDialog extends StatefulWidget {
 
 class _SearchDialogState extends State<SearchDialog> {
   String query = '';
+  List<dynamic> hits = [];
+  String searchError = '';
+  bool loading = false;
+  Timer? debounce;
+  int generation = 0;
+  @override
+  void dispose() {
+    debounce?.cancel();
+    super.dispose();
+  }
+
+  Widget snippet(Map<String, dynamic> hit) {
+    final html = (hit['snippet_html'] ?? '').toString();
+    final text = (html.isEmpty
+        ? (hit['text'] ?? '').toString()
+        : html
+              .replaceAll(RegExp(r'<[^>]*>'), '')
+              .replaceAll('&amp;', '&')
+              .replaceAll('&lt;', '<')
+              .replaceAll('&gt;', '>')
+              .replaceAll('&quot;', '"')
+              .replaceAll('&#39;', "'"));
+    final needle = query.trim();
+    final at = needle.isEmpty
+        ? -1
+        : text.toLowerCase().indexOf(needle.toLowerCase());
+    if (at < 0 || at + needle.length > text.length) {
+      return Text(text, maxLines: 3, overflow: TextOverflow.ellipsis);
+    }
+    return Text.rich(
+      TextSpan(
+        children: [
+          TextSpan(text: text.substring(0, at)),
+          TextSpan(
+            text: text.substring(at, at + needle.length),
+            style: const TextStyle(fontWeight: FontWeight.bold),
+          ),
+          TextSpan(text: text.substring(at + needle.length)),
+        ],
+      ),
+      maxLines: 3,
+      overflow: TextOverflow.ellipsis,
+    );
+  }
+
+  void changed(String value) {
+    debounce?.cancel();
+    final turn = ++generation;
+    setState(() {
+      query = value;
+      hits = [];
+      searchError = '';
+      loading =
+          value.trim().isNotEmpty && widget.hub.capabilities['search'] == true;
+    });
+    if (!loading) return;
+    debounce = Timer(const Duration(milliseconds: 300), () async {
+      try {
+        final result = await widget.hub.request(
+          '/orgs/${widget.hub.org}/search?q=${Uri.encodeQueryComponent(value.trim())}',
+        );
+        if (mounted && turn == generation) {
+          setState(() {
+            hits = result['matches'];
+            loading = false;
+          });
+        }
+      } catch (e) {
+        if (mounted && turn == generation) {
+          setState(() {
+            searchError = errorText(e);
+            loading = false;
+          });
+        }
+      }
+    });
+  }
+
   @override
   Widget build(BuildContext context) {
     final c = HubColors.of(context);
     final q = query.trim().toLowerCase();
     bool match(Object? v) => q.isEmpty || '$v'.toLowerCase().contains(q);
     final conversations = widget.hub.conversations
-        .where((x) => match(x['title']))
+        .where((x) => x['temporary'] != true && match(x['title']))
         .toList();
     final projects = widget.hub.activeProjects
         .where((p) => match(p['name']))
@@ -325,7 +433,7 @@ class _SearchDialogState extends State<SearchDialog> {
                   Expanded(
                     child: TextField(
                       autofocus: true,
-                      onChanged: (v) => setState(() => query = v),
+                      onChanged: changed,
                       decoration: InputDecoration(
                         hintText: tr('搜索对话…', 'Search chats…'),
                         border: InputBorder.none,
@@ -373,7 +481,34 @@ class _SearchDialogState extends State<SearchDialog> {
                           ? tr('已归档', 'Archived')
                           : null,
                     ),
-                  if (q.isNotEmpty && conversations.isEmpty && projects.isEmpty)
+                  if (loading) const LinearProgressIndicator(),
+                  if (searchError.isNotEmpty) EmptyHint(searchError),
+                  if (hits.isNotEmpty)
+                    SectionLabel(tr('消息与文件', 'Messages and files')),
+                  for (final hit in hits)
+                    ListTile(
+                      title: snippet(Map<String, dynamic>.from(hit)),
+                      subtitle: Text(
+                        hit['conversation_id'] != null
+                            ? tr('历史对话', 'Chat history')
+                            : tr('项目文件', 'Project file'),
+                      ),
+                      onTap: () => Navigator.pop(
+                        context,
+                        hit['conversation_id'] != null
+                            ? SearchConversation(
+                                hit['conversation_id'],
+                                itemId: hit['item_id'],
+                                seq: hit['seq'],
+                              )
+                            : SearchProject(hit['project_id']),
+                      ),
+                    ),
+                  if (q.isNotEmpty &&
+                      !loading &&
+                      hits.isEmpty &&
+                      conversations.isEmpty &&
+                      projects.isEmpty)
                     EmptyHint(tr('没有匹配的结果', 'No matches')),
                 ],
               ),

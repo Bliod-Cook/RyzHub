@@ -1,5 +1,5 @@
-//! MCP gateway. Every tool call needs a one-use user approval enforced here, outside the
-//! sandbox, so a harness (or code inside the sandbox) cannot bypass it.
+//! MCP gateway. Remote tools require one-use user approval outside the sandbox.
+//! Built-in memory tools instead enforce live memory policy and private scope here.
 use anyhow::{Context, ensure};
 use axum::{
     Json,
@@ -79,13 +79,16 @@ async fn call(app: App, headers: HeaderMap, request: Value) -> anyhow::Result<Va
         }
         "notifications/initialized" | "ping" => return Ok(json!({})),
         "tools/list" => {
-            let tools: Vec<Value> = app
+            let mut tools: Vec<Value> = app
                 .config
                 .work
                 .mcp_tools
                 .iter()
                 .map(|t| json!({"name":t.name,"description":t.description,"inputSchema":t.input_schema}))
                 .collect();
+            if app.config.search.enabled {
+                tools.extend(crate::memory::definitions().into_iter().map(|t|json!({"name":t["name"],"description":t["description"],"inputSchema":t["input_schema"]})));
+            }
             return Ok(json!({ "tools": tools }));
         }
         "tools/call" => {}
@@ -94,6 +97,37 @@ async fn call(app: App, headers: HeaderMap, request: Value) -> anyhow::Result<Va
     let name = request["params"]["name"]
         .as_str()
         .context(Code::InvalidTool)?;
+    if crate::memory::TOOLS.contains(&name) {
+        ensure!(request.get("id").is_some(), Code::RequestIdRequired);
+        let args = request["params"]
+            .get("arguments")
+            .cloned()
+            .unwrap_or(json!({}));
+        let vector =
+            crate::memory::prepare_search(&app, key.org_id, key.run_id, name, &args).await?;
+        let mut tx = app.store.tx(key.org_id).await?;
+        validate_key(&mut tx, &key, false).await?;
+        let session = headers
+            .get("mcp-session-id")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("stateless");
+        let result = crate::memory::execute(
+            &mut tx,
+            &app,
+            key.org_id,
+            key.run_id,
+            name,
+            args,
+            format!(
+                "mcp:{}:{:?}:{:?}:{}:{}",
+                key.run_id, key.sandbox_id, key.lease_epoch, session, request["id"]
+            ),
+            vector,
+        )
+        .await?;
+        tx.commit().await?;
+        return Ok(json!({"content":[{"type":"text","text":result.to_string()}],"isError":false}));
+    }
     let tool = app
         .config
         .work
@@ -278,6 +312,7 @@ async fn wait_for_approval(
 /// Only the Owner turns gateway requests into ordered timeline events.
 pub async fn project(app: &App, lease: &Lease, run: Uuid) -> anyhow::Result<()> {
     let mut tx = app.store.fenced(lease).await?;
+    crate::memory::project(&mut tx, lease).await?;
     let pending: Vec<(Uuid, Uuid)> = sqlx::query_as(
         "SELECT id,action_id FROM mcp_calls WHERE org_id=$1 AND run_id=$2 AND state='pending' FOR UPDATE",
     )

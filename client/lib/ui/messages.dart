@@ -15,11 +15,17 @@ class MessageCard extends StatelessWidget {
   final Map<String, dynamic> item;
   final String? agentLabel;
   final VoidCallback? onFork;
+  final VoidCallback? onMemoryUndo;
+  final Future<List<dynamic>> Function()? onMemoryRead;
+  final ValueChanged<String>? onSource;
   const MessageCard({
     super.key,
     required this.item,
     this.agentLabel,
     this.onFork,
+    this.onMemoryUndo,
+    this.onMemoryRead,
+    this.onSource,
   });
 
   List<Widget> blocks(BuildContext context, String text, double size) {
@@ -51,6 +57,9 @@ class MessageCard extends StatelessWidget {
         out.add(
           MarkdownBody(
             data: text.substring(cursor, code.start),
+            onTapLink: (_, href, _) {
+              if (href != null) onSource?.call(href);
+            },
             selectable: true,
             styleSheet: sheet,
           ),
@@ -110,6 +119,9 @@ class MessageCard extends StatelessWidget {
       out.add(
         MarkdownBody(
           data: text.substring(cursor),
+          onTapLink: (_, href, _) {
+            if (href != null) onSource?.call(href);
+          },
           selectable: true,
           styleSheet: sheet,
         ),
@@ -173,6 +185,35 @@ class MessageCard extends StatelessWidget {
     final c = HubColors.of(context);
     final text = item['text'] as String;
     final kind = item['kind'];
+    if (kind == 'memory_context') {
+      return _MemoryContext(read: onMemoryRead, onSource: onSource);
+    }
+    if (kind == 'memory_notice') {
+      Map<String, dynamic> notice;
+      try {
+        notice = jsonDecode(text) as Map<String, dynamic>;
+      } catch (_) {
+        notice = {};
+      }
+      return Padding(
+        padding: const EdgeInsets.symmetric(vertical: 6),
+        child: Row(
+          children: [
+            const Icon(Icons.psychology_outlined, size: 16),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text(
+                notice['action'] == 'delete'
+                    ? tr('记忆已删除', 'Memory deleted')
+                    : tr('记忆已更新', 'Memory updated'),
+                style: TextStyle(fontSize: 12, color: c.subtle),
+              ),
+            ),
+            TextButton(onPressed: onMemoryUndo, child: Text(tr('撤销', 'Undo'))),
+          ],
+        ),
+      );
+    }
     final copy = IconButton(
       tooltip: tr('复制消息', 'Copy message'),
       onPressed: () => Clipboard.setData(ClipboardData(text: text)),
@@ -517,4 +558,63 @@ class _QuestionCardState extends State<QuestionCard> {
       ),
     );
   }
+}
+
+class _MemoryContext extends StatefulWidget {
+  final Future<List<dynamic>> Function()? read;
+  final ValueChanged<String>? onSource;
+  const _MemoryContext({this.read, this.onSource});
+  @override
+  State<_MemoryContext> createState() => _MemoryContextState();
+}
+
+class _MemoryContextState extends State<_MemoryContext> {
+  List<dynamic> entries = [];
+  String error = '';
+  bool loading = false;
+  Future<void> load(bool expanded) async {
+    if (!expanded || loading || widget.read == null) return;
+    setState(() {
+      loading = true;
+      entries = [];
+      error = '';
+    });
+    try {
+      final value = await widget.read!();
+      if (mounted) setState(() => entries = value);
+    } catch (_) {
+      if (mounted) {
+        setState(() => error = tr('无法读取记忆', 'Unable to load memories'));
+      }
+    } finally {
+      if (mounted) setState(() => loading = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) => ExpansionTile(
+    title: Text(
+      tr('本轮引用的记忆', 'Memories referenced this turn'),
+      style: TextStyle(fontSize: 12, color: HubColors.of(context).subtle),
+    ),
+    onExpansionChanged: load,
+    children: [
+      if (loading) const LinearProgressIndicator(),
+      if (error.isNotEmpty) Text(error),
+      for (final memory in entries)
+        ListTile(
+          dense: true,
+          title: Text(memory['content'] ?? memory['title'] ?? ''),
+          subtitle: memory['points'] == null ? null : Text(memory['points']),
+          onTap: memory['source'] == null
+              ? null
+              : () => widget.onSource?.call(memory['source']),
+        ),
+      if (!loading && entries.isEmpty && error.isEmpty)
+        Padding(
+          padding: const EdgeInsets.all(12),
+          child: Text(tr('记忆已失效或不可用', 'Memories are no longer available')),
+        ),
+    ],
+  );
 }

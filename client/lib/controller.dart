@@ -110,7 +110,12 @@ class HubController extends ChangeNotifier {
   bool get canTemporary => capabilities['conversation_temporary'] == true;
 
   List<Map<String, dynamic>> get pinned => conversations
-      .where((c) => c['pinned'] == true && c['state'] == 'active')
+      .where(
+        (c) =>
+            c['pinned'] == true &&
+            c['state'] == 'active' &&
+            c['temporary'] != true,
+      )
       .toList();
   List<Map<String, dynamic>> get recents => conversations
       .where(
@@ -121,8 +126,9 @@ class HubController extends ChangeNotifier {
             c['project_id'] == null,
       )
       .toList();
-  List<Map<String, dynamic>> get archived =>
-      conversations.where((c) => c['state'] == 'archived').toList();
+  List<Map<String, dynamic>> get archived => conversations
+      .where((c) => c['state'] == 'archived' && c['temporary'] != true)
+      .toList();
   List<Map<String, dynamic>> projectConversations(String id) => conversations
       .where(
         (c) =>
@@ -174,7 +180,9 @@ class HubController extends ChangeNotifier {
               const [])
           .cast<String>();
   bool get historyLoading => _historyLoading.contains(channel);
-  bool get hasOlder => !_historyExhausted.contains(channel);
+  bool get hasOlder => searchFocusSeq != null
+      ? _searchHasMore
+      : !_historyExhausted.contains(channel);
   bool get historyFailed => _historyFailed.contains(channel);
 
   Future<void> loadOlder() async {
@@ -183,6 +191,8 @@ class HubController extends ChangeNotifier {
     if (_closed || current.isEmpty || !hasOlder || historyLoading) return;
     final version = _historyVersion[name] ?? 0;
     final core = _core!;
+    final focused = searchFocusSeq;
+    final view = _view;
     _historyLoading.add(name);
     notifyListeners();
     try {
@@ -200,6 +210,16 @@ class HubController extends ChangeNotifier {
       // bare list, where a short page meant the end.
       final page = body is Map ? body['items'] as List : body as List;
       final more = body is Map ? body['has_more'] == true : page.length >= 100;
+      if (focused != null) {
+        if (!_closed && view == _view && searchFocusSeq == focused) {
+          _searchItems = [
+            ...?_searchItems,
+            ...page.map((v) => Map<String, dynamic>.from(v)),
+          ];
+          _searchHasMore = more;
+        }
+        return;
+      }
       final task = _serial.then((_) async {
         if (_closed ||
             core != _core ||
@@ -226,9 +246,12 @@ class HubController extends ChangeNotifier {
   }
 
   List<Map<String, dynamic>> get items =>
-      (_items[channel]?.values.toList() ?? [])..sort(
-        (a, b) => (a['first_seq'] as num).compareTo(b['first_seq'] as num),
-      );
+      (searchFocusSeq != null
+            ? [...?_searchItems]
+            : (_items[channel]?.values.toList() ?? []))
+        ..sort(
+          (a, b) => (a['first_seq'] as num).compareTo(b['first_seq'] as num),
+        );
   List<Map<String, dynamic>> get actions =>
       (_actions[channel] ?? []).where((a) => a['status'] == 'pending').toList();
   bool get running => (_runs[channel] ?? []).any(
@@ -378,11 +401,17 @@ class HubController extends ChangeNotifier {
   }
 
   /// Reserved contract: `DELETE /orgs/{org}/conversations/{conv}`.
-  Future<void> deleteConversation(String conv) async {
+  Future<void> deleteConversation(
+    String conv, {
+    bool deleteMemories = false,
+  }) async {
     if (!canDelete) {
       throw Exception(tr('服务器暂不支持删除', 'Deleting is not available'));
     }
-    await request('/orgs/$org/conversations/$conv', method: 'DELETE');
+    await request(
+      '/orgs/$org/conversations/$conv?delete_memories=$deleteMemories',
+      method: 'DELETE',
+    );
     await refreshConversations();
     if (conv == selected) startDraft();
   }
@@ -560,6 +589,7 @@ class HubController extends ChangeNotifier {
     commandCatalog = {};
     draftReasoning = null;
     temporary = false;
+    searchFocusSeq = null;
     this.project = project;
     final defaults = _projectDefaults;
     this.mode = mode ?? defaults?['mode'] ?? this.mode;
@@ -618,7 +648,35 @@ class HubController extends ChangeNotifier {
     notifyListeners();
   }
 
+  int? searchFocusSeq;
+  List<Map<String, dynamic>>? _searchItems;
+  bool _searchHasMore = false;
+  Future<void> selectSearch(String id, String? itemId, int? seq) async {
+    await select(id);
+    if (selected != id || itemId == null || seq == null) return;
+    final view = _view;
+    final body = await request(
+      '/orgs/$org/conversations/$id/items?before_seq=${seq + 1}',
+    );
+    if (_closed || view != _view) return;
+    if (view == _view) {
+      searchFocusSeq = seq;
+      _searchItems = (body['items'] as List)
+          .map((v) => Map<String, dynamic>.from(v))
+          .toList();
+      _searchHasMore = body['has_more'] == true;
+      notifyListeners();
+    }
+  }
+
+  void clearSearchFocus() {
+    searchFocusSeq = null;
+    _searchItems = null;
+    notifyListeners();
+  }
+
   Future<void> select(String id) async {
+    searchFocusSeq = null;
     final view = ++_view;
     selected = id;
     workspace = {};
@@ -634,6 +692,7 @@ class HubController extends ChangeNotifier {
 
   Future<void> send(String text) async {
     if (text.trim().isEmpty) return;
+    searchFocusSeq = null;
     if (isDraft) return _createAndSend(text);
     final ch = channel, steerable = realChat || realWork;
     final pending = _pendingConfig[ch]?.isNotEmpty == true
@@ -765,6 +824,10 @@ class HubController extends ChangeNotifier {
         _historyExhausted.remove(name);
       }
       if (diff['revoked'] == true) {
+        if (name == channel) {
+          searchFocusSeq = null;
+          _searchItems = null;
+        }
         _items.remove(name);
         _actions.remove(name);
         _runs.remove(name);

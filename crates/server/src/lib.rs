@@ -31,7 +31,7 @@ macro_rules! action_columns {
 }
 macro_rules! conversation_columns {
     () => {
-        "id,org_id,creator_id,title,mode,state,project_id,run_config"
+        "id,org_id,creator_id,title,mode,state,project_id,run_config,temporary"
     };
 }
 
@@ -44,6 +44,7 @@ pub mod http;
 pub mod llm;
 pub mod maintenance;
 pub mod mcp;
+pub mod memory;
 pub mod owner;
 pub mod projects;
 pub mod provider;
@@ -52,6 +53,7 @@ pub mod revocation;
 pub mod run_config;
 pub mod runs;
 pub mod sandbox;
+pub mod search;
 pub mod store;
 pub mod work;
 pub mod workspace;

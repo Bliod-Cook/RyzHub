@@ -124,6 +124,7 @@ class _LoginPageState extends State<LoginPage> {
                       TextField(
                         controller: password,
                         obscureText: true,
+                        style: obscuredStyle,
                         decoration: InputDecoration(
                           labelText: tr(
                             '密码（至少 8 位）',

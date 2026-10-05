@@ -59,6 +59,11 @@ impl Store {
         };
         let mode = if mode.is_empty() { "chat".into() } else { mode };
         ensure!(matches!(mode.as_str(), "chat" | "work"), Code::InvalidMode);
+        let temporary = settings
+            .as_object_mut()
+            .and_then(|s| s.remove("temporary"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         if let Some(config) = config {
             let resolved = RunConfig::resolve(settings, &mode, config)?;
             resolved.validate(&mut tx, ctx.org_id, config).await?;
@@ -66,8 +71,8 @@ impl Store {
         }
         let id = Uuid::now_v7();
         let conversation: Conversation = sqlx::query_as(concat!(
-            "INSERT INTO conversations(id,org_id,creator_id,title,mode,run_config,project_id)
-             VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING ",
+            "INSERT INTO conversations(id,org_id,creator_id,title,mode,run_config,project_id,temporary,expires_at)
+             VALUES($1,$2,$3,$4,$5,$6,$7,$8,CASE WHEN $8 THEN now()+interval '30 days' END) RETURNING ",
             conversation_columns!()
         ))
         .bind(id)
@@ -77,6 +82,7 @@ impl Store {
         .bind(&mode)
         .bind(settings)
         .bind(project)
+        .bind(temporary)
         .fetch_one(&mut *tx)
         .await?;
         sqlx::query(

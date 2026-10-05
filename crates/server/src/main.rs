@@ -12,12 +12,12 @@ async fn main() -> anyhow::Result<()> {
         .init();
     let args: Vec<String> = std::env::args().collect();
     let role = args.get(1).map_or("all", String::as_str);
-    if matches!(role, "migrate" | "maintain") {
+    if matches!(role, "migrate" | "maintain" | "reindex") {
         return maintain(role, args.iter().any(|a| a == "--loop")).await;
     }
     ensure!(
         matches!(role, "all" | "gateway" | "owner" | "llm-gateway"),
-        "usage: ryzhub-server [all|gateway|owner|llm-gateway|migrate|maintain [--loop]]"
+        "usage: ryzhub-server [all|gateway|owner|llm-gateway|migrate|maintain [--loop]|reindex]"
     );
     let config = Config::load()?;
     let store = Store::connect(&env("DATABASE_URL")?).await?;
@@ -41,6 +41,16 @@ async fn main() -> anyhow::Result<()> {
         supervise("project collector", {
             let (app, worker) = (app.clone(), worker.clone());
             move || ryzhub_server::projects::collector(app.clone(), worker.clone())
+        });
+        if app.config.search.enabled {
+            supervise("search index", {
+                let (app, worker) = (app.clone(), worker.clone());
+                move || ryzhub_server::search::worker(app.clone(), worker.clone())
+            });
+        }
+        supervise("memory and conversation collector", {
+            let (app, worker) = (app.clone(), worker.clone());
+            move || ryzhub_server::memory::collector(app.clone(), worker.clone())
         });
         supervise("retention", {
             let (app, worker) = (app.clone(), worker.clone());
@@ -158,6 +168,14 @@ async fn maintain(role: &str, repeat: bool) -> anyhow::Result<()> {
         sqlx::migrate!("../../migrations").run(&pool).await?;
     }
     let config = Config::load()?;
+    if role == "reindex" {
+        sqlx::query("INSERT INTO search_jobs(org_id,source_id,source_kind,source_version,op,available_at,priority)
+            SELECT org_id,id,doc_kind,source_version,'upsert',now(),-10 FROM search_sources WHERE NOT deleted
+            ON CONFLICT(org_id,source_id,source_version) DO UPDATE SET state='queued',attempts=0,
+                claim_token=NULL,lease_until=NULL,available_at=excluded.available_at,priority=-10").execute(&pool).await?;
+        tracing::info!("search backfill queued");
+        return Ok(());
+    }
     loop {
         match ryzhub_server::maintenance::maintain(&pool, &config).await {
             Ok(()) => tracing::info!("maintenance complete"),

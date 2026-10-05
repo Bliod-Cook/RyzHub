@@ -455,6 +455,7 @@ pub async fn jobs(app: &App, lease: &Lease, link: &OwnerLink) -> anyhow::Result<
 #[derive(sqlx::FromRow)]
 struct ForkSource {
     creator_id: Uuid,
+    temporary: bool,
     mode: String,
     title: String,
     run_config: Value,
@@ -483,7 +484,7 @@ async fn fork(
         return Ok(id);
     }
     let source: ForkSource = sqlx::query_as(
-        "SELECT creator_id,mode,title,run_config,project_id,model_credential_id FROM conversations
+        "SELECT creator_id,mode,title,run_config,project_id,model_credential_id,temporary FROM conversations
          WHERE org_id=$1 AND id=$2",
     )
     .bind(lease.org_id)
@@ -550,8 +551,8 @@ async fn fork(
     let title = format!("{} · 分叉", source.title);
     sqlx::query(
         "INSERT INTO conversations(id,org_id,creator_id,title,mode,run_config,project_id,model_credential_id,
-             context_seed,native_fork,owner_epoch)
-         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,1)",
+             context_seed,native_fork,owner_epoch,temporary,expires_at)
+         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,1,$11,CASE WHEN $11 THEN now()+interval '30 days' END)",
     )
     .bind(id)
     .bind(lease.org_id)
@@ -563,6 +564,7 @@ async fn fork(
     .bind(source.model_credential_id)
     .bind(seed)
     .bind((!native.is_null()).then_some(native))
+    .bind(source.temporary)
     .execute(&mut *tx)
     .await?;
     let child = Lease {

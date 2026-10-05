@@ -116,6 +116,10 @@ class HubColors extends ThemeExtension<HubColors> {
 const fontFamily = 'RyzHub Sans';
 const fontFallback = ['Microsoft YaHei', 'Noto Sans CJK SC', 'PingFang SC'];
 
+/// Masked fields: the UI font's bullet is a full-width CJK dot, so masks set
+/// in 0xProto's Latin one.
+const obscuredStyle = TextStyle(fontFamily: '0xProto');
+
 /// Model identifiers and reasoning levels: even glyph widths keep the label
 /// steady as values change. CJK labels fall back to the UI font.
 TextStyle modelLabelStyle({required double size, required Color color}) =>

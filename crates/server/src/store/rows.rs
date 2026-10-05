@@ -18,6 +18,7 @@ pub struct Conversation {
     pub state: String,
     pub project_id: Option<Uuid>,
     pub run_config: serde_json::Value,
+    pub temporary: bool,
 }
 
 #[derive(sqlx::FromRow)]

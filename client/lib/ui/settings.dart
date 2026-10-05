@@ -12,6 +12,7 @@ import 'dialogs.dart';
 import 'icons.dart';
 import 'login.dart';
 import 'model_picker.dart';
+import 'memories.dart';
 
 class _Section {
   final String id, group;
@@ -22,6 +23,13 @@ class _Section {
 }
 
 final _sections = [
+  _Section(
+    'memories',
+    'personal',
+    Icons.psychology_outlined,
+    () => tr('记忆', 'Memory'),
+    ['记忆', 'memory', '历史', 'history'],
+  ),
   _Section(
     'general',
     'personal',
@@ -301,6 +309,7 @@ class _SettingsPageState extends State<SettingsPage> {
                       KeyedSubtree(
                         key: ValueKey(s.id),
                         child: switch (s.id) {
+                          'memories' => MemorySettings(hub: widget.hub),
                           'general' => const _General(),
                           'appearance' => const _Appearance(),
                           'personalization' => _Personalization(
@@ -1103,6 +1112,7 @@ class _CredentialsState extends State<_Credentials> {
                   TextField(
                     controller: key,
                     obscureText: true,
+                    style: obscuredStyle,
                     decoration: InputDecoration(
                       labelText: tr('API 密钥', 'API key'),
                     ),

@@ -23,7 +23,7 @@ const EXEC_POLL_MS: u64 = 5000;
 /// The Chat engine's tools, in the model's tool-definition format.
 pub fn definitions() -> Value {
     let string = || json!({"type": "string"});
-    json!([
+    let mut definitions = json!([
         tool(
             "project_file_search",
             "Search text in the current project knowledge files. Read only, returns file names and line numbers.",
@@ -68,7 +68,12 @@ pub fn definitions() -> Value {
             json!({"question": string(), "options": {"type": "array", "items": string()}}),
             &["question"],
         ),
-    ])
+    ]);
+    definitions
+        .as_array_mut()
+        .unwrap()
+        .extend(crate::memory::definitions());
+    definitions
 }
 
 fn tool(name: &str, description: &str, properties: Value, required: &[&str]) -> Value {
@@ -90,7 +95,12 @@ const KNOWN: [&str; 6] = [
 /// Read-only tools never need approval.
 fn needs_approval(name: &str, full_auto: bool) -> bool {
     match name {
-        "exec_poll" | "project_file_search" => false,
+        "exec_poll"
+        | "project_file_search"
+        | "conversation_search"
+        | "memory_search"
+        | "memory_save"
+        | "memory_forget" => false,
         "ask_user" => true,
         _ => !full_auto,
     }
@@ -122,7 +132,7 @@ pub async fn advance(
         let name: String = row.get("name");
         let args: Value = row.get("arguments");
         let status: String = row.get("status");
-        if !KNOWN.contains(&name.as_str()) {
+        if !KNOWN.contains(&name.as_str()) && !crate::memory::TOOLS.contains(&name.as_str()) {
             tx.commit().await?;
             record(
                 app,
@@ -185,13 +195,27 @@ pub async fn advance(
         match dispatch(app, lease, run, &call, &name, args, link).await {
             Ok(value) => record(app, lease, run, &call, value, link).await?,
             Err(error) if is_fenced(&error) => return Err(error),
+            Err(error) if crate::memory::TOOLS.contains(&name.as_str()) => {
+                record(
+                    app,
+                    lease,
+                    run,
+                    &call,
+                    json!({"error":crate::error::public_code(&error).as_str()}),
+                    link,
+                )
+                .await?;
+            }
             // Argument and capability errors are answers the model can act on. Anything else
             // may have reached the guest: keep `started` so the next attempt asks the guest.
             Err(error) => match code_of(&error) {
                 Some(
                     code @ (Code::SandboxDisabled
                     | Code::InvalidToolArguments
-                    | Code::PtyUnsupported),
+                    | Code::PtyUnsupported
+                    | Code::PolicyDenied
+                    | Code::Forbidden
+                    | Code::InvalidArguments),
                 ) => record(app, lease, run, &call, json!({"error":code.as_str()}), link).await?,
                 _ => return Err(error),
             },
@@ -244,6 +268,24 @@ async fn dispatch(
     args: Value,
     link: &OwnerLink,
 ) -> anyhow::Result<Value> {
+    if crate::memory::TOOLS.contains(&name) {
+        let vector = crate::memory::prepare_search(app, lease.org_id, run, name, &args).await?;
+        let mut tx = crate::runs::guarded(&app.store, lease, run).await?;
+        let result = crate::memory::execute(
+            &mut tx,
+            app,
+            lease.org_id,
+            run,
+            name,
+            args,
+            format!("chat:{run}:{call}"),
+            vector,
+        )
+        .await?;
+        crate::memory::project(&mut tx, lease).await?;
+        tx.commit().await?;
+        return Ok(result);
+    }
     if name == "project_file_search" {
         let query = args["query"].as_str().context(Code::InvalidToolArguments)?;
         let mut tx = crate::runs::guarded(&app.store, lease, run).await?;

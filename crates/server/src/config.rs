@@ -24,6 +24,7 @@ pub struct Config {
     pub sandbox: SandboxConfig,
     pub work: WorkConfig,
     pub retention: RetentionConfig,
+    pub search: SearchConfig,
 }
 
 impl Default for Config {
@@ -43,6 +44,7 @@ impl Default for Config {
             sandbox: SandboxConfig::default(),
             work: WorkConfig::default(),
             retention: RetentionConfig::default(),
+            search: SearchConfig::default(),
         }
     }
 }
@@ -250,6 +252,28 @@ impl Config {
             self.retention.command_days >= 1,
             "processed commands must be kept at least one day"
         );
+        ensure!(
+            self.search.max_attempts > 0 && self.search.memory_budget_chars <= 100_000,
+            "invalid search limits"
+        );
+        if !self.search.embedding_url.is_empty() {
+            let url = reqwest::Url::parse(&self.search.embedding_url)?;
+            ensure!(
+                matches!(url.scheme(), "http" | "https")
+                    && url.host_str().is_some()
+                    && url.username().is_empty()
+                    && url.password().is_none()
+                    && url.query().is_none()
+                    && url.fragment().is_none()
+                    && !self.search.embedding_model.is_empty(),
+                "invalid embedding configuration"
+            );
+            ensure!(
+                !self.search.embedding_key_env.is_empty()
+                    || (url.scheme() == "https" && url.host_str() == Some("api.openai.com")),
+                "custom embedding_url requires embedding_key_env; personal OpenAI keys are only sent to api.openai.com"
+            );
+        }
         if self.llm.enabled {
             let llm = &self.llm;
             ensure!(!llm.model.trim().is_empty(), "llm.model required");
@@ -296,6 +320,7 @@ impl Config {
                         && url.username().is_empty()
                         && url.password().is_none()
                         && names.insert(&tool.name)
+                        && !crate::memory::TOOLS.contains(&tool.name.as_str())
                         && !tool.name.is_empty()
                         && tool.input_schema.is_object(),
                     "invalid MCP catalog"
@@ -321,6 +346,32 @@ impl Config {
             Some(limit) if self.work.idle_suspend_secs == 0 => limit,
             Some(limit) => self.work.idle_suspend_secs.min(limit),
             None => self.work.idle_suspend_secs,
+        }
+    }
+}
+
+/// Search is available without embeddings; vector/hybrid modes require a real provider.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SearchConfig {
+    pub enabled: bool,
+    /// OpenAI-compatible base URL. Empty means full-text only.
+    pub embedding_url: String,
+    pub embedding_model: String,
+    /// Empty uses the existing OpenAI BYOK/platform credential selection.
+    pub embedding_key_env: String,
+    pub memory_budget_chars: usize,
+    pub max_attempts: i32,
+}
+impl Default for SearchConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            embedding_url: String::new(),
+            embedding_model: String::new(),
+            embedding_key_env: String::new(),
+            memory_budget_chars: 12000,
+            max_attempts: 6,
         }
     }
 }

@@ -155,8 +155,8 @@ async fn open_thread(
         (row.get("native_thread_id"), row.get("native_fork"))
     };
     let instructions = {
-        let mut tx = app.store.tx(lease.org_id).await?;
-        let instructions = crate::projects::instructions(&mut tx, lease.org_id, run).await?;
+        let mut tx = app.store.fenced(lease).await?;
+        let instructions = crate::projects::instructions(&mut tx, lease, run, &app.config).await?;
         tx.commit().await?;
         instructions
     };

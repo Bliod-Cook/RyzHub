@@ -1,6 +1,6 @@
 # RyzHub
 
-按[架构方案](agent-platform-architecture-2026-09-25.md) §13 实现的 Rust + Flutter Agent 平台。已完成 M0 一致性、M1 Chat、M2 Codex Work 与 M3 第二条路径：官方 Claude Agent SDK、Responses Chat、统一命令和私有项目。模型上游继续使用本地协议 fixture；Codex、Claude SDK、containerd、gVisor、数据库和浏览器实际运行。
+按[架构方案](agent-platform-architecture-2026-09-25.md) §13 实现的 Rust + Flutter Agent 平台。已完成 M0 一致性、M1 Chat、M2 Codex Work、M3 第二条路径，以及 M4 搜索与记忆：PGroonga/pgvector、版本化索引、显式记忆、历史摘要、project_only 和临时对话。模型上游继续使用本地协议 fixture；Codex、Claude SDK、containerd、gVisor、数据库和浏览器实际运行。
 
 项目代码与启动脚本均位于仓库根目录。最新目录调整和 M3 修复复核见[迁移与验证记录](docs/root-migration.md)。
 
@@ -15,7 +15,7 @@ cd RyzHub
 
 REST/WS：`http://127.0.0.1:8080`，实例配置页：`/admin`。首次在客户端注册邮箱和密码，自动创建个人组织。`.env.example` 仅包含本地开发凭据；实际配置可复制为 `.env` 后使用 `RYZHUB_ENV_FILE=.env ./scripts/dev.sh`。
 
-二进制支持 `all`、`gateway`、`owner`、`llm-gateway`、`migrate`、`maintain` 六个角色。Gateway 只需要 `DATABASE_URL` 和 `NATS_URL`；Owner 另需只读 BYPASSRLS 的 `WORKER_DATABASE_URL`。迁移和维护使用 `MIGRATION_DATABASE_URL`，不会授予运行进程 DDL 权限。运行进程拒绝超级用户或 BYPASSRLS 数据库账号。
+二进制支持 `all`、`gateway`、`owner`、`llm-gateway`、`migrate`、`maintain` 及 `reindex` 七个角色。Gateway 只需要 `DATABASE_URL` 和 `NATS_URL`；Owner 另需只读 BYPASSRLS 的 `WORKER_DATABASE_URL`。迁移和维护使用 `MIGRATION_DATABASE_URL`，不会授予运行进程 DDL 权限。运行进程拒绝超级用户或 BYPASSRLS 数据库账号。
 
 管理员设置在 `config/development.toml`：监听地址、Origin、事件保留期、租约时长、模型/harness 白名单、组织并发上限等。修改后重启对应角色。实例管理员与组织 owner 分开；管理员可通过数据库运维会话设置 `users.is_instance_admin`，再用其登录 token 在 `/admin` 查看生效配置。
 
@@ -121,6 +121,12 @@ python3 scripts/serve-web.py --directory var/demo/web
 - 移除组织成员只撤销其在该组织的访问（订阅、网关密钥、运行中的任务），不再注销其全部会话。
 - 新增配置：`approval_ttl_secs`（默认 24 小时）、`[retention]`、`[work] checkpoint_keep_last` / `idle_suspend_secs`、`llm.vault_key_id` / `vault_retired_keys`。检查点保留期默认从「不清理」改为 30 天。
 
+## M4 搜索与记忆
+
+侧栏搜索支持消息内容与项目文件，结果可定位消息；设置页“记忆”管理个人/项目记忆、优先级和两个独立开关。Chat/Work 提供历史搜索与显式记忆工具，写入提示支持撤销。临时对话不进入搜索或记忆；删除对话可同时删除相关记忆。检索实时核对源权限，删除和项目边界变更不等待索引更新。
+
+升级需要先更新 Compose PostgreSQL 镜像（包含 PGroonga 4.0.4 与 pgvector 0.8.2），再运行迁移 0013。全文默认可用；向量检索配置真实 embedding 服务后启用，更换模型用 `ryzhub-server reindex` 回填。配置、接口、验收和部署边界见 [M4 验收](docs/m4-acceptance.md)，两轮 Claude Code 审查及修复见 [审查记录](docs/m4-code-review.md)。
+
 ## 运行 Flutter 客户端
 
 本次使用 Flutter 3.47.5 / Dart 3.13.4、flutter_rust_bridge 2.11.1。Rust 生成的绑定已提交。原生 UI 的 SQLite 缓存和 Web 的 IndexedDB 缓存都按服务器、用户、组织隔离；访问 token 不写磁盘。
@@ -155,6 +161,7 @@ cargo test --workspace --locked
 ./scripts/test-m1.sh
 ./scripts/test-m2.sh
 ./scripts/test-m3.sh
+./scripts/test-m4.sh
 TEST_RUNTIME=runsc ./scripts/test-m3.sh
 cd client
 flutter analyze
@@ -165,7 +172,7 @@ flutter test
 
 承载一致性保证的 SQL（租约接管/续期/fencing、seq 分配、发布、命令幂等、成员关系、run 守卫与网关密钥查找）使用 SQLx 编译期检查，`.sqlx` 提供离线元数据；其余参数化 SQL 用真实数据库集成测试验证。修改 schema 或这些查询后，对一个迁移后的数据库运行 `DATABASE_URL=... ./scripts/prepare-sql.sh` 并提交 `.sqlx` 的变化。
 
-[M0 验收](docs/m0-acceptance.md) · [M1 与完整回归记录](docs/m1-acceptance.md) · [M2 验收](docs/m2-acceptance.md) · [M3 验收](docs/m3-acceptance.md) · [线协议](docs/wire-protocol-v1.md)
+[M0 验收](docs/m0-acceptance.md) · [M1 与完整回归记录](docs/m1-acceptance.md) · [M2 验收](docs/m2-acceptance.md) · [M3 验收](docs/m3-acceptance.md) · [M4 验收](docs/m4-acceptance.md) · [线协议](docs/wire-protocol-v1.md)
 
 ## 代码导航
 

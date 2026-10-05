@@ -1,4 +1,4 @@
-name: RyzHub M0 through M3
+name: RyzHub M0 through M4
 on: [push, pull_request]
 jobs:
   rust:
@@ -44,6 +44,7 @@ jobs:
           echo "RYZHUB_CODEX_BINARY=$PWD/var/m2/codex/codex-x86_64-unknown-linux-musl" >> "$GITHUB_ENV"
       - run: ./scripts/test-m2.sh
       - run: ./scripts/prepare-m3.sh
+      - run: ./scripts/test-m4.sh
       - run: ./scripts/test-m3.sh
       - run: TEST_RUNTIME=runsc ./scripts/test-m3.sh
       - if: always()

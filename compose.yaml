@@ -1,7 +1,8 @@
 name: ryzhub-m0
 services:
   postgres:
-    image: postgres:18-alpine
+    build: ./infra/postgres
+    image: ryzhub-postgres:18-search
     environment:
       POSTGRES_DB: ryzhub
       POSTGRES_USER: postgres

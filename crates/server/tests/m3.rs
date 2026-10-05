@@ -207,11 +207,15 @@ impl Harness {
                 .display()
                 .to_string()
         });
-        config.sandbox.image = std::fs::read_to_string(workspace.join("var/m3/image.txt"))
-            .unwrap_or_default()
-            .trim()
-            .into();
-        let socket_dir = workspace.join("var/execution/gateway");
+        config.sandbox.image = std::env::var("TEST_M3_IMAGE").unwrap_or_else(|_| {
+            std::fs::read_to_string(workspace.join("var/m3/image.txt"))
+                .unwrap_or_default()
+                .trim()
+                .into()
+        });
+        let socket_dir = std::env::var_os("TEST_GATEWAY_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| workspace.join("var/execution/gateway"));
         std::fs::create_dir_all(&socket_dir)?;
         let socket_path = socket_dir.join(format!(
             "llm-{}.sock",

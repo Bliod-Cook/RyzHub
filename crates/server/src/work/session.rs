@@ -215,7 +215,7 @@ pub async fn ensure_work(app: &App, lease: &Lease, run: Uuid) -> anyhow::Result<
         GuestCommand::NativeStart {
             harness: settings.harness.clone(),
             model: settings.model.clone(),
-            mcp: !app.config.work.mcp_tools.is_empty(),
+            mcp: app.config.search.enabled || !app.config.work.mcp_tools.is_empty(),
         },
     )
     .await?;

@@ -449,16 +449,21 @@ pub async fn snapshot(tx: &mut Tx<'_>, org: Uuid, project: Uuid) -> anyhow::Resu
 }
 
 /// The project context block frozen with the run.
-pub async fn instructions(tx: &mut Tx<'_>, org: Uuid, run: Uuid) -> anyhow::Result<String> {
-    Ok(sqlx::query_scalar(
-        "SELECT coalesce(p.context,'') FROM runs r
-         LEFT JOIN project_revisions p ON p.org_id=r.org_id AND p.id=r.project_revision_id
-         WHERE r.org_id=$1 AND r.id=$2",
-    )
-    .bind(org)
-    .bind(run)
-    .fetch_one(&mut **tx)
-    .await?)
+pub async fn instructions(
+    tx: &mut Tx<'_>,
+    lease: &Lease,
+    run: Uuid,
+    config: &crate::config::Config,
+) -> anyhow::Result<String> {
+    let org = lease.org_id;
+    let project: String = sqlx::query_scalar(
+        "SELECT coalesce(p.context,'') FROM runs r LEFT JOIN project_revisions p ON p.org_id=r.org_id AND p.id=r.project_revision_id WHERE r.org_id=$1 AND r.id=$2")
+        .bind(org).bind(run).fetch_one(&mut **tx).await?;
+    let (conversation,user): (Uuid,Uuid) = sqlx::query_as("SELECT c.id,c.creator_id FROM runs r JOIN conversations c ON c.org_id=r.org_id AND c.id=r.conversation_id WHERE r.org_id=$1 AND r.id=$2")
+        .bind(org).bind(run).fetch_one(&mut **tx).await?;
+    let memory = crate::memory::context(tx, config, org, conversation, user).await?;
+    crate::memory::announce(tx, lease, run, &memory.used).await?;
+    Ok(project + &memory.text)
 }
 
 /// The project files frozen with the run, by name.
@@ -475,23 +480,57 @@ async fn run_files(tx: &mut Tx<'_>, org: Uuid, run: Uuid) -> anyhow::Result<Vec<
     .await?)
 }
 
-/// `project_file_search`: case-insensitive substring search over the run's project files.
+/// Search the live indexed project files, restricted to content frozen into this run.
 pub async fn search(tx: &mut Tx<'_>, org: Uuid, run: Uuid, query: &str) -> anyhow::Result<Value> {
-    ensure!(query.len() <= 256, Code::InvalidToolArguments);
-    let needle = query.to_lowercase();
-    let mut matches = vec![];
-    for (name, content) in run_files(tx, org, run).await? {
-        for (n, line) in content.lines().enumerate() {
-            if line.to_lowercase().contains(&needle) {
-                let text: String = line.chars().take(1500).collect();
-                matches.push(json!({"file": name, "line": n + 1, "text": text}));
-                if matches.len() >= 20 {
-                    return Ok(json!({ "matches": matches }));
-                }
-            }
-        }
-    }
-    Ok(json!({ "matches": matches }))
+    ensure!(
+        !query.trim().is_empty() && query.len() <= 512,
+        Code::InvalidToolArguments
+    );
+    let (project,user): (Option<Uuid>,Uuid) = sqlx::query_as("SELECT r.project_id,c.creator_id FROM runs r JOIN conversations c ON c.org_id=r.org_id AND c.id=r.conversation_id WHERE r.org_id=$1 AND r.id=$2")
+        .bind(org).bind(run).fetch_one(&mut **tx).await?;
+    let Some(project) = project else {
+        return Ok(json!({"matches":[]}));
+    };
+    use crate::search::SearchBackend;
+    let q = crate::search::SearchQuery {
+        q: query.into(),
+        project: Some(project),
+        run: Some(run),
+        ..Default::default()
+    };
+    let mut matches = crate::search::PostgresSearch
+        .search(
+            tx,
+            org,
+            user,
+            &q,
+            crate::search::Boundary::default(),
+            "project_file",
+            None,
+            "",
+        )
+        .await?;
+    // A run keeps its immutable knowledge after a file edit. If that version is no
+    // longer in the live index (or indexing is pending), query the frozen text with
+    // PGroonga, still joining the live project/file/creator/member authorization.
+    let indexed: Vec<String> = matches
+        .iter()
+        .filter_map(|v| v["file"].as_str().map(str::to_owned))
+        .collect();
+    let frozen:Vec<Value>=sqlx::query_scalar("SELECT jsonb_build_object('file',entry.key,'line',1,'text',left(entry.value,1500),
+        'snippet_html',array_to_string(pgroonga_snippet_html(entry.value,ARRAY[$4]),' … '))
+        FROM runs r JOIN conversations c ON c.org_id=r.org_id AND c.id=r.conversation_id
+        JOIN projects p ON p.org_id=r.org_id AND p.id=r.project_id
+        JOIN project_revisions rev ON rev.org_id=r.org_id AND rev.id=r.project_revision_id
+        CROSS JOIN LATERAL jsonb_each_text(rev.files) entry
+        JOIN project_files f ON f.org_id=p.org_id AND f.project_id=p.id AND f.name=entry.key
+        WHERE r.org_id=$1 AND r.id=$2 AND c.creator_id=$3 AND p.creator_id=$3 AND p.state='active'
+          AND c.state IN ('active','archived') AND EXISTS(SELECT 1 FROM memberships WHERE org_id=$1 AND user_id=$3)
+          AND NOT (entry.key=ANY($5)) AND entry.value &@~ pgroonga_query_escape($4) LIMIT 20")
+        .bind(org).bind(run).bind(user).bind(query).bind(&indexed).fetch_all(&mut **tx).await?;
+    matches.extend(frozen);
+    matches.truncate(20);
+    Ok(json!({"matches":matches}))
 }
 
 /// Mount the run's project files read-only at `/project` and install its instructions.
@@ -499,7 +538,7 @@ pub async fn mount(app: &App, lease: &Lease, run: Uuid, sandbox: Uuid) -> anyhow
     let (files, instructions) = {
         let mut tx = app.store.fenced(lease).await?;
         let files = run_files(&mut tx, lease.org_id, run).await?;
-        let instructions = instructions(&mut tx, lease.org_id, run).await?;
+        let instructions = instructions(&mut tx, lease, run, &app.config).await?;
         tx.commit().await?;
         (files, instructions)
     };
@@ -608,7 +647,19 @@ pub async fn collect(app: &App, org: Uuid, project: Uuid) -> anyhow::Result<bool
         }
         purge_conversation(&mut tx, org, conv, epoch).await?;
     }
+    let memories: Vec<Uuid> =
+        sqlx::query_scalar("SELECT id FROM memory_items WHERE org_id=$1 AND project_id=$2")
+            .bind(org)
+            .bind(project)
+            .fetch_all(&mut *tx)
+            .await?;
+    crate::memory::purge_memories(&mut tx, org, &memories).await?;
     sqlx::query("DELETE FROM project_files WHERE org_id=$1 AND project_id=$2")
+        .bind(org)
+        .bind(project)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM search_docs WHERE org_id=$1 AND project_id=$2")
         .bind(org)
         .bind(project)
         .execute(&mut *tx)
@@ -636,7 +687,7 @@ pub async fn collect(app: &App, org: Uuid, project: Uuid) -> anyhow::Result<bool
 }
 
 /// Delete a conversation's content, keeping ids and accounting rows as tombstones.
-async fn purge_conversation(
+pub(crate) async fn purge_conversation(
     tx: &mut Tx<'_>,
     org: Uuid,
     conv: Uuid,
@@ -680,6 +731,8 @@ async fn purge_conversation(
     statements.extend(
         [
             // A fork's restore pin is keyed by the forked conversation.
+            "DELETE FROM conversation_digests WHERE org_id=$1 AND conversation_id=$2",
+            "UPDATE conversations SET memory_snapshot=NULL,expires_at=NULL WHERE org_id=$1 AND id=$2",
             "DELETE FROM restore_pins WHERE org_id=$1 AND id=$2",
             "UPDATE checkpoints SET state='tombstoned',delete_after=now()
              WHERE org_id=$1 AND conversation_id=$2 AND state<>'deleted'",
@@ -697,6 +750,11 @@ async fn purge_conversation(
             .execute(&mut **tx)
             .await?;
     }
+    sqlx::query("DELETE FROM search_docs WHERE org_id=$1 AND conversation_id=$2")
+        .bind(org)
+        .bind(conv)
+        .execute(&mut **tx)
+        .await?;
     sqlx::query("DELETE FROM events WHERE org_id=$1 AND channel_id=$2")
         .bind(org)
         .bind(format!("conv:{conv}"))

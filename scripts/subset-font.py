@@ -23,14 +23,17 @@ def recenter(font):
 if sys.argv[1] == '--recenter':
     path = Path(sys.argv[2]); font = TTFont(path); recenter(font); font.save(path); sys.exit()
 font=TTFont(sys.argv[1])
-instantiateVariableFont(font,{'wght':400},inplace=True)
-chars=set(range(32,127))|set(range(0x3000,0x3040))|set(range(0xff00,0xffef))|{0x2026,0x00b7}
+# Latin-1 Supplement and General Punctuation: GB2312 lacks •, the password mask.
+chars=(set(range(32,127))|set(range(0xa0,0x100))|set(range(0x2000,0x2070))
+       |set(range(0x3000,0x3040))|set(range(0xff00,0xffef)))
 for hi in range(0xa1,0xf8):
     for lo in range(0xa1,0xff):
         try: chars.add(ord(bytes([hi,lo]).decode('gb2312')))
         except (UnicodeDecodeError,TypeError): pass
 options=subset.Options();options.name_IDs=['*'];options.name_legacy=True
 subsetter=subset.Subsetter(options=options);subsetter.populate(unicodes=chars);subsetter.subset(font)
+# Instance after subsetting: the same outlines, without holding all glyphs' variations.
+instantiateVariableFont(font,{'wght':400},inplace=True)
 for name in font['name'].names:
     if name.nameID in (1,4,6,16): name.string='RyzHubSans'.encode(name.getEncoding())
 recenter(font)

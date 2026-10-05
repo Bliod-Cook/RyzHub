@@ -19,6 +19,8 @@ use crate::{
 #[derive(Deserialize)]
 pub struct CreateConversation {
     title: String,
+    #[serde(default)]
+    temporary: bool,
     /// Empty: the project's default mode, else chat.
     #[serde(default)]
     mode: String,
@@ -46,7 +48,13 @@ pub async fn create_conversation(
             &ctx,
             &input.title,
             &input.mode,
-            input.run_config,
+            {
+                let mut settings = input.run_config;
+                if input.temporary {
+                    settings["temporary"] = json!(true);
+                }
+                settings
+            },
             input.project_id,
             Some(&app.config),
         )

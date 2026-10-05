@@ -22,7 +22,7 @@ use crate::{
 use ryzhub_domain::OrgContext;
 
 pub fn router(app: App) -> Router {
-    use crate::{conversation_commands as conversations, llm, projects, workspace};
+    use crate::{conversation_commands as conversations, llm, memory, projects, search, workspace};
     let origins: Vec<axum::http::HeaderValue> = app
         .config
         .allowed_origins
@@ -34,6 +34,22 @@ pub fn router(app: App) -> Router {
         .allow_methods([Method::GET, Method::POST, Method::PATCH, Method::DELETE])
         .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE]);
     Router::new()
+        .route("/orgs/{org}/search", get(search::endpoint))
+        .route("/orgs/{org}/memories", get(memory::list).post(memory::put))
+        .route(
+            "/orgs/{org}/memories/preferences",
+            patch(memory::set_preferences),
+        )
+        .route("/orgs/{org}/memories/{id}", delete(memory::remove))
+        .route("/orgs/{org}/memory-events/{id}/undo", post(memory::revert))
+        .route(
+            "/orgs/{org}/conversations/{conv}/memory-context/{item}",
+            get(memory::timeline_context),
+        )
+        .route(
+            "/orgs/{org}/conversations/{conv}",
+            delete(memory::delete_conversation),
+        )
         .route("/healthz", get(healthz))
         .route("/capabilities", get(capabilities))
         .route(
@@ -152,7 +168,9 @@ pub(crate) async fn user_orgs(store: &Store, user: Uuid) -> anyhow::Result<Vec<(
 
 fn milestone(app: &App) -> &'static str {
     let config = &app.config;
-    if !config.work.claude_model.is_empty() {
+    if config.search.enabled {
+        "M4"
+    } else if !config.work.claude_model.is_empty() {
         "M3"
     } else if config.work.enabled {
         "M2"
@@ -193,6 +211,10 @@ async fn capabilities(State(app): State<App>) -> Json<Value> {
         "harnesses": harnesses,
         "work_capabilities": if config.work.enabled { work } else { json!({}) },
         "milestone": milestone(&app),
+        "search": config.search.enabled,
+        "memory": config.search.enabled,
+        "conversation_temporary": config.search.enabled,
+        "conversation_delete": config.search.enabled,
     }))
 }
 

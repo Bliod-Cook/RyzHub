@@ -200,7 +200,7 @@ async fn prepare(
     .bind(item_id)
     .execute(&mut *tx)
     .await?;
-    let instructions = crate::projects::instructions(&mut tx, org, run).await?;
+    let instructions = crate::projects::instructions(&mut tx, lease, run, &app.config).await?;
     tx.commit().await?;
     link.committed().await;
     Ok(Some(Step {

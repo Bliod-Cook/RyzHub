@@ -64,6 +64,7 @@ async function start() {
   if (sdk) return;
   input=new Input();
   let project='';try {project=await readFile('/workspace/.platform/project.md','utf8');}catch{}
+  try {project+='\n'+await readFile('/workspace/.platform/memory.md','utf8');}catch{}
   sdk=query({prompt:input,options:{
     cwd:process.env.RYZHUB_WORKSPACE??'/workspace',
     model:config.model,effort:config.reasoning,

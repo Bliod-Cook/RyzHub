@@ -170,7 +170,9 @@ impl Harness {
             .unwrap_or_default()
             .trim()
             .into();
-        let socket_dir = workspace.join("var/execution/gateway");
+        let socket_dir = std::env::var_os("TEST_GATEWAY_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| workspace.join("var/execution/gateway"));
         std::fs::create_dir_all(&socket_dir)?;
         let socket_path = socket_dir.join(format!(
             "llm-{}.sock",

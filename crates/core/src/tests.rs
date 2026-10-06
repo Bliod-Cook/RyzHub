@@ -256,3 +256,45 @@ fn subscription_diff_keeps_cache_but_removes_inactive_resume_subscriptions() {
         .is_empty()
     );
 }
+
+#[test]
+fn cache_from_an_older_schema_is_refetched_but_keeps_pending_commands() {
+    let mut e = engine();
+    e.apply(event(1, 1, "cached", "completed"));
+    let command = e.enqueue(
+        "conv:x".into(),
+        CommandEnvelope {
+            cid: "unsent".into(),
+            command: Some(command_envelope::Command::SendMessage(SendMessage {
+                text: "hi".into(),
+                ..Default::default()
+            })),
+        },
+    );
+    let mut old = serde_json::to_value(&e).unwrap();
+    old.as_object_mut().unwrap().remove("schema");
+    let mut restored = Engine::restore(&old.to_string()).unwrap();
+    assert_eq!(content(&restored), "cached");
+    let frames = restored.reconnect();
+    assert!(frames.contains(&command));
+    assert!(frames.iter().any(|f| matches!(
+        &f.body,
+        Some(Body::Subscribe(Subscribe { since_seq: None }))
+    )));
+
+    let mut current = Engine::restore(&serde_json::to_string(&restored).unwrap()).unwrap();
+    current.apply(frame(
+        "conv:x",
+        Body::Snapshot(Snapshot {
+            head_seq: 1,
+            ..Default::default()
+        }),
+    ));
+    let current = Engine::restore(&serde_json::to_string(&current).unwrap()).unwrap();
+    assert_eq!(
+        current.channels["conv:x"]
+            .initialized
+            .then_some(current.channels["conv:x"].cursor),
+        Some(1)
+    );
+}

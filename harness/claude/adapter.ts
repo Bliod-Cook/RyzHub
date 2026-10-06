@@ -76,7 +76,7 @@ async function start() {
     env:{...process.env,ANTHROPIC_BASE_URL:process.env.ANTHROPIC_BASE_URL??'http://127.0.0.1:8090',ANTHROPIC_API_KEY:process.env.ANTHROPIC_API_KEY??'guest-proxy',CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC:'1'},
     ...(process.env.RYZHUB_MCP==='1'?{mcpServers:{ryzhub:{type:'http' as const,url:'http://127.0.0.1:8090/mcp'}}}:{}),
     canUseTool:(name,args,options)=>authorize(name,args,options.signal,options.toolUseID),
-    hooks:{PostToolUse:[{hooks:[async event=>{if(event.hook_event_name==='PostToolUse'){item('item/completed',event.tool_use_id,'commandExecution',{command:event.tool_name,aggregatedOutput:JSON.stringify(event.tool_response)},event);}return {}; }]}]},
+    hooks:{PostToolUse:[{hooks:[async event=>{if(event.hook_event_name==='PostToolUse'){const output=JSON.stringify(event.tool_response);if(event.tool_name==='WebSearch')item('item/completed',event.tool_use_id,'webSearch',{query:(event.tool_input as Json)?.query??'',output},event);else item('item/completed',event.tool_use_id,'commandExecution',{command:event.tool_name,aggregatedOutput:output},event);}return {}; }]}]},
   }});
   const active=sdk;
   void consume(active).catch(()=>{if(sdk===active){sdk=undefined;notify('harness/exited',{outcome:'unknown',error:'SDK_STREAM_FAILED'});}});
@@ -108,7 +108,9 @@ async function consume(active:Query) {
         const id=block.type==='tool_use'?block.id:(blockIds.get(key)?.shift()??`${message.uuid}:${n}`);
         if(block.type==='text') {if(!started.has(id))item('item/started',id,'agentMessage',{text:''});item('item/completed',id,'agentMessage',{text:block.text,nativeMessageId:message.uuid},message);}
         if(block.type==='thinking') item('item/completed',id,'reasoning',{summary:[block.thinking],nativeMessageId:message.uuid},message);
-        if(block.type==='tool_use') {tools.set(id,{name:block.name,input:block.input});item('item/started',id,block.name==='TodoWrite'?'plan':'commandExecution',{command:block.name+' '+JSON.stringify(block.input),text:JSON.stringify(block.input),nativeMessageId:message.uuid},message);}
+        // WebSearch runs on the provider; it is projected like Codex's search, not as a command.
+        if(block.type==='tool_use' && block.name==='WebSearch') {tools.set(id,{name:block.name,input:block.input});item('item/started',id,'webSearch',{query:block.input?.query??'',nativeMessageId:message.uuid},message);}
+        else if(block.type==='tool_use') {tools.set(id,{name:block.name,input:block.input});item('item/started',id,block.name==='TodoWrite'?'plan':'commandExecution',{command:block.name+' '+JSON.stringify(block.input),text:JSON.stringify(block.input),nativeMessageId:message.uuid},message);}
       }
     } else if(message.type==='result') {
       const ended=turn;turn=undefined;

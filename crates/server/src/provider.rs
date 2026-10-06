@@ -157,6 +157,11 @@ impl NativeMessage {
         Ok(None)
     }
 
+    /// A content block as received so far.
+    pub fn block(&self, index: usize) -> Option<&Value> {
+        self.blocks.get(&index)
+    }
+
     pub fn finish(self) -> anyhow::Result<Value> {
         ensure!(self.stopped, Code::UpstreamStreamInterrupted);
         Ok(self.response)

@@ -1,11 +1,15 @@
 import 'dart:convert';
 import 'dart:math';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:url_launcher/url_launcher.dart';
 
+import '../browser.dart';
 import '../controller.dart';
 import '../l10n.dart';
+import '../link.dart';
 import '../prefs.dart';
 import '../theme.dart';
 import 'common.dart';
@@ -18,7 +22,9 @@ import 'settings.dart';
 import 'sidebar.dart';
 
 class HubPage extends StatefulWidget {
-  const HubPage({super.key});
+  /// The address that names the open conversation.
+  final ConversationLink? link;
+  const HubPage({super.key, this.link});
   @override
   State<HubPage> createState() => _HubPageState();
 }
@@ -30,17 +36,78 @@ class _HubPageState extends State<HubPage>
   final composerKey = GlobalKey();
   final scaffoldKey = GlobalKey<ScaffoldState>();
 
+  /// Signing back in with the device's refresh cookie; the login page waits.
+  bool restoring = keepsSession;
+
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     hub.addListener(_changed);
     prefs.addListener(_changed);
+    widget.link?.requested.addListener(_follow);
     HardwareKeyboard.instance.addHandler(_shortcut);
+    if (restoring) _restore();
   }
 
   void _changed() {
-    if (mounted) setState(() {});
+    if (!mounted) return;
+    setState(() {});
+    _report();
+  }
+
+  String get _lastKey => '${hub.base} ${hub.org}';
+
+  /// The address shows the open conversation; a native build remembers it.
+  void _report() {
+    widget.link?.show(hub.signedIn ? hub.selected : '');
+    if (!kIsWeb &&
+        hub.signedIn &&
+        prefs.lastConversations[_lastKey] != hub.selected) {
+      prefs.update((p) => p.lastConversations[_lastKey] = hub.selected);
+    }
+  }
+
+  Future<void> _restore() async {
+    hub
+      ..mode = prefs.defaultMode
+      ..harness = prefs.defaultHarness;
+    final server = prefs.server.isEmpty ? defaultServerUrl : prefs.server;
+    final restored = await hub.restore(server);
+    if (!mounted) return;
+    setState(() => restoring = false);
+    if (restored) _opened();
+  }
+
+  /// After signing in, open the conversation the address names; a native
+  /// start reopens the last one.
+  void _opened() {
+    final asked = widget.link?.requested.value ?? '';
+    widget.link?.requested.value = null;
+    final id = asked.isNotEmpty || kIsWeb
+        ? asked
+        : prefs.lastConversations[_lastKey] ?? '';
+    if (id.isEmpty) return;
+    if (hub.has(id)) {
+      openConversation(id);
+    } else {
+      widget.link?.refuse();
+    }
+  }
+
+  /// Back, forward or an entered address opens what it names.
+  void _follow() {
+    final id = widget.link?.requested.value;
+    if (id == null || !hub.signedIn) return;
+    widget.link!.requested.value = null;
+    if (id == hub.selected) return;
+    if (id.isEmpty) {
+      newChat();
+    } else if (hub.has(id)) {
+      openConversation(id);
+    } else {
+      widget.link!.refuse();
+    }
   }
 
   @override
@@ -57,6 +124,7 @@ class _HubPageState extends State<HubPage>
     WidgetsBinding.instance.removeObserver(this);
     HardwareKeyboard.instance.removeHandler(_shortcut);
     prefs.removeListener(_changed);
+    widget.link?.requested.removeListener(_follow);
     hub.dispose();
     super.dispose();
   }
@@ -196,6 +264,7 @@ class _HubPageState extends State<HubPage>
     final old = hub;
     old.removeListener(_changed);
     setState(() => hub = HubController()..addListener(_changed));
+    _report();
     try {
       await old.logout();
     } finally {
@@ -208,11 +277,13 @@ class _HubPageState extends State<HubPage>
     String email,
     String password,
     bool register,
-  ) {
+  ) async {
     hub
       ..mode = prefs.defaultMode
       ..harness = prefs.defaultHarness;
-    return hub.login(server, email, password, register);
+    await hub.login(server, email, password, register);
+    prefs.update((p) => p.server = server);
+    _opened();
   }
 
   void setMode(String mode) {
@@ -609,13 +680,37 @@ class _HubPageState extends State<HubPage>
 
   Widget conversationView() {
     final c = HubColors.of(context);
-    final items = hub.items
-        .where(
-          (i) =>
-              hub.searchFocusSeq == null ||
-              (i['first_seq'] as int) <= hub.searchFocusSeq!,
-        )
-        .toList();
+    final rows = timeline(
+      hub.items.where(
+        (i) =>
+            hub.searchFocusSeq == null ||
+            (i['first_seq'] as int) <= hub.searchFocusSeq!,
+      ),
+    );
+    // Found by key, a row keeps its state (an opened steps group) as rows
+    // arrive below it.
+    final positions = {for (final (i, row) in rows.indexed) row['id']: i};
+    void openSource(String href) {
+      final uri = Uri.tryParse(href);
+      final parts = uri?.pathSegments ?? [];
+      if (parts.length >= 4 &&
+          parts[0] == 'orgs' &&
+          parts[2] == 'conversations') {
+        if (parts[1] != hub.org) return;
+        action(
+          () => hub.selectSearch(
+            parts[3],
+            uri?.queryParameters['item'],
+            int.tryParse(uri?.queryParameters['seq'] ?? ''),
+          ),
+        );
+      } else if (uri != null &&
+          (uri.isScheme('https') || uri.isScheme('http'))) {
+        // Other links, such as cited web pages, open outside the app.
+        launchUrl(uri, mode: LaunchMode.externalApplication);
+      }
+    }
+
     Widget centered(Widget child, {Key? key}) => Center(
       key: key,
       child: ConstrainedBox(
@@ -626,7 +721,7 @@ class _HubPageState extends State<HubPage>
     return Column(
       children: [
         Expanded(
-          child: items.isEmpty
+          child: rows.isEmpty
               ? Center(
                   child: Text(
                     tr('还没有消息', 'No messages yet'),
@@ -641,46 +736,37 @@ class _HubPageState extends State<HubPage>
                     reverse: true,
                     shrinkWrap: true,
                     padding: const EdgeInsets.fromLTRB(24, 16, 24, 8),
-                    itemCount: items.length + 1,
+                    itemCount: rows.length + 1,
+                    findChildIndexCallback: (key) {
+                      final i = key is ValueKey ? positions[key.value] : null;
+                      return i == null ? null : rows.length - 1 - i;
+                    },
                     itemBuilder: (context, index) {
-                      if (index == items.length) {
+                      if (index == rows.length) {
                         return OlderLoader(
                           key: ValueKey('older:${hub.selected}'),
                           hub: hub,
                         );
                       }
-                      final item = items[items.length - 1 - index];
+                      final item = rows[rows.length - 1 - index];
+                      if (item['kind'] == 'steps') {
+                        return centered(
+                          key: ValueKey(item['id']),
+                          StepsGroup(
+                            steps: item['steps'],
+                            running: hub.runActive(item['run_id']),
+                            latest: item['latest'] == true,
+                            worked: hub.workedFor(item['run_id']),
+                            onSource: openSource,
+                          ),
+                        );
+                      }
                       return centered(
                         key: ValueKey(item['id']),
                         MessageCard(
                           item: item,
                           agentLabel: hub.agentLabel,
-                          onMemoryRead: item['kind'] == 'memory_context'
-                              ? () async {
-                                  final result = await hub.request(
-                                    '/orgs/${hub.org}/conversations/${hub.selected}/memory-context/${item['id']}',
-                                  );
-                                  return result['items'] as List<dynamic>;
-                                }
-                              : null,
-                          onSource: (href) {
-                            final uri = Uri.tryParse(href);
-                            final parts = uri?.pathSegments ?? [];
-                            if (parts.length >= 4 &&
-                                parts[0] == 'orgs' &&
-                                parts[1] == hub.org &&
-                                parts[2] == 'conversations') {
-                              action(
-                                () => hub.selectSearch(
-                                  parts[3],
-                                  uri?.queryParameters['item'],
-                                  int.tryParse(
-                                    uri?.queryParameters['seq'] ?? '',
-                                  ),
-                                ),
-                              );
-                            }
-                          },
+                          onSource: openSource,
                           onMemoryUndo: item['kind'] == 'memory_notice'
                               ? () => action(() async {
                                   final notice = jsonDecode(item['text']);
@@ -739,6 +825,7 @@ class _HubPageState extends State<HubPage>
 
   @override
   Widget build(BuildContext context) {
+    if (restoring) return const Scaffold();
     if (!hub.signedIn) return LoginPage(onLogin: login);
     final c = HubColors.of(context);
     final collapsed = wide && prefs.sidebarCollapsed;

@@ -653,6 +653,100 @@ async fn gateway_process_restart_client_resubscribes_and_revocation_clears_it() 
 
 #[tokio::test]
 #[ignore = "requires PostgreSQL 18 and NATS"]
+async fn refresh_cookie_rotates_survives_concurrent_tabs_and_revokes_replays() -> anyhow::Result<()>
+{
+    let h = Harness::new().await?;
+    let http = reqwest::Client::new();
+    let cookie = |response: &reqwest::Response| {
+        response
+            .headers()
+            .get("set-cookie")
+            .map(|v| v.to_str().unwrap().to_owned())
+    };
+    let token = |set: &str| {
+        set.split(';')
+            .next()
+            .unwrap()
+            .strip_prefix("ryzhub_refresh=")
+            .unwrap()
+            .to_owned()
+    };
+    let refresh = |value: String| {
+        http.post(format!("{}/auth/refresh", h.base))
+            .header("cookie", format!("ryzhub_refresh={value}"))
+            .send()
+    };
+    let me = |access: Value| {
+        http.get(format!("{}/me", h.base))
+            .bearer_auth(access["token"].as_str().unwrap().to_owned())
+            .send()
+    };
+    let email = format!("{}@example.test", Uuid::now_v7());
+    let registered = http
+        .post(format!("{}/auth/register", h.base))
+        .header("origin", "https://hub.example")
+        .json(&json!({"email":email,"password":"correct-test-password"}))
+        .send()
+        .await?;
+    let set = cookie(&registered).unwrap();
+    assert!(set.contains("; Path=/auth;") && set.contains("; HttpOnly; SameSite=Strict; Secure"));
+    let first = token(&set);
+    // Without an HTTPS page the cookie cannot be Secure, or a plain-HTTP dev setup loses it.
+    let plain = refresh(first.clone()).await?;
+    assert_eq!(plain.status(), 200);
+    let set = cookie(&plain).unwrap();
+    assert!(!set.contains("Secure"));
+    let second = token(&set);
+    let access: Value = plain.json().await?;
+    assert_eq!(access["email"], email.as_str());
+    assert_eq!(me(access).await?.status(), 200);
+    // A tab that refreshed with the old token at the same moment still gets in.
+    let concurrent = refresh(first.clone()).await?;
+    assert_eq!(concurrent.status(), 200);
+    assert!(cookie(&concurrent).is_none());
+    let third = refresh(second.clone()).await?;
+    let latest = token(&cookie(&third).unwrap());
+    let access: Value = third.json().await?;
+    // After the grace a replaced token is a replay: the device signs out everywhere.
+    sqlx::query("UPDATE auth_refresh SET rotated_at=now()-interval '2 minutes'")
+        .execute(&h.db)
+        .await?;
+    assert_eq!(refresh(second).await?.status(), 401);
+    assert_eq!(refresh(latest).await?.status(), 401);
+    assert_eq!(me(access).await?.status(), 401);
+    assert_eq!(refresh("unknown".into()).await?.status(), 401);
+    assert_eq!(
+        http.post(format!("{}/auth/refresh", h.base))
+            .send()
+            .await?
+            .status(),
+        401
+    );
+    // Logging out ends the device and clears its cookie.
+    let login = http
+        .post(format!("{}/auth/login", h.base))
+        .json(&json!({"email":email,"password":"correct-test-password"}))
+        .send()
+        .await?;
+    let device = token(&cookie(&login).unwrap());
+    let access: Value = login.json().await?;
+    let out = http
+        .post(format!("{}/auth/logout", h.base))
+        .bearer_auth(access["token"].as_str().unwrap())
+        .send()
+        .await?;
+    assert_eq!(out.status(), 204);
+    assert!(
+        cookie(&out)
+            .unwrap()
+            .starts_with("ryzhub_refresh=; Path=/auth; Max-Age=0;")
+    );
+    assert_eq!(refresh(device).await?.status(), 401);
+    h.close().await
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL 18 and NATS"]
 async fn member_removal_revokes_org_access_and_stops_waiting_run() -> anyhow::Result<()> {
     let h = Harness::new().await?;
     let admin = h.user().await?;

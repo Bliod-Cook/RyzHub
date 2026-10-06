@@ -116,14 +116,24 @@ message Item {
   string run_id = 8;
   // `text` was cut at the server's per-item size limit; the full content is not replayed.
   bool truncated = 9;
-  // Structured content for tool and file-change items (minor version 1).
+  // Structured content for tool and file-change items (minor version 1) and the sources an
+  // assistant reply cites (minor version 2).
   ItemDetail detail = 10;
 }
 message ItemDetail {
   oneof kind {
     ToolDetail tool = 1;
     FileChangeDetail file_change = 2;
+    AnswerDetail answer = 3;
   }
+}
+// Sources from the provider's built-in web search, in order of first citation.
+message AnswerDetail { repeated Citation citations = 1; }
+message Citation {
+  string url = 1;
+  string title = 2;
+  // The cited passage, when the provider returns one.
+  string cited_text = 3;
 }
 message ToolDetail {
   string name = 1;
@@ -162,7 +172,15 @@ message EventEnvelope {
     ReadState read_state_changed = 13;
   }
 }
-message RunState { string run_id = 1; string state = 2; uint64 exec_epoch = 3; bool read_only = 4; }
+message RunState {
+  string run_id = 1;
+  string state = 2;
+  uint64 exec_epoch = 3;
+  bool read_only = 4;
+  // Unix milliseconds; `ended_at_ms` is 0 while the run is active (minor version 2).
+  int64 started_at_ms = 5;
+  int64 ended_at_ms = 6;
+}
 message ReadState { string user_id = 1; uint64 read_seq = 2; string conversation_id = 3; }
 message Delta {
   string item_id = 1;

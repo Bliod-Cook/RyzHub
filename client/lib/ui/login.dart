@@ -44,7 +44,9 @@ class LoginPage extends StatefulWidget {
 }
 
 class _LoginPageState extends State<LoginPage> {
-  final server = TextEditingController(text: defaultServerUrl);
+  final server = TextEditingController(
+    text: prefs.server.isEmpty ? defaultServerUrl : prefs.server,
+  );
   final email = TextEditingController(), password = TextEditingController();
   bool register = true, busy = false;
   String error = '';

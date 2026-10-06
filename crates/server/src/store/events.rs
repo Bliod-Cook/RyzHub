@@ -57,6 +57,18 @@ fn bound_item(item: &mut Item) {
                 cut |= truncate_utf8(&mut change.diff, MAX_DETAIL_FIELD);
             }
         }
+        Some(Kind::Answer(answer)) => {
+            answer.citations.truncate(64);
+            for citation in &mut answer.citations {
+                for field in [
+                    &mut citation.url,
+                    &mut citation.title,
+                    &mut citation.cited_text,
+                ] {
+                    cut |= truncate_utf8(field, 4096);
+                }
+            }
+        }
         None => {}
     }
     item.truncated |= cut;
@@ -229,16 +241,18 @@ impl Store {
             .bind(epoch)
             .execute(&mut *tx)
             .await?;
-        let runs: Vec<(Uuid, String, bool)> = sqlx::query_as(
+        type RunRow = (Uuid, String, bool, Option<i64>, Option<i64>);
+        let runs: Vec<RunRow> = sqlx::query_as(concat!(
             "UPDATE runs SET exec_epoch=$3 WHERE org_id=$1 AND conversation_id=$2
-             AND state IN ('running','requires_action') RETURNING id,state,read_only",
-        )
+             AND state IN ('running','requires_action') RETURNING id,state,read_only,",
+            run_times!()
+        ))
         .bind(org)
         .bind(conv)
         .bind(epoch)
         .fetch_all(&mut *tx)
         .await?;
-        for (run, state, read_only) in runs {
+        for (run, state, read_only, started_at_ms, ended_at_ms) in runs {
             append(
                 &mut tx,
                 org,
@@ -250,6 +264,8 @@ impl Store {
                     run_id: run.to_string(),
                     state,
                     exec_epoch: epoch as u64,
+                    started_at_ms: started_at_ms.unwrap_or_default(),
+                    ended_at_ms: ended_at_ms.unwrap_or_default(),
                 }),
             )
             .await?;
@@ -496,10 +512,12 @@ async fn conversation_snapshot(tx: &mut Tx<'_>, org: Uuid, conv: Uuid) -> anyhow
     .bind(conv)
     .fetch_all(&mut **tx)
     .await?;
-    let runs: Vec<(Uuid, String, i64, bool)> = sqlx::query_as(
-        "SELECT id,state,exec_epoch,read_only FROM runs WHERE org_id=$1 AND conversation_id=$2
-         ORDER BY started_at DESC LIMIT 50",
-    )
+    type RunRow = (Uuid, String, i64, bool, Option<i64>, Option<i64>);
+    let runs: Vec<RunRow> = sqlx::query_as(concat!(
+        "SELECT id,state,exec_epoch,read_only,",
+        run_times!(),
+        " FROM runs WHERE org_id=$1 AND conversation_id=$2 ORDER BY started_at DESC LIMIT 50"
+    ))
     .bind(org)
     .bind(conv)
     .fetch_all(&mut **tx)
@@ -509,12 +527,16 @@ async fn conversation_snapshot(tx: &mut Tx<'_>, org: Uuid, conv: Uuid) -> anyhow
         pending_actions: actions.into_iter().map(Into::into).collect(),
         runs: runs
             .into_iter()
-            .map(|(id, state, epoch, read_only)| RunState {
-                read_only,
-                run_id: id.to_string(),
-                state,
-                exec_epoch: epoch as u64,
-            })
+            .map(
+                |(id, state, epoch, read_only, started_at_ms, ended_at_ms)| RunState {
+                    read_only,
+                    run_id: id.to_string(),
+                    state,
+                    exec_epoch: epoch as u64,
+                    started_at_ms: started_at_ms.unwrap_or_default(),
+                    ended_at_ms: ended_at_ms.unwrap_or_default(),
+                },
+            )
             .collect(),
         ..Default::default()
     })

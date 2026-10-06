@@ -138,15 +138,17 @@ pub async fn request_messages(
 }
 
 /// The context after step `(run, step)`: its request, its response and completed tool results.
-/// Tool calls without a result are omitted, so this is also a valid committed prefix while the
-/// step's tools are still pending.
+/// Tool calls without a result are omitted and an open provider turn is closed, so this is also
+/// a valid prefix for a new user message while the step's tools are still pending.
 pub async fn committed_prefix(
     tx: &mut Tx<'_>,
     org: Uuid,
     run: Uuid,
     step: i32,
 ) -> anyhow::Result<Value> {
-    Ok(walk(tx, org, run, step).await?.1)
+    let (_, mut after, last) = walk(tx, org, run, step).await?;
+    protocol::close_turn(&last.protocol, &mut after);
+    Ok(after)
 }
 
 /// How a new step is stored, and its full model input.

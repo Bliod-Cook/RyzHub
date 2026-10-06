@@ -61,29 +61,25 @@ void main() {
     hub.clearSearchFocus();
     expect(hub.items, isEmpty);
   });
-  testWidgets(
-    'memory context tolerates truncated text and resolves only current details',
-    (tester) async {
-      await tester.pumpWidget(
-        MaterialApp(
-          home: Scaffold(
-            body: MessageCard(
-              item: {
-                'kind': 'memory_context',
-                'state': 'completed',
-                'text': '[{"content":"old secret',
-              },
-              onMemoryRead: () async => [],
-            ),
-          ),
-        ),
-      );
-      await tester.tap(find.text('本轮引用的记忆'));
-      await tester.pumpAndSettle();
-      expect(find.text('记忆已失效或不可用'), findsOneWidget);
-      expect(find.textContaining('old secret'), findsNothing);
-    },
-  );
+  test('memory context stays out of the conversation', () {
+    final rows = timeline([
+      {
+        'id': 'context',
+        'kind': 'memory_context',
+        'state': 'completed',
+        'text': '[{"content":"old secret',
+        'run_id': 'run',
+      },
+      {
+        'id': 'reply',
+        'kind': 'assistant',
+        'state': 'completed',
+        'text': 'hi',
+        'run_id': 'run',
+      },
+    ]);
+    expect(rows.map((r) => r['id']), ['reply']);
+  });
   testWidgets(
     'remote search discards an older response and keeps hit navigation',
     (tester) async {

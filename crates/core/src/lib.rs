@@ -6,6 +6,9 @@ use std::collections::BTreeMap;
 const MAX_BUFFERED: usize = 256;
 const MAX_BUFFERED_BYTES: usize = 1024 * 1024;
 
+/// Bumped when cached projections may lack fields clients now read. 1: item `detail`.
+pub const CACHE_SCHEMA: u32 = 1;
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Channel {
@@ -31,6 +34,8 @@ pub struct Engine {
     /// Persist this alongside projections and cursors, atomically, before sending.
     pub pending_commands: BTreeMap<String, Frame>,
     pub last_error: Option<String>,
+    /// The `CACHE_SCHEMA` this state was cached under; absent in older caches.
+    pub schema: u32,
 }
 
 #[derive(Debug, Default)]
@@ -40,6 +45,24 @@ pub struct Effects {
 }
 
 impl Engine {
+    /// The engine from its cache. Channels cached under an older schema keep showing their
+    /// items but resubscribe without a cursor, so a fresh snapshot replaces them; pending
+    /// commands survive.
+    pub fn restore(cache_json: &str) -> serde_json::Result<Self> {
+        let mut engine: Engine = if cache_json.is_empty() {
+            Engine::default()
+        } else {
+            serde_json::from_str(cache_json)?
+        };
+        if engine.schema < CACHE_SCHEMA {
+            for state in engine.channels.values_mut() {
+                state.initialized = false;
+            }
+            engine.schema = CACHE_SCHEMA;
+        }
+        Ok(engine)
+    }
+
     /// History fills older projections without advancing the live replay cursor.
     pub fn merge_history(&mut self, channel: &str, items: Vec<Item>) -> Vec<Item> {
         let Some(state) = self.channels.get_mut(channel) else {

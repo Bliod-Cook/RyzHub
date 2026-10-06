@@ -2,7 +2,7 @@
 include!(concat!(env!("OUT_DIR"), "/agentplatform.v1.rs"));
 
 pub const PROTOCOL_MAJOR: u32 = 1;
-pub const PROTOCOL_MINOR: u32 = 1;
+pub const PROTOCOL_MINOR: u32 = 2;
 pub const SUBPROTOCOL: &str = "ryzhub.v1.protobuf";
 
 pub fn frame(channel: impl Into<String>, body: frame::Body) -> Frame {

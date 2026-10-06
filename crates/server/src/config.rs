@@ -110,7 +110,7 @@ pub struct LlmConfig {
     pub responses_key_env: String,
     pub responses_model: String,
     pub models: Vec<ModelRoute>,
-    /// Default Chat model.
+    /// Default Chat model; its protocol follows an explicit `models` route, else Anthropic.
     pub model: String,
     pub platform_key_env: String,
     /// Environment variable with the current vault key (32 bytes, URL-safe base64).

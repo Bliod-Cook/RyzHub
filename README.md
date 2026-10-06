@@ -127,9 +127,17 @@ python3 scripts/serve-web.py --directory var/demo/web
 
 升级需要先更新 Compose PostgreSQL 镜像（包含 PGroonga 4.0.4 与 pgvector 0.8.2），再运行迁移 0013。全文默认可用；向量检索配置真实 embedding 服务后启用，更换模型用 `ryzhub-server reindex` 回填。配置、接口、验收和部署边界见 [M4 验收](docs/m4-acceptance.md)，两轮 Claude Code 审查及修复见 [审查记录](docs/m4-code-review.md)。
 
+M4 接真实上游时，将实例配置保存为 `var/m4/config.toml`，将模型密钥环境变量保存为权限 0600 的 `var/m4/secrets.env`，运行 `./scripts/dev-m4.sh`。此脚本保留这两份文件，复用 `var/m1/secrets.env` 的 vault 主密钥和已有 `ryzhub_m3` 数据库，不启动协议 fixture。可用 `RYZHUB_M4_CONFIG`、`RYZHUB_M4_SECRETS` 和 `RYZHUB_M4_DATABASE` 指定其他本地文件及已有数据库。
+
+Responses 服务设置 `llm.responses_url`（服务端自动追加 `/v1/responses`，基础地址不要重复包含 `/v1`）、`llm.responses_key_env`、`llm.responses_model` 和 `work.model`。将模型加入 `policy.models` 及 `llm.models`（`protocol = "responses"`，`harnesses = ["chat", "codex"]`）；`llm.model` 也可设为这个模型，使新建 Chat 和历史摘要默认走 Responses。未配置兼容的 1024 维 embedding 服务时，全文搜索与记忆仍可使用。
+
+## 联网搜索
+
+联网搜索使用模型服务商自带的 web search，平台不做额外限制：Chat 请求始终附带内置工具（Anthropic 为 `web_search_20260318`，Responses 为 `web_search`），因此上游必须支持服务端工具；Codex 配置为 `web_search = "live"`；Claude Code 保留自带的 WebSearch。Anthropic 的 `pause_turn` 会把原样的 assistant 内容再发送一次来续写。回合未结束时（暂停中，或服务端工具排在客户端工具之后），补充指令会等到回合结束再发送。搜索在 Chat 和 Work 中都显示为 `web_search` 工具步骤。Chat 的流式回复遇到搜索会在当场拆分：已输出的文字单独成条，接着是搜索步骤，后续文字写入新的条目。暂停的回合中，搜索的结果会在下一步补上。重试时，失败那次尝试新增的条目标记为 `discarded`，客户端不显示。每段文字引用的网页显示在该段下方（`ItemDetail.answer`，协议 minor 2）。
+
 ## 运行 Flutter 客户端
 
-本次使用 Flutter 3.47.5 / Dart 3.13.4、flutter_rust_bridge 2.11.1。Rust 生成的绑定已提交。原生 UI 的 SQLite 缓存和 Web 的 IndexedDB 缓存都按服务器、用户、组织隔离；访问 token 不写磁盘。
+本次使用 Flutter 3.47.5 / Dart 3.13.4、flutter_rust_bridge 2.11.1。Rust 生成的绑定已提交。原生 UI 的 SQLite 缓存和 Web 的 IndexedDB 缓存都按服务器、用户、组织隔离；访问 token 不写磁盘。Web 登录后，服务端把设备的 refresh token 写入 HttpOnly Cookie（`Path=/auth`、`SameSite=Strict`，HTTPS 下加 `Secure`，30 天滑动有效）。页面刷新或访问 token 过期时，用它换取新的访问 token，并轮换 refresh token；被替换的旧 token 在 60 秒内仍可使用，供同时刷新的多个标签页共用，超过 60 秒再出现就视为重放，吊销整个设备。退出登录会吊销该设备签发的所有 token。页面和 API 都在本机回环地址上时，客户端会让 API 使用和页面相同的主机名，保证 Cookie 同站。打开的对话写在地址里（`#/c/<id>`），刷新、前进后退和书签都能回到它；原生端没有 refresh token，每次启动需要重新登录，但会记住每个服务器和组织上次打开的对话。
 
 Web 构建准备：
 

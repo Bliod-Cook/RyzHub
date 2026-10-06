@@ -7,6 +7,7 @@ use axum::{
     http::HeaderMap,
     routing::post,
 };
+use prost::Message;
 use ryzhub_proto::{command_envelope::Command, *};
 use ryzhub_server::{
     app::App,
@@ -41,11 +42,26 @@ async fn upstream(
     let result = last
         .as_array()
         .is_some_and(|blocks| blocks.iter().any(|b| b["type"] == "tool_result"));
+    // Re-sent assistant content continues a paused turn.
+    let continued = body["messages"].as_array().unwrap().last().unwrap()["role"] == "assistant";
     let mut content = vec![
         json!({"type":"thinking","thinking":"opaque reasoning","signature":"signed-block"}),
         json!({"type":"redacted_thinking","data":"opaque-data"}),
     ];
-    if !result && body.get("tools").is_some() && prompt.contains("exec") {
+    let mut paused = false;
+    if continued {
+        content.push(json!({"type":"text","text":"搜索结果显示 RyzHub 已发布","citations":[
+            {"type":"web_search_result_location","url":"https://example.com/a","title":"Example A","encrypted_index":"opaque-index","cited_text":"RyzHub released"},
+            {"type":"web_search_result_location","url":"https://example.com/a","title":"Example A","encrypted_index":"opaque-index-2","cited_text":"again"}
+        ]}));
+    } else if !result && body.get("tools").is_some() && prompt.contains("websearch") {
+        content.push(json!({"type":"text","text":"先搜索一下"}));
+        content.push(json!({"type":"server_tool_use","id":"srvtoolu_1","name":"web_search","input":{"query":"RyzHub"}}));
+        content.push(json!({"type":"web_search_tool_result","tool_use_id":"srvtoolu_1","content":[
+            {"type":"web_search_result","url":"https://example.com/a","title":"Example A","encrypted_content":"opaque-search","page_age":null}
+        ]}));
+        paused = true;
+    } else if !result && body.get("tools").is_some() && prompt.contains("exec") {
         let command = if prompt.contains("proxyexec") {
             r#"sleep 2; wget -qO- --header 'Content-Type: application/json' --post-data '{"model":"fixture-model","max_tokens":32,"stream":true,"messages":[{"role":"user","content":"guest local proxy"}]}' http://127.0.0.1:8090/v1/messages"#
         } else {
@@ -66,15 +82,33 @@ async fn upstream(
     for (index, block) in content.iter().enumerate() {
         let mut start = block.clone();
         if block["type"] == "text" {
-            start["text"] = json!("");
+            start = json!({"type":"text","text":""});
+        }
+        if block["type"] == "server_tool_use" {
+            start["input"] = json!({});
         }
         events.push(json!({"type":"content_block_start","index":index,"content_block":start}));
+        for citation in block["citations"].as_array().into_iter().flatten() {
+            events.push(json!({"type":"content_block_delta","index":index,"delta":{"type":"citations_delta","citation":citation}}));
+        }
         if block["type"] == "text" {
             events.push(json!({"type":"content_block_delta","index":index,"delta":{"type":"text_delta","text":block["text"]}}));
         }
+        if block["type"] == "server_tool_use" {
+            events.push(json!({"type":"content_block_delta","index":index,"delta":{"type":"input_json_delta","partial_json":block["input"].to_string()}}));
+        }
         events.push(json!({"type":"content_block_stop","index":index}));
     }
-    events.push(json!({"type":"message_delta","delta":{"stop_reason":if tool{"tool_use"}else{"end_turn"}},"usage":{"output_tokens":4}}));
+    let stop = if paused {
+        "pause_turn"
+    } else if tool {
+        "tool_use"
+    } else {
+        "end_turn"
+    };
+    events.push(
+        json!({"type":"message_delta","delta":{"stop_reason":stop},"usage":{"output_tokens":4}}),
+    );
     events.push(json!({"type":"message_delta","delta":{},"usage":{"output_tokens":8}}));
     events.push(json!({"type":"message_stop"}));
     let delay = if prompt.contains("slow") { 100 } else { 5 };
@@ -560,6 +594,202 @@ async fn loop_question_checkpoint_steer_and_read_only_side_query() -> anyhow::Re
             .fetch_one(&h.db)
             .await?;
     assert_eq!(state, "cancelled");
+    owner.kill().await?;
+    owner.wait().await?;
+    h.close().await
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL/NATS and test gateway secrets"]
+async fn paused_web_search_turn_resumes_before_steer_and_keeps_citations() -> anyhow::Result<()> {
+    let h = Harness::new().await?;
+    let user = h.user().await?;
+    let conv = h.conversation(&user).await?;
+    let mut owner = h.owner()?;
+    h.send(&user, conv, message("websearch slow")).await?;
+    // The steer must arrive while the paused step streams, after it took its inputs.
+    for _ in 0..400 {
+        let started = h
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(r, _)| r["messages"].to_string().contains("websearch slow"));
+        if started {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    h.send(
+        &user,
+        conv,
+        Command::Steer(Steer {
+            text: "补充输入".into(),
+        }),
+    )
+    .await?;
+    let run = h.wait_state(conv, "completed").await?;
+    let requests: Vec<Value> = h
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(r, _)| r.clone())
+        .filter(|r| r["messages"].to_string().contains("websearch slow"))
+        .collect();
+    assert_eq!(requests.len(), 3);
+    for request in &requests {
+        assert!(
+            request["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t["type"] == "web_search_20260318" && t["name"] == "web_search")
+        );
+    }
+    // The paused turn is re-sent as is, without the steer that arrived meanwhile.
+    let resumed = requests[1]["messages"].as_array().unwrap();
+    let paused = resumed.last().unwrap();
+    assert_eq!(paused["role"], "assistant");
+    assert!(!paused.to_string().contains("补充输入"));
+    let blocks = paused["content"].as_array().unwrap();
+    assert!(
+        blocks
+            .iter()
+            .any(|b| b["type"] == "server_tool_use" && b["input"]["query"] == "RyzHub")
+    );
+    assert!(blocks.iter().any(|b| b["type"] == "web_search_tool_result"
+        && b["content"][0]["encrypted_content"] == "opaque-search"));
+    // The steer follows the finished turn, which is one assistant message.
+    let after = requests[2]["messages"].as_array().unwrap();
+    assert_eq!(after.last().unwrap()["content"], "补充输入");
+    let turn = &after[after.len() - 2];
+    assert_eq!(turn["role"], "assistant");
+    assert_eq!(after[after.len() - 3]["role"], "user");
+    let turn = turn.to_string();
+    assert!(turn.contains("先搜索一下") && turn.contains("opaque-index"));
+    // The search splits the paused step's reply where it happened.
+    let items: Vec<(String, String, String, Option<Value>)> = sqlx::query_as(
+        "SELECT kind,state,text,detail FROM items WHERE run_id=$1 AND kind IN ('assistant','tool')
+         ORDER BY first_seq",
+    )
+    .bind(run)
+    .fetch_all(&h.db)
+    .await?;
+    let shape: Vec<(&str, &str, &str)> = items
+        .iter()
+        .map(|(kind, state, text, _)| (kind.as_str(), state.as_str(), text.as_str()))
+        .collect();
+    assert_eq!(shape[0], ("assistant", "completed", "先搜索一下"));
+    assert_eq!((shape[1].0, shape[1].1), ("tool", "completed"));
+    assert_eq!(shape[2], ("assistant", "completed", ""));
+    assert_eq!(
+        shape[3],
+        (
+            "assistant",
+            "completed",
+            "搜索结果显示 RyzHub 已发布 ([example.com](https://example.com/a))"
+        )
+    );
+    assert_eq!(
+        shape[4],
+        ("assistant", "completed", "本地协议联调：你好 Rust")
+    );
+    assert_eq!(shape.len(), 5);
+    let search = &items[1].3.as_ref().unwrap()["kind"]["Tool"];
+    assert_eq!(search["name"], "web_search");
+    assert_eq!(search["arguments_json"], r#"{"query":"RyzHub"}"#);
+    let result: Value = serde_json::from_str(search["result_json"].as_str().unwrap())?;
+    assert_eq!(
+        result,
+        json!({"matches":[{"url":"https://example.com/a","title":"Example A"}]})
+    );
+    let details: Vec<&Value> = items.iter().filter_map(|i| i.3.as_ref()).collect();
+    assert_eq!(details.len(), 2);
+    let citations = details[1]["kind"]["Answer"]["citations"]
+        .as_array()
+        .unwrap();
+    assert_eq!(citations.len(), 1);
+    assert_eq!(citations[0]["url"], "https://example.com/a");
+    assert_eq!(citations[0]["title"], "Example A");
+    assert_eq!(citations[0]["cited_text"], "RyzHub released");
+    // The run's end is announced with how long it took.
+    let payloads: Vec<Vec<u8>> =
+        sqlx::query_scalar("SELECT payload FROM events WHERE kind='run_state_changed'")
+            .fetch_all(&h.db)
+            .await?;
+    let ended = payloads
+        .iter()
+        .filter_map(|p| match EventEnvelope::decode(p.as_slice()).ok()?.event? {
+            event_envelope::Event::RunStateChanged(state) => Some(state),
+            _ => None,
+        })
+        .find(|state| state.run_id == run.to_string() && state.state == "completed")
+        .unwrap();
+    assert!(ended.started_at_ms > 0 && ended.ended_at_ms >= ended.started_at_ms);
+    // The cited page showed while the reply was still streaming, with its link in the text.
+    let payloads: Vec<Vec<u8>> =
+        sqlx::query_scalar("SELECT payload FROM events WHERE kind='item_upserted'")
+            .fetch_all(&h.db)
+            .await?;
+    let live = payloads
+        .iter()
+        .filter_map(|p| match EventEnvelope::decode(p.as_slice()).ok()?.event? {
+            event_envelope::Event::ItemUpserted(item) => Some(item),
+            _ => None,
+        })
+        .find(|item| {
+            item.state == "streaming"
+                && item.run_id == run.to_string()
+                && matches!(
+                    item.detail.as_ref().and_then(|d| d.kind.as_ref()),
+                    Some(item_detail::Kind::Answer(answer)) if answer.citations.len() == 1
+                )
+        })
+        .unwrap();
+    assert!(
+        live.text
+            .ends_with(" ([example.com](https://example.com/a))")
+    );
+    owner.kill().await?;
+    owner.wait().await?;
+    h.close().await
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL/NATS and test gateway secrets"]
+async fn retried_step_hides_what_its_failed_searches_split() -> anyhow::Result<()> {
+    let h = Harness::new().await?;
+    let user = h.user().await?;
+    let conv = h.conversation(&user).await?;
+    let mut owner = h.owner()?;
+    // Every attempt searches, then loses the end of its stream.
+    h.send(&user, conv, message("websearch interrupt")).await?;
+    let run = h.wait_state(conv, "failed").await?;
+    let items: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT kind,state,text FROM items WHERE run_id=$1 AND kind IN ('assistant','tool')
+         ORDER BY first_seq",
+    )
+    .bind(run)
+    .fetch_all(&h.db)
+    .await?;
+    let shape: Vec<(&str, &str)> = items
+        .iter()
+        .map(|(kind, state, _)| (kind.as_str(), state.as_str()))
+        .collect();
+    // The search item is shared by the attempts; each attempt's continuation is its own.
+    assert_eq!(
+        shape,
+        [
+            ("assistant", "completed"),
+            ("tool", "completed"),
+            ("assistant", "discarded"),
+            ("assistant", "discarded"),
+            ("assistant", "failed"),
+        ]
+    );
+    assert_eq!(items[0].2, "先搜索一下");
+    assert!(items[2].2.is_empty() && items[3].2.is_empty());
     owner.kill().await?;
     owner.wait().await?;
     h.close().await

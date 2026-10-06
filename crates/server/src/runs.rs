@@ -74,6 +74,15 @@ async fn announce_run(
     state: &str,
     read_only: bool,
 ) -> anyhow::Result<()> {
+    let (started_at_ms, ended_at_ms): (Option<i64>, Option<i64>) = sqlx::query_as(concat!(
+        "SELECT ",
+        run_times!(),
+        " FROM runs WHERE org_id=$1 AND id=$2"
+    ))
+    .bind(lease.org_id)
+    .bind(run)
+    .fetch_one(&mut **tx)
+    .await?;
     append(
         tx,
         lease.org_id,
@@ -85,6 +94,8 @@ async fn announce_run(
             run_id: run.to_string(),
             state: state.into(),
             exec_epoch: lease.epoch as u64,
+            started_at_ms: started_at_ms.unwrap_or_default(),
+            ended_at_ms: ended_at_ms.unwrap_or_default(),
         }),
     )
     .await?;

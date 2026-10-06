@@ -34,6 +34,12 @@ macro_rules! conversation_columns {
         "id,org_id,creator_id,title,mode,state,project_id,run_config,temporary"
     };
 }
+/// A run's start and end in Unix milliseconds, as `RunState` carries them.
+macro_rules! run_times {
+    () => {
+        "(extract(epoch FROM started_at)*1000)::bigint,(extract(epoch FROM ended_at)*1000)::bigint"
+    };
+}
 
 pub mod app;
 pub mod chat;

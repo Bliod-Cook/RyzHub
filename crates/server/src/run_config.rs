@@ -49,13 +49,6 @@ impl RunConfig {
                     .unwrap_or_else(|| "codex".into())
             };
         }
-        if c.protocol.is_empty() {
-            // The upstream wire format follows the model's provider; clients pick models only.
-            c.protocol = catalog
-                .iter()
-                .find(|m| m.id == c.model && m.harnesses.contains(&c.harness))
-                .map_or_else(|| "anthropic".into(), |m| m.protocol.clone());
-        }
         if c.model.is_empty() && !config.llm.enabled {
             c.model = "mock".into();
         }
@@ -66,6 +59,13 @@ impl RunConfig {
                 _ if c.protocol == "responses" => config.llm.responses_model.clone(),
                 _ => config.llm.model.clone(),
             };
+        }
+        if c.protocol.is_empty() {
+            // Resolve the default model first, then follow its catalog route.
+            c.protocol = catalog
+                .iter()
+                .find(|m| m.id == c.model && m.harnesses.contains(&c.harness))
+                .map_or_else(|| "anthropic".into(), |m| m.protocol.clone());
         }
         ensure!(
             matches!(
@@ -140,23 +140,21 @@ pub fn models(config: &Config, harness: &str, protocol: &str) -> Vec<String> {
     if !config.llm.enabled {
         return vec!["mock".into()];
     }
-    let mut models: Vec<String> = config
+    catalog(config)
+        .into_iter()
+        .filter(|m| m.protocol == protocol && m.harnesses.iter().any(|h| h == harness))
+        .map(|m| m.id)
+        .collect()
+}
+
+/// An explicit route can make the default Chat model use Responses.
+pub fn default_chat_protocol(config: &Config) -> &str {
+    config
         .llm
         .models
         .iter()
-        .filter(|m| m.protocol == protocol && m.harnesses.iter().any(|h| h == harness))
-        .map(|m| m.id.clone())
-        .collect();
-    let default = match harness {
-        "codex" => &config.work.model,
-        "claude" => &config.work.claude_model,
-        _ if protocol == "responses" => &config.llm.responses_model,
-        _ => &config.llm.model,
-    };
-    if !default.is_empty() && !models.contains(default) {
-        models.push(default.clone());
-    }
-    models
+        .find(|m| m.id == config.llm.model && m.harnesses.iter().any(|h| h == "chat"))
+        .map_or("anthropic", |m| m.protocol.as_str())
 }
 
 /// A routable model: explicit `llm.models` routes plus the per-path defaults.
@@ -176,7 +174,7 @@ pub fn catalog(config: &Config) -> Vec<ModelEntry> {
         }];
     }
     let defaults = [
-        (&config.llm.model, "anthropic", "chat"),
+        (&config.llm.model, default_chat_protocol(config), "chat"),
         (&config.llm.responses_model, "responses", "chat"),
         (&config.work.model, "responses", "codex"),
         (&config.work.claude_model, "anthropic", "claude"),
@@ -341,6 +339,30 @@ mod tests {
         );
         // Explicit protocols from older clients are kept as sent.
         assert_eq!(chat(json!({"protocol":"responses"})).model, "gpt-5.4");
+    }
+
+    #[test]
+    fn responses_default_chat_has_one_route_and_resolves_without_a_model() {
+        let mut c = config();
+        c.llm.model = "gpt-5.2".into();
+        let entries = catalog(&c);
+        let defaults: Vec<_> = entries.iter().filter(|m| m.id == c.llm.model).collect();
+        assert_eq!(defaults.len(), 1);
+        assert_eq!(defaults[0].protocol, "responses");
+        assert_eq!(default_chat_protocol(&c), "responses");
+        assert!(!models(&c, "chat", "anthropic").contains(&c.llm.model));
+        assert!(models(&c, "chat", "responses").contains(&c.llm.model));
+
+        let resolved = RunConfig::resolve(json!({}), "chat", &c).unwrap();
+        assert_eq!(resolved.model, "gpt-5.2");
+        assert_eq!(resolved.protocol, "responses");
+        // Older clients can still request the separate Responses default explicitly.
+        assert_eq!(
+            RunConfig::resolve(json!({"protocol":"responses"}), "chat", &c)
+                .unwrap()
+                .model,
+            "gpt-5.4"
+        );
     }
 
     #[test]

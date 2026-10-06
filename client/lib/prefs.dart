@@ -18,6 +18,13 @@ class AppPrefs extends ChangeNotifier {
 
   /// Sidebar sections folded on this device: `pinned`, `projects`, `recents`.
   Set<String> collapsedSections = {};
+
+  /// The server this device last signed in to.
+  String server = '';
+
+  /// The conversation last open per `server org`, reopened on a native start.
+  /// The web build keeps it in the address instead.
+  Map<String, String> lastConversations = {};
   String _detected = 'en';
   PrefsStore? _store;
 
@@ -47,6 +54,11 @@ class AppPrefs extends ChangeNotifier {
         for (final s in v['collapsed_sections'] as List? ?? []) '$s',
       };
       defaultHarness = v['default_harness'] ?? defaultHarness;
+      server = v['server'] ?? server;
+      lastConversations = {
+        for (final e in (v['last_conversations'] as Map? ?? {}).entries)
+          '${e.key}': '${e.value}',
+      };
     } catch (_) {
       // Unreadable preferences fall back to defaults; they are not critical.
     }
@@ -71,6 +83,8 @@ class AppPrefs extends ChangeNotifier {
               'default_work_model': defaultWorkModel,
               'collapsed_sections': collapsedSections.toList(),
               'default_harness': defaultHarness,
+              'server': server,
+              'last_conversations': lastConversations,
             }),
           )
           .catchError((_) {}),

@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
 
+import 'link.dart';
 import 'prefs.dart';
 import 'theme.dart';
 import 'ui/home.dart';
@@ -13,6 +14,7 @@ class RyzHubApp extends StatefulWidget {
 
 class _RyzHubAppState extends State<RyzHubApp> with WidgetsBindingObserver {
   String lang = prefs.lang;
+  final link = ConversationLink((link) => HubPage(link: link));
 
   @override
   void initState() {
@@ -25,6 +27,7 @@ class _RyzHubAppState extends State<RyzHubApp> with WidgetsBindingObserver {
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     prefs.removeListener(_changed);
+    link.dispose();
     super.dispose();
   }
 
@@ -50,7 +53,7 @@ class _RyzHubAppState extends State<RyzHubApp> with WidgetsBindingObserver {
   @override
   Widget build(BuildContext context) {
     final accent = accentColor(prefs.accent);
-    return MaterialApp(
+    return MaterialApp.router(
       title: 'RyzHub',
       debugShowCheckedModeBanner: false,
       theme: buildTheme(Brightness.light, accent),
@@ -61,7 +64,8 @@ class _RyzHubAppState extends State<RyzHubApp> with WidgetsBindingObserver {
           : const Locale('en'),
       supportedLocales: const [Locale('zh', 'CN'), Locale('en')],
       localizationsDelegates: GlobalMaterialLocalizations.delegates,
-      home: const HubPage(),
+      routerDelegate: link,
+      routeInformationParser: const ConversationLinkParser(),
     );
   }
 }

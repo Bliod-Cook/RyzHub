@@ -107,7 +107,7 @@ impl Native {
         let mut config = format!(
             r#"model = {}
 model_provider = "ryzhub"
-web_search = "disabled"
+web_search = "live"
 [model_providers.ryzhub]
 name = "RyzHub"
 base_url = "http://127.0.0.1:8090/v1"
@@ -596,6 +596,27 @@ fn item_event(method: &str, params: &Value, turn_id: Option<String>) -> Incoming
                 ..Default::default()
             },
         ),
+        // The provider's own search, also emitted by the Claude adapter for its WebSearch tool.
+        "webSearch" => {
+            let action = &item["action"];
+            let arguments = match [&item["query"], &action["query"]]
+                .into_iter()
+                .find_map(|q| q.as_str().filter(|q| !q.is_empty()))
+            {
+                Some(query) => json!({ "query": query }),
+                None => json!({ "url": action["url"].as_str().unwrap_or_default() }),
+            };
+            (
+                ItemKind::ToolCall,
+                ItemContent {
+                    text: format!("web_search {arguments}"),
+                    name: Some("web_search".into()),
+                    arguments_json: Some(arguments.to_string()),
+                    output: item["output"].as_str().map(str::to_owned),
+                    ..Default::default()
+                },
+            )
+        }
         other => (
             ItemKind::Other,
             ItemContent {
@@ -683,6 +704,26 @@ mod tests {
         };
         assert_eq!((kind, turn_id.as_deref()), (ItemKind::Command, Some("t")));
         assert_eq!(content.text, "ls\na\n");
+        for (item, arguments) in [
+            (
+                json!({"id":"w","type":"webSearch","query":"rust 2026"}),
+                json!({"query":"rust 2026"}),
+            ),
+            (
+                json!({"id":"w","type":"webSearch","query":"","action":{"type":"openPage","url":"https://a.example"}}),
+                json!({"url":"https://a.example"}),
+            ),
+        ] {
+            let search =
+                json!({"method":"item/completed","params":{"turn":{"id":"t"},"item":item}});
+            let Incoming::Event(HarnessEvent::Item { kind, content, .. }) = classify(&search)
+            else {
+                panic!("search not classified")
+            };
+            assert_eq!(kind, ItemKind::ToolCall);
+            assert_eq!(content.name.as_deref(), Some("web_search"));
+            assert_eq!(content.arguments_json, Some(arguments.to_string()));
+        }
         let models = result_of(
             &HarnessRequest::ListModels,
             &json!({"result":{"data":[{"model":"gpt","supportedReasoningEfforts":[{"reasoningEffort":"low"}]}]}}),

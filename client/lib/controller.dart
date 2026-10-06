@@ -7,6 +7,7 @@ import 'package:http/http.dart' as http;
 import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
+import 'browser.dart';
 import 'l10n.dart';
 import 'prefs.dart';
 import 'rust/api.dart';
@@ -96,6 +97,8 @@ class HubController extends ChangeNotifier {
   int _generation = 0, _attempt = 0;
   bool _closed = false, _connecting = false;
   DateTime _lastFrame = DateTime.now();
+  final http.Client _http = sessionClient();
+  Future<bool>? _renewing;
   final String _device =
       'flutter-${DateTime.now().microsecondsSinceEpoch}-${Random().nextInt(1000000)}';
 
@@ -257,6 +260,25 @@ class HubController extends ChangeNotifier {
   bool get running => (_runs[channel] ?? []).any(
     (r) => r['state'] == 'running' || r['state'] == 'requires_action',
   );
+
+  /// The run is working or waiting for the user.
+  bool runActive(String id) => (_runs[channel] ?? []).any(
+    (r) =>
+        r['run_id'] == id &&
+        (r['state'] == 'running' || r['state'] == 'requires_action'),
+  );
+
+  /// How long a finished run worked, when its times are known.
+  Duration? workedFor(String id) {
+    final run = (_runs[channel] ?? []).where((r) => r['run_id'] == id);
+    final started = run.firstOrNull?['started_at_ms'];
+    final ended = run.firstOrNull?['ended_at_ms'];
+    if (started is! int || ended is! int || started <= 0 || ended < started) {
+      return null;
+    }
+    return Duration(milliseconds: ended - started);
+  }
+
   bool get mainlineRunning => (_runs[channel] ?? []).any(
     (r) =>
         r['read_only'] != true &&
@@ -484,30 +506,71 @@ class HubController extends ChangeNotifier {
     }
   }
 
+  /// Requests that exchange credentials themselves; any other request whose
+  /// access token expired renews it once.
+  static const _exchanges = {
+    '/auth/login',
+    '/auth/register',
+    '/auth/refresh',
+    '/auth/logout',
+  };
+
   Future<dynamic> request(
     String path, {
     Map<String, dynamic>? body,
     String? method,
   }) async {
+    var response = await _send(path, body, method);
+    if (response.statusCode == 401 &&
+        token.isNotEmpty &&
+        !_exchanges.contains(path) &&
+        await _renew()) {
+      response = await _send(path, body, method);
+    }
+    final data = response.body.isEmpty ? null : jsonDecode(response.body);
+    if (response.statusCode >= 400) {
+      throw Exception(data?['error'] ?? response.statusCode);
+    }
+    return data;
+  }
+
+  Future<http.Response> _send(
+    String path,
+    Map<String, dynamic>? body,
+    String? method,
+  ) {
     final headers = {
       'Content-Type': 'application/json',
       if (token.isNotEmpty) 'Authorization': 'Bearer $token',
     };
     final url = Uri.parse('$base$path');
-    final response =
-        await (method == 'PATCH'
-                ? http.patch(url, headers: headers, body: jsonEncode(body))
-                : method == 'DELETE'
-                ? http.delete(url, headers: headers)
-                : body == null
-                ? http.get(url, headers: headers)
-                : http.post(url, headers: headers, body: jsonEncode(body)))
-            .timeout(const Duration(seconds: 15));
-    final data = response.body.isEmpty ? null : jsonDecode(response.body);
-    if (response.statusCode >= 400) {
-      throw Exception(data['error'] ?? response.statusCode);
-    }
-    return data;
+    return (method == 'PATCH'
+            ? _http.patch(url, headers: headers, body: jsonEncode(body))
+            : method == 'DELETE'
+            ? _http.delete(url, headers: headers)
+            : body == null
+            ? _http.get(url, headers: headers)
+            : _http.post(url, headers: headers, body: jsonEncode(body)))
+        .timeout(const Duration(seconds: 15));
+  }
+
+  /// A new access token through the device's refresh cookie, shared by the
+  /// requests that found theirs expired. False when the device is signed out.
+  Future<bool> _renew() {
+    if (!keepsSession) return Future.value(false);
+    return _renewing ??= () async {
+      try {
+        final result = await request('/auth/refresh', body: {});
+        if (result['user_id'] != user) return false;
+        token = result['token'];
+        expiresAtMs = (result['expires_at_ms'] as num?)?.toInt() ?? 0;
+        return true;
+      } catch (_) {
+        return false;
+      } finally {
+        _renewing = null;
+      }
+    }();
   }
 
   Future<void> login(
@@ -516,16 +579,39 @@ class HubController extends ChangeNotifier {
     String password,
     bool register,
   ) async {
-    base = server.replaceAll(RegExp(r'/+$'), '');
+    base = sameSiteServer(server.replaceAll(RegExp(r'/+$'), ''));
     capabilities = Map<String, dynamic>.from(await request('/capabilities'));
-    final result = await request(
-      register ? '/auth/register' : '/auth/login',
-      body: {'email': email, 'password': password},
+    await _start(
+      await request(
+        register ? '/auth/register' : '/auth/login',
+        body: {'email': email, 'password': password},
+      ),
     );
+  }
+
+  /// Signs this device back in to [server] with its refresh cookie. False
+  /// when it has none or it lapsed, and on platforms that keep no session.
+  Future<bool> restore(String server) async {
+    if (!keepsSession || server.isEmpty) return false;
+    base = sameSiteServer(server.replaceAll(RegExp(r'/+$'), ''));
+    try {
+      capabilities = Map<String, dynamic>.from(await request('/capabilities'));
+      await _start(await request('/auth/refresh', body: {}));
+      return true;
+    } catch (_) {
+      token = '';
+      return false;
+    }
+  }
+
+  bool has(String conversation) =>
+      conversations.any((c) => c['id'] == conversation);
+
+  Future<void> _start(Map<String, dynamic> result) async {
     token = result['token'];
     user = result['user_id'];
     org = result['org_id'];
-    this.email = email.trim().toLowerCase();
+    email = result['email'] ?? '';
     expiresAtMs = (result['expires_at_ms'] as num?)?.toInt() ?? 0;
     _cache = await LocalCache.open('$base:$user:$org');
     _core = ClientCore(cacheJson: await _cache!.load());
@@ -1030,6 +1116,7 @@ class HubController extends ChangeNotifier {
 
   @override
   void dispose() {
+    _http.close();
     _closed = true;
     _generation++;
     _retry?.cancel();

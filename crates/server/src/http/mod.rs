@@ -32,7 +32,9 @@ pub fn router(app: App) -> Router {
     let cors = CorsLayer::new()
         .allow_origin(origins)
         .allow_methods([Method::GET, Method::POST, Method::PATCH, Method::DELETE])
-        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE]);
+        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
+        // The refresh cookie travels with the web client's `/auth` requests.
+        .allow_credentials(true);
     Router::new()
         .route("/orgs/{org}/search", get(search::endpoint))
         .route("/orgs/{org}/memories", get(memory::list).post(memory::put))
@@ -61,6 +63,7 @@ pub fn router(app: App) -> Router {
         .route("/auth/register", post(auth::register))
         .route("/auth/login", post(auth::login))
         .route("/auth/logout", post(auth::logout))
+        .route("/auth/refresh", post(auth::refresh))
         .route("/auth/ticket", post(auth::ticket))
         .route("/me", get(auth::me))
         .route("/orgs/{org}/policy", get(orgs::policy))
@@ -202,7 +205,7 @@ async fn capabilities(State(app): State<App>) -> Json<Value> {
         vec!["codex", "claude"]
     };
     Json(json!({
-        "chat": if config.llm.enabled { "anthropic" } else { "mock" },
+        "chat": if config.llm.enabled { crate::run_config::default_chat_protocol(config) } else { "mock" },
         "model": if config.llm.enabled { config.llm.model.as_str() } else { "mock" },
         "work": if config.work.enabled { "codex" } else { "mock" },
         "work_model": config.work.model,

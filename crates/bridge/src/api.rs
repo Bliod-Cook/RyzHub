@@ -18,11 +18,7 @@ pub struct Update {
 impl ClientCore {
     #[frb(sync)]
     pub fn new(cache_json: String) -> Result<Self, String> {
-        let engine = if cache_json.is_empty() {
-            Engine::default()
-        } else {
-            serde_json::from_str(&cache_json).map_err(|e| e.to_string())?
-        };
+        let engine = Engine::restore(&cache_json).map_err(|e| e.to_string())?;
         Ok(Self {
             inner: Mutex::new(engine),
         })

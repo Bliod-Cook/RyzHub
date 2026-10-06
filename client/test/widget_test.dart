@@ -48,6 +48,59 @@ void main() {
     await tester.pump();
     expect(sent, ['中文输入']);
   });
+  testWidgets('Enter sends, Shift+Enter breaks the line, IME keeps Enter', (
+    tester,
+  ) async {
+    final sent = <String>[];
+    final focus = FocusNode();
+    addTearDown(focus.dispose);
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: Composer(
+            onSend: (text) async {
+              sent.add(text);
+            },
+            onCancel: () {},
+            running: false,
+            focusNode: focus,
+          ),
+        ),
+      ),
+    );
+    // A caller's focus lands in the message field.
+    focus.requestFocus();
+    await tester.pump();
+    expect(
+      tester.widget<EditableText>(find.byType(EditableText)).focusNode,
+      focus,
+    );
+    expect(focus.hasFocus, isTrue);
+    tester.testTextInput.updateEditingValue(
+      const TextEditingValue(
+        text: 'zhong',
+        selection: TextSelection.collapsed(offset: 5),
+        composing: TextRange(start: 0, end: 5),
+      ),
+    );
+    await tester.sendKeyEvent(LogicalKeyboardKey.enter);
+    await tester.pump();
+    expect(sent, isEmpty);
+    tester.testTextInput.updateEditingValue(
+      const TextEditingValue(
+        text: '第一行',
+        selection: TextSelection.collapsed(offset: 3),
+      ),
+    );
+    await tester.sendKeyDownEvent(LogicalKeyboardKey.shiftLeft);
+    await tester.sendKeyEvent(LogicalKeyboardKey.enter);
+    await tester.sendKeyUpEvent(LogicalKeyboardKey.shiftLeft);
+    await tester.pump();
+    expect(sent, isEmpty);
+    await tester.sendKeyEvent(LogicalKeyboardKey.enter);
+    await tester.pump();
+    expect(sent, ['第一行']);
+  });
   testWidgets(
     'streaming Markdown supports a partial code block and independent copy',
     (tester) async {

@@ -766,7 +766,10 @@ class _Keyboard extends StatelessWidget {
           (tr('搜索对话', 'Search chats'), ['Ctrl', 'K']),
           (tr('收起或展开侧边栏', 'Toggle sidebar'), ['Ctrl', 'Shift', 'S']),
           (tr('打开设置', 'Open settings'), ['Ctrl', ',']),
-          (tr('发送消息', 'Send message'), ['Ctrl', 'Enter']),
+          (
+            tr('发送消息', 'Send message'),
+            prefs.enterToSend ? ['Enter'] : ['Ctrl', 'Enter'],
+          ),
           (
             tr('换行', 'New line'),
             prefs.enterToSend ? ['Shift', 'Enter'] : ['Enter'],

@@ -10,7 +10,7 @@ import 'storage/prefs_store.dart';
 /// Per-client preferences. They belong to this device, not to the account.
 class AppPrefs extends ChangeNotifier {
   String language = 'auto', theme = 'system', accent = 'orange';
-  bool enterToSend = false, sidebarCollapsed = false;
+  bool enterToSend = true, sidebarCollapsed = false;
   String defaultMode = 'chat', defaultHarness = 'codex';
 
   /// Null follows the server's default model.
@@ -45,7 +45,8 @@ class AppPrefs extends ChangeNotifier {
       language = v['language'] ?? language;
       theme = v['theme'] ?? theme;
       accent = v['accent'] ?? accent;
-      enterToSend = v['enter_to_send'] ?? enterToSend;
+      // A new key: `enter_to_send` was false by default, not by choice.
+      enterToSend = v['enter_sends'] ?? enterToSend;
       sidebarCollapsed = v['sidebar_collapsed'] ?? sidebarCollapsed;
       defaultMode = v['default_mode'] ?? defaultMode;
       defaultChatModel = v['default_chat_model'];
@@ -76,7 +77,7 @@ class AppPrefs extends ChangeNotifier {
               'language': language,
               'theme': theme,
               'accent': accent,
-              'enter_to_send': enterToSend,
+              'enter_sends': enterToSend,
               'sidebar_collapsed': sidebarCollapsed,
               'default_mode': defaultMode,
               'default_chat_model': defaultChatModel,

@@ -34,6 +34,7 @@ class _HubPageState extends State<HubPage>
     implements HubActions {
   HubController hub = HubController();
   final composerKey = GlobalKey();
+  final composerFocus = FocusNode();
   final scaffoldKey = GlobalKey<ScaffoldState>();
 
   /// Signing back in with the device's refresh cookie; the login page waits.
@@ -125,6 +126,7 @@ class _HubPageState extends State<HubPage>
     HardwareKeyboard.instance.removeHandler(_shortcut);
     prefs.removeListener(_changed);
     widget.link?.requested.removeListener(_follow);
+    composerFocus.dispose();
     hub.dispose();
     super.dispose();
   }
@@ -184,6 +186,16 @@ class _HubPageState extends State<HubPage>
     closeDrawer();
     // The controller falls back to this device's default model for the mode.
     hub.startDraft(mode: prefs.defaultMode, harness: prefs.defaultHarness);
+    focusComposer();
+  }
+
+  /// A new chat starts at the message field. Touch screens wait for a tap
+  /// rather than raise the keyboard.
+  void focusComposer() {
+    if (touchPlatform) return;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) composerFocus.requestFocus();
+    });
   }
 
   @override
@@ -235,6 +247,7 @@ class _HubPageState extends State<HubPage>
   void openProject(String id) {
     closeDrawer();
     hub.startDraft(project: id);
+    focusComposer();
   }
 
   @override
@@ -446,6 +459,7 @@ class _HubPageState extends State<HubPage>
       // they are meant to come back as commands.
       steer: !draft && (hub.realChat || hub.realWork) && hub.mainlineRunning,
       enterToSend: prefs.enterToSend,
+      focusNode: composerFocus,
       leading: plusMenu(context, hub, action, onNewProject: manageProjects),
       tools: runTools(hub, action),
       trailing: modelControl(hub, action),

@@ -25,7 +25,12 @@ class Composer extends StatefulWidget {
   /// Always put the field above the controls (Work), instead of one row.
   final bool stacked;
   final List<Widget> footer;
+
+  /// Enter sends and Shift+Enter breaks the line; Ctrl+Enter always sends.
   final bool enterToSend;
+
+  /// The text field's focus, for callers that move the cursor to it.
+  final FocusNode? focusNode;
   const Composer({
     super.key,
     required this.onSend,
@@ -38,7 +43,8 @@ class Composer extends StatefulWidget {
     this.trailing,
     this.stacked = false,
     this.footer = const [],
-    this.enterToSend = false,
+    this.enterToSend = true,
+    this.focusNode,
   });
   @override
   State<Composer> createState() => _ComposerState();
@@ -292,6 +298,7 @@ class _ComposerState extends State<Composer> {
                               container: true,
                               child: TextField(
                                 controller: input,
+                                focusNode: widget.focusNode,
                                 minLines: 1,
                                 maxLines: 8,
                                 textInputAction: TextInputAction.newline,

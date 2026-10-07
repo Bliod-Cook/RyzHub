@@ -215,6 +215,19 @@ pub fn catalog(config: &Config) -> Vec<ModelEntry> {
     out
 }
 
+/// What `model` reads besides text. Models without an explicit route read images and PDFs.
+pub fn inputs(config: &Config, model: &str) -> Vec<String> {
+    config
+        .llm
+        .models
+        .iter()
+        .find(|route| route.id == model)
+        .map_or_else(
+            || vec!["image".into(), "pdf".into()],
+            |route| route.inputs.clone(),
+        )
+}
+
 /// The provider behind a wire protocol; also the gateway credential provider.
 pub fn provider(protocol: &str) -> &'static str {
     if protocol == "responses" {
@@ -293,11 +306,13 @@ mod tests {
                 id: "gpt-5.2".into(),
                 protocol: "responses".into(),
                 harnesses: vec!["codex".into(), "chat".into()],
+                ..Default::default()
             },
             ModelRoute {
                 id: "claude-opus-4-6".into(),
                 protocol: "anthropic".into(),
                 harnesses: vec!["claude".into(), "chat".into()],
+                ..Default::default()
             },
         ];
         c

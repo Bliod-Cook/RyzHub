@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:collection';
 import 'dart:convert';
 import 'dart:math';
 
@@ -29,6 +30,52 @@ String conversationTitle(String text) {
         : '${String.fromCharCodes(runes.take(40))}…';
   }
   return tr('新对话', 'New chat');
+}
+
+/// A message on its way to the server: what it said and carried, kept until
+/// the server accepts it, so a refusal can give it back for editing.
+class SentInput {
+  final String channel, text;
+  final List<Map<String, dynamic>> files;
+
+  /// Why the server refused it; empty while it is on its way.
+  final String code;
+  const SentInput({
+    required this.channel,
+    required this.text,
+    required this.files,
+    this.code = '',
+  });
+
+  SentInput refused(String code) =>
+      SentInput(channel: channel, text: text, files: files, code: code);
+}
+
+/// A file for the next message: on its way into the library, in it, or
+/// refused.
+class PendingFile {
+  final String name;
+  final int size;
+
+  /// Local bytes to show an image before the server has it.
+  final Uint8List? thumbnail;
+
+  /// Picked from the library: removing it from the message keeps the file.
+  final bool fromLibrary;
+
+  /// The library entry, once uploaded.
+  String? id;
+  String? kind;
+  String? error;
+  PendingFile({
+    required this.name,
+    required this.size,
+    this.thumbnail,
+    this.fromLibrary = false,
+    this.id,
+    this.kind,
+  });
+  bool get uploading => id == null && error == null;
 }
 
 /// Platform IO only. Protobuf, ordering, deduplication and projection live in Rust.
@@ -99,8 +146,47 @@ class HubController extends ChangeNotifier {
   DateTime _lastFrame = DateTime.now();
   final http.Client _http = sessionClient();
   Future<bool>? _renewing;
+
+  /// Files picked for the next message.
+  final List<PendingFile> pendingFiles = [];
+  final LinkedHashMap<String, Future<Uint8List>> _previews = LinkedHashMap();
+  bool get canAttach => capabilities['attachments'] is Map;
+  int get maxFiles =>
+      (capabilities['attachments']?['max_per_message'] as num?)?.toInt() ?? 10;
+  bool get filesBusy => pendingFiles.any((f) => f.uploading);
+
+  /// The largest file the server accepts, once it has said.
+  int? get maxFileBytes =>
+      (capabilities['attachments']?['max_bytes'] as num?)?.toInt();
+
+  /// Ids of the picked files the server has, in order.
+  List<String> get readyFiles => [
+    for (final f in pendingFiles)
+      if (f.id != null) f.id!,
+  ];
   final String _device =
       'flutter-${DateTime.now().microsecondsSinceEpoch}-${Random().nextInt(1000000)}';
+
+  /// The file library fills the main area in place of a conversation.
+  bool libraryOpen = false;
+
+  /// Messages the server has not accepted yet, by command id.
+  final Map<String, SentInput> _outbox = {};
+
+  /// The last message the server refused, to edit and send again.
+  SentInput? failedSend;
+
+  /// The session ran out and could not be renewed: sign in again.
+  bool sessionEnded = false;
+
+  /// Files the preview steps through, and the one shown; null while there is
+  /// no preview.
+  List<Map<String, dynamic>>? previewFiles;
+  int previewIndex = 0;
+
+  /// The preview was opened from the conversation and floats over it, and
+  /// questions about the file go on in it. Otherwise it is the library's.
+  bool previewInConversation = false;
 
   bool get signedIn => token.isNotEmpty;
   bool get isDraft => selected.isEmpty;
@@ -442,18 +528,26 @@ class HubController extends ChangeNotifier {
       Map<String, dynamic>.from(await request('/me'));
 
   Map<String, dynamic> workspace = {};
-  String workspaceBusy = '';
+
+  /// Workspace jobs under way, by conversation: a job keeps running, and
+  /// belongs to its conversation, while another is open.
+  final Map<String, String> _workspaceBusy = {};
+  String get workspaceBusy => _workspaceBusy[selected] ?? '';
   Future<void> refreshWorkspace() async {
     if (!realWork) return;
-    workspace = Map<String, dynamic>.from(
-      await request('/orgs/$org/conversations/$selected/workspace'),
+    final conv = selected, view = _view;
+    final status = Map<String, dynamic>.from(
+      await request('/orgs/$org/conversations/$conv/workspace'),
     );
+    // Answered after another conversation opened: it is not this one's.
+    if (selected != conv || view != _view) return;
+    workspace = status;
     notifyListeners();
   }
 
   Future<void> workspaceOperation(String kind, {String? conv}) async {
     conv ??= selected;
-    workspaceBusy = kind;
+    _workspaceBusy[conv] = kind;
     notifyListeners();
     try {
       dynamic job;
@@ -498,7 +592,7 @@ class HubController extends ChangeNotifier {
         tr('任务仍在后台运行，请刷新状态。', 'The job is still running. Refresh later.'),
       );
     } finally {
-      workspaceBusy = '';
+      _workspaceBusy.remove(conv);
       notifyListeners();
       // Workspace archive/restore changes the conversation state without a
       // user-channel event.
@@ -552,6 +646,249 @@ class HubController extends ChangeNotifier {
             ? _http.get(url, headers: headers)
             : _http.post(url, headers: headers, body: jsonEncode(body)))
         .timeout(const Duration(seconds: 15));
+  }
+
+  /// Upload [size] bytes from [open] as [name] to the member's library. [open]
+  /// is called again if the access token has to be renewed first.
+  Future<Map<String, dynamic>> uploadFile(
+    String name,
+    int size,
+    Stream<List<int>> Function() open,
+  ) async {
+    Future<http.StreamedResponse> once() {
+      final query = Uri(queryParameters: {'name': name}).query;
+      final request = http.StreamedRequest(
+        'POST',
+        Uri.parse('$base/orgs/$org/attachments?$query'),
+      );
+      request.headers['Authorization'] = 'Bearer $token';
+      request.headers['Content-Type'] = 'application/octet-stream';
+      request.contentLength = size;
+      open().listen(
+        request.sink.add,
+        onDone: request.sink.close,
+        onError: request.sink.addError,
+        cancelOnError: true,
+      );
+      return _http.send(request);
+    }
+
+    var response = await once();
+    if (response.statusCode == 401 && await _renew()) response = await once();
+    final body = await response.stream.bytesToString();
+    final data = body.isEmpty ? null : jsonDecode(body);
+    if (response.statusCode >= 400) {
+      throw Exception(data?['error'] ?? response.statusCode);
+    }
+    return Map<String, dynamic>.from(data);
+  }
+
+  /// A file's bytes from [path], e.g. its preview or content.
+  Future<Uint8List> fileBytes(String path) async {
+    Future<http.Response> once() => _http.get(
+      Uri.parse('$base$path'),
+      headers: {'Authorization': 'Bearer $token'},
+    );
+    var response = await once();
+    if (response.statusCode == 401 && await _renew()) response = await once();
+    if (response.statusCode >= 400) {
+      String? code;
+      try {
+        code = jsonDecode(response.body)['error'];
+      } catch (_) {}
+      throw Exception(code ?? response.statusCode);
+    }
+    return response.bodyBytes;
+  }
+
+  /// An image file as models see it, cached for the timeline.
+  Future<Uint8List> preview(String id) {
+    final cached = _previews.remove(id);
+    final future = cached ?? fileBytes('/orgs/$org/attachments/$id/preview');
+    _previews[id] = future;
+    while (_previews.length > 64) {
+      _previews.remove(_previews.keys.first);
+    }
+    // A failure is not remembered: the next look tries again.
+    future.catchError((_) {
+      _previews.remove(id);
+      return Uint8List(0);
+    });
+    return future;
+  }
+
+  Future<Uint8List> fileContent(String id) =>
+      fileBytes('/orgs/$org/attachments/$id/content');
+
+  /// Files as uploaded that were recently previewed, newest last.
+  final LinkedHashMap<String, Uint8List> _originals = LinkedHashMap();
+
+  /// What [_originals] holds at most, in bytes; a larger file is not kept.
+  static const _originalsBudget = 32 * 1024 * 1024;
+
+  /// A file as uploaded, for the preview: stepping back to a file shows it
+  /// again without fetching it again.
+  Future<Uint8List> original(String id) async {
+    final cached = _originals.remove(id);
+    if (cached != null) return _originals[id] = cached;
+    final bytes = await fileContent(id);
+    if (bytes.length > _originalsBudget) return bytes;
+    _originals[id] = bytes;
+    var held = _originals.values.fold(0, (sum, b) => sum + b.length);
+    while (held > _originalsBudget) {
+      held -= _originals.remove(_originals.keys.first)!.length;
+    }
+    return bytes;
+  }
+
+  /// Preview [files], starting at [index]: over the conversation, or else
+  /// over the main area.
+  void openPreview(
+    List<Map<String, dynamic>> files, {
+    int index = 0,
+    bool inConversation = false,
+  }) {
+    if (files.isEmpty) return;
+    previewFiles = List.unmodifiable(files);
+    previewIndex = index.clamp(0, files.length - 1);
+    previewInConversation = inConversation;
+    notifyListeners();
+  }
+
+  void previewAt(int index) {
+    final files = previewFiles;
+    if (files == null || index < 0 || index >= files.length) return;
+    previewIndex = index;
+    notifyListeners();
+  }
+
+  void closePreview() {
+    if (previewFiles == null) return;
+    previewFiles = null;
+    notifyListeners();
+  }
+
+  /// Show the file library instead of a conversation; the conversation
+  /// closes as when a new chat starts.
+  void openLibrary() {
+    startDraft();
+    libraryOpen = true;
+    notifyListeners();
+  }
+
+  /// The member's files, newest first: those whose name contains [query] and,
+  /// given [kinds], only of those kinds; given [direction], only uploads
+  /// (`upload`) or files models handed over (`output`).
+  Future<List<Map<String, dynamic>>> library({
+    String? before,
+    String? query,
+    List<String>? kinds,
+    String? direction,
+  }) async {
+    final path = Uri(
+      path: '/orgs/$org/attachments',
+      queryParameters: {
+        'before': ?before,
+        if (query != null && query.trim().isNotEmpty) 'q': query.trim(),
+        if (kinds != null) 'kind': kinds.join(','),
+        'direction': ?direction,
+      },
+    ).toString();
+    final data = await request(path);
+    return [
+      for (final file in data['files'] as List)
+        Map<String, dynamic>.from(file as Map),
+    ];
+  }
+
+  /// Delete a file everywhere: every conversation that carried it loses it,
+  /// and so does the next message.
+  Future<void> deleteFile(String id) async {
+    await request('/orgs/$org/attachments/$id', method: 'DELETE');
+    _previews.remove(id);
+    _originals.remove(id);
+    final before = pendingFiles.length;
+    pendingFiles.removeWhere((f) => f.id == id);
+    if (pendingFiles.length != before) notifyListeners();
+  }
+
+  /// Upload a file for the next message.
+  Future<void> attach(
+    String name,
+    int size,
+    Stream<List<int>> Function() open, {
+    Uint8List? thumbnail,
+  }) async {
+    final file = PendingFile(name: name, size: size, thumbnail: thumbnail);
+    pendingFiles.add(file);
+    notifyListeners();
+    final limit = maxFileBytes;
+    if (pendingFiles.length > maxFiles) {
+      file.error = 'TOO_MANY_ATTACHMENTS';
+    } else if (limit != null && size > limit) {
+      file.error = 'ATTACHMENT_TOO_LARGE';
+    } else {
+      try {
+        final uploaded = await uploadFile(name, size, open);
+        file.id = uploaded['id'] as String;
+        file.kind = uploaded['kind'] as String?;
+        // Removed while it uploaded: nothing will send it.
+        if (!pendingFiles.contains(file)) {
+          unawaited(deleteFile(file.id!).catchError((_) {}));
+        }
+      } catch (e) {
+        file.error = '$e'.replaceFirst('Exception: ', '');
+      }
+    }
+    notifyListeners();
+  }
+
+  /// Add files of the library to the next message.
+  void attachFromLibrary(Iterable<Map<String, dynamic>> files) {
+    for (final file in files) {
+      if (pendingFiles.any((f) => f.id == file['id'])) continue;
+      pendingFiles.add(
+        PendingFile(
+          name: file['name'] as String,
+          size: (file['size'] as num).toInt(),
+          fromLibrary: true,
+          id: file['id'] as String,
+          kind: file['kind'] as String?,
+        ),
+      );
+    }
+    notifyListeners();
+  }
+
+  /// Take a file off the next message. A file uploaded for it is deleted; one
+  /// from the library stays there.
+  void detach(PendingFile file) {
+    pendingFiles.remove(file);
+    if (!file.fromLibrary && file.id != null) {
+      unawaited(deleteFile(file.id!).catchError((_) {}));
+    }
+    notifyListeners();
+  }
+
+  /// Renew the session before it ends and carry the connection over to the new
+  /// token, keeping its channels. Without a renewal the server closes the
+  /// connection at expiry, and reconnecting ends the session.
+  Future<void> _carryOver() async {
+    if (await _renew()) _socket?.sink.add(_core!.authRefresh(token: token));
+  }
+
+  /// The session ran out and could not be renewed. The page signs in afresh;
+  /// the cache, with any queued command, stays for the next sign-in.
+  void _endSession() {
+    if (sessionEnded) return;
+    sessionEnded = true;
+    _closed = true;
+    _generation++;
+    _retry?.cancel();
+    _resend?.cancel();
+    _heartbeat?.cancel();
+    connection = 'offline';
+    notifyListeners();
   }
 
   /// A new access token through the device's refresh cookie, shared by the
@@ -614,7 +951,12 @@ class HubController extends ChangeNotifier {
     email = result['email'] ?? '';
     expiresAtMs = (result['expires_at_ms'] as num?)?.toInt() ?? 0;
     _cache = await LocalCache.open('$base:$user:$org');
-    _core = ClientCore(cacheJson: await _cache!.load());
+    _core = ClientCore(
+      records: [
+        for (final MapEntry(:key, :value) in (await _cache!.load()).entries)
+          CacheRecord(key: key, value: value),
+      ],
+    );
     final restored =
         jsonDecode(_core!.viewJson())['channels'] as Map<String, dynamic>;
     for (final entry in restored.entries) {
@@ -670,6 +1012,8 @@ class HubController extends ChangeNotifier {
     String? project,
   }) {
     _view++;
+    libraryOpen = false;
+    previewFiles = null;
     selected = '';
     workspace = {};
     commandCatalog = {};
@@ -764,6 +1108,8 @@ class HubController extends ChangeNotifier {
   Future<void> select(String id) async {
     searchFocusSeq = null;
     final view = ++_view;
+    libraryOpen = false;
+    previewFiles = null;
     selected = id;
     workspace = {};
     commandCatalog = {};
@@ -776,33 +1122,114 @@ class HubController extends ChangeNotifier {
     notifyListeners();
   }
 
-  Future<void> send(String text) async {
-    if (text.trim().isEmpty) return;
+  /// Send [text] with the files picked in the composer, or with the files
+  /// in [only], leaving the composer's other files for the next message.
+  Future<void> send(String text, {List<Map<String, dynamic>>? only}) async {
+    final picked = only == null;
+    final carried =
+        only ??
+        [
+          for (final f in pendingFiles)
+            if (f.id != null)
+              {'id': f.id, 'name': f.name, 'size': f.size, 'kind': f.kind},
+        ];
+    final files = [for (final f in carried) f['id'] as String];
+    if ((text.trim().isEmpty && files.isEmpty) || (picked && filesBusy)) {
+      return;
+    }
     searchFocusSeq = null;
-    if (isDraft) return _createAndSend(text);
+    if (isDraft) return _createAndSend(text, carried, picked: picked);
     final ch = channel, steerable = realChat || realWork;
     final pending = _pendingConfig[ch]?.isNotEmpty == true
         ? Map<String, dynamic>.of(_pendingConfig[ch]!)
         : null;
     await _schedule(
-      () =>
-          steerable &&
-              (_runs[ch] ?? []).any(
-                (r) =>
-                    r['read_only'] != true &&
-                    (r['state'] == 'running' ||
-                        r['state'] == 'requires_action'),
-              )
-          ? _core!.steer(channel: ch, text: text)
-          : _core!.sendText(
-              channel: ch,
-              text: text,
-              configJson: pending == null ? null : jsonEncode(pending),
-            ),
+      () => _remember(
+        steerable &&
+                (_runs[ch] ?? []).any(
+                  (r) =>
+                      r['read_only'] != true &&
+                      (r['state'] == 'running' ||
+                          r['state'] == 'requires_action'),
+                )
+            ? _core!.steer(channel: ch, text: text, attachmentIds: files)
+            : _core!.sendText(
+                channel: ch,
+                text: text,
+                configJson: pending == null ? null : jsonEncode(pending),
+                attachmentIds: files,
+              ),
+        SentInput(channel: ch, text: text, files: carried),
+      ),
     );
+    _sent(files);
   }
 
-  Future<void> _createAndSend(String text) async {
+  /// [update], with the message it queued kept under its command id before
+  /// anything goes out, so its result always finds it.
+  Update _remember(Update update, SentInput input) {
+    final cid = update.cid;
+    if (cid != null) _outbox[cid] = input;
+    return update;
+  }
+
+  /// The commands the server finished with: accepted ones are forgotten, a
+  /// refused message comes back for editing.
+  void _results(String json) {
+    for (final result in jsonDecode(json) as List) {
+      final cid = result['cid'] as String;
+      final sent = _outbox.remove(cid);
+      if (result['accepted'] == true) continue;
+      if (result['retryable'] == true) {
+        // The same command goes again.
+        if (sent != null) _outbox[cid] = sent;
+        continue;
+      }
+      final code = result['code'] as String;
+      // A refused setting must not ride along with this conversation's
+      // later messages; other conversations keep theirs.
+      if (_configErrors.contains(code)) {
+        _pendingConfig.remove(result['channel']);
+      }
+      if (sent != null) {
+        failedSend = sent.refused(code);
+      } else {
+        error = code;
+      }
+    }
+  }
+
+  @visibleForTesting
+  void debugQueued(String cid, SentInput input) => _outbox[cid] = input;
+
+  @visibleForTesting
+  void debugResults(String json) => _results(json);
+
+  @visibleForTesting
+  void debugPendingConfig(String channel, Map<String, dynamic> patch) =>
+      (_pendingConfig[channel] ??= {}).addAll(patch);
+
+  /// Take back the refused message, to edit and send again.
+  SentInput? takeFailedSend() {
+    final failed = failedSend;
+    failedSend = null;
+    notifyListeners();
+    return failed;
+  }
+
+  /// The files went with a message: the composer no longer holds them.
+  void _sent(List<String> files) {
+    if (files.isEmpty) return;
+    pendingFiles.removeWhere((f) => files.contains(f.id));
+    notifyListeners();
+  }
+
+  Future<void> _createAndSend(
+    String text,
+    List<Map<String, dynamic>> carried, {
+    required bool picked,
+  }) async {
+    final files = [for (final f in carried) f['id'] as String];
     if (creating) return;
     creating = true;
     notifyListeners();
@@ -816,7 +1243,11 @@ class HubController extends ChangeNotifier {
         await request(
           '/orgs/$org/conversations',
           body: {
-            'title': conversationTitle(text),
+            'title': conversationTitle(
+              text.trim().isEmpty && picked && pendingFiles.isNotEmpty
+                  ? pendingFiles.first.name
+                  : text,
+            ),
             'mode': mode,
             'project_id': project,
             if (temporary && canTemporary) 'temporary': true,
@@ -842,7 +1273,13 @@ class HubController extends ChangeNotifier {
       temporary = false;
       notifyListeners();
       await _schedule(() => _core!.subscribe(channel: ch));
-      await _schedule(() => _core!.sendText(channel: ch, text: text));
+      await _schedule(
+        () => _remember(
+          _core!.sendText(channel: ch, text: text, attachmentIds: files),
+          SentInput(channel: ch, text: text, files: carried),
+        ),
+      );
+      _sent(files);
       unawaited(refreshCommands().catchError((_) {}));
       if (realWork) unawaited(refreshWorkspace().catchError((_) {}));
     } finally {
@@ -899,8 +1336,12 @@ class HubController extends ChangeNotifier {
   }
 
   Future<void> _apply(Update update) async {
-    // The caller is serialized. Write the command queue/cursor before any network send.
-    if (update.cacheJson != null) await _cache!.save(update.cacheJson!);
+    // The caller is serialized. Write the command queue/cursor before any network send; only
+    // stored commands are ever sent again.
+    if (update.cacheWrites.isNotEmpty) {
+      await _cache!.write({for (final w in update.cacheWrites) w.key: w.value});
+      _core!.committed();
+    }
     var needsConversationRefresh = false;
     var needsCommandRefresh = false;
     for (final diff in jsonDecode(update.changesJson) as List) {
@@ -958,11 +1399,9 @@ class HubController extends ChangeNotifier {
     }
     if (needsConversationRefresh) await refreshConversations();
     if (needsCommandRefresh) unawaited(refreshCommands().catchError((_) {}));
-    if (update.error != null) {
-      error = update.error!;
-      // A rejected setting must not ride along with every later message.
-      if (_configErrors.contains(update.error)) _pendingConfig.clear();
-    }
+    if (update.error != null) error = update.error!;
+    _results(update.resultsJson);
+    if (update.authExpiring) unawaited(_carryOver());
     if (connection == 'online') {
       for (final bytes in update.outboundFrames) {
         _socket?.sink.add(bytes);
@@ -1040,6 +1479,12 @@ class HubController extends ChangeNotifier {
         onDone: () => _disconnected(generation),
       );
     } catch (e) {
+      // The ticket request renews an expired token itself; refused still, the
+      // session is over rather than the network down.
+      if ('$e'.contains('UNAUTHORIZED')) {
+        _connecting = false;
+        return _endSession();
+      }
       _connectionError(e);
       _disconnected(generation);
     } finally {

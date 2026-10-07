@@ -5,12 +5,22 @@ use sqlx::PgPool;
 use std::{future::Future, time::Duration};
 use tokio::task::JoinSet;
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+    // Decodes one uploaded image for the server, before any runtime or thread exists.
+    if args.get(1).is_some_and(|role| role == "render-image") {
+        return ryzhub_execution::picture::child_main(&args[2..]);
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run(args))
+}
+
+async fn run(args: Vec<String>) -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
-    let args: Vec<String> = std::env::args().collect();
     let role = args.get(1).map_or("all", String::as_str);
     if matches!(role, "migrate" | "maintain" | "reindex") {
         return maintain(role, args.iter().any(|a| a == "--loop")).await;
@@ -51,6 +61,10 @@ async fn main() -> anyhow::Result<()> {
         supervise("memory and conversation collector", {
             let (app, worker) = (app.clone(), worker.clone());
             move || ryzhub_server::memory::collector(app.clone(), worker.clone())
+        });
+        supervise("attachment collector", {
+            let (app, worker) = (app.clone(), worker.clone());
+            move || ryzhub_server::attachments::gc::collector(app.clone(), worker.clone())
         });
         supervise("retention", {
             let (app, worker) = (app.clone(), worker.clone());

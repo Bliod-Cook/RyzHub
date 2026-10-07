@@ -3,6 +3,7 @@ import { query, forkSession, type Query, type SDKUserMessage, type PermissionRes
 import { createInterface } from 'node:readline';
 import { randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
+import { posix } from 'node:path';
 
 type Json = Record<string, any>;
 const emit = (value: Json) => process.stdout.write(JSON.stringify(value) + '\n');
@@ -11,8 +12,8 @@ class Input implements AsyncIterable<SDKUserMessage> {
   private items: SDKUserMessage[] = [];
   private wake?: () => void;
   closed = false;
-  push(text: string, uuid: string, session: string) {
-    this.items.push({type:'user',message:{role:'user',content:text},parent_tool_use_id:null,session_id:session,uuid:uuid as `${string}-${string}-${string}-${string}-${string}`});
+  push(content: string | Json[], uuid: string, session: string) {
+    this.items.push({type:'user',message:{role:'user',content:content as any},parent_tool_use_id:null,session_id:session,uuid:uuid as `${string}-${string}-${string}-${string}-${string}`});
     this.wake?.();
   }
   close() { this.closed=true; this.wake?.(); }
@@ -22,6 +23,32 @@ class Input implements AsyncIterable<SDKUserMessage> {
       while (this.items.length) yield this.items.shift()!;
     }
   }
+}
+/** Largest image sent as is: 5 MB once base64-encoded. */
+const MAX_IMAGE = 3_932_160;
+/** An attached image as a content block; undefined for anything else under /attachments or elsewhere. */
+async function image(path: string): Promise<Json | undefined> {
+  if (!posix.normalize(path).startsWith('/attachments/')) return undefined;
+  const data = await readFile(path).catch(() => undefined);
+  if (!data || data.length > MAX_IMAGE) return undefined;
+  const head = (start: number, end: number) => data.subarray(start, end).toString('latin1');
+  const type = head(0, 8) === '\x89PNG\r\n\x1a\n' ? 'image/png'
+    : data[0] === 0xff && data[1] === 0xd8 && data[2] === 0xff ? 'image/jpeg'
+    : head(0, 4) === 'RIFF' && head(8, 12) === 'WEBP' ? 'image/webp'
+    : head(0, 6) === 'GIF87a' || head(0, 6) === 'GIF89a' ? 'image/gif'
+    : undefined;
+  return type && {type:'image', source:{type:'base64', media_type:type, data:data.toString('base64')}};
+}
+/** A turn's input as message content: images first, then the text. */
+async function content(items: Json[]): Promise<string | Json[]> {
+  const text = items.filter(i => i.type === 'text').map(i => i.text ?? '').join('\n');
+  const blocks: Json[] = [];
+  for (const item of items) {
+    if (item.type !== 'localImage' || typeof item.path !== 'string') continue;
+    blocks.push(await image(item.path) ?? {type:'text', text:`[Image ${item.path} could not be attached; open it with your tools.]`});
+  }
+  if (!blocks.length) return text;
+  return text.trim() ? [...blocks, {type:'text', text}] : blocks;
 }
 let sdk: Query | undefined;
 let input: Input | undefined;
@@ -151,7 +178,7 @@ async function handle(request:Json):Promise<any> {
       await start();turn=randomUUID();interrupted=false;
       const id=turn;
       // Reply before any projection event so the server can register the native turn.
-      setImmediate(()=>input!.push((p.input??[]).map((i:Json)=>i.text??'').join('\n'),id,session));
+      setImmediate(()=>void content(p.input??[]).then(message=>input!.push(message,id,session)));
       return {turn:{id}};
     }
     case 'turn/steer':throw new Error('STEER_EMULATED_QUEUE_NEXT_TURN');

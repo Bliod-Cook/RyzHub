@@ -132,6 +132,10 @@ pub struct Policy {
     pub allow_full_auto: Option<bool>,
     pub allow_projects: Option<bool>,
     pub project_file_bytes: Option<u64>,
+    /// Largest file a member may upload to their file library.
+    pub attachment_bytes: Option<u64>,
+    /// Total size of one member's file library.
+    pub attachment_quota_bytes: Option<u64>,
 }
 
 fn intersection(
@@ -179,6 +183,8 @@ impl Policy {
             allow_full_auto: cap(self.allow_full_auto, lower.allow_full_auto),
             allow_projects: cap(self.allow_projects, lower.allow_projects),
             project_file_bytes: cap(self.project_file_bytes, lower.project_file_bytes),
+            attachment_bytes: cap(self.attachment_bytes, lower.attachment_bytes),
+            attachment_quota_bytes: cap(self.attachment_quota_bytes, lower.attachment_quota_bytes),
         }
     }
 
@@ -219,11 +225,14 @@ mod tests {
             models: Some(BTreeSet::from(["a".into(), "b".into()])),
             max_sandboxes: Some(4),
             allow_memory: Some(false),
+            attachment_bytes: Some(50),
             ..Default::default()
         };
         let org = Policy {
             models: Some(BTreeSet::from(["b".into(), "c".into()])),
             max_sandboxes: Some(2),
+            attachment_bytes: Some(80),
+            attachment_quota_bytes: Some(1000),
             ..Default::default()
         };
         let user = Policy {
@@ -235,6 +244,8 @@ mod tests {
         assert_eq!(merged.models, Some(BTreeSet::from(["b".into()])));
         assert_eq!(merged.max_sandboxes, Some(2));
         assert_eq!(merged.allow_memory, Some(false));
+        assert_eq!(merged.attachment_bytes, Some(50));
+        assert_eq!(merged.attachment_quota_bytes, Some(1000));
         assert_eq!(
             merged
                 .restrict(&Policy {

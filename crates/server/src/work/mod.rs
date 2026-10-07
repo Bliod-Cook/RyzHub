@@ -156,7 +156,8 @@ async fn open_thread(
     };
     let instructions = {
         let mut tx = app.store.fenced(lease).await?;
-        let instructions = crate::projects::instructions(&mut tx, lease, run, &app.config).await?;
+        let instructions =
+            crate::projects::harness_instructions(&mut tx, lease, run, &app.config).await?;
         tx.commit().await?;
         instructions
     };
@@ -266,13 +267,29 @@ async fn deliver(
         .bind(run)
         .fetch_one(&mut *tx)
         .await?;
-        let inputs: Vec<(i64, String, String, Uuid)> = sqlx::query_as(
-            "SELECT id,text,kind,item_id FROM pending_inputs WHERE org_id=$1 AND run_id=$2 AND consumed_step IS NULL ORDER BY id",
+        let pending: Vec<(i64, String, String, Uuid, Vec<Uuid>)> = sqlx::query_as(
+            "SELECT id,text,kind,item_id,attachment_ids FROM pending_inputs WHERE org_id=$1 AND run_id=$2 AND consumed_step IS NULL ORDER BY id",
         )
         .bind(lease.org_id)
         .bind(run)
         .fetch_all(&mut *tx)
         .await?;
+        // Files become a list of paths in the text, plus the images the model takes as is.
+        let mut inputs = Vec::with_capacity(pending.len());
+        for (seq, text, kind, item, files) in pending {
+            let (text, images) = if files.is_empty() {
+                (text, vec![])
+            } else {
+                let (list, images) = crate::attachments::turn_files(&mut tx, lease, &files).await?;
+                let text = if text.trim().is_empty() {
+                    list
+                } else {
+                    format!("{text}\n\n{list}")
+                };
+                (text, images)
+            };
+            inputs.push((seq, text, kind, item, !files.is_empty(), images));
+        }
         let answers: Vec<(String, Value)> = sqlx::query_as(
             "SELECT request_id,answer FROM native_requests WHERE org_id=$1 AND sandbox_id=$2
              AND answer IS NOT NULL AND NOT delivered",
@@ -327,7 +344,11 @@ async fn deliver(
         tx.commit().await?;
     }
     let claude = settings.harness == "claude";
-    for (seq, text, kind, item) in inputs {
+    // Files sent since the sandbox started must be in /attachments before the turn names them.
+    if inputs.iter().any(|input| input.4) {
+        crate::attachments::sandbox::sync(app, lease, sandbox_id).await?;
+    }
+    for (seq, text, kind, item, _, images) in inputs {
         let steer = kind == "steer";
         // Claude has no native steer: steers wait for the next turn of the same run.
         let queued = steer && claude;
@@ -352,6 +373,7 @@ async fn deliver(
                     thread_id: thread.into(),
                     text,
                     settings: session::turn_settings(settings),
+                    images,
                 }
             }
         } else {
@@ -359,6 +381,7 @@ async fn deliver(
                 thread_id: thread.into(),
                 turn_id: turn.clone().unwrap_or_default(),
                 text,
+                images,
             }
         };
         let starts_turn = matches!(request, HarnessRequest::StartTurn { .. });

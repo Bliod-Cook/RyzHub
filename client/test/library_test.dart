@@ -1,0 +1,195 @@
+import 'dart:typed_data';
+
+import 'package:flutter/gestures.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:ryzhub/controller.dart';
+import 'package:ryzhub/main.dart';
+import 'package:ryzhub/ui/library.dart';
+
+Map<String, dynamic> _file(String id, String name, String kind) => {
+  'id': id,
+  'name': name,
+  'kind': kind,
+  // A model made the report.
+  'direction': id == 'f3' ? 'output' : 'upload',
+  'size': 2048,
+  'created_at': '2026-09-18T10:00:00Z',
+  'conversations': id == 'f1' ? 2 : 0,
+};
+
+/// A hub whose library is a fixed list, filtered the way the server filters.
+class _Hub extends HubController {
+  final searches = <(String?, List<String>?)>[];
+  final deleted = <String>[];
+  final files = [
+    _file('f3', 'Report.pdf', 'pdf'),
+    _file('f2', 'notes.md', 'text'),
+    _file('f1', 'chart.png', 'image'),
+  ];
+  _Hub() {
+    capabilities = {
+      'attachments': {'max_bytes': 100, 'max_per_message': 2},
+    };
+    org = 'org';
+  }
+
+  @override
+  Future<List<Map<String, dynamic>>> library({
+    String? before,
+    String? query,
+    List<String>? kinds,
+    String? direction,
+  }) async {
+    searches.add((query, kinds));
+    final words = (query ?? '').toLowerCase();
+    return [
+      for (final file in files)
+        if ((kinds == null || kinds.contains(file['kind'])) &&
+            (direction == null || file['direction'] == direction) &&
+            '${file['name']}'.toLowerCase().contains(words))
+          file,
+    ];
+  }
+
+  @override
+  Future<Uint8List> preview(String id) async => Uint8List(0);
+
+  @override
+  Future<void> deleteFile(String id) async => deleted.add(id);
+}
+
+Future<void> _show(
+  WidgetTester tester,
+  _Hub hub, {
+  Size? size,
+  ValueChanged<Map<String, dynamic>>? onUse,
+}) async {
+  tester.view.physicalSize = size ?? const Size(1200, 900);
+  tester.view.devicePixelRatio = 1;
+  addTearDown(tester.view.reset);
+  await tester.pumpWidget(
+    MaterialApp(
+      home: Scaffold(
+        body: LibraryView(hub: hub, onUse: onUse ?? (_) {}),
+      ),
+    ),
+  );
+  await tester.pumpAndSettle();
+}
+
+void main() {
+  setUpAll(() => prefs.language = 'en');
+  setUp(() => prefs.libraryList = false);
+
+  test('an upload date names the year only when it is not this one', () {
+    final now = DateTime(2026, 10, 6);
+    expect(uploadedOn('2026-09-18T10:00:00', now: now), 'Uploaded Sep 18');
+    expect(uploadedOn('2025-01-02T10:00:00', now: now), 'Uploaded Jan 2, 2025');
+    expect(uploadedOn(null, now: now), '');
+  });
+
+  test('the library replaces the conversation until one opens', () {
+    final hub = _Hub()..selected = 'c1';
+    hub.openLibrary();
+    expect(hub.libraryOpen, isTrue);
+    expect(hub.isDraft, isTrue);
+    hub.startDraft();
+    expect(hub.libraryOpen, isFalse);
+  });
+
+  testWidgets('files are searched by name and filtered by kind', (
+    tester,
+  ) async {
+    final hub = _Hub();
+    await _show(tester, hub);
+    expect(find.text('Report.pdf'), findsOneWidget);
+    expect(find.text('notes.md'), findsOneWidget);
+    // A picture fills its card; its name is for assistive tech and hover.
+    expect(find.bySemanticsLabel('chart.png'), findsWidgets);
+    expect(find.text('Uploaded Sep 18'), findsOneWidget);
+    expect(find.text('Made by AI Sep 18'), findsOneWidget);
+
+    await tester.enterText(find.byType(TextField), 'NOTES');
+    await tester.pump(const Duration(milliseconds: 350));
+    await tester.pumpAndSettle();
+    expect(hub.searches.last, ('NOTES', null));
+    expect(find.text('notes.md'), findsOneWidget);
+    expect(find.text('Report.pdf'), findsNothing);
+
+    await tester.tap(find.byTooltip('Clear'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Documents'));
+    await tester.pumpAndSettle();
+    expect(hub.searches.last.$1, '');
+    expect(hub.searches.last.$2, ['pdf', 'text']);
+    expect(find.bySemanticsLabel('chart.png'), findsNothing);
+
+    await tester.tap(find.text('Other'));
+    await tester.pumpAndSettle();
+    expect(find.text('No matching files'), findsOneWidget);
+
+    await tester.tap(find.text('AI-made'));
+    await tester.pumpAndSettle();
+    expect(find.text('Report.pdf'), findsOneWidget);
+    expect(find.text('notes.md'), findsNothing);
+  });
+
+  testWidgets('rows show size and use, and a file is deleted after asking', (
+    tester,
+  ) async {
+    final hub = _Hub();
+    await _show(tester, hub);
+    await tester.tap(find.byTooltip('List view'));
+    await tester.pumpAndSettle();
+    expect(prefs.libraryList, isTrue);
+    expect(
+      find.text('2.0 KB · Uploaded Sep 18 · In 2 conversations'),
+      findsOneWidget,
+    );
+
+    await tester.tap(find.byTooltip('File options').last);
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Delete'));
+    await tester.pumpAndSettle();
+    expect(find.textContaining('removed from the 2 conversations'), findsOne);
+    await tester.tap(find.widgetWithText(FilledButton, 'Delete'));
+    await tester.pumpAndSettle();
+    expect(hub.deleted, ['f1']);
+    expect(find.text('chart.png'), findsNothing);
+    expect(find.text('Report.pdf'), findsOneWidget);
+  });
+
+  testWidgets('a picture\'s menu still acts once the pointer leaves for it', (
+    tester,
+  ) async {
+    final used = <String>[];
+    await _show(tester, _Hub(), onUse: (file) => used.add(file['id']));
+    final mouse = await tester.createGesture(kind: PointerDeviceKind.mouse);
+    await mouse.addPointer(
+      location: tester.getCenter(find.bySemanticsLabel('chart.png').last),
+    );
+    addTearDown(mouse.removePointer);
+    await tester.pumpAndSettle();
+    await tester.tap(find.byTooltip('File options').last);
+    await tester.pumpAndSettle();
+    // Over the menu, the card is no longer hovered and its name fades out.
+    await mouse.moveTo(tester.getCenter(find.text('Use in new chat')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Use in new chat'));
+    await tester.pumpAndSettle();
+    expect(used, ['f1']);
+  }, variant: TargetPlatformVariant.only(TargetPlatform.linux));
+
+  testWidgets('a narrow screen stacks the search under the title', (
+    tester,
+  ) async {
+    final hub = _Hub()..files.clear();
+    await _show(tester, hub, size: const Size(390, 800));
+    expect(find.text('No files yet'), findsOneWidget);
+    final title = tester.getRect(find.text('Library'));
+    final search = tester.getRect(find.byType(TextField));
+    expect(search.top, greaterThan(title.bottom));
+    expect(tester.takeException(), isNull);
+  });
+}

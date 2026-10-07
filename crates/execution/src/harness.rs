@@ -47,11 +47,17 @@ pub enum HarnessRequest {
         thread_id: String,
         text: String,
         settings: TurnSettings,
+        /// Images under `/attachments` the model sees with the text. Omitted when empty, so
+        /// journaled requests without images keep their fingerprints.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<String>,
     },
     SteerTurn {
         thread_id: String,
         turn_id: String,
         text: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<String>,
     },
     InterruptTurn {
         thread_id: String,

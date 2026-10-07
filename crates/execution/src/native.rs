@@ -271,8 +271,15 @@ fn approval_policy(settings: &TurnSettings) -> &'static str {
     }
 }
 
-fn text_input(text: &str) -> Value {
-    json!([{"type":"text","text":text,"text_elements":[]}])
+/// A user turn's input: the text, then each image as a local file the harness reads.
+fn user_input(text: &str, images: &[String]) -> Value {
+    let mut input = vec![json!({"type":"text","text":text,"text_elements":[]})];
+    input.extend(
+        images
+            .iter()
+            .map(|path| json!({"type":"localImage","path":path})),
+    );
+    Value::Array(input)
 }
 
 fn translate(harness: Harness, request: &HarnessRequest) -> Option<(&'static str, Value)> {
@@ -321,8 +328,9 @@ fn translate(harness: Harness, request: &HarnessRequest) -> Option<(&'static str
             thread_id,
             text,
             settings,
+            images,
         } => {
-            let mut params = json!({"threadId":thread_id,"input":text_input(text)});
+            let mut params = json!({"threadId":thread_id,"input":user_input(text, images)});
             if harness == Harness::Codex {
                 params["model"] = json!(settings.model);
                 params["effort"] = json!(settings.reasoning);
@@ -339,9 +347,10 @@ fn translate(harness: Harness, request: &HarnessRequest) -> Option<(&'static str
             thread_id,
             turn_id,
             text,
+            images,
         } => (
             "turn/steer",
-            json!({"threadId":thread_id,"expectedTurnId":turn_id,"input":text_input(text)}),
+            json!({"threadId":thread_id,"expectedTurnId":turn_id,"input":user_input(text, images)}),
         ),
         HarnessRequest::InterruptTurn { thread_id, turn_id } => (
             "turn/interrupt",
@@ -739,10 +748,34 @@ mod tests {
                     plan: true,
                     ..Default::default()
                 },
+                images: vec![],
             },
         )
         .unwrap();
         assert_eq!(turn.1["collaborationMode"]["mode"], "plan");
+        assert_eq!(turn.1["input"].as_array().unwrap().len(), 1);
+        let steer = HarnessRequest::SteerTurn {
+            thread_id: "th".into(),
+            turn_id: "t1".into(),
+            text: "look".into(),
+            images: vec!["/attachments/a.png".into()],
+        };
+        let (_, params) = translate(Harness::Codex, &steer).unwrap();
+        assert_eq!(
+            params["input"][1],
+            json!({"type":"localImage","path":"/attachments/a.png"})
+        );
+        // Requests without images serialize as before, so journal fingerprints hold.
+        let plain = HarnessRequest::SteerTurn {
+            thread_id: "th".into(),
+            turn_id: "t1".into(),
+            text: "look".into(),
+            images: vec![],
+        };
+        assert_eq!(
+            serde_json::to_value(&plain).unwrap(),
+            json!({"type":"steer_turn","thread_id":"th","turn_id":"t1","text":"look"})
+        );
         assert!(
             translate(
                 Harness::Codex,

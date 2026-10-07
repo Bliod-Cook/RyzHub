@@ -166,6 +166,11 @@ void main() {
           'arguments_json': '{"url":"https://a.example/post"}',
         },
       ),
+      _item(
+        'image',
+        'tool',
+        tool: {'name': 'view_image', 'arguments_json': '{"path":"chart.png"}'},
+      ),
     ];
     await tester.pumpWidget(
       MaterialApp(
@@ -185,6 +190,7 @@ void main() {
       find.textContaining('Searched the web “https://a.example/post”'),
       findsOneWidget,
     );
+    expect(find.textContaining('Viewed an image chart.png'), findsOneWidget);
     await tester.pumpWidget(const SizedBox());
   });
 
@@ -194,15 +200,20 @@ void main() {
       'tool',
       tool: {'name': 'web_search', 'arguments_json': '{"query":"q"}'},
     );
+    final image = _item(
+      'image',
+      'tool',
+      tool: {'name': 'view_image', 'arguments_json': '{"path":"a.png"}'},
+    );
     for (final (language, label) in [
-      ('en', 'Searched the web twice, used 1 tool'),
-      ('zh', '已搜索网页 2 次，调用 1 个工具'),
+      ('en', 'Searched the web twice, viewed 1 image, used 1 tool'),
+      ('zh', '已搜索网页 2 次，查看 1 张图片，调用 1 个工具'),
     ]) {
       prefs.language = language;
       await tester.pumpWidget(
         MaterialApp(
           home: Scaffold(
-            body: StepsGroup(steps: [web('a'), _run[3], web('b')]),
+            body: StepsGroup(steps: [web('a'), _run[3], image, web('b')]),
           ),
         ),
       );

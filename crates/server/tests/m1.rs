@@ -31,6 +31,9 @@ use tokio::{
 use uuid::Uuid;
 
 type Requests = Arc<Mutex<Vec<(Value, HeaderMap)>>>;
+/// A 1×1 PNG, small enough to reach the model unchanged.
+const DOT_PNG: &str =
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
 async fn upstream(
     State(requests): State<Requests>,
     headers: HeaderMap,
@@ -38,12 +41,32 @@ async fn upstream(
 ) -> axum::response::Response {
     requests.lock().unwrap().push((body.clone(), headers));
     let last = body["messages"].as_array().unwrap().last().unwrap()["content"].clone();
-    let prompt = last.as_str().unwrap_or("");
+    // A message carrying files is a list of parts; its text parts make the prompt.
+    let prompt = match &last {
+        Value::Array(parts) => parts
+            .iter()
+            .filter(|part| part["type"] == "text")
+            .filter_map(|part| part["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        other => other.as_str().unwrap_or("").to_owned(),
+    };
+    let prompt = prompt.as_str();
     let result = last
         .as_array()
         .is_some_and(|blocks| blocks.iter().any(|b| b["type"] == "tool_result"));
     // Re-sent assistant content continues a paused turn.
     let continued = body["messages"].as_array().unwrap().last().unwrap()["role"] == "assistant";
+    // What the member last asked, past the tool results that followed it.
+    let asked = body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rev()
+        .filter(|m| m["role"] == "user")
+        .map(|m| m["content"].to_string())
+        .find(|content| !content.contains("tool_result"))
+        .unwrap_or_default();
     let mut content = vec![
         json!({"type":"thinking","thinking":"opaque reasoning","signature":"signed-block"}),
         json!({"type":"redacted_thinking","data":"opaque-data"}),
@@ -61,6 +84,20 @@ async fn upstream(
             {"type":"web_search_result","url":"https://example.com/a","title":"Example A","encrypted_content":"opaque-search","page_age":null}
         ]}));
         paused = true;
+    } else if !result && body.get("tools").is_some() && prompt.contains("sharefiles") {
+        let cmd = "mkdir -p out && printf 'quarterly report' > out/report.txt && ln -sf /etc/passwd leak && echo made";
+        content.push(json!({"type":"tool_use","id":"call_exec","name":"exec","input":{"cmd":cmd,"timeout_ms":10000}}));
+    } else if !result && body.get("tools").is_some() && prompt.contains("sharecheck") {
+        content.push(json!({"type":"tool_use","id":"call_exec","name":"exec","input":{"cmd":"cat /attachments/report.txt","timeout_ms":10000}}));
+    } else if result && asked.contains("sharefiles") {
+        content.push(json!({"type":"text","text":"文件在这里：[报告](sandbox:/workspace/out/report.txt)、[缺失](sandbox:/workspace/missing.txt)、[泄露](sandbox:/workspace/leak)、[目录](sandbox:/workspace/out)，代码里的 `[不算](sandbox:/workspace/out/report.txt)` 不算。"}));
+    } else if result && asked.contains("sharecheck") {
+        content.push(json!({"type":"text","text":"还是这份：[报告](sandbox:/workspace/out/report.txt)，也就是 [附件里的](/attachments/report.txt)。"}));
+    } else if !result && body.get("tools").is_some() && prompt.contains("attachfiles") {
+        let cmd = "cat /attachments/notes.csv; ls /attachments; touch /attachments/new 2>/dev/null || echo READONLY";
+        content.push(json!({"type":"tool_use","id":"call_exec","name":"exec","input":{"cmd":cmd,"timeout_ms":10000}}));
+    } else if !result && body.get("tools").is_some() && prompt.contains("attachls") {
+        content.push(json!({"type":"tool_use","id":"call_exec","name":"exec","input":{"cmd":"ls /attachments","timeout_ms":10000}}));
     } else if !result && body.get("tools").is_some() && prompt.contains("exec") {
         let command = if prompt.contains("proxyexec") {
             r#"sleep 2; wget -qO- --header 'Content-Type: application/json' --post-data '{"model":"fixture-model","max_tokens":32,"stream":true,"messages":[{"role":"user","content":"guest local proxy"}]}' http://127.0.0.1:8090/v1/messages"#
@@ -69,6 +106,12 @@ async fn upstream(
         };
         content.push(json!({"type":"text","text":"准备执行工具"}));
         content.push(json!({"type":"tool_use","id":"call_exec","name":"exec","input":{"cmd":command,"timeout_ms":10000}}));
+    } else if !result && body.get("tools").is_some() && prompt.contains("viewimage") {
+        let cmd = format!("printf %s {DOT_PNG} | base64 -d > dot.png");
+        content.push(json!({"type":"tool_use","id":"call_a","name":"exec","input":{"cmd":cmd,"timeout_ms":10000}}));
+        content.push(
+            json!({"type":"tool_use","id":"call_b","name":"view_image","input":{"path":"dot.png"}}),
+        );
     } else if !result && body.get("tools").is_some() && prompt.contains("question") {
         content.push(json!({"type":"tool_use","id":"call_question","name":"ask_user","input":{"question":"选择一种颜色"}}));
     } else {
@@ -176,6 +219,8 @@ impl Harness {
         config.llm.platform_key_env = "RYZHUB_TEST_UPSTREAM_KEY".into();
         config.llm.vault_key_env = "RYZHUB_TEST_VAULT_KEY".into();
         config.sandbox.enabled = true;
+        config.attachment_renderer = env!("CARGO_BIN_EXE_ryzhub-server").into();
+        config.work.storage_root = format!("/tmp/{name}/blobs");
         let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../..")
             .canonicalize()?;
@@ -284,6 +329,39 @@ impl Harness {
             )
             .await?;
         Ok(cid)
+    }
+    /// The command's outcome once the Owner has processed it.
+    async fn outcome(&self, cid: Uuid) -> anyhow::Result<frame::Body> {
+        for _ in 0..400 {
+            let result: Option<Vec<u8>> =
+                sqlx::query_scalar("SELECT result FROM commands WHERE cid=$1")
+                    .bind(cid)
+                    .fetch_one(&self.db)
+                    .await?;
+            if let Some(result) = result {
+                return Frame::decode(result.as_slice())?
+                    .body
+                    .context("empty frame");
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        anyhow::bail!("command was not processed")
+    }
+    /// Upload `body` as `name` to the user's file library.
+    async fn upload(&self, user: &Value, name: &str, body: Vec<u8>) -> anyhow::Result<Value> {
+        let org = id(user, "org_id");
+        let response = reqwest::Client::new()
+            .post(format!("{}/orgs/{org}/attachments?name={name}", self.base))
+            .bearer_auth(user["token"].as_str().unwrap())
+            .body(body)
+            .send()
+            .await?;
+        ensure!(
+            response.status().is_success(),
+            "upload: {}",
+            response.status()
+        );
+        Ok(response.json().await?)
     }
     fn owner(&self) -> anyhow::Result<Child> {
         Ok(Process::new(env!("CARGO_BIN_EXE_ryzhub-server"))
@@ -515,6 +593,7 @@ async fn loop_question_checkpoint_steer_and_read_only_side_query() -> anyhow::Re
         conv2,
         Command::Steer(Steer {
             text: "补充输入".into(),
+            ..Default::default()
         }),
     )
     .await?;
@@ -583,6 +662,7 @@ async fn loop_question_checkpoint_steer_and_read_only_side_query() -> anyhow::Re
         paused,
         Command::Steer(Steer {
             text: "不会被采用的补充".into(),
+            ..Default::default()
         }),
     )
     .await?;
@@ -625,6 +705,7 @@ async fn paused_web_search_turn_resumes_before_steer_and_keeps_citations() -> an
         conv,
         Command::Steer(Steer {
             text: "补充输入".into(),
+            ..Default::default()
         }),
     )
     .await?;
@@ -796,6 +877,698 @@ async fn retried_step_hides_what_its_failed_searches_split() -> anyhow::Result<(
 }
 
 #[tokio::test]
+#[ignore = "requires PostgreSQL/NATS and test gateway secrets"]
+async fn a_conversation_held_by_a_lock_does_not_hold_up_others() -> anyhow::Result<()> {
+    let h = Harness::new().await?;
+    let user = h.user().await?;
+    let (held, free) = (h.conversation(&user).await?, h.conversation(&user).await?);
+    // Someone holds the first conversation's channel row, as a long cleanup would.
+    let mut lock = h.db.begin().await?;
+    sqlx::query("SELECT 1 FROM channels WHERE conversation_id=$1 FOR UPDATE")
+        .bind(held)
+        .execute(&mut *lock)
+        .await?;
+    let mut owner = h.owner()?;
+    let waiting = h.send(&user, held, message("hello held")).await?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let started = std::time::Instant::now();
+    let other = h.send(&user, free, message("hello free")).await?;
+    h.outcome(other).await?;
+    ensure!(
+        started.elapsed() < Duration::from_secs(5),
+        "the other conversation waited {:?} behind the lock",
+        started.elapsed()
+    );
+    // Once the row is free, the first conversation is claimed too.
+    lock.rollback().await?;
+    h.outcome(waiting).await?;
+    owner.kill().await?;
+    owner.wait().await?;
+    h.close().await
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL/NATS, secrets and scripts/start-execution-node.sh"]
+async fn replies_hand_over_the_sandbox_files_they_link_to() -> anyhow::Result<()> {
+    let h = Harness::new().await?;
+    ensure!(
+        !h.app.config.sandbox.image.is_empty(),
+        "execution image missing"
+    );
+    let user = h.user().await?;
+    let org = id(&user, "org_id");
+    let token = user["token"].as_str().unwrap().to_owned();
+    let mut owner = h.owner()?;
+    let conv = h.conversation(&user).await?;
+    h.send(&user, conv, message("sharefiles 做个报告")).await?;
+    let run = h.wait_state(conv, "completed").await?;
+    // Models are told how.
+    assert!(
+        h.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(body, _)| body["system"]
+                .to_string()
+                .contains("sandbox:/workspace/report.pdf")),
+        "no request explained file links"
+    );
+    let reply = |run: Uuid| {
+        let db = h.db.clone();
+        async move {
+            let detail: Value = sqlx::query_scalar(
+                "SELECT detail FROM items WHERE run_id=$1 AND kind='assistant' AND state='completed'
+                 AND text LIKE '%sandbox:%' ORDER BY first_seq DESC LIMIT 1",
+            )
+            .bind(run)
+            .fetch_one(&db)
+            .await?;
+            anyhow::Ok(
+                detail["kind"]["Answer"]["files"]
+                    .as_array()
+                    .unwrap()
+                    .clone(),
+            )
+        }
+    };
+    let files = reply(run).await?;
+    // In order, each once; the link inside code is not one.
+    let links: Vec<&str> = files.iter().map(|f| f["link"].as_str().unwrap()).collect();
+    assert_eq!(
+        links,
+        [
+            "/workspace/out/report.txt",
+            "/workspace/missing.txt",
+            "/workspace/leak",
+            "/workspace/out"
+        ]
+    );
+    let report = &files[0]["file"];
+    assert_eq!(report["name"], "report.txt");
+    assert_eq!(report["path"], "report.txt");
+    assert_eq!(report["kind"], "text");
+    assert_eq!(report["size"], 16);
+    assert_eq!(files[1]["error"], "FILE_NOT_FOUND");
+    // The link resolves inside the workspace, where there is no /etc/passwd.
+    assert_eq!(files[2]["error"], "FILE_NOT_FOUND");
+    assert!(files[2]["file"].is_null());
+    assert_eq!(files[3]["error"], "NOT_A_FILE");
+    // It is in the owner's library as a published file, and reads back as written.
+    let http = reqwest::Client::new();
+    let library: Value = http
+        .get(format!(
+            "{}/orgs/{org}/attachments?direction=output",
+            h.base
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await?
+        .json()
+        .await?;
+    let listed = library["files"].as_array().unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0]["id"], report["id"]);
+    assert_eq!(listed[0]["direction"], "output");
+    let content = http
+        .get(format!(
+            "{}/orgs/{org}/attachments/{}/content",
+            h.base,
+            report["id"].as_str().unwrap()
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await?
+        .bytes()
+        .await?;
+    assert_eq!(&content[..], b"quarterly report");
+
+    // The next run's sandbox has it under /attachments; linking it again hands over the same
+    // entry, by either path.
+    h.send(&user, conv, message("sharecheck 再看看")).await?;
+    let mut second = run;
+    for _ in 0..200 {
+        second = h.wait_state(conv, "completed").await?;
+        if second != run {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    ensure!(second != run, "the second run did not complete");
+    let result: Value =
+        sqlx::query_scalar("SELECT result FROM tool_calls WHERE run_id=$1 AND call_id='call_exec'")
+            .bind(second)
+            .fetch_one(&h.db)
+            .await?;
+    assert!(
+        result["stdout_head"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("quarterly report"),
+        "{result}"
+    );
+    let again = reply(second).await?;
+    assert_eq!(again.len(), 2);
+    assert_eq!(again[0]["file"]["id"], report["id"]);
+    assert_eq!(again[1]["link"], "/attachments/report.txt");
+    assert_eq!(again[1]["file"]["id"], report["id"]);
+    let library: Value = http
+        .get(format!(
+            "{}/orgs/{org}/attachments?direction=output",
+            h.base
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await?
+        .json()
+        .await?;
+    assert_eq!(library["files"].as_array().unwrap().len(), 1);
+    owner.kill().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL/NATS, secrets and scripts/start-execution-node.sh"]
+async fn library_files_reach_models_and_sandboxes_until_deleted() -> anyhow::Result<()> {
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let h = Harness::new().await?;
+    ensure!(
+        !h.app.config.sandbox.image.is_empty(),
+        "execution image missing"
+    );
+    let user = h.user().await?;
+    let org = id(&user, "org_id");
+    let token = user["token"].as_str().unwrap().to_owned();
+    let png = b64.decode(DOT_PNG)?;
+    let pdf = b"%PDF-1.4\n1 0 obj<<>>endobj\ntrailer<<>>\n%%EOF\n".to_vec();
+    let image = h.upload(&user, "dot.png", png.clone()).await?;
+    let document = h.upload(&user, "brief.pdf", pdf.clone()).await?;
+    let text = h.upload(&user, "notes.csv", b"a,b\n1,2\n".to_vec()).await?;
+    let binary = h.upload(&user, "data.bin", vec![0, 1, 2, 3]).await?;
+    let kinds: Vec<&str> = [&image, &document, &text, &binary]
+        .iter()
+        .map(|file| file["kind"].as_str().unwrap())
+        .collect();
+    assert_eq!(kinds, ["image", "pdf", "text", "file"]);
+    assert_eq!(image["preview"], true);
+    assert_eq!(
+        (image["width"].as_u64(), image["height"].as_u64()),
+        (Some(1), Some(1))
+    );
+    let http = reqwest::Client::new();
+    let get = |path: String, token: String| {
+        let http = http.clone();
+        let url = format!("{}{path}", h.base);
+        async move { http.get(url).bearer_auth(token).send().await }
+    };
+    let image_id = image["id"].as_str().unwrap().to_owned();
+    let content = get(
+        format!("/orgs/{org}/attachments/{image_id}/content"),
+        token.clone(),
+    )
+    .await?;
+    assert_eq!(
+        content.headers()["content-type"],
+        "application/octet-stream"
+    );
+    assert!(
+        content.headers()["content-disposition"]
+            .to_str()?
+            .starts_with("attachment;")
+    );
+    assert_eq!(content.bytes().await?.to_vec(), png);
+    let preview = get(
+        format!("/orgs/{org}/attachments/{image_id}/preview"),
+        token.clone(),
+    )
+    .await?;
+    assert_eq!(preview.headers()["content-type"], "image/png");
+    // Another member's library is out of reach, to read or to send.
+    let stranger = h.user().await?;
+    let elsewhere = format!(
+        "/orgs/{}/attachments/{image_id}/content",
+        id(&stranger, "org_id")
+    );
+    assert!(
+        !get(elsewhere, stranger["token"].as_str().unwrap().into())
+            .await?
+            .status()
+            .is_success()
+    );
+    let mut owner = h.owner()?;
+    let theirs = h.conversation(&stranger).await?;
+    let cid = h
+        .send(
+            &stranger,
+            theirs,
+            Command::SendMessage(SendMessage {
+                text: "borrow".into(),
+                attachment_ids: vec![image_id.clone()],
+                ..Default::default()
+            }),
+        )
+        .await?;
+    match h.outcome(cid).await? {
+        frame::Body::CommandRejected(rejected) => {
+            assert_eq!(rejected.code, "ATTACHMENT_UNAVAILABLE")
+        }
+        other => anyhow::bail!("expected a rejection: {other:?}"),
+    }
+
+    let conv = h.conversation(&user).await?;
+    let ids: Vec<String> = [&image, &document, &text, &binary]
+        .iter()
+        .map(|file| file["id"].as_str().unwrap().to_owned())
+        .collect();
+    h.send(
+        &user,
+        conv,
+        Command::SendMessage(SendMessage {
+            text: "attachfiles 看看".into(),
+            attachment_ids: ids,
+            ..Default::default()
+        }),
+    )
+    .await?;
+    let run = h.wait_state(conv, "completed").await?;
+    let first = h
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(body, _)| body.clone())
+        .find(|body| body.to_string().contains("\"document\""))
+        .context("no request carried the files")?;
+    let parts = first["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["role"] == "user" && message["content"][0]["type"] == "image")
+        .context("user message with files")?["content"]
+        .clone();
+    assert_eq!(
+        parts[0],
+        json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":DOT_PNG}})
+    );
+    assert_eq!(parts[1]["type"], "document");
+    assert_eq!(parts[1]["source"]["data"], b64.encode(&pdf));
+    let note = parts[2]["text"].as_str().unwrap();
+    assert!(
+        note.contains("/attachments/dot.png") && note.contains("/attachments/data.bin"),
+        "{note}"
+    );
+    assert!(
+        parts[3]["text"]
+            .as_str()
+            .unwrap()
+            .contains("<attachment path=\"/attachments/notes.csv\">\na,b\n1,2\n"),
+        "{}",
+        parts[3]
+    );
+    assert_eq!(parts[4]["text"], "attachfiles 看看");
+    let result: Value =
+        sqlx::query_scalar("SELECT result FROM tool_calls WHERE run_id=$1 AND call_id='call_exec'")
+            .bind(run)
+            .fetch_one(&h.db)
+            .await?;
+    let stdout = result["stdout_head"].as_str().unwrap_or_default();
+    assert!(
+        stdout.contains("a,b") && stdout.contains("dot.png") && stdout.contains("READONLY"),
+        "{result}"
+    );
+    let detail: Value =
+        sqlx::query_scalar("SELECT detail FROM items WHERE conversation_id=$1 AND kind='user'")
+            .bind(conv)
+            .fetch_one(&h.db)
+            .await?;
+    let files = detail["kind"]["Attachments"]["files"]
+        .as_array()
+        .context("attachments detail")?;
+    assert_eq!(files.len(), 4);
+    assert_eq!(
+        (files[0]["path"].as_str(), files[0]["kind"].as_str()),
+        (Some("dot.png"), Some("image"))
+    );
+    let copies: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM loop_steps s JOIN runs r ON r.id=s.run_id WHERE r.conversation_id=$1
+         AND (coalesce(s.request_messages::text,'') LIKE '%'||$2||'%' OR coalesce(s.input_delta::text,'') LIKE '%'||$2||'%')",
+    )
+    .bind(conv)
+    .bind(DOT_PNG)
+    .fetch_one(&h.db)
+    .await?;
+    assert_eq!(copies, 0, "model context must not store file bytes");
+
+    // A fork keeps the files: its references, the message's detail and the model context.
+    let latest: Uuid = sqlx::query_scalar(
+        "SELECT id FROM items WHERE conversation_id=$1 AND kind='assistant' AND state='completed'
+         ORDER BY last_seq DESC LIMIT 1",
+    )
+    .bind(conv)
+    .fetch_one(&h.db)
+    .await?;
+    let cid = h
+        .send(
+            &user,
+            conv,
+            Command::Fork(Fork {
+                item_id: latest.to_string(),
+            }),
+        )
+        .await?;
+    let mut fork = None;
+    for _ in 0..400 {
+        let row: Option<(String, Option<Value>)> =
+            sqlx::query_as("SELECT state,result FROM conversation_operations WHERE id=$1")
+                .bind(cid)
+                .fetch_optional(&h.db)
+                .await?;
+        let Some((state, result)) = row else {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            continue;
+        };
+        ensure!(state != "failed", "fork failed: {result:?}");
+        if state == "completed" {
+            fork = result.map(|result| id(&result, "conversation_id"));
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let fork = fork.context("fork did not complete")?;
+    let references: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM conversation_files WHERE conversation_id=$1")
+            .bind(fork)
+            .fetch_one(&h.db)
+            .await?;
+    assert_eq!(references, 4);
+    let copied: Value =
+        sqlx::query_scalar("SELECT detail FROM items WHERE conversation_id=$1 AND kind='user'")
+            .bind(fork)
+            .fetch_one(&h.db)
+            .await?;
+    assert_eq!(
+        copied["kind"]["Attachments"]["files"]
+            .as_array()
+            .map(Vec::len),
+        Some(4)
+    );
+    h.send(&user, fork, message("forked follow-up")).await?;
+    h.wait_state(fork, "completed").await?;
+    assert!(
+        h.requests
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .0
+            .to_string()
+            .contains(DOT_PNG)
+    );
+
+    // The same file in another conversation, with no text at all.
+    let other = h.conversation(&user).await?;
+    h.send(
+        &user,
+        other,
+        Command::SendMessage(SendMessage {
+            attachment_ids: vec![image_id.clone()],
+            ..Default::default()
+        }),
+    )
+    .await?;
+    h.wait_state(other, "completed").await?;
+    assert!(
+        h.requests
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .0
+            .to_string()
+            .contains(DOT_PNG)
+    );
+    let library = get(format!("/orgs/{org}/attachments"), token.clone())
+        .await?
+        .json::<Value>()
+        .await?;
+    let listed = library["files"].as_array().unwrap();
+    assert_eq!(listed.len(), 4);
+    let entry = listed
+        .iter()
+        .find(|file| file["id"] == image["id"])
+        .unwrap();
+    // The first conversation, its fork and the second conversation.
+    assert_eq!(entry["conversations"], 3);
+    // The library is searched by name, ignoring case, and filtered by kind.
+    let names = |path: String| {
+        let get = &get;
+        let token = token.clone();
+        async move {
+            let page = get(path, token).await?.json::<Value>().await?;
+            anyhow::Ok(
+                page["files"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|file| file["name"].as_str().unwrap().to_owned())
+                    .collect::<Vec<_>>(),
+            )
+        }
+    };
+    assert_eq!(
+        names(format!("/orgs/{org}/attachments?q=NOTES")).await?,
+        ["notes.csv"]
+    );
+    assert_eq!(
+        names(format!("/orgs/{org}/attachments?kind=pdf,text")).await?,
+        ["notes.csv", "brief.pdf"]
+    );
+    assert!(
+        names(format!("/orgs/{org}/attachments?q=dot&kind=pdf"))
+            .await?
+            .is_empty()
+    );
+    assert_eq!(
+        get(format!("/orgs/{org}/attachments?kind=video"), token.clone())
+            .await?
+            .status(),
+        400
+    );
+
+    // A second entry with the same content, then deleting the first removes it everywhere.
+    let copy = h.upload(&user, "dot-copy.png", png.clone()).await?;
+    let deleted = http
+        .delete(format!("{}/orgs/{org}/attachments/{image_id}", h.base))
+        .bearer_auth(&token)
+        .send()
+        .await?;
+    assert!(deleted.status().is_success());
+    let gone = get(
+        format!("/orgs/{org}/attachments/{image_id}/preview"),
+        token.clone(),
+    )
+    .await?;
+    assert_eq!(gone.status(), 410);
+    h.send(&user, conv, message("attachls")).await?;
+    let mut later = None;
+    for _ in 0..400 {
+        let runs: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM runs WHERE conversation_id=$1 AND state='completed' ORDER BY started_at",
+        )
+        .bind(conv)
+        .fetch_all(&h.db)
+        .await?;
+        if runs.len() == 2 {
+            later = Some(runs[1]);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let later = later.context("second run did not complete")?;
+    let request = h.requests.lock().unwrap().last().unwrap().0.to_string();
+    assert!(request.contains("[File /attachments/dot.png was deleted by the user.]"));
+    assert!(!request.contains(DOT_PNG));
+    let listing: Value =
+        sqlx::query_scalar("SELECT result FROM tool_calls WHERE run_id=$1 AND call_id='call_exec'")
+            .bind(later)
+            .fetch_one(&h.db)
+            .await?;
+    let listing = listing["stdout_head"].as_str().unwrap_or_default();
+    assert!(
+        !listing.contains("dot.png") && listing.contains("notes.csv"),
+        "{listing}"
+    );
+    // A text file's content is never copied into stored context, so deleting it removes it
+    // from every request after.
+    let stored: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM loop_steps WHERE run_id=$1 AND request_messages::text LIKE '%1,2%'",
+    )
+    .bind(run)
+    .fetch_one(&h.db)
+    .await?;
+    assert_eq!(stored, 0, "text attachment content was stored in context");
+    let text_id = text["id"].as_str().unwrap();
+    let removed = http
+        .delete(format!("{}/orgs/{org}/attachments/{text_id}", h.base))
+        .bearer_auth(&token)
+        .send()
+        .await?;
+    assert!(removed.status().is_success());
+    h.send(&user, conv, message("after the text is gone"))
+        .await?;
+    for _ in 0..400 {
+        let done: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM runs WHERE conversation_id=$1 AND state='completed'",
+        )
+        .bind(conv)
+        .fetch_one(&h.db)
+        .await?;
+        if done == 3 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let request = h.requests.lock().unwrap().last().unwrap().0.to_string();
+    assert!(
+        request.contains("[File /attachments/notes.csv was deleted by the user.]"),
+        "{request}"
+    );
+    assert!(
+        !request.contains("a,b\\n1,2"),
+        "deleted text was sent again"
+    );
+    // Content goes with the last entry that holds it.
+    let sha256: String = sqlx::query_scalar("SELECT sha256 FROM attachments WHERE id=$1")
+        .bind(Uuid::parse_str(&image_id)?)
+        .fetch_one(&h.db)
+        .await?;
+    let object = std::path::Path::new(&h.app.config.work.storage_root)
+        .join(org.to_string())
+        .join("attachments")
+        .join(&sha256);
+    ryzhub_server::attachments::gc::collect_org(&h.app, org).await?;
+    let state: String = sqlx::query_scalar("SELECT state FROM attachments WHERE id=$1")
+        .bind(Uuid::parse_str(&image_id)?)
+        .fetch_one(&h.db)
+        .await?;
+    assert_eq!(state, "reclaimed");
+    assert!(object.exists(), "a live entry still holds the content");
+    let copy_id = copy["id"].as_str().unwrap();
+    http.delete(format!("{}/orgs/{org}/attachments/{copy_id}", h.base))
+        .bearer_auth(&token)
+        .send()
+        .await?;
+    ryzhub_server::attachments::gc::collect_org(&h.app, org).await?;
+    assert!(!object.exists());
+    owner.kill().await?;
+    owner.wait().await?;
+    h.close().await
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL/NATS, secrets and scripts/start-execution-node.sh"]
+async fn chat_tools_run_silently_and_viewed_images_reach_the_model() -> anyhow::Result<()> {
+    use base64::Engine;
+    let h = Harness::new().await?;
+    ensure!(
+        !h.app.config.sandbox.image.is_empty(),
+        "execution image missing"
+    );
+    let user = h.user().await?;
+    let conv = h.conversation(&user).await?;
+    let mut owner = h.owner()?;
+    h.send(&user, conv, message("viewimage")).await?;
+    let run = h.wait_state(conv, "completed").await?;
+    let actions: i64 = sqlx::query_scalar("SELECT count(*) FROM pending_actions WHERE run_id=$1")
+        .bind(run)
+        .fetch_one(&h.db)
+        .await?;
+    assert_eq!(actions, 0, "sandbox tools must not ask");
+    let result: Value =
+        sqlx::query_scalar("SELECT result FROM tool_calls WHERE run_id=$1 AND call_id='call_b'")
+            .bind(run)
+            .fetch_one(&h.db)
+            .await?;
+    let sha256 = result["image"]["sha256"]
+        .as_str()
+        .with_context(|| format!("no image reference: {result}"))?
+        .to_owned();
+    assert!(
+        !result.to_string().contains(DOT_PNG),
+        "results keep a reference only"
+    );
+    let stored: Vec<u8> =
+        sqlx::query_scalar("SELECT data FROM chat_images WHERE conversation_id=$1 AND sha256=$2")
+            .bind(conv)
+            .bind(&sha256)
+            .fetch_one(&h.db)
+            .await?;
+    assert_eq!(
+        base64::engine::general_purpose::STANDARD.encode(&stored),
+        DOT_PNG
+    );
+    let expected =
+        json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":DOT_PNG}});
+    let sees_image = |body: &Value| {
+        body["messages"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|message| {
+                message["content"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|block| block["type"] == "tool_result" && block["content"][0] == expected)
+            })
+    };
+    ensure!(
+        h.requests
+            .lock()
+            .unwrap()
+            .last()
+            .is_some_and(|(body, _)| sees_image(body)),
+        "the tool result must carry the image"
+    );
+    // A later turn still sees it, while stored context holds only the reference.
+    h.send(&user, conv, message("what was in it?")).await?;
+    let mut completed = 0;
+    for _ in 0..400 {
+        completed = sqlx::query_scalar(
+            "SELECT count(*) FROM runs WHERE conversation_id=$1 AND state='completed'",
+        )
+        .bind(conv)
+        .fetch_one(&h.db)
+        .await?;
+        if completed == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(completed, 2i64);
+    ensure!(
+        h.requests
+            .lock()
+            .unwrap()
+            .last()
+            .is_some_and(|(body, _)| sees_image(body)),
+        "later turns must still see the image"
+    );
+    let copies: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM loop_steps s JOIN runs r ON r.id=s.run_id WHERE r.conversation_id=$1
+         AND (coalesce(s.request_messages::text,'') LIKE '%'||$2||'%' OR coalesce(s.input_delta::text,'') LIKE '%'||$2||'%')",
+    )
+    .bind(conv)
+    .bind(DOT_PNG)
+    .fetch_one(&h.db)
+    .await?;
+    assert_eq!(copies, 0, "model context must not store image bytes");
+    owner.kill().await?;
+    owner.wait().await?;
+    h.close().await
+}
+
+#[tokio::test]
 #[ignore = "requires PostgreSQL/NATS, secrets and scripts/start-execution-node.sh"]
 async fn tool_completed_before_owner_crash_replays_once_after_host_restart() -> anyhow::Result<()> {
     let h = Harness::new().await?;
@@ -807,18 +1580,8 @@ async fn tool_completed_before_owner_crash_replays_once_after_host_restart() -> 
     let conv = h.conversation(&user).await?;
     let mut owner = h.owner()?;
     h.send(&user, conv, message("exec")).await?;
-    let run = h.wait_state(conv, "requires_action").await?;
-    let (action, epoch) = h.action(run).await?;
-    h.send(
-        &user,
-        conv,
-        Command::DecideApproval(DecideApproval {
-            action_id: action.to_string(),
-            run_epoch: epoch as u64,
-            decision: "allow".into(),
-        }),
-    )
-    .await?;
+    // Sandbox tools run without asking.
+    let run = h.wait_state(conv, "running").await?;
     let mut sandbox = None;
     for _ in 0..400 {
         sandbox = sqlx::query_scalar::<_, Option<Uuid>>(
@@ -1035,18 +1798,8 @@ async fn guest_proxy_live_host_restart_and_terminal_cleanup_recovery() -> anyhow
     let conv = h.conversation(&user).await?;
     let mut owner = h.owner()?;
     h.send(&user, conv, message("proxyexec")).await?;
-    let run = h.wait_state(conv, "requires_action").await?;
-    let (action, epoch) = h.action(run).await?;
-    h.send(
-        &user,
-        conv,
-        Command::DecideApproval(DecideApproval {
-            action_id: action.to_string(),
-            run_epoch: epoch as u64,
-            decision: "allow".into(),
-        }),
-    )
-    .await?;
+    // Sandbox tools run without asking.
+    let run = h.wait_state(conv, "running").await?;
     let mut sandbox = None;
     for _ in 0..400 {
         sandbox = sqlx::query_scalar::<_, Option<Uuid>>(

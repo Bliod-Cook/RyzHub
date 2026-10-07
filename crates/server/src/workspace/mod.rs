@@ -47,6 +47,18 @@ fn stores(app: &App, org: Uuid) -> anyhow::Result<(BlobStore, Option<BlobStore>)
     Ok((primary, secondary))
 }
 
+/// Primary and optional secondary store for `org`'s file library.
+pub(crate) fn attachment_stores(
+    app: &App,
+    org: Uuid,
+) -> anyhow::Result<(BlobStore, Option<BlobStore>)> {
+    let (primary, secondary) = stores(app, org)?;
+    Ok((
+        primary.within("attachments"),
+        secondary.map(|store| store.within("attachments")),
+    ))
+}
+
 /// Serialize publication and reclamation of one tenant's content-addressed object.
 async fn blob_lock(tx: &mut Tx<'_>, org: Uuid, key: &str) -> anyhow::Result<()> {
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))")

@@ -3,10 +3,14 @@ import 'package:flutter/material.dart';
 
 final _uuid = RegExp(r'^[0-9a-fA-F-]{36}$');
 
-/// The conversation an address names: `/c/<id>`, or '' for a new chat. The
-/// web build shows it after the `#`.
+/// What an address shows in place of a conversation: the file library.
+const libraryLink = 'library';
+
+/// The conversation an address names: `/c/<id>`, [libraryLink] for
+/// `/library`, or '' for a new chat. The web build shows it after the `#`.
 String conversationIn(Uri uri) {
   final parts = uri.pathSegments;
+  if (parts.length == 1 && parts[0] == libraryLink) return libraryLink;
   return parts.length == 2 && parts[0] == 'c' && _uuid.hasMatch(parts[1])
       ? parts[1]
       : '';
@@ -22,7 +26,13 @@ class ConversationLinkParser extends RouteInformationParser<String> {
   @override
   RouteInformation restoreRouteInformation(String configuration) =>
       RouteInformation(
-        uri: Uri(path: configuration.isEmpty ? '/' : '/c/$configuration'),
+        uri: Uri(
+          path: switch (configuration) {
+            '' => '/',
+            libraryLink => '/$libraryLink',
+            _ => '/c/$configuration',
+          },
+        ),
       );
 }
 

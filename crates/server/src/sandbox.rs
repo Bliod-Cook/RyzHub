@@ -169,6 +169,7 @@ pub async fn ensure_sandbox(
         tx.commit().await?;
     }
     crate::projects::mount(app, lease, run, id).await?;
+    crate::attachments::sandbox::sync(app, lease, id).await?;
     // A fresh key per dispatch supersedes the previous one; accepted streams continue.
     if app.config.llm.unix_socket.is_some() {
         let (user, credential) = run_identity(app, lease, run).await?;

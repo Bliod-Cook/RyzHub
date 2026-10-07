@@ -200,6 +200,45 @@ async fn subscribe(socket: &mut Socket, channel: &str, since: Option<u64>) -> an
 
 #[tokio::test]
 #[ignore = "requires PostgreSQL 18 and NATS"]
+async fn an_expired_session_keeps_its_channels_and_a_revoked_one_loses_them() -> anyhow::Result<()>
+{
+    let h = Harness::new().await?;
+    // Read what a socket sends until it closes: whether it revoked anything.
+    async fn revokes_before_closing(socket: &mut Socket) -> bool {
+        let mut revoked = false;
+        while let Ok(f) = next(socket).await {
+            revoked |= matches!(f.body, Some(Body::SubscriptionRevoked(_)));
+        }
+        revoked
+    }
+    for (expire, label) in [(true, "expired"), (false, "revoked")] {
+        let user = h.user().await?;
+        let conv = h.conversation(&user).await?;
+        let channel = format!("conv:{conv}");
+        let mut socket = connect(&h.base, &user, label).await?;
+        subscribe(&mut socket, &channel, None).await?;
+        until(&mut socket, |f| matches!(f.body, Some(Body::Snapshot(_)))).await?;
+        let change = if expire {
+            "UPDATE auth_sessions SET expires_at=now()-interval '1 second' WHERE user_id=$1"
+        } else {
+            "UPDATE auth_sessions SET revoked_at=now() WHERE user_id=$1"
+        };
+        sqlx::query(change)
+            .bind(id(&user, "user_id"))
+            .execute(&h.db)
+            .await?;
+        // Either way the connection ends; only a revoked session takes the channels with it.
+        assert_eq!(
+            revokes_before_closing(&mut socket).await,
+            !expire,
+            "{label}"
+        );
+    }
+    h.close().await
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL 18 and NATS"]
 async fn database_idempotency_fencing_rls_and_transaction_outbox() -> anyhow::Result<()> {
     let h = Harness::new().await?;
     let user = h.user().await?;

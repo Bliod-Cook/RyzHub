@@ -74,6 +74,8 @@ async fn upstream(
         })
     {
         content.push(json!({"type":"tool_use","id":"call_question","name":if claude {"AskUserQuestion"}else{"ask_user"},"input":if claude{json!({"questions":[{"question":"选择一种颜色","header":"颜色","options":[{"label":"Blue","description":"Blue"},{"label":"Green","description":"Green"}],"multiSelect":false}]})}else{json!({"question":"选择一种颜色"})}}));
+    } else if !result && prompt.contains("M3_SHARE") {
+        content.push(json!({"type":"text","text":SHARED_REPLY}));
     } else {
         content.push(json!({"type":"text","text":if result{"工具结果已用于回答"}else if body.get("tools").is_none(){"只读旁问完成"}else{"本地协议联调：你好 Rust"}}));
     }
@@ -179,11 +181,13 @@ impl Harness {
             id: "claude-opus-4-6".into(),
             protocol: "anthropic".into(),
             harnesses: vec!["claude".into(), "chat".into()],
+            ..Default::default()
         }];
         config.llm.models.push(ryzhub_server::config::ModelRoute {
             id: "gpt-5.2".into(),
             protocol: "responses".into(),
             harnesses: vec!["codex".into()],
+            ..Default::default()
         });
         config.policy.allow_full_auto = Some(false);
         config.work.storage_root = format!("/tmp/{name}/primary");
@@ -384,6 +388,9 @@ fn message(text: &str) -> Command {
     })
 }
 
+/// A reply handing over a file of the workspace.
+const SHARED_REPLY: &str = "这是报告：[报告](sandbox:/workspace/share/report.txt)";
+
 async fn responses(
     State(requests): State<Requests>,
     headers: HeaderMap,
@@ -392,7 +399,18 @@ async fn responses(
     requests.lock().unwrap().push((body.clone(), headers));
     let rid = format!("resp_{}", Uuid::now_v7());
     let mid = format!("msg_{}", Uuid::now_v7());
-    let text = "Codex / Responses 本地协议联调成功：你好 Rust。";
+    let share = body["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|i| i["role"] == "user")
+        .is_some_and(|i| i.to_string().contains("M3_SHARE"));
+    let text = if share {
+        SHARED_REPLY
+    } else {
+        "Codex / Responses 本地协议联调成功：你好 Rust。"
+    };
     let mut item = json!({"id":mid,"type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":text,"annotations":[]}]});
     let inputs = body["input"].as_array().unwrap();
     let user_at = inputs
@@ -442,6 +460,8 @@ async fn responses(
     ];
     for delta in if exec {
         vec![]
+    } else if share {
+        vec![SHARED_REPLY]
     } else {
         vec!["Codex 本地协议联调成功：", "你好 Rust。"]
     } {
@@ -650,8 +670,8 @@ async fn responses_native_history_projects_and_commands() -> anyhow::Result<()> 
  let inherited=h.json(&user,&format!("/orgs/{org}/conversations"),reqwest::Method::POST,json!({"title":"Inherit defaults","project_id":defaults["id"]})).await?;ensure!(inherited["mode"]=="work" && inherited["run_config"]["harness"]=="claude");
  let conv=h.configured(&user,"chat",json!({}),Some(project)).await?;
  ensure!(h.configured(&user,"chat",json!({"approval":"full_auto"}),None).await.unwrap_err().to_string().contains("POLICY_DENIED"));
- h.submit(&user,conv,message("native-exec")).await?;let run=h.wait_state(conv,"requires_action").await?;let (action,epoch)=h.action(run).await?;
- h.submit(&user,conv,Command::DecideApproval(DecideApproval{action_id:action.to_string(),run_epoch:epoch as u64,decision:"allow".into()})).await?;h.wait_state(conv,"completed").await?;
+ // Chat sandbox tools run without asking.
+ h.submit(&user,conv,message("native-exec")).await?;let run=h.wait_state(conv,"completed").await?;
  let steps:Vec<Value>=sqlx::query_scalar("SELECT native_response FROM loop_steps WHERE run_id=$1 ORDER BY step_no").bind(run).fetch_all(&h.db).await?;ensure!(steps.len()==2 && steps[0]["output"][1]["encrypted_content"]=="opaque-reasoning");
  {let requests=h.requests.lock().unwrap();let next=&requests.iter().rfind(|(b,_)|b.get("input").is_some()).unwrap().0;ensure!(next["input"].to_string().contains("opaque-reasoning") && next["input"].to_string().contains("function_call_output"));ensure!(next["instructions"].as_str().unwrap().contains("PROJECT_SENTINEL"));}
  let mut tx=h.app.store.tx(org).await?;let found=ryzhub_server::projects::search(&mut tx,org,run,"42").await?;ensure!(found["matches"][0]["file"]=="knowledge.txt");tx.commit().await?;
@@ -805,7 +825,7 @@ async fn two_harnesses_steer_commands_fork_and_restore() -> anyhow::Result<()> {
   let conv=h.configured(&user,"work",json!({"harness":harness}),None).await?;
   h.submit(&user,conv,message("slow hello")).await?;let run=h.wait_state(conv,"running").await?;
   // Steer immediately, including while the native session is still being provisioned.
-  h.submit(&user,conv,Command::Steer(Steer{text:"second queued instruction".into()})).await?;
+  h.submit(&user,conv,Command::Steer(Steer{text:"second queued instruction".into(),..Default::default()})).await?;
   let model=if harness=="claude" {"claude-opus-4-6"}else{"gpt-5.2"};
   h.submit(&user,conv,Command::UpdateRunConfig(UpdateRunConfig{config_json:json!({"model":model,"reasoning":"high","plan":true}).to_string()})).await?;
   let snapshot:Value=sqlx::query_scalar("SELECT run_config FROM runs WHERE id=$1").bind(run).fetch_one(&h.db).await?;ensure!(snapshot["model"]!=model && snapshot["plan"]==false,"settings must not alter the active run");
@@ -820,6 +840,13 @@ async fn two_harnesses_steer_commands_fork_and_restore() -> anyhow::Result<()> {
   h.submit(&user,conv,Command::UpdateRunConfig(UpdateRunConfig{config_json:json!({"plan":false}).to_string()})).await?;
   h.submit(&user,conv,message(if harness=="codex"{"native-exec"}else{"M3_EXEC"})).await?;let run=h.wait_state(conv,"requires_action").await?;let (action,epoch)=h.action(run).await?;
   h.submit(&user,conv,Command::DecideApproval(DecideApproval{action_id:action.to_string(),run_epoch:epoch as u64,decision:"allow".into()})).await?;h.wait_state(conv,"completed").await?;h.idle(conv).await?;
+  // A reply hands over the workspace files it links to.
+  let (sandbox,epoch):(Uuid,i64)=sqlx::query_as("SELECT id,exec_epoch FROM sandboxes WHERE conversation_id=$1 AND state='running'").bind(conv).fetch_one(&h.db).await?;
+  guest_exec(std::path::Path::new(&h.app.config.sandbox.host_socket),sandbox,epoch,"share-report","mkdir -p /workspace/share && printf 'work report' > /workspace/share/report.txt").await?;
+  h.submit(&user,conv,message("M3_SHARE")).await?;let shared=h.wait_state(conv,"completed").await?;h.idle(conv).await?;
+  let detail:Value=sqlx::query_scalar("SELECT detail FROM items WHERE run_id=$1 AND kind='assistant' AND state='completed' AND text LIKE '%sandbox:%'").bind(shared).fetch_one(&h.db).await?;
+  let file=&detail["kind"]["Answer"]["files"][0];
+  ensure!(file["link"]=="/workspace/share/report.txt" && file["file"]["name"]=="report.txt" && file["file"]["size"]==11,"{harness} hand-over: {detail}");
   if harness=="claude" {
    h.submit(&user,conv,message("M3_QUESTION")).await?;let run=h.wait_state(conv,"requires_action").await?;let (action,epoch)=h.action(run).await?;
    h.submit(&user,conv,Command::AnswerQuestion(AnswerQuestion{action_id:action.to_string(),run_epoch:epoch as u64,answer:"Blue".into()})).await?;h.wait_state(conv,"completed").await?;h.idle(conv).await?;

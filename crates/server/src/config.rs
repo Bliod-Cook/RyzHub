@@ -25,6 +25,9 @@ pub struct Config {
     pub work: WorkConfig,
     pub retention: RetentionConfig,
     pub search: SearchConfig,
+    /// Program run as `<program> render-image` to decode uploaded images in a process of its
+    /// own; empty runs this server binary.
+    pub attachment_renderer: String,
 }
 
 impl Default for Config {
@@ -45,6 +48,7 @@ impl Default for Config {
             work: WorkConfig::default(),
             retention: RetentionConfig::default(),
             search: SearchConfig::default(),
+            attachment_renderer: String::new(),
         }
     }
 }
@@ -84,6 +88,9 @@ pub struct ModelRoute {
     pub protocol: String,
     /// `chat`, `codex` and/or `claude`.
     pub harnesses: Vec<String>,
+    /// What the model reads besides text: `image` and/or `pdf`. Files of other kinds, and of
+    /// kinds left out here, reach it as paths in the sandbox.
+    pub inputs: Vec<String>,
 }
 
 impl Default for ModelRoute {
@@ -92,6 +99,7 @@ impl Default for ModelRoute {
             id: String::new(),
             protocol: "anthropic".into(),
             harnesses: vec!["chat".into()],
+            inputs: vec!["image".into(), "pdf".into()],
         }
     }
 }

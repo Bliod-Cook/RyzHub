@@ -31,7 +31,7 @@ REST/WS：`http://127.0.0.1:8080`，实例配置页：`/admin`。首次在客户
 
 脚本启动 PostgreSQL/NATS、独立 containerd 执行节点、localhost:9081 协议 fixture、8080 API/WS 和 8081 LLM Gateway，自动迁移数据库。执行节点为名为 `ryzhub-m1-execution` 的 privileged 开发容器，只挂载本项目执行状态和二进制，不挂载 Docker socket；需要 Linux、Docker 及可用的 overlay/cgroup。默认镜像运行时为 runc，镜像按 digest 交给 host。
 
-Web 客户端发“执行沙箱验收”会请求执行审批，允许后在实际容器中执行命令；“请向我提问”会出现回答卡片；“slow 慢速响应”可用于测试运行中的补充输入。“只读旁问”只读最近提交的主线前缀，不提供工具或写回主线；它和审批模式暂时不在输入框中提供，计划后续以命令方式调整。
+Web 客户端发“执行沙箱验收”会直接在实际容器中执行命令；“请向我提问”会出现回答卡片；“slow 慢速响应”可用于测试运行中的补充输入。“只读旁问”只读最近提交的主线前缀，不提供工具或写回主线；它和审批模式暂时不在输入框中提供，计划后续以命令方式调整。
 
 本地配置在 `var/m1/config.toml`，vault 主密钥在权限 0600 的 `var/m1/secrets.env`，均已忽略。vault 主密钥需要保留；轮换时把旧密钥所在的环境变量名登记到 `llm.vault_retired_keys`（以旧 `vault_key_id` 为键），新密钥放入 `vault_key_env` 并递增 `llm.vault_key_id`，旧 BYOK 密文仍可解密。网关密钥是随机不透明令牌，数据库只存其 SHA-256，无需签名密钥；撤销立即生效。`/capabilities` 与 `/admin/settings` 反映生效模式；`llm.enabled=false` 时保留 M0 模拟模式。
 
@@ -51,7 +51,9 @@ Web 客户端发“执行沙箱验收”会请求执行审批，允许后在实�
 
 自动选择顺序为个人 → 组织 → 平台；实例/组织策略可禁用个人或平台凭据。指定的凭据无权使用、已撤销或不可用时直接拒绝，不自动降级到平台 key。M1 暂无凭据管理 UI。
 
-沙箱内通过 `http://127.0.0.1:8090/v1/messages` 请求模型，由 guest 内存凭据代理经 Unix socket 转发。exec 工具支持后台运行、poll/stdin/kill、超时和截断输出；PTY 明确不支持。沙箱默认无外网，完整输出留在执行节点。仅 `/workspace` 为后续任务保留。
+沙箱内通过 `http://127.0.0.1:8090/v1/messages` 请求模型，由 guest 内存凭据代理经 Unix socket 转发。Chat 的沙箱工具静默执行，不请求审批。exec 工具支持后台运行、poll/stdin/kill、超时和截断输出；PTY 明确不支持。沙箱默认无外网，完整输出留在执行节点。仅 `/workspace` 为后续任务保留。
+
+`view_image` 让 Chat 模型查看沙箱里的图片（PNG、JPEG、GIF、WebP、BMP），相对路径从 `/workspace` 开始。文件在沙箱内由 guest 解码：符合要求的 PNG/JPEG/WebP 原样返回，其余的转正、缩放到长边不超过 2000 px 后重新编码（优先 PNG，过大时改用 JPEG），单张不超过 3 MiB。图片按对话存入 `chat_images`（迁移 0015），模型上下文和检查点只保存引用，发送请求时才内联。分叉会复制图片，删除对话时一并清除。LLM Gateway 请求体上限为 32 MiB。
 
 ## M2 Work 本地联调
 
@@ -97,7 +99,7 @@ S3 配置、MCP catalog、故障场景、验证范围和部署限制见 [M2 验�
 python3 scripts/serve-web.py --directory var/demo/web
 ```
 
-访问 [http://127.0.0.1:3000](http://127.0.0.1:3000)，填写测试邮箱和至少 8 位密码注册即可。Chat 中发送普通文字可测试流式响应，发送“执行”或“提问”可测试工具审批与用户回答。当前回复由本地协议 fixture 生成，尚未接入真实模型；项目、会话、审批和沙箱执行链路实际运行。
+访问 [http://127.0.0.1:3000](http://127.0.0.1:3000)，填写测试邮箱和至少 8 位密码注册即可。Chat 中发送普通文字可测试流式响应，发送“执行”或“提问”可测试沙箱执行与用户回答。当前回复由本地协议 fixture 生成，尚未接入真实模型；项目、会话、审批和沙箱执行链路实际运行。
 
 前端只让用户选模型：输入框的“模型”选择器中，Chat 按提供方列出模型，Work 在 Codex / Claude Code 子菜单里选模型；上游格式（Anthropic Messages 或 OpenAI Responses）由服务端按模型所属提供方推断。对话开始后只能切换同一提供方（Work 为同一执行器）的模型，选择其他模型会用它打开新对话。在侧栏“项目”中管理项目指令和文本知识文件，在模型菜单中切换推理强度，Work 中切换计划模式，在消息上分叉，并通过对话菜单执行压缩、重命名、归档和导出。设置与项目内容在下一轮生效，设置变更不写入时间线，发送消息时会携带尚未确认的设置。Claude 的运行中补充会排入下一轮；界面分别显示“等待注入点”和“已转交执行器”，不声称模型已采纳。
 
@@ -135,9 +137,23 @@ Responses 服务设置 `llm.responses_url`（服务端自动追加 `/v1/response
 
 联网搜索使用模型服务商自带的 web search，平台不做额外限制：Chat 请求始终附带内置工具（Anthropic 为 `web_search_20260318`，Responses 为 `web_search`），因此上游必须支持服务端工具；Codex 配置为 `web_search = "live"`；Claude Code 保留自带的 WebSearch。Anthropic 的 `pause_turn` 会把原样的 assistant 内容再发送一次来续写。回合未结束时（暂停中，或服务端工具排在客户端工具之后），补充指令会等到回合结束再发送。搜索在 Chat 和 Work 中都显示为 `web_search` 工具步骤。Chat 的流式回复遇到搜索会在当场拆分：已输出的文字单独成条，接着是搜索步骤，后续文字写入新的条目。暂停的回合中，搜索的结果会在下一步补上。重试时，失败那次尝试新增的条目标记为 `discarded`，客户端不显示。每段文字引用的网页显示在该段下方（`ItemDetail.answer`，协议 minor 2）。
 
+## 附件与文件库
+
+每个成员有自己的文件库。文件属于上传者，不属于某个对话；同一个文件可以在上传者的多个对话里引用。删除对话只移除引用，文件留在库里；在文件库里删除文件会把它从所有对话中移除：时间线显示“已删除”，模型下一次请求里换成提示文字，沙箱下次同步时文件消失。
+
+- 上传：`POST /orgs/{org}/attachments?name=<文件名>`，请求体是文件原始字节。服务端边收边算 sha256，不信任客户端声明的类型或哈希。单个文件默认 50 MB（策略 `attachment_bytes`，平台上限 64 MiB），每个成员文件库总量由策略 `attachment_quota_bytes` 限制（默认不限）。每条消息最多 10 个文件。
+- 类型按文件头判断：图片（PNG/JPEG/GIF/WebP/BMP）由独立的 `ryzhub-server render-image` 子进程解码，限制内存和 CPU，生成长边不超过 2000 px、不超过 3 MiB 的渲染版；PDF 发给模型时从存储读取；不超过 32 KiB 的 UTF-8 文本直接内联；其余文件只告诉模型路径。
+- 存储：内容写入 `BlobStore` 的 `<org>/attachments/<sha256>`（主存储与可选二级存储），同组织内相同内容共用一个对象，最后一个引用它的条目删除后由 Owner 每 60 秒的回收任务清理；中断的上传 24 小时后放弃。迁移 0016 新增 `attachments`、`conversation_files` 和 `pending_inputs.attachment_ids`。
+- 接口：`GET /orgs/{org}/attachments?q=&kind=`（文件库列表，可按文件名搜索、按 `image,pdf,text,file` 过滤）、`…/{id}/content`（原文件，总是作为下载返回）、`…/{id}/preview`（图片渲染版）、`DELETE …/{id}`；只有上传者能访问。`SendMessage.attachment_ids` / `Steer.attachment_ids` 携带文件，消息条目的 `ItemDetail.attachments` 列出文件（协议 minor 3），有文件时正文可以为空。
+- Chat：用户消息里依次是图片/PDF 引用、一段列出 `/attachments/<名字>` 路径的说明、内联的文本文件、正文。上下文和检查点只存引用，发请求时才内联；每次请求最多带最近 20 张图、4 个 PDF，合计 16 MiB，其余换成提示文字；压缩上下文时只发提示文字。`llm.models` 的 `inputs`（默认 `["image","pdf"]`）声明模型能直接读的类型，其他类型只给路径。
+- 沙箱：Chat 与 Work 沙箱都以只读方式挂载 `/attachments`，内容是该对话当前引用的全部文件，按需从存储上传到执行节点（执行节点上按对话保存一份，删除工作区时清除）。Chat 每次执行工具前同步，Work 在每次运行开始以及发送带文件的输入前同步。
+- Work：本轮正文末尾附上文件路径列表；原样可用的图片同时作为图片输入（Codex 为 `localImage`，Claude 适配层读成图片块）。执行器自己复制进 `/workspace` 的副本在文件删除后无法收回。
+- 模型交给用户的文件：模型（Chat 和 Work 的 Codex、Claude 都一样）在回答里用链接引用沙箱里的文件，如 `[报告](sandbox:/workspace/report.pdf)`，也可以引用 `/attachments/<名字>`。回答完成时服务端把链接指向的文件复制进对话创建者的文件库（`direction=output`，计入配额，每条回答最多 20 个），绑定到本对话，之后的沙箱在 `/attachments` 下还能拿到；同名同内容的文件再次引用时复用同一条目。读取走执行节点的 `WorkspaceFile` 命令：用 `openat2(RESOLVE_IN_ROOT)` 把路径解析限定在 `/workspace` 内，符号链接和 `..` 都出不去，只接受普通文件。结果记在回答条目的 `AnswerDetail.files`（协议 minor 4）：每个链接对应一个文件，或一个错误码（`FILE_NOT_FOUND`、`NOT_A_FILE`、`FILE_TOO_LARGE`、`ATTACHMENT_QUOTA_EXCEEDED` 等）。客户端把这类链接显示为带文件图标的链接，点击打开预览；文件库有“AI 生成”标签页。
+- 客户端：输入框“+”菜单里的“上传文件”和“从文件库选择”，也可以拖放文件到对话区域，或在网页版直接粘贴截图。消息里的图片显示缩略图。点击任何文件（消息里、输入框里或文件库里）都打开预览。从对话里打开的预览浮在整个页面上（包括侧边栏），底下的页面模糊显示，点击模糊处等于关闭；底部输入框在当前对话里带着这个文件继续提问（回答进行中时作为补充指令），发出后预览关闭。从文件库打开的预览盖住侧边栏右侧的整个区域，底部提问会开一个带着该文件的新对话。图片先显示服务端的渲染版、再换成原图（原图不超过 20 MB 时；全分辨率、动图会动，服务端没渲染成功的图片也能显示），可缩放，PDF 由 pdfrx（PDFium，网页版是 WASM，首次打开 PDF 时才加载）渲染，文本和代码按原样显示、Markdown 渲染显示，其他类型显示“无法预览”和下载按钮；同一组文件可用 ← → 或两侧按钮切换。渲染器在 `client/lib/ui/preview.dart` 的 `previewers` 里按顺序登记，以后加 HTML、SVG 预览只需插入新的渲染器。构建 Windows 版需要开启开发者模式（pdfrx 的要求）。侧边栏的“文件库”页（网页地址 `#/library`）可以按网格或列表浏览、搜索、按类型筛选、上传（也可拖放或粘贴到该页）、下载、删除文件，或把文件带进一个新对话。
+
 ## 运行 Flutter 客户端
 
-本次使用 Flutter 3.47.5 / Dart 3.13.4、flutter_rust_bridge 2.11.1。Rust 生成的绑定已提交。原生 UI 的 SQLite 缓存和 Web 的 IndexedDB 缓存都按服务器、用户、组织隔离；访问 token 不写磁盘。Web 登录后，服务端把设备的 refresh token 写入 HttpOnly Cookie（`Path=/auth`、`SameSite=Strict`，HTTPS 下加 `Secure`，30 天滑动有效）。页面刷新或访问 token 过期时，用它换取新的访问 token，并轮换 refresh token；被替换的旧 token 在 60 秒内仍可使用，供同时刷新的多个标签页共用，超过 60 秒再出现就视为重放，吊销整个设备。退出登录会吊销该设备签发的所有 token。页面和 API 都在本机回环地址上时，客户端会让 API 使用和页面相同的主机名，保证 Cookie 同站。打开的对话写在地址里（`#/c/<id>`），刷新、前进后退和书签都能回到它；原生端没有 refresh token，每次启动需要重新登录，但会记住每个服务器和组织上次打开的对话。
+本次使用 Flutter 3.47.5 / Dart 3.13.4、flutter_rust_bridge 2.11.1。Rust 生成的绑定已提交。原生 UI 的 SQLite 缓存和 Web 的 IndexedDB 缓存都按服务器、用户、组织隔离；访问 token 不写磁盘。缓存按记录保存：一条 `engine`（resume token、未确认的命令）加每个频道一条，一次更新只写它改动的频道，同一批写入在一个本地事务里提交；旧版的整份缓存在首次保存时改写成记录，未确认的命令保留。命令写入成功之后才会发送，定时重发和重连重发也只发已写入的命令。服务端在访问 token 到期前一分钟发 `AuthExpiring`，客户端随即续期并在原连接上发 `AuthRefresh`，频道和待发命令都不受影响；token 自然过期只会断开连接，只有会话被吊销或用户被停用才会撤销频道（`SubscriptionRevoked`）。续期失败时回到登录页。服务端拒绝的消息会在页面上提示原因，可以“恢复编辑”，把原文和附件放回输入框。Web 登录后，服务端把设备的 refresh token 写入 HttpOnly Cookie（`Path=/auth`、`SameSite=Strict`，HTTPS 下加 `Secure`，30 天滑动有效）。页面刷新或访问 token 过期时，用它换取新的访问 token，并轮换 refresh token；被替换的旧 token 在 60 秒内仍可使用，供同时刷新的多个标签页共用，超过 60 秒再出现就视为重放，吊销整个设备。退出登录会吊销该设备签发的所有 token。页面和 API 都在本机回环地址上时，客户端会让 API 使用和页面相同的主机名，保证 Cookie 同站。打开的对话写在地址里（`#/c/<id>`），刷新、前进后退和书签都能回到它；原生端没有 refresh token，每次启动需要重新登录，但会记住每个服务器和组织上次打开的对话。
 
 Web 构建准备：
 
@@ -157,7 +173,7 @@ python3 scripts/serve-web.py
 - Android：安装 SDK/NDK、`cargo-ndk` 和三个 Rust Android target 后运行 `scripts/build-android.sh`。Debug manifest 允许本地 HTTP；release 使用 HTTPS。
 - 原生开发时可用 `--dart-define=RYZHUB_RUST_LIBRARY=<Rust 动态库绝对路径>` 显式指定库。Flutter 外壳通过 Dart 注入传输和平台缓存；独立 `driver-native` crate 提供 tokio/tungstenite + SQLite 驱动。两者使用相同 Rust 协议与状态机。
 
-M0 模式输入 `/approve 任意内容` 会打开模拟审批，可用两个浏览器窗口登录同一账号竞争决议。普通消息流式输出；侧栏顶部的连接状态在异常（黄色）时可点击重连，网络变化和应用恢复前台也会触发按游标补齐。Ctrl+Enter 发送（可在设置中改为 Enter 发送）；IME 组字期间不会误发送。浏览器测试脚本以 `zh-CN` locale 运行。
+M0 模式输入 `/approve 任意内容` 会打开模拟审批，可用两个浏览器窗口登录同一账号竞争决议。普通消息流式输出；侧栏顶部的连接状态在异常（黄色）时可点击重连，网络变化和应用恢复前台也会触发按游标补齐。Enter 发送、Shift+Enter 换行，Ctrl+Enter 也可发送（可在设置中改为只用 Ctrl+Enter 发送）；IME 组字期间不会误发送。浏览器测试脚本以 `zh-CN` locale 运行。
 
 ## 验证
 

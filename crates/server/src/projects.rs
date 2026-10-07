@@ -466,6 +466,22 @@ pub async fn instructions(
     Ok(project + &memory.text)
 }
 
+/// What a Work harness is told: how to hand files over, then the run's project context.
+pub async fn harness_instructions(
+    tx: &mut Tx<'_>,
+    lease: &Lease,
+    run: Uuid,
+    config: &crate::config::Config,
+) -> anyhow::Result<String> {
+    let project = instructions(tx, lease, run, config).await?;
+    let files = crate::attachments::outputs::INSTRUCTIONS;
+    Ok(if project.is_empty() {
+        files.to_owned()
+    } else {
+        format!("{files}\n\n{project}")
+    })
+}
+
 /// The project files frozen with the run, by name.
 async fn run_files(tx: &mut Tx<'_>, org: Uuid, run: Uuid) -> anyhow::Result<Vec<(String, String)>> {
     Ok(sqlx::query_as(
@@ -538,7 +554,7 @@ pub async fn mount(app: &App, lease: &Lease, run: Uuid, sandbox: Uuid) -> anyhow
     let (files, instructions) = {
         let mut tx = app.store.fenced(lease).await?;
         let files = run_files(&mut tx, lease.org_id, run).await?;
-        let instructions = instructions(&mut tx, lease, run, &app.config).await?;
+        let instructions = harness_instructions(&mut tx, lease, run, &app.config).await?;
         tx.commit().await?;
         (files, instructions)
     };
@@ -723,6 +739,9 @@ pub(crate) async fn purge_conversation(
         "conversation_operations",
         "workspace_jobs",
         "workspace_heads",
+        "chat_images",
+        // References only: the files stay in their owner's library.
+        "conversation_files",
     ] {
         statements.push(format!(
             "DELETE FROM {table} WHERE org_id=$1 AND conversation_id=$2"

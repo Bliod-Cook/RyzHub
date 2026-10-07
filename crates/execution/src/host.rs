@@ -4,7 +4,7 @@ use serde_json::json;
 use std::{
     collections::BTreeSet,
     os::unix::fs::PermissionsExt,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Weak},
 };
 use tokio::{
@@ -242,6 +242,43 @@ impl Host {
                 }
                 Ok(json!({"mounted":true}))
             }
+            HostCommand::Attachments {
+                sandbox_id,
+                exec_epoch,
+                files,
+            } => {
+                let _operation = self.operation(sandbox_id).await;
+                let spec = self.fenced(sandbox_id, exec_epoch).await?;
+                for (name, file) in &files {
+                    valid_attachment(name, file)?;
+                }
+                let directory = self.attachments(&spec);
+                std::fs::create_dir_all(&directory)?;
+                let mut manifest: BTreeMap<String, String> =
+                    journal::load(&directory.with_extension("json"))?;
+                for entry in std::fs::read_dir(&directory)? {
+                    let entry = entry?;
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    let current = files.get(&name).is_some_and(|file| {
+                        manifest.get(&name) == Some(&file.sha256)
+                            && entry.metadata().is_ok_and(|m| m.len() == file.size)
+                    });
+                    if !current {
+                        std::fs::remove_file(entry.path())?;
+                        manifest.remove(&name);
+                    }
+                }
+                manifest.retain(|name, _| files.contains_key(name));
+                journal::save(&directory.with_extension("json"), &manifest)?;
+                let missing: Vec<&String> = files
+                    .keys()
+                    .filter(|name| !manifest.contains_key(*name))
+                    .collect();
+                Ok(json!({"missing": missing}))
+            }
+            HostCommand::AttachmentUpload { .. } => {
+                anyhow::bail!("attachment uploads need a dedicated connection")
+            }
             HostCommand::Create { spec } => self.create(spec).await,
             HostCommand::Status => {
                 let tasks = self.ctr(&["tasks", "list"]).await?;
@@ -264,8 +301,10 @@ impl Host {
                 artifact,
                 sha256,
             } => self.start_restore(spec, artifact, sha256),
-            HostCommand::ArtifactDownload { .. } | HostCommand::ArtifactUpload { .. } => {
-                anyhow::bail!("artifact streams need a dedicated connection")
+            HostCommand::ArtifactDownload { .. }
+            | HostCommand::ArtifactUpload { .. }
+            | HostCommand::WorkspaceFile { .. } => {
+                anyhow::bail!("streams need a dedicated connection")
             }
             HostCommand::DeleteArtifact { artifact } => {
                 for path in [
@@ -316,7 +355,25 @@ impl Host {
                     .join(org_id.to_string())
                     .join("workspaces")
                     .join(workspace_id.to_string());
-                match tokio::fs::remove_dir_all(path).await {
+                let attachments = self
+                    .config
+                    .root
+                    .join("org")
+                    .join(org_id.to_string())
+                    .join("attachments")
+                    .join(workspace_id.to_string());
+                for path in [
+                    path,
+                    attachments.with_extension("parts"),
+                    attachments.clone(),
+                ] {
+                    match tokio::fs::remove_dir_all(path).await {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+                match tokio::fs::remove_file(attachments.with_extension("json")).await {
                     Ok(()) => {}
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                     Err(e) => return Err(e.into()),
@@ -337,6 +394,87 @@ impl Host {
 
     fn artifact(&self, id: Uuid) -> PathBuf {
         self.config.root.join("artifacts").join(format!("{id}.tar"))
+    }
+
+    /// The workspace's `/attachments`, outside the sandbox's own directory so it outlives it.
+    /// Beside it: `<dir>.json`, each file's content address, and `<dir>.parts`, uploads in
+    /// progress.
+    fn attachments(&self, spec: &SandboxSpec) -> PathBuf {
+        self.config
+            .root
+            .join("org")
+            .join(spec.org_id.to_string())
+            .join("attachments")
+            .join(spec.workspace_id.to_string())
+    }
+
+    /// The workspace directory a sandbox without its own copy mounts at `/workspace`.
+    fn workspace(&self, spec: &SandboxSpec) -> PathBuf {
+        self.config
+            .root
+            .join("org")
+            .join(spec.org_id.to_string())
+            .join("workspaces")
+            .join(spec.workspace_id.to_string())
+    }
+
+    /// The spec of a running sandbox whose current execution epoch is `exec_epoch`.
+    async fn fenced(&self, sandbox_id: Uuid, exec_epoch: u64) -> anyhow::Result<SandboxSpec> {
+        let state = self.state.lock().await;
+        let entry = state
+            .sandboxes
+            .get(&sandbox_id)
+            .context("UNKNOWN_SANDBOX")?;
+        ensure!(
+            entry.epoch == exec_epoch && entry.state == "running",
+            "FENCED"
+        );
+        Ok(entry.spec.clone())
+    }
+
+    /// Receive one `/attachments` file, verified before it becomes visible.
+    async fn attachment_upload(
+        &self,
+        sandbox_id: Uuid,
+        exec_epoch: u64,
+        name: &str,
+        file: AttachmentFile,
+        body: impl tokio::io::AsyncRead + Unpin,
+    ) -> anyhow::Result<Value> {
+        let _operation = self.operation(sandbox_id).await;
+        let spec = self.fenced(sandbox_id, exec_epoch).await?;
+        valid_attachment(name, &file)?;
+        let directory = self.attachments(&spec);
+        let parts = directory.with_extension("parts");
+        std::fs::create_dir_all(&directory)?;
+        std::fs::create_dir_all(&parts)?;
+        let partial = parts.join(Uuid::now_v7().to_string());
+        let mut out = tokio::fs::File::create(&partial).await?;
+        let copied = copy_exact(body, &mut out, file.size).await;
+        let result = async {
+            ensure!(
+                copied? == file.size,
+                "attachment ended before {} bytes",
+                file.size
+            );
+            out.sync_all().await?;
+            let check = partial.clone();
+            let (actual, _) =
+                tokio::task::spawn_blocking(move || crate::archive::digest(&check)).await??;
+            ensure!(actual == file.sha256, "CHECKSUM_MISMATCH");
+            std::fs::set_permissions(&partial, std::fs::Permissions::from_mode(0o444))?;
+            tokio::fs::rename(&partial, directory.join(name)).await?;
+            let path = directory.with_extension("json");
+            let mut manifest: BTreeMap<String, String> = journal::load(&path)?;
+            manifest.insert(name.to_owned(), file.sha256.clone());
+            journal::save(&path, &manifest)?;
+            Ok(json!({"size": file.size}))
+        }
+        .await;
+        if result.is_err() {
+            let _ = std::fs::remove_file(&partial);
+        }
+        result
     }
 
     /// Report on `artifact`'s checkpoint, starting it on first request. The sandbox is frozen
@@ -518,6 +656,45 @@ impl Host {
         Ok(())
     }
 
+    /// Stream a file of a sandbox's `/workspace` to the caller after a `{"size":n}` header.
+    /// A refusal replies instead of the header.
+    async fn workspace_file(
+        &self,
+        sandbox_id: Uuid,
+        exec_epoch: u64,
+        path: String,
+        write: &mut tokio::net::unix::OwnedWriteHalf,
+    ) -> anyhow::Result<()> {
+        let opened = async {
+            let spec = self.fenced(sandbox_id, exec_epoch).await?;
+            // A persistent sandbox's `/workspace` is a directory of its own overlay.
+            let root = if spec.persistent {
+                self.dir(sandbox_id).join("merged/workspace")
+            } else {
+                self.workspace(&spec)
+            };
+            let (file, size) =
+                tokio::task::spawn_blocking(move || open_inside(&root, &path, MAX_ATTACHMENT))
+                    .await?
+                    .map_err(|code| anyhow::anyhow!(code))?;
+            Ok::<_, anyhow::Error>((tokio::fs::File::from_std(file), size))
+        }
+        .await;
+        let (file, size) = match opened {
+            Ok(opened) => opened,
+            Err(error) => {
+                write.write_all(&Reply::from(Err(error)).line()).await?;
+                return Ok(());
+            }
+        };
+        write
+            .write_all(&Reply::from(Ok(json!({"size":size}))).line())
+            .await?;
+        copy_exact(file, write, size).await?;
+        write.flush().await?;
+        Ok(())
+    }
+
     /// Receive `size` bytes into the artifact, verifying the digest before it becomes visible.
     async fn upload(
         &self,
@@ -591,11 +768,37 @@ impl Host {
                         }
                         return;
                     }
+                    Ok(HostCommand::WorkspaceFile {
+                        sandbox_id,
+                        exec_epoch,
+                        path,
+                    }) => {
+                        let streamed = this
+                            .workspace_file(sandbox_id, exec_epoch, path, &mut write)
+                            .await;
+                        if let Err(error) = streamed {
+                            eprintln!("sandbox {sandbox_id} file stream failed: {error:#}");
+                        }
+                        return;
+                    }
                     Ok(HostCommand::ArtifactUpload {
                         artifact,
                         size,
                         sha256,
                     }) => Reply::from(this.upload(artifact, size, &sha256, &mut reader).await),
+                    Ok(HostCommand::AttachmentUpload {
+                        sandbox_id,
+                        exec_epoch,
+                        name,
+                        size,
+                        sha256,
+                    }) => {
+                        let file = AttachmentFile { sha256, size };
+                        let received = this
+                            .attachment_upload(sandbox_id, exec_epoch, &name, file, &mut reader)
+                            .await;
+                        Reply::from(received)
+                    }
                     Ok(command) => Reply::from(this.handle(command).await),
                     Err(error) => Reply::from(Err(error)),
                 };
@@ -685,13 +888,7 @@ impl Host {
         for sub in ["base", "upper", "work", "merged", "control"] {
             std::fs::create_dir_all(dir.join(sub))?;
         }
-        let workspace = self
-            .config
-            .root
-            .join("org")
-            .join(spec.org_id.to_string())
-            .join("workspaces")
-            .join(spec.workspace_id.to_string());
+        let workspace = self.workspace(&spec);
         std::fs::create_dir_all(&workspace)?;
         state.sandboxes.insert(
             spec.id,
@@ -761,6 +958,13 @@ impl Host {
         mounts(&mut config).push(bind(
             "/project",
             &project,
+            &["bind", "ro", "nosuid", "nodev", "noexec"],
+        ));
+        let attachments = self.attachments(&spec);
+        std::fs::create_dir_all(&attachments)?;
+        mounts(&mut config).push(bind(
+            "/attachments",
+            &attachments,
             &["bind", "ro", "nosuid", "nodev", "noexec"],
         ));
         let config_path = dir.join("config.json");
@@ -1059,14 +1263,116 @@ fn mounts(config: &mut Value) -> &mut Vec<Value> {
         .expect("OCI spec has mounts")
 }
 
+/// A name and content address `/attachments` may hold.
+fn valid_attachment(name: &str, file: &AttachmentFile) -> anyhow::Result<()> {
+    ensure!(
+        !name.is_empty()
+            && name.len() <= 128
+            && !name.starts_with('.')
+            && !name.contains(['/', '\\', '\0']),
+        "INVALID_ATTACHMENT"
+    );
+    ensure!(
+        file.sha256.len() == 64 && file.sha256.bytes().all(|c| c.is_ascii_hexdigit()),
+        "INVALID_ATTACHMENT"
+    );
+    ensure!(file.size <= MAX_ATTACHMENT, "ATTACHMENT_TOO_LARGE");
+    Ok(())
+}
+
 /// A bind mount in OCI form.
 fn bind(destination: &str, source: &Path, options: &[&str]) -> Value {
     json!({"destination": destination, "type": "bind", "source": source, "options": options})
 }
 
+/// Open `path`, relative to `/workspace`, as a regular file of at most `limit` bytes under
+/// `root`. The sandbox controls the directory, so the kernel resolves every component inside
+/// `root`: `..` and symlinks, even absolute ones, cannot lead out of it, and magic links and
+/// other mounts are refused. The sandbox cannot make device nodes; a FIFO opens without
+/// blocking and, like a socket or a directory, is not a file.
+fn open_inside(root: &Path, path: &str, limit: u64) -> Result<(std::fs::File, u64), &'static str> {
+    use nix::{
+        errno::Errno,
+        fcntl::{OFlag, OpenHow, ResolveFlag},
+        sys::stat::Mode,
+    };
+    if path.is_empty() || path.len() > 4096 || path.contains('\0') {
+        return Err("INVALID_PATH");
+    }
+    let directory = nix::fcntl::open(
+        root,
+        OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|_| "FILE_NOT_FOUND")?;
+    let how = OpenHow::new()
+        .flags(OFlag::O_RDONLY | OFlag::O_NONBLOCK | OFlag::O_CLOEXEC | OFlag::O_NOCTTY)
+        .resolve(
+            ResolveFlag::RESOLVE_IN_ROOT
+                | ResolveFlag::RESOLVE_NO_MAGICLINKS
+                | ResolveFlag::RESOLVE_NO_XDEV,
+        );
+    let file = nix::fcntl::openat2(&directory, path, how).map_err(|error| match error {
+        Errno::ENAMETOOLONG => "INVALID_PATH",
+        Errno::ENXIO => "NOT_A_FILE",
+        Errno::ENOSYS => "OPENAT2_UNSUPPORTED",
+        _ => "FILE_NOT_FOUND",
+    })?;
+    let file = std::fs::File::from(file);
+    let metadata = file.metadata().map_err(|_| "FILE_NOT_FOUND")?;
+    if !metadata.is_file() {
+        return Err("NOT_A_FILE");
+    }
+    if metadata.len() > limit {
+        return Err("FILE_TOO_LARGE");
+    }
+    Ok((file, metadata.len()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workspace_files_open_only_inside_the_workspace() {
+        use std::{io::Read, os::unix::fs::symlink};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("workspace");
+        std::fs::create_dir_all(root.join("out")).unwrap();
+        std::fs::write(root.join("out/report.txt"), b"report").unwrap();
+        std::fs::write(dir.path().join("secret"), b"secret").unwrap();
+        let secret = dir.path().join("secret");
+        symlink(&secret, root.join("absolute")).unwrap();
+        symlink("../secret", root.join("relative")).unwrap();
+        symlink("out/report.txt", root.join("inside")).unwrap();
+        nix::unistd::mkfifo(&root.join("pipe"), nix::sys::stat::Mode::S_IRWXU).unwrap();
+        let read = |path: &str| {
+            open_inside(&root, path, 1024).map(|(mut file, size)| {
+                let mut text = String::new();
+                file.read_to_string(&mut text).unwrap();
+                (text, size)
+            })
+        };
+        assert_eq!(read("out/report.txt"), Ok(("report".into(), 6)));
+        // A link inside the workspace is followed, staying inside.
+        assert_eq!(read("inside"), Ok(("report".into(), 6)));
+        // `..` and links, even absolute ones, resolve inside the workspace: nothing outside.
+        assert_eq!(read("../secret"), Err("FILE_NOT_FOUND"));
+        assert_eq!(read("out/../../secret"), Err("FILE_NOT_FOUND"));
+        assert_eq!(read("relative"), Err("FILE_NOT_FOUND"));
+        assert_eq!(read("absolute"), Err("FILE_NOT_FOUND"));
+        assert_eq!(read(secret.to_str().unwrap()), Err("FILE_NOT_FOUND"));
+        // A FIFO opens without waiting for a writer, and is refused.
+        assert_eq!(read("pipe"), Err("NOT_A_FILE"));
+        assert_eq!(read("out"), Err("NOT_A_FILE"));
+        assert_eq!(read("missing.txt"), Err("FILE_NOT_FOUND"));
+        assert_eq!(read(""), Err("INVALID_PATH"));
+        assert_eq!(read("a\0b"), Err("INVALID_PATH"));
+        assert_eq!(
+            open_inside(&root, "out/report.txt", 5).map(|(_, size)| size),
+            Err("FILE_TOO_LARGE")
+        );
+    }
 
     #[test]
     fn a_failed_job_is_reported_once_then_retried() {
@@ -1141,6 +1447,94 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.to_string(), "WORKSPACE_DELETED");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn attachments_hold_exactly_the_listed_verified_files() -> anyhow::Result<()> {
+        use sha2::{Digest, Sha256};
+        let root = tempfile::tempdir()?;
+        let host = Arc::new(Host {
+            config: Config {
+                root: root.path().to_path_buf(),
+                containerd: String::new(),
+                guest_binary: "/unused".into(),
+                multi_tenant: false,
+                allowed_uid: 0,
+                runsc_config: None,
+            },
+            state: Mutex::new(State::default()),
+            operations: Mutex::new(BTreeMap::new()),
+            checkpointing: std::sync::Mutex::new(BTreeSet::new()),
+            jobs: std::sync::Mutex::new(BTreeMap::new()),
+            _lock: std::fs::File::create(root.path().join("host.lock"))?,
+        });
+        let (sandbox, org, workspace) = (Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7());
+        let spec = SandboxSpec {
+            id: sandbox,
+            org_id: org,
+            workspace_id: workspace,
+            exec_epoch: 2,
+            image: String::new(),
+            runtime: "runc".into(),
+            memory_bytes: 0,
+            pids_limit: 0,
+            persistent: false,
+        };
+        host.state.lock().await.sandboxes.insert(
+            sandbox,
+            Entry {
+                spec: spec.clone(),
+                epoch: 2,
+                state: "running".into(),
+            },
+        );
+        let file = |content: &[u8]| AttachmentFile {
+            sha256: format!("{:x}", Sha256::digest(content)),
+            size: content.len() as u64,
+        };
+        let sync = |files: BTreeMap<String, AttachmentFile>, epoch| {
+            host.handle(HostCommand::Attachments {
+                sandbox_id: sandbox,
+                exec_epoch: epoch,
+                files,
+            })
+        };
+        let listed = BTreeMap::from([("a.txt".to_owned(), file(b"alpha"))]);
+        assert_eq!(sync(listed.clone(), 2).await?["missing"], json!(["a.txt"]));
+        // A body that does not match its address never becomes visible.
+        let wrong = host
+            .attachment_upload(sandbox, 2, "a.txt", file(b"alpha"), &b"alpho"[..])
+            .await;
+        assert_eq!(wrong.unwrap_err().to_string(), "CHECKSUM_MISMATCH");
+        host.attachment_upload(sandbox, 2, "a.txt", file(b"alpha"), &b"alpha"[..])
+            .await?;
+        let directory = host.attachments(&spec);
+        assert_eq!(std::fs::read(directory.join("a.txt"))?, b"alpha");
+        assert_eq!(sync(listed, 2).await?["missing"], json!([]));
+        // The same name with other content is replaced; unlisted files go.
+        let replaced = BTreeMap::from([("a.txt".to_owned(), file(b"omega"))]);
+        assert_eq!(sync(replaced, 2).await?["missing"], json!(["a.txt"]));
+        assert!(!directory.join("a.txt").exists());
+        assert_eq!(sync(BTreeMap::new(), 2).await?["missing"], json!([]));
+        // Stale writers and bad names are refused.
+        assert_eq!(
+            sync(BTreeMap::new(), 1).await.unwrap_err().to_string(),
+            "FENCED"
+        );
+        let bad = BTreeMap::from([("../x".to_owned(), file(b"x"))]);
+        assert_eq!(
+            sync(bad, 2).await.unwrap_err().to_string(),
+            "INVALID_ATTACHMENT"
+        );
+        host.state.lock().await.sandboxes.clear();
+        host.handle(HostCommand::PurgeWorkspace {
+            org_id: org,
+            workspace_id: workspace,
+            artifacts: vec![],
+        })
+        .await?;
+        assert!(!directory.exists() && !directory.with_extension("json").exists());
         Ok(())
     }
 

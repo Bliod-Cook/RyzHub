@@ -80,9 +80,11 @@ message Compact {}
 message Fork { string item_id = 1; }
 // config_json optionally carries settings chosen since the last UpdateRunConfig
 // was confirmed; they apply before this message's run, in the same transaction.
+// attachment_ids name files of the sender's library (minor version 3); text may then be empty.
 message SendMessage {
   string text = 1;
   string config_json = 2;
+  repeated string attachment_ids = 3;
 }
 message DecideApproval {
   string action_id = 1;
@@ -91,7 +93,10 @@ message DecideApproval {
 }
 message Cancel {}
 message MarkRead { uint64 read_seq = 1; }
-message Steer { string text = 1; }
+message Steer {
+  string text = 1;
+  repeated string attachment_ids = 2;
+}
 message SideQuery { string text = 1; }
 message AnswerQuestion { string action_id = 1; uint64 run_epoch = 2; string answer = 3; }
 message CommandAck {
@@ -116,8 +121,8 @@ message Item {
   string run_id = 8;
   // `text` was cut at the server's per-item size limit; the full content is not replayed.
   bool truncated = 9;
-  // Structured content for tool and file-change items (minor version 1) and the sources an
-  // assistant reply cites (minor version 2).
+  // Structured content for tool and file-change items (minor version 1), the sources an
+  // assistant reply cites (minor version 2) and the files a message carries (minor version 3).
   ItemDetail detail = 10;
 }
 message ItemDetail {
@@ -125,10 +130,40 @@ message ItemDetail {
     ToolDetail tool = 1;
     FileChangeDetail file_change = 2;
     AnswerDetail answer = 3;
+    AttachmentsDetail attachments = 4;
   }
 }
+// Files a user message or steer carries, in order.
+message AttachmentsDetail { repeated Attachment files = 1; }
+message Attachment {
+  // The library entry; fetch its content or preview with this id.
+  string id = 1;
+  // Its name under /attachments in this conversation's sandboxes.
+  string path = 2;
+  string name = 3;
+  string media_type = 4;
+  uint64 size = 5;
+  // image, pdf, text or file.
+  string kind = 6;
+  uint32 width = 7;
+  uint32 height = 8;
+}
 // Sources from the provider's built-in web search, in order of first citation.
-message AnswerDetail { repeated Citation citations = 1; }
+message AnswerDetail {
+  repeated Citation citations = 1;
+  // Sandbox files the reply links to, published to the member's library when it completed
+  // (minor version 4).
+  repeated SharedFile files = 2;
+}
+// A file a reply links to as `sandbox:/workspace/...` or `/attachments/...`.
+message SharedFile {
+  // The linked path, normalized: `/workspace/<path>` or `/attachments/<name>`.
+  string link = 1;
+  // The library entry it became; absent when it could not be published.
+  Attachment file = 2;
+  // Why not, e.g. FILE_NOT_FOUND, NOT_A_FILE, FILE_TOO_LARGE, ATTACHMENT_QUOTA_EXCEEDED.
+  string error = 3;
+}
 message Citation {
   string url = 1;
   string title = 2;

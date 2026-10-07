@@ -469,6 +469,24 @@ impl Guest {
                 self.changed.notify_waiters();
                 Ok(result)
             }
+            GuestCommand::ReadImage {
+                path,
+                max_edge,
+                max_bytes,
+            } => {
+                drop(journal);
+                ensure!(
+                    !path.is_empty()
+                        && path.len() <= 4096
+                        && (64..=8000).contains(&max_edge)
+                        && max_bytes <= 8 * 1024 * 1024,
+                    "INVALID_IMAGE_REQUEST"
+                );
+                Ok(tokio::task::spawn_blocking(move || {
+                    crate::picture::read(&path, max_edge, max_bytes)
+                })
+                .await?)
+            }
             GuestCommand::Replay {
                 after,
                 wait_ms,

@@ -32,9 +32,8 @@ pub fn definitions() -> Value {
         ),
         tool(
             "exec",
-            "Execute a shell command in the sandbox. User approval is required. Only /workspace persists; \
-             installed system packages may be discarded. Full output is saved on the execution node. \
-             PTY is unsupported.",
+            "Execute a shell command in the sandbox. Only /workspace persists; installed system \
+             packages may be discarded. Full output is saved on the execution node. PTY is unsupported.",
             json!({
                 "cmd": string(),
                 "cwd": string(),
@@ -52,15 +51,23 @@ pub fn definitions() -> Value {
         ),
         tool(
             "exec_write",
-            "Write to the stdin of a running job. User approval is required.",
+            "Write to the stdin of a running job.",
             json!({"handle": string(), "data": string()}),
             &["handle", "data"],
         ),
         tool(
             "exec_kill",
-            "Stop a running job. User approval is required.",
+            "Stop a running job.",
             json!({"handle": string()}),
             &["handle"],
+        ),
+        tool(
+            "view_image",
+            "Look at an image file in the sandbox (PNG, JPEG, GIF, WebP or BMP), such as a chart you \
+             rendered. Relative paths start at /workspace. Images over 2000 px on the long side are \
+             scaled down. The image stays in the conversation for later turns.",
+            json!({"path": string()}),
+            &["path"],
         ),
         tool(
             "ask_user",
@@ -84,26 +91,18 @@ fn tool(name: &str, description: &str, properties: Value, required: &[&str]) -> 
     })
 }
 
-const KNOWN: [&str; 6] = [
+const KNOWN: [&str; 7] = [
     "exec",
     "exec_poll",
     "exec_write",
     "exec_kill",
+    "view_image",
     "ask_user",
     "project_file_search",
 ];
-/// Read-only tools never need approval.
-fn needs_approval(name: &str, full_auto: bool) -> bool {
-    match name {
-        "exec_poll"
-        | "project_file_search"
-        | "conversation_search"
-        | "memory_search"
-        | "memory_save"
-        | "memory_forget" => false,
-        "ask_user" => true,
-        _ => !full_auto,
-    }
+/// Tools run silently; only a question waits for the user.
+fn waits_for_user(name: &str) -> bool {
+    name == "ask_user"
 }
 
 /// Execute every unfinished tool call of the run, in order. Returns false when a call waits
@@ -145,13 +144,7 @@ pub async fn advance(
             .await?;
             continue;
         }
-        let settings: Value =
-            sqlx::query_scalar("SELECT run_config FROM runs WHERE org_id=$1 AND id=$2")
-                .bind(lease.org_id)
-                .bind(run)
-                .fetch_one(&mut *tx)
-                .await?;
-        if status == "planned" && needs_approval(&name, settings["approval"] == "full_auto") {
+        if status == "planned" && waits_for_user(&name) {
             match row.get::<Option<Uuid>, _>("action_id") {
                 Some(action) => {
                     let decision: String = sqlx::query_scalar(
@@ -174,7 +167,7 @@ pub async fn advance(
                     }
                 }
                 None => {
-                    ask(app, &mut tx, lease, run, &call, &name, &args).await?;
+                    ask(app, &mut tx, lease, run, &call, &args).await?;
                     tx.commit().await?;
                     link.committed().await;
                     return Ok(false);
@@ -223,32 +216,30 @@ pub async fn advance(
     }
 }
 
-/// Create the approval or question for a planned call and pause the run.
+/// Create the question of a planned `ask_user` call and pause the run.
 async fn ask(
     app: &App,
     tx: &mut Tx<'_>,
     lease: &Lease,
     run: Uuid,
     call: &str,
-    name: &str,
     args: &Value,
 ) -> anyhow::Result<()> {
-    let question = name == "ask_user";
-    let summary = if question {
-        format!(
-            "问题：{}",
-            args["question"].as_str().unwrap_or("请提供更多信息")
-        )
-    } else {
-        format!("允许执行 {name}？\n{args}")
-    };
+    let summary = format!(
+        "问题：{}",
+        args["question"].as_str().unwrap_or("请提供更多信息")
+    );
     ensure!(summary.len() <= 65_536, Code::InvalidToolArguments);
-    let (kind, options): (&str, &[&str]) = if question {
-        ("question", &["__answer__"])
-    } else {
-        ("approval", &["allow", "deny"])
-    };
-    let action = new_action(tx, lease, run, kind, &summary, options, &app.config).await?;
+    let action = new_action(
+        tx,
+        lease,
+        run,
+        "question",
+        &summary,
+        &["__answer__"],
+        &app.config,
+    )
+    .await?;
     sqlx::query("UPDATE tool_calls SET action_id=$4 WHERE org_id=$1 AND run_id=$2 AND call_id=$3")
         .bind(lease.org_id)
         .bind(run)
@@ -365,6 +356,7 @@ async fn dispatch(
             };
             sandbox::guest(app, lease, sandbox, command).await?
         }
+        "view_image" => super::media::view(app, lease, run, sandbox, &args).await?,
         _ => anyhow::bail!(Code::InvalidToolArguments),
     };
     Ok(if value["state"] == "outcome_unknown" {

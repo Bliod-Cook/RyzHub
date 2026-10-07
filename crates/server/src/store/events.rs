@@ -68,6 +68,40 @@ fn bound_item(item: &mut Item) {
                     cut |= truncate_utf8(field, 4096);
                 }
             }
+            answer
+                .files
+                .truncate(crate::attachments::outputs::MAX_PER_ANSWER);
+            for shared in &mut answer.files {
+                cut |= truncate_utf8(&mut shared.link, 1024);
+                cut |= truncate_utf8(&mut shared.error, 64);
+                if let Some(file) = &mut shared.file {
+                    for field in [
+                        &mut file.id,
+                        &mut file.path,
+                        &mut file.name,
+                        &mut file.media_type,
+                        &mut file.kind,
+                    ] {
+                        cut |= truncate_utf8(field, 1024);
+                    }
+                }
+            }
+        }
+        Some(Kind::Attachments(attachments)) => {
+            attachments
+                .files
+                .truncate(crate::attachments::MAX_PER_MESSAGE);
+            for file in &mut attachments.files {
+                for field in [
+                    &mut file.id,
+                    &mut file.path,
+                    &mut file.name,
+                    &mut file.media_type,
+                    &mut file.kind,
+                ] {
+                    cut |= truncate_utf8(field, 1024);
+                }
+            }
         }
         None => {}
     }
@@ -213,6 +247,19 @@ impl Store {
         ttl_ms: u64,
     ) -> anyhow::Result<Option<Lease>> {
         let mut tx = self.tx(org).await?;
+        // A conversation whose channel row someone else holds right now is skipped, not waited
+        // for: reconciliation tries it again shortly.
+        let free: Option<i32> = sqlx::query_scalar(
+            "SELECT 1 FROM channels WHERE org_id=$1 AND conversation_id=$2 FOR UPDATE SKIP LOCKED",
+        )
+        .bind(org)
+        .bind(conv)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if free.is_none() {
+            tx.rollback().await?;
+            return Ok(None);
+        }
         let epoch = sqlx::query_scalar!(
             r#"UPDATE channels SET owner_id=$3,writer_epoch=writer_epoch+1,
                  lease_until=clock_timestamp()+($4::bigint * interval '1 millisecond')

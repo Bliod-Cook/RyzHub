@@ -11,7 +11,8 @@ use sqlx::Row;
 use std::time::Duration;
 use uuid::Uuid;
 
-use super::{context, protocol, tools};
+use super::{context, media, protocol, tools};
+use crate::attachments::outputs;
 use crate::{
     app::App,
     error::{Code, code_of, or_code},
@@ -149,6 +150,27 @@ async fn prepare(
                 .is_some_and(|response| protocol::turn_open(&protocol, response));
             // A final answer with no steer waiting ends the run.
             if !called && !open && (!pending || read_only) {
+                // Its files are handed over first: the sandbox goes with the run.
+                let replies = if read_only || compact {
+                    Vec::new()
+                } else {
+                    outputs::unhanded(&mut tx, org, run).await?
+                };
+                if !replies.is_empty() {
+                    let sandbox: Option<Uuid> = sqlx::query_scalar(
+                        "SELECT id FROM sandboxes WHERE org_id=$1 AND run_id=$2 AND state='running'
+                         ORDER BY created_at DESC LIMIT 1",
+                    )
+                    .bind(org)
+                    .bind(run)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+                    // Nothing written yet; no transaction is held while files are copied.
+                    drop(tx);
+                    hand_over(app, lease, run, sandbox, replies, link).await?;
+                    // Decided again: a steer may have arrived meanwhile.
+                    return Box::pin(prepare(app, lease, run, link)).await;
+                }
                 finish(&mut tx, lease, run, "completed", None).await?;
                 tx.commit().await?;
                 link.committed().await;
@@ -165,6 +187,7 @@ async fn prepare(
                 Value::Null,
                 compact,
                 !open,
+                app.config.sandbox.enabled,
             )
             .await?;
             (next, messages, 0)
@@ -181,6 +204,7 @@ async fn prepare(
                 row.get("seed_messages"),
                 compact,
                 true,
+                app.config.sandbox.enabled,
             )
             .await?;
             (0, messages, 0)
@@ -288,11 +312,19 @@ async fn plan(
     initial: Value,
     compact: bool,
     consume: bool,
+    sandbox: bool,
 ) -> anyhow::Result<Value> {
     let org = lease.org_id;
-    let inputs: Vec<(i64, String, String, Uuid)> = if consume {
+    let protocol: String =
+        sqlx::query_scalar("SELECT protocol FROM runs WHERE org_id=$1 AND id=$2")
+            .bind(org)
+            .bind(run)
+            .fetch_one(&mut **tx)
+            .await?;
+    type Input = (i64, String, String, Uuid, Vec<Uuid>);
+    let inputs: Vec<Input> = if consume {
         sqlx::query_as(
-            "SELECT id,text,kind,item_id FROM pending_inputs WHERE org_id=$1 AND run_id=$2
+            "SELECT id,text,kind,item_id,attachment_ids FROM pending_inputs WHERE org_id=$1 AND run_id=$2
              AND consumed_step IS NULL ORDER BY id FOR UPDATE",
         )
         .bind(org)
@@ -304,11 +336,18 @@ async fn plan(
     };
     let mut messages = vec![];
     let mut consumed = 0;
-    for (id, text, kind, item) in inputs {
+    for (id, text, kind, item, files) in inputs {
         consumed = id;
         // A compaction request is an operation, not a message the model should see.
-        if !compact {
+        if compact {
+        } else if files.is_empty() {
             messages.push(json!({"role":"user","content":text}));
+        } else {
+            let conversation = lease.conversation_id;
+            messages.push(
+                media::user_message(tx, org, conversation, &protocol, &text, &files, sandbox)
+                    .await?,
+            );
         }
         if kind == "steer" {
             let mut item = load_item(tx, org, item).await?;
@@ -333,12 +372,6 @@ async fn plan(
         initial
     };
     let step = context::plan_step(tx, org, base, initial, messages).await?;
-    let protocol: String =
-        sqlx::query_scalar("SELECT protocol FROM runs WHERE org_id=$1 AND id=$2")
-            .bind(org)
-            .bind(run)
-            .fetch_one(&mut **tx)
-            .await?;
     sqlx::query(
         "INSERT INTO loop_steps(org_id,run_id,step_no,request_messages,base_run_id,base_step,input_delta,
              chain_length,consumed_input_seq,status,attempt,protocol)
@@ -360,8 +393,13 @@ async fn plan(
 }
 
 fn request_body(app: &App, step: &Step) -> Value {
+    let files = if app.config.sandbox.enabled {
+        format!(" {}", outputs::INSTRUCTIONS)
+    } else {
+        String::new()
+    };
     let system = format!(
-        "You are a helpful assistant. Use ask_user when a decision is needed. Execution tools run only in a sandbox; only /workspace persists. Never claim a tool succeeded without its result.{}",
+        "You are a helpful assistant. Use ask_user when a decision is needed. Execution tools run only in a sandbox; only /workspace persists. Never claim a tool succeeded without its result.{files}{}",
         step.instructions
     );
     let responses = step.config.protocol == "responses";
@@ -442,8 +480,27 @@ fn answer_detail(citations: &[Citation]) -> Option<ItemDetail> {
     (!citations.is_empty()).then(|| ItemDetail {
         kind: Some(item_detail::Kind::Answer(AnswerDetail {
             citations: citations.to_vec(),
+            files: Vec::new(),
         })),
     })
+}
+
+/// Publish the files the run's replies link to and record them on the replies.
+async fn hand_over(
+    app: &App,
+    lease: &Lease,
+    run: Uuid,
+    sandbox: Option<Uuid>,
+    replies: Vec<Item>,
+    link: &OwnerLink,
+) -> anyhow::Result<()> {
+    let targets = outputs::gather(replies.iter().map(|item| item.text.as_str()));
+    let shared = outputs::publish(app, lease, sandbox, &targets).await;
+    let mut tx = crate::runs::guarded(&app.store, lease, run).await?;
+    outputs::record(&mut tx, lease, run, &shared).await?;
+    tx.commit().await?;
+    link.committed().await;
+    Ok(())
 }
 
 /// A search's item id, stable across steps: a paused turn's search returns in the next step.
@@ -644,6 +701,21 @@ async fn model(
     )
     .await?;
     let responses = step.config.protocol == "responses";
+    let mut body = request_body(app, step);
+    let options = media::Options {
+        media: !step.compact,
+        accepts: crate::run_config::inputs(&app.config, &step.config.model),
+        sandbox: app.config.sandbox.enabled,
+    };
+    media::inline(
+        app,
+        lease.org_id,
+        lease.conversation_id,
+        &step.config.protocol,
+        &mut body,
+        &options,
+    )
+    .await?;
     let path = if step.compact {
         "responses/compact"
     } else if responses {
@@ -660,7 +732,7 @@ async fn model(
         ))
         .bearer_auth(key)
         .header("anthropic-version", "2023-06-01")
-        .json(&request_body(app, step))
+        .json(&body)
         .send()
         .await
         .context(Code::ModelConnectionFailed)?;
@@ -670,8 +742,10 @@ async fn model(
         anyhow::bail!(gateway_error(status, &body));
     }
     if step.compact {
-        let value: Value = response.json().await?;
+        let mut value: Value = response.json().await?;
         ensure!(value["output"].is_array(), Code::ModelRequestFailed);
+        // The compacted context is stored; it must not keep inline media.
+        media::scrub(&mut value["output"]);
         return Ok((value, layout));
     }
     mark_steers_handed(app, lease, run, step.number, link).await?;

@@ -15,15 +15,20 @@ pub use publish::{publish, publish_transient};
 
 use futures_util::StreamExt;
 use std::{collections::HashMap, time::Duration};
-use tokio::{sync::Notify, task::JoinSet};
+use tokio::{
+    sync::Notify,
+    task::{self, JoinSet},
+};
 use uuid::Uuid;
 
-use crate::{app::App, config::Config};
+use crate::{app::App, config::Config, store::Lease};
 
 /// How often an Owner process looks for conversations that need an actor without a wake-up.
 const RECONCILE: Duration = Duration::from_secs(1);
 /// How often user and organization channels are published.
 const OUTBOX: Duration = Duration::from_millis(500);
+/// Claims an Owner process makes at once; more wait for the next reconciliation.
+const MAX_CLAIMS: usize = 16;
 
 pub fn subject(channel: &str) -> String {
     format!("ryzhub.events.{}", channel.replace(':', "."))
@@ -70,6 +75,7 @@ pub async fn run(app: App, worker: sqlx::PgPool) -> anyhow::Result<()> {
     let owner = Uuid::now_v7();
     let mut actors: HashMap<Uuid, std::sync::Arc<Notify>> = HashMap::new();
     let mut running: JoinSet<Uuid> = JoinSet::new();
+    let mut claims = Claims::default();
     let mut wakes = app.nats.subscribe("ryzhub.wake.>").await?;
     let mut reconcile = tokio::time::interval(RECONCILE);
     let mut outbox = tokio::time::interval(OUTBOX);
@@ -79,21 +85,72 @@ pub async fn run(app: App, worker: sqlx::PgPool) -> anyhow::Result<()> {
                 let Some((org, conv)) = parse_wake(&message.subject) else { continue };
                 match actors.get(&conv) {
                     Some(wake) => wake.notify_one(),
-                    None => claim(&app, owner, org, conv, &mut actors, &mut running).await,
+                    None => claims.start(&app, owner, org, conv),
                 }
             }
             _ = reconcile.tick() => {
                 for (org, conv) in active_conversations(&worker, &app.config).await? {
                     if !actors.contains_key(&conv) {
-                        claim(&app, owner, org, conv, &mut actors, &mut running).await;
+                        claims.start(&app, owner, org, conv);
                     }
                 }
             }
             _ = outbox.tick() => publish_outbox(&app, &worker).await?,
+            Some(claimed) = claims.tasks.join_next_with_id() => {
+                if let Some((conv, Some(lease))) = claims.finished(claimed) {
+                    start(&app, conv, lease, &mut actors, &mut running);
+                }
+            }
             Some(ended) = running.join_next() => {
                 if let Ok(conv) = ended {
                     actors.remove(&conv);
                 }
+            }
+        }
+    }
+}
+
+/// Claims under way, each in a task of its own: one waiting on its conversation holds up
+/// neither the wake-ups and claims of others nor the outbox.
+#[derive(Default)]
+struct Claims {
+    tasks: JoinSet<Option<Lease>>,
+    by_task: HashMap<task::Id, Uuid>,
+}
+
+impl Claims {
+    /// Claim `conv` unless it is being claimed already or too many claims are under way.
+    fn start(&mut self, app: &App, owner: Uuid, org: Uuid, conv: Uuid) {
+        if self.by_task.len() >= MAX_CLAIMS || self.by_task.values().any(|c| *c == conv) {
+            return;
+        }
+        let app = app.clone();
+        let handle = self.tasks.spawn(async move {
+            match app
+                .store
+                .claim(org, conv, owner, app.config.owner_lease_ms)
+                .await
+            {
+                Ok(lease) => lease,
+                Err(error) => {
+                    tracing::warn!(%conv, %error, "claim failed");
+                    None
+                }
+            }
+        });
+        self.by_task.insert(handle.id(), conv);
+    }
+
+    /// The conversation a finished claim was for, with its lease if it won one.
+    fn finished(
+        &mut self,
+        claimed: Result<(task::Id, Option<Lease>), task::JoinError>,
+    ) -> Option<(Uuid, Option<Lease>)> {
+        match claimed {
+            Ok((id, lease)) => Some((self.by_task.remove(&id)?, lease)),
+            Err(error) => {
+                self.by_task.remove(&error.id());
+                None
             }
         }
     }
@@ -104,26 +161,14 @@ fn parse_wake(subject: &str) -> Option<(Uuid, Uuid)> {
     Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?))
 }
 
-async fn claim(
+/// Run the actor of a conversation this Owner has just claimed.
+fn start(
     app: &App,
-    owner: Uuid,
-    org: Uuid,
     conv: Uuid,
+    lease: Lease,
     actors: &mut HashMap<Uuid, std::sync::Arc<Notify>>,
     running: &mut JoinSet<Uuid>,
 ) {
-    let lease = match app
-        .store
-        .claim(org, conv, owner, app.config.owner_lease_ms)
-        .await
-    {
-        Ok(Some(lease)) => lease,
-        Ok(None) => return,
-        Err(error) => {
-            tracing::warn!(%conv, %error, "claim failed");
-            return;
-        }
-    };
     let wake = std::sync::Arc::new(Notify::new());
     // A wake that raced the claim still finds its command on the first pass.
     wake.notify_one();

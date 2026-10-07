@@ -100,8 +100,11 @@ List<Widget> _blocks(
     },
     selectable: true,
     styleSheet: sheet,
-    inlineSyntaxes: [if (chips) _ChipSyntax()],
-    builders: {if (chips) 'cite': _ChipBuilder(citations, onSource)},
+    inlineSyntaxes: [if (chips) _ChipSyntax(), _FileLinkSyntax()],
+    builders: {
+      if (chips) 'cite': _ChipBuilder(citations, onSource),
+      'file': _FileLinkBuilder(onSource),
+    },
   );
   final out = <Widget>[];
   var cursor = 0;
@@ -291,6 +294,121 @@ class _Citations {
       for (final source in byUrl.values)
         if (!shown.contains(source['url'])) source,
     ];
+  }
+}
+
+/// [href] as the server records the files replies link to: without
+/// `sandbox:` and percent-decoded.
+String fileLinkPath(String href) {
+  final path = href.startsWith('sandbox:') ? href.substring(8) : href;
+  try {
+    return Uri.decodeComponent(path);
+  } on ArgumentError {
+    return path;
+  }
+}
+
+/// What a file link resolves to in [replies], the first that recorded it:
+/// the files handed over with that reply and which one is linked, or [error]
+/// saying why it was not handed over. Null when none recorded it.
+({List<Map<String, dynamic>> files, int index, String? error})? linkedFile(
+  String href,
+  Iterable<dynamic> replies,
+) {
+  final link = fileLinkPath(href);
+  for (final reply in replies) {
+    if (reply is! Map) continue;
+    final recorded = reply['detail']?['kind']?['Answer']?['files'];
+    if (recorded is! List) continue;
+    final shared = recorded.whereType<Map>().toList();
+    final found = shared.where((f) => f['link'] == link).firstOrNull;
+    if (found == null) continue;
+    final files = [
+      for (final f in shared)
+        if (f['file'] is Map) Map<String, dynamic>.from(f['file'] as Map),
+    ];
+    final file = found['file'];
+    if (file is! Map) {
+      return (files: files, index: -1, error: '${found['error']}');
+    }
+    return (
+      files: files,
+      index: files.indexWhere((f) => f['id'] == file['id']),
+      error: null,
+    );
+  }
+  return null;
+}
+
+/// Whether [href] names a file of the sandbox rather than a page.
+bool isFileLink(String href) {
+  final path = fileLinkPath(href);
+  return path.startsWith('/workspace/') || path.startsWith('/attachments/');
+}
+
+/// A link to a sandbox file, as `[label](sandbox:/workspace/...)`,
+/// `[label](/attachments/...)` or with the path in `<...>`.
+class _FileLinkSyntax extends md.InlineSyntax {
+  _FileLinkSyntax()
+    : super(
+        r'\[([^\]\n]+)\]\((?:<((?:sandbox:)?/(?:workspace|attachments)/[^>\n]+)>'
+        r'|((?:sandbox:)?/(?:workspace|attachments)/(?:[^()\s]|\([^()\s]*\))+))'
+        r'(?:\s+"[^"\n]*")?\)',
+      );
+
+  @override
+  bool onMatch(md.InlineParser parser, Match match) {
+    parser.addNode(
+      md.Element.text('file', match[1]!)
+        ..attributes['href'] = match[2] ?? match[3]!,
+    );
+    return true;
+  }
+}
+
+/// A file link inline: the file's glyph before the label, opened on tap.
+class _FileLinkBuilder extends MarkdownElementBuilder {
+  final ValueChanged<String>? onSource;
+  _FileLinkBuilder(this.onSource);
+
+  @override
+  Widget? visitElementAfterWithContext(
+    BuildContext context,
+    md.Element element,
+    TextStyle? preferredStyle,
+    TextStyle? parentStyle,
+  ) {
+    final c = HubColors.of(context);
+    final href = element.attributes['href'] ?? '';
+    final style = (parentStyle ?? const TextStyle()).copyWith(color: c.accent);
+    return Text.rich(
+      TextSpan(
+        children: [
+          WidgetSpan(
+            alignment: PlaceholderAlignment.middle,
+            child: Semantics(
+              link: true,
+              child: InkWell(
+                borderRadius: BorderRadius.circular(4),
+                onTap: () => onSource?.call(href),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(
+                      Icons.insert_drive_file_outlined,
+                      size: (style.fontSize ?? 15) * .95,
+                      color: c.accent,
+                    ),
+                    const SizedBox(width: 2),
+                    Text(element.textContent, style: style),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
   }
 }
 
@@ -548,12 +666,27 @@ class _Action extends StatelessWidget {
   );
 }
 
+/// Markdown as messages show it, e.g. for a previewed file.
+class MarkdownText extends StatelessWidget {
+  final String text;
+  final double size;
+  const MarkdownText(this.text, {super.key, this.size = 15});
+  @override
+  Widget build(BuildContext context) => Column(
+    crossAxisAlignment: CrossAxisAlignment.stretch,
+    children: _blocks(context, text, size),
+  );
+}
+
 class MessageCard extends StatelessWidget {
   final Map<String, dynamic> item;
   final String? agentLabel;
   final VoidCallback? onFork;
   final VoidCallback? onMemoryUndo;
   final ValueChanged<String>? onSource;
+
+  /// Shows the files a message carried.
+  final Widget Function(List<dynamic> files)? files;
   const MessageCard({
     super.key,
     required this.item,
@@ -561,6 +694,7 @@ class MessageCard extends StatelessWidget {
     this.onFork,
     this.onMemoryUndo,
     this.onSource,
+    this.files,
   });
 
   @override
@@ -599,6 +733,9 @@ class MessageCard extends StatelessWidget {
       icon: Icons.copy_rounded,
       onPressed: () => Clipboard.setData(ClipboardData(text: text)),
     );
+    final attached =
+        item['detail']?['kind']?['Attachments']?['files'] as List? ?? const [];
+    final carried = attached.isEmpty ? null : files?.call(attached);
     if (kind == 'user') {
       return Hover(
         // Full width so the bubble sits on the right, chat style; a loose
@@ -609,26 +746,37 @@ class MessageCard extends StatelessWidget {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.end,
             children: [
-              LayoutBuilder(
-                builder: (context, box) => ConstrainedBox(
-                  constraints: BoxConstraints(maxWidth: box.maxWidth * .78),
-                  child: Container(
-                    padding: const EdgeInsets.fromLTRB(18, 10, 18, 10),
-                    decoration: BoxDecoration(
-                      color: c.bubble,
-                      borderRadius: BorderRadius.circular(22),
-                    ),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        ..._blocks(context, text, 15, onSource: onSource),
-                        ..._states(context, item),
-                      ],
+              if (carried != null)
+                Padding(
+                  padding: EdgeInsets.only(bottom: text.isEmpty ? 0 : 6),
+                  child: LayoutBuilder(
+                    builder: (context, box) => ConstrainedBox(
+                      constraints: BoxConstraints(maxWidth: box.maxWidth * .78),
+                      child: carried,
                     ),
                   ),
                 ),
-              ),
+              if (text.isNotEmpty)
+                LayoutBuilder(
+                  builder: (context, box) => ConstrainedBox(
+                    constraints: BoxConstraints(maxWidth: box.maxWidth * .78),
+                    child: Container(
+                      padding: const EdgeInsets.fromLTRB(18, 10, 18, 10),
+                      decoration: BoxDecoration(
+                        color: c.bubble,
+                        borderRadius: BorderRadius.circular(22),
+                      ),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          ..._blocks(context, text, 15, onSource: onSource),
+                          ..._states(context, item),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
               const SizedBox(height: 6),
               // Its glyph lines up with the bubble's right edge.
               Transform.translate(
@@ -727,7 +875,16 @@ class MessageCard extends StatelessWidget {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
-                  ..._blocks(context, text, 14, onSource: onSource),
+                  if (carried != null)
+                    Padding(
+                      padding: const EdgeInsets.only(top: 6, bottom: 4),
+                      child: Align(
+                        alignment: Alignment.centerLeft,
+                        child: carried,
+                      ),
+                    ),
+                  if (text.isNotEmpty)
+                    ..._blocks(context, text, 14, onSource: onSource),
                   ..._states(context, item),
                 ],
               ),
@@ -1018,7 +1175,10 @@ List<(String, String)> _done(Iterable<Map<String, dynamic>> steps) {
       .where((s) => _ToolCall.of(s).name == 'web_search')
       .length;
   final commands = calls.where(_isCommand).length;
-  final tools = calls.length - searches - commands;
+  final images = calls
+      .where((s) => _ToolCall.of(s).name == 'view_image')
+      .length;
+  final tools = calls.length - searches - commands - images;
   final files = {
     for (final step in steps.where((s) => s['kind'] == 'file_change'))
       ...switch (_changes(step)) {
@@ -1038,6 +1198,7 @@ List<(String, String)> _done(Iterable<Map<String, dynamic>> steps) {
         }}',
       ),
     if (commands > 0) ('运行 $commands 条命令', 'ran ${count(commands, 'command')}'),
+    if (images > 0) ('查看 $images 张图片', 'viewed ${count(images, 'image')}'),
     if (tools > 0) ('调用 $tools 个工具', 'used ${count(tools, 'tool')}'),
     if (files > 0) ('修改 $files 个文件', 'edited ${count(files, 'file')}'),
   ];
@@ -1266,6 +1427,13 @@ class _ToolCall {
       'Stopping a background job',
       'Stopped a background job',
     ),
+    'view_image': (
+      Icons.image_outlined,
+      '查看图片',
+      'View an image',
+      'Viewing an image',
+      'Viewed an image',
+    ),
     'ask_user': (
       Icons.help_outline,
       '向你提问',
@@ -1309,13 +1477,16 @@ class _ToolCall {
           'memory_save' => 'content',
           'ask_user' => 'question',
           'exec' => 'cmd',
+          'view_image' => 'path',
           _ => '',
         }] ??
         // A search that opened a page names the page instead.
         (name == 'web_search' ? args['url'] : null);
     if (value is! String || value.isEmpty) return '';
     // Full-width quotes bring their own space in Chinese.
-    return name == 'exec' ? ' $value' : tr('“$value”', ' “$value”');
+    return name == 'exec' || name == 'view_image'
+        ? ' $value'
+        : tr('“$value”', ' “$value”');
   }
 
   /// How the call ended, when that is worth a word, and whether it failed.

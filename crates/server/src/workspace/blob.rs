@@ -29,7 +29,7 @@ enum Backend {
 #[derive(Clone)]
 pub struct BlobStore {
     backend: Backend,
-    /// `<org>/` once scoped.
+    /// `<org>/` once scoped, plus a namespace if any.
     prefix: String,
 }
 
@@ -108,6 +108,14 @@ impl BlobStore {
 
     pub fn scoped(mut self, org: uuid::Uuid) -> Self {
         self.prefix = format!("{org}/");
+        self
+    }
+
+    /// A namespace of its own under the organization, e.g. `<org>/attachments/`. Checkpoint
+    /// reclamation never looks inside it.
+    pub fn within(mut self, namespace: &str) -> Self {
+        self.prefix.push_str(namespace);
+        self.prefix.push('/');
         self
     }
 

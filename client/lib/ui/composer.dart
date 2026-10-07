@@ -7,6 +7,7 @@ import 'package:flutter/services.dart';
 import '../controller.dart';
 import '../l10n.dart';
 import '../theme.dart';
+import 'attachments.dart';
 import 'common.dart';
 import 'model_picker.dart';
 
@@ -31,6 +32,21 @@ class Composer extends StatefulWidget {
 
   /// The text field's focus, for callers that move the cursor to it.
   final FocusNode? focusNode;
+
+  /// Files picked for the message, shown above the text.
+  final Widget? attachments;
+
+  /// The message may be sent without text: it carries files.
+  final bool canSendEmpty;
+
+  /// Sending waits, e.g. for files still uploading.
+  final bool blocked;
+
+  /// Replaces the field's usual prompt.
+  final String? hint;
+
+  /// The field's text, when the page needs to put a message back into it.
+  final TextEditingController? controller;
   const Composer({
     super.key,
     required this.onSend,
@@ -45,13 +61,19 @@ class Composer extends StatefulWidget {
     this.footer = const [],
     this.enterToSend = true,
     this.focusNode,
+    this.attachments,
+    this.canSendEmpty = false,
+    this.blocked = false,
+    this.hint,
+    this.controller,
   });
   @override
   State<Composer> createState() => _ComposerState();
 }
 
 class _ComposerState extends State<Composer> {
-  final input = TextEditingController();
+  late final TextEditingController input =
+      widget.controller ?? TextEditingController();
 
   // One anchor for the composer's menus, so `+` and the model panel both hang
   // from the box and only one is open at a time.
@@ -90,24 +112,33 @@ class _ComposerState extends State<Composer> {
 
   @override
   void dispose() {
-    input.dispose();
+    if (widget.controller == null) input.dispose();
     super.dispose();
   }
 
   Future<void> send() async {
+    final sideQuery = this.sideQuery && widget.onSideQuery != null;
     if (sending ||
-        input.text.trim().isEmpty ||
+        widget.blocked ||
+        (input.text.trim().isEmpty && (sideQuery || !widget.canSendEmpty)) ||
         !input.value.composing.isCollapsed) {
       return;
     }
+    final text = input.text;
     setState(() => sending = true);
+    // Free for the next message at once: what is typed while this one goes
+    // out is the next draft, which nothing clears.
+    input.clear();
     try {
-      await (sideQuery && widget.onSideQuery != null
-          ? widget.onSideQuery!(input.text)
-          : widget.onSend(input.text));
-      input.clear();
+      await (sideQuery ? widget.onSideQuery!(text) : widget.onSend(text));
     } catch (_) {
-      // The caller reports the failure; the text stays for a retry.
+      // The caller reports the failure; the text comes back for a retry, ahead
+      // of anything typed since.
+      if (mounted) {
+        final typed = input.text;
+        input.text = typed.isEmpty ? text : '$text\n$typed';
+        input.selection = TextSelection.collapsed(offset: input.text.length);
+      }
     } finally {
       if (mounted) setState(() => sending = false);
     }
@@ -242,110 +273,131 @@ class _ComposerState extends State<Composer> {
                     child: Semantics(
                       container: true,
                       explicitChildNodes: true,
-                      child: _ComposerRow(
-                        textWidth: textWidth,
-                        multiline: widget.stacked || input.text.contains('\n'),
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        crossAxisAlignment: CrossAxisAlignment.stretch,
                         children: [
-                          for (final (i, part) in [
-                            Row(
-                              mainAxisSize: MainAxisSize.min,
-                              children: [
-                                ?widget.leading,
-                                Flexible(
-                                  child: SingleChildScrollView(
-                                    scrollDirection: Axis.horizontal,
-                                    child: Row(
-                                      mainAxisSize: MainAxisSize.min,
-                                      children: [
-                                        if (widget.onSideQuery != null)
-                                          Padding(
-                                            padding: const EdgeInsets.only(
-                                              left: 4,
-                                            ),
-                                            child: FilterChip(
-                                              label: Text(
-                                                tr('只读旁问', 'Side question'),
+                          if (widget.attachments != null)
+                            Padding(
+                              padding: const EdgeInsets.fromLTRB(6, 4, 6, 4),
+                              child: widget.attachments,
+                            ),
+                          _ComposerRow(
+                            textWidth: textWidth,
+                            multiline:
+                                widget.stacked || input.text.contains('\n'),
+                            children: [
+                              for (final (i, part) in [
+                                Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    ?widget.leading,
+                                    Flexible(
+                                      child: SingleChildScrollView(
+                                        scrollDirection: Axis.horizontal,
+                                        child: Row(
+                                          mainAxisSize: MainAxisSize.min,
+                                          children: [
+                                            if (widget.onSideQuery != null)
+                                              Padding(
+                                                padding: const EdgeInsets.only(
+                                                  left: 4,
+                                                ),
+                                                child: FilterChip(
+                                                  label: Text(
+                                                    tr('只读旁问', 'Side question'),
+                                                  ),
+                                                  avatar: sideQuery
+                                                      ? null
+                                                      : Icon(
+                                                          Icons
+                                                              .visibility_outlined,
+                                                          size: 15,
+                                                          color: c.muted,
+                                                        ),
+                                                  selected: sideQuery,
+                                                  visualDensity:
+                                                      VisualDensity.compact,
+                                                  onSelected: (value) =>
+                                                      setState(
+                                                        () => sideQuery = value,
+                                                      ),
+                                                ),
                                               ),
-                                              avatar: sideQuery
-                                                  ? null
-                                                  : Icon(
-                                                      Icons.visibility_outlined,
-                                                      size: 15,
-                                                      color: c.muted,
-                                                    ),
-                                              selected: sideQuery,
-                                              visualDensity:
-                                                  VisualDensity.compact,
-                                              onSelected: (value) => setState(
-                                                () => sideQuery = value,
+                                            for (final tool in widget.tools)
+                                              Padding(
+                                                padding: const EdgeInsets.only(
+                                                  left: 6,
+                                                ),
+                                                child: tool,
                                               ),
-                                            ),
-                                          ),
-                                        for (final tool in widget.tools)
-                                          Padding(
-                                            padding: const EdgeInsets.only(
-                                              left: 6,
-                                            ),
-                                            child: tool,
-                                          ),
-                                      ],
+                                          ],
+                                        ),
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                                Semantics(
+                                  container: true,
+                                  child: TextField(
+                                    controller: input,
+                                    focusNode: widget.focusNode,
+                                    minLines: 1,
+                                    maxLines: 8,
+                                    textInputAction: TextInputAction.newline,
+                                    style: fieldStyle,
+                                    decoration: InputDecoration(
+                                      hintText:
+                                          widget.hint ??
+                                          tr('写下你的想法…', 'Ask anything…'),
+                                      border: InputBorder.none,
+                                      enabledBorder: InputBorder.none,
+                                      focusedBorder: InputBorder.none,
+                                      filled: false,
+                                      isDense: true,
+                                      contentPadding: const EdgeInsets.fromLTRB(
+                                        _ComposerRow.fieldStart,
+                                        10,
+                                        _ComposerRow.fieldEnd,
+                                        10,
+                                      ),
                                     ),
                                   ),
                                 ),
-                              ],
-                            ),
-                            Semantics(
-                              container: true,
-                              child: TextField(
-                                controller: input,
-                                focusNode: widget.focusNode,
-                                minLines: 1,
-                                maxLines: 8,
-                                textInputAction: TextInputAction.newline,
-                                style: fieldStyle,
-                                decoration: InputDecoration(
-                                  hintText: tr('写下你的想法…', 'Ask anything…'),
-                                  border: InputBorder.none,
-                                  enabledBorder: InputBorder.none,
-                                  focusedBorder: InputBorder.none,
-                                  filled: false,
-                                  isDense: true,
-                                  contentPadding: const EdgeInsets.fromLTRB(
-                                    _ComposerRow.fieldStart,
-                                    10,
-                                    _ComposerRow.fieldEnd,
-                                    10,
-                                  ),
+                                Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    ?widget.trailing,
+                                    if (widget.trailing != null)
+                                      const SizedBox(width: 4),
+                                    if (widget.running) stop,
+                                    if (widget.running && canSend)
+                                      const SizedBox(width: 6),
+                                    if (canSend)
+                                      round(
+                                        tooltip: tr('发送', 'Send'),
+                                        icon: Icons.arrow_upward_rounded,
+                                        onPressed: sending || widget.blocked
+                                            ? null
+                                            : send,
+                                        background:
+                                            (empty && !widget.canSendEmpty) ||
+                                                sending ||
+                                                widget.blocked
+                                            ? c.accent.withValues(alpha: .35)
+                                            : c.accent,
+                                        foreground: c.onAccent,
+                                      ),
+                                  ],
                                 ),
-                              ),
-                            ),
-                            Row(
-                              mainAxisSize: MainAxisSize.min,
-                              children: [
-                                ?widget.trailing,
-                                if (widget.trailing != null)
-                                  const SizedBox(width: 4),
-                                if (widget.running) stop,
-                                if (widget.running && canSend)
-                                  const SizedBox(width: 6),
-                                if (canSend)
-                                  round(
-                                    tooltip: tr('发送', 'Send'),
-                                    icon: Icons.arrow_upward_rounded,
-                                    onPressed: sending ? null : send,
-                                    background: empty || sending
-                                        ? c.accent.withValues(alpha: .35)
-                                        : c.accent,
-                                    foreground: c.onAccent,
-                                  ),
-                              ],
-                            ),
-                          ].indexed)
-                            Semantics(
-                              container: true,
-                              sortKey: OrdinalSortKey(i.toDouble()),
-                              child: part,
-                            ),
+                              ].indexed)
+                                Semantics(
+                                  container: true,
+                                  sortKey: OrdinalSortKey(i.toDouble()),
+                                  child: part,
+                                ),
+                            ],
+                          ),
                         ],
                       ),
                     ),
@@ -605,6 +657,8 @@ Widget? plusMenu(
   RunAction action, {
   required VoidCallback onNewProject,
 }) {
+  // The menu's own context goes away when it closes; dialogs outlive it.
+  final page = context;
   final commands = hub.isDraft
       ? const []
       : (hub.commandCatalog['harness_commands'] as List? ?? [])
@@ -639,9 +693,27 @@ Widget? plusMenu(
         ],
       ),
     );
+    final files = [
+      if (hub.canAttach) ...[
+        row(
+          Icons.attach_file,
+          tr('上传文件', 'Upload files'),
+          tr('图片、PDF、文本或任意文件', 'Images, PDFs, text or any file'),
+          () => pickFiles(hub),
+        ),
+        row(
+          Icons.folder_copy_outlined,
+          tr('从文件库选择', 'Choose from library'),
+          tr('用过的文件可以再次附带', 'Reuse files you uploaded before'),
+          () => chooseFromLibrary(page, hub),
+        ),
+        const MenuDivider(),
+      ],
+    ];
     if (!hub.isDraft) {
       // The + stays in a conversation too, so the composer keeps one layout.
       return [
+        ...files,
         if (commands.isEmpty)
           row(
             Icons.terminal,
@@ -661,6 +733,7 @@ Widget? plusMenu(
       ];
     }
     return [
+      ...files,
       Padding(
         padding: const EdgeInsets.fromLTRB(14, 8, 14, 4),
         child: Text(

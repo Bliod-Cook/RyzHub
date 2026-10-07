@@ -141,30 +141,33 @@ async fn execute(
             if engine != Engine::Mock && !message.config_json.is_empty() {
                 conversation_commands::configure(tx, lease, &message.config_json, config).await?;
             }
-            runs::create(
-                tx,
-                lease,
-                envelope,
-                &message.text,
-                RunKind::Main,
-                engine,
-                config,
-            )
-            .await?;
+            let input = runs::Input {
+                text: &message.text,
+                files: &message.attachment_ids,
+                user,
+            };
+            runs::create(tx, lease, envelope, input, RunKind::Main, engine, config).await?;
         }
         Command::SideQuery(query) => {
             runs::create(
                 tx,
                 lease,
                 envelope,
-                &query.text,
+                runs::Input::text(&query.text),
                 RunKind::SideQuery,
                 engine,
                 config,
             )
             .await?;
         }
-        Command::Steer(steer) => runs::steer(tx, lease, &steer.text, cid).await?,
+        Command::Steer(steer) => {
+            let input = runs::Input {
+                text: &steer.text,
+                files: &steer.attachment_ids,
+                user,
+            };
+            runs::steer(tx, lease, input, cid).await?
+        }
         Command::DecideApproval(decision) => {
             ensure!(
                 matches!(decision.decision.as_str(), "allow" | "deny"),
@@ -217,7 +220,7 @@ async fn execute(
                 tx,
                 lease,
                 envelope,
-                "/compact",
+                runs::Input::text("/compact"),
                 RunKind::Compact,
                 engine,
                 config,

@@ -8,6 +8,7 @@ pub mod harness;
 pub mod host;
 pub mod journal;
 pub mod native;
+pub mod picture;
 pub mod proxy;
 
 use anyhow::ensure;
@@ -100,6 +101,12 @@ pub enum GuestCommand {
         op_id: String,
         request_id: String,
     },
+    /// An image file, at most `max_edge` pixels on its long side and `max_bytes` encoded.
+    ReadImage {
+        path: String,
+        max_edge: u32,
+        max_bytes: usize,
+    },
     /// Unacknowledged events after `after`, waiting up to `wait_ms` for new events or for
     /// streaming text newer than `folds_seen`.
     Replay {
@@ -122,7 +129,10 @@ impl GuestCommand {
     /// Commands that only read state; the host forwards them without serializing behind
     /// other operations of the same sandbox.
     pub fn read_only(&self) -> bool {
-        matches!(self, Self::Poll { .. } | Self::Replay { .. })
+        matches!(
+            self,
+            Self::Poll { .. } | Self::Replay { .. } | Self::ReadImage { .. }
+        )
     }
 }
 
@@ -206,6 +216,16 @@ pub struct SandboxSpec {
     pub persistent: bool,
 }
 
+/// A file of the conversation's library references, as `/attachments/<name>` holds it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttachmentFile {
+    pub sha256: String,
+    pub size: u64,
+}
+
+/// Largest file `/attachments` holds.
+pub const MAX_ATTACHMENT: u64 = 64 * 1024 * 1024;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum HostCommand {
@@ -213,6 +233,22 @@ pub enum HostCommand {
         sandbox_id: Uuid,
         exec_epoch: u64,
         files: BTreeMap<String, String>,
+    },
+    /// Make the sandbox's `/attachments` hold exactly `files`: drop the others and reply with
+    /// the names still to upload (`{"missing":[..]}`). The directory belongs to the workspace,
+    /// so later sandboxes of the same conversation on this node start with it.
+    Attachments {
+        sandbox_id: Uuid,
+        exec_epoch: u64,
+        files: BTreeMap<String, AttachmentFile>,
+    },
+    /// Receive one file for `/attachments`: `size` raw bytes follow the request line.
+    AttachmentUpload {
+        sandbox_id: Uuid,
+        exec_epoch: u64,
+        name: String,
+        size: u64,
+        sha256: String,
     },
     Create {
         spec: SandboxSpec,
@@ -235,6 +271,13 @@ pub enum HostCommand {
     /// Stream an artifact: a header `{"size":n}` followed by `n` raw bytes.
     ArtifactDownload {
         artifact: Uuid,
+    },
+    /// Stream one regular file of a running sandbox's `/workspace`, `path` relative to it, the
+    /// same way. Refusals: `INVALID_PATH`, `FILE_NOT_FOUND`, `NOT_A_FILE`, `FILE_TOO_LARGE`.
+    WorkspaceFile {
+        sandbox_id: Uuid,
+        exec_epoch: u64,
+        path: String,
     },
     /// Receive an artifact: `size` raw bytes follow the request line.
     ArtifactUpload {

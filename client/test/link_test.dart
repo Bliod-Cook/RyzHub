@@ -17,6 +17,16 @@ void main() {
     expect(parser.restoreRouteInformation('').uri.toString(), '/');
   });
 
+  test('the library has its own address', () {
+    expect(conversationIn(Uri.parse('/library')), libraryLink);
+    expect(conversationIn(Uri.parse('/library/x')), '');
+    const parser = ConversationLinkParser();
+    expect(
+      parser.restoreRouteInformation(libraryLink).uri.toString(),
+      '/library',
+    );
+  });
+
   testWidgets('the address follows the page and back reaches the page', (
     tester,
   ) async {

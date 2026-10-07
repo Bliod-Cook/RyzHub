@@ -4,7 +4,10 @@
 //! by [`guard`]) before any projection is written.
 use anyhow::{Context, ensure};
 use ryzhub_domain::OrgContext;
-use ryzhub_proto::{CommandEnvelope, Item, ReadState, RunState, event_envelope::Event};
+use ryzhub_proto::{
+    AttachmentsDetail, CommandEnvelope, Item, ItemDetail, ReadState, RunState,
+    event_envelope::Event, item_detail,
+};
 use serde_json::{Value, json};
 use sqlx::Row;
 use uuid::Uuid;
@@ -37,6 +40,43 @@ pub fn valid_text(text: &str) -> anyhow::Result<()> {
     ensure!(
         !text.trim().is_empty() && text.len() <= MAX_INPUT,
         Code::InvalidMessage
+    );
+    Ok(())
+}
+
+/// What a member sent: text and files of their own library. With files, the text may be empty.
+#[derive(Clone, Copy)]
+pub struct Input<'a> {
+    pub text: &'a str,
+    /// Library entry ids, in order.
+    pub files: &'a [String],
+    /// The sender, who must own every file.
+    pub user: Uuid,
+}
+
+impl<'a> Input<'a> {
+    pub fn text(text: &'a str) -> Self {
+        Self {
+            text,
+            files: &[],
+            user: Uuid::nil(),
+        }
+    }
+}
+
+pub fn valid_input(input: &Input) -> anyhow::Result<()> {
+    if input.files.is_empty() {
+        return valid_text(input.text);
+    }
+    ensure!(input.text.len() <= MAX_INPUT, Code::InvalidMessage);
+    ensure!(
+        input.files.len() <= crate::attachments::MAX_PER_MESSAGE,
+        Code::TooManyAttachments
+    );
+    let distinct: std::collections::HashSet<&String> = input.files.iter().collect();
+    ensure!(
+        distinct.len() == input.files.len(),
+        Code::AttachmentUnavailable
     );
     Ok(())
 }
@@ -145,15 +185,20 @@ pub async fn create(
     tx: &mut Tx<'_>,
     lease: &Lease,
     cmd: &CommandEnvelope,
-    text: &str,
+    input: Input<'_>,
     kind: RunKind,
     engine: Engine,
     config: &Config,
 ) -> anyhow::Result<Uuid> {
+    // Files reach models and sandboxes of the main line only.
+    ensure!(
+        input.files.is_empty() || (engine != Engine::Mock && kind == RunKind::Main),
+        Code::UnsupportedCommand
+    );
     if engine == Engine::Mock {
-        return create_mock(tx, lease, cmd, text, config).await;
+        return create_mock(tx, lease, cmd, input.text, config).await;
     }
-    valid_text(text)?;
+    valid_input(&input)?;
     let read_only = kind == RunKind::SideQuery;
     let conversation = sqlx::query(
         "SELECT mode,run_config,context_seed,model_credential_id,project_id FROM conversations
@@ -264,7 +309,7 @@ pub async fn create(
     .bind(if kind == RunKind::Compact { "compact" } else { "" })
     .execute(&mut **tx)
     .await?;
-    add_input(tx, lease, run, text, "message", &cmd.cid).await?;
+    add_input(tx, lease, run, input, "message", &cmd.cid).await?;
     append(
         tx,
         lease.org_id,
@@ -393,7 +438,7 @@ async fn create_mock(
     .bind(Uuid::parse_str(&cmd.cid)?)
     .execute(&mut **tx)
     .await?;
-    add_input(tx, lease, run, text, "message", &cmd.cid).await?;
+    add_input(tx, lease, run, Input::text(text), "message", &cmd.cid).await?;
     append(
         tx,
         lease.org_id,
@@ -435,17 +480,25 @@ async fn create_mock(
     Ok(run)
 }
 
-/// Record a user message or steer: a timeline item plus a pending input for the engine.
+/// Record a user message or steer: a timeline item plus a pending input for the engine. Its
+/// files become references of this conversation.
 pub async fn add_input(
     tx: &mut Tx<'_>,
     lease: &Lease,
     run: Uuid,
-    text: &str,
+    input: Input<'_>,
     kind: &str,
     cid: &str,
 ) -> anyhow::Result<()> {
     let item = Uuid::now_v7();
     let steer = kind == "steer";
+    let files = crate::attachments::bind(tx, lease, input.user, input.files).await?;
+    let ids: Vec<Uuid> = files.iter().map(|(id, _)| *id).collect();
+    let detail = (!files.is_empty()).then(|| ItemDetail {
+        kind: Some(item_detail::Kind::Attachments(AttachmentsDetail {
+            files: files.into_iter().map(|(_, file)| file).collect(),
+        })),
+    });
     append(
         tx,
         lease.org_id,
@@ -457,28 +510,36 @@ pub async fn add_input(
             revision: 1,
             kind: if steer { "steer" } else { "user" }.into(),
             state: if steer { "accepted" } else { "completed" }.into(),
-            text: text.into(),
+            text: input.text.into(),
             run_id: run.to_string(),
+            detail,
             ..Default::default()
         }),
     )
     .await?;
     sqlx::query(
-        "INSERT INTO pending_inputs(org_id,run_id,text,kind,item_id) VALUES($1,$2,$3,$4,$5)",
+        "INSERT INTO pending_inputs(org_id,run_id,text,kind,item_id,attachment_ids)
+         VALUES($1,$2,$3,$4,$5,$6)",
     )
     .bind(lease.org_id)
     .bind(run)
-    .bind(text)
+    .bind(input.text)
     .bind(kind)
     .bind(item)
+    .bind(&ids)
     .execute(&mut **tx)
     .await?;
     Ok(())
 }
 
 /// Additional input for the active main run.
-pub async fn steer(tx: &mut Tx<'_>, lease: &Lease, text: &str, cid: &str) -> anyhow::Result<()> {
-    valid_text(text)?;
+pub async fn steer(
+    tx: &mut Tx<'_>,
+    lease: &Lease,
+    input: Input<'_>,
+    cid: &str,
+) -> anyhow::Result<()> {
+    valid_input(&input)?;
     let run: Uuid = sqlx::query_scalar(
         "SELECT id FROM runs WHERE org_id=$1 AND conversation_id=$2 AND NOT read_only
          AND state IN ('running','requires_action')",
@@ -488,7 +549,7 @@ pub async fn steer(tx: &mut Tx<'_>, lease: &Lease, text: &str, cid: &str) -> any
     .fetch_optional(&mut **tx)
     .await?
     .context(Code::NoActiveRun)?;
-    add_input(tx, lease, run, text, "steer", cid).await
+    add_input(tx, lease, run, input, "steer", cid).await
 }
 
 /// Insert a pending approval or question for `run`, expiring after the configured TTL.

@@ -208,6 +208,7 @@ pub async fn ensure_work(app: &App, lease: &Lease, run: Uuid) -> anyhow::Result<
     }
     refresh_key(app, lease, run, id).await?;
     crate::projects::mount(app, lease, run, id).await?;
+    crate::attachments::sandbox::sync(app, lease, id).await?;
     sandbox::guest(
         app,
         lease,

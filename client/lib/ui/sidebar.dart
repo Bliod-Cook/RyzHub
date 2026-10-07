@@ -85,9 +85,16 @@ class Sidebar extends StatelessWidget {
             NavRow(
               leading: HubIcon(HubIcons.newChat, size: 18, color: c.text),
               label: tr('新建对话', 'New chat'),
-              selected: hub.isDraft && hub.project == null,
+              selected: hub.isDraft && hub.project == null && !hub.libraryOpen,
               onTap: app.newChat,
             ),
+            if (hub.canAttach)
+              NavRow(
+                leading: HubIcon(HubIcons.library, size: 18, color: c.text),
+                label: tr('文件库', 'Library'),
+                selected: hub.libraryOpen,
+                onTap: app.openLibrary,
+              ),
             NavRow(
               icon: Icons.archive_outlined,
               label: tr('已归档', 'Archived'),
@@ -218,6 +225,13 @@ class SidebarRail extends StatelessWidget {
               icon: const Icon(Icons.search, size: 20),
               onPressed: app.openSearch,
             ),
+            if (hub.canAttach)
+              IconButton(
+                tooltip: tr('文件库', 'Library'),
+                isSelected: hub.libraryOpen,
+                icon: HubIcon(HubIcons.library, color: c.text),
+                onPressed: app.openLibrary,
+              ),
             const Spacer(),
             AccountButton(hub: hub, app: app, compact: true),
             const SizedBox(height: 8),

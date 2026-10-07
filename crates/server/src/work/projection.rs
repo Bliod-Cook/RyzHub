@@ -9,12 +9,15 @@ use ryzhub_execution::{
     GuestCommand, GuestEvent, HarnessAnswer, HarnessEvent,
     harness::{ApprovalCategory, ItemContent, ItemKind, ItemPhase, TurnStatus},
 };
-use ryzhub_proto::{FileChange, FileChangeDetail, Item, ItemDetail, ToolDetail, item_detail};
+use ryzhub_proto::{
+    FileChange, FileChangeDetail, Item, ItemDetail, SharedFile, ToolDetail, item_detail,
+};
 use serde_json::Value;
 use uuid::Uuid;
 
 use crate::{
     app::App,
+    attachments::outputs,
     error::Code,
     owner::{LiveRef, OwnerLink, WorkerEvent},
     runs, sandbox,
@@ -32,6 +35,9 @@ pub async fn apply(
     link: &OwnerLink,
 ) -> anyhow::Result<bool> {
     let events: Vec<GuestEvent> = serde_json::from_value(reply["events"].clone())?;
+    // Files the finishing turn's replies link to are copied out first, with no transaction
+    // open; a crash before the commit below publishes them again, finding the same entries.
+    let shared = hand_over(app, lease, run, sandbox_id, &events).await?;
     let mut tx = app.store.fenced(lease).await?;
     let mut current: i64 =
         sqlx::query_scalar("SELECT acked_gseq FROM sandboxes WHERE org_id=$1 AND id=$2 FOR UPDATE")
@@ -70,8 +76,16 @@ pub async fn apply(
                 };
                 owner = target;
             }
-            let finished =
-                project(&mut tx, lease, owner, sandbox_id, &harness, &app.config).await?;
+            let finished = project(
+                &mut tx,
+                lease,
+                owner,
+                sandbox_id,
+                &harness,
+                &app.config,
+                &shared,
+            )
+            .await?;
             // Recorded after projection: its channel position covers what this event wrote.
             record(&mut tx, lease, sandbox_id, &event).await?;
             done |= owner == run && finished;
@@ -199,6 +213,7 @@ async fn project(
     sandbox: Uuid,
     event: &HarnessEvent,
     config: &crate::config::Config,
+    shared: &[SharedFile],
 ) -> anyhow::Result<bool> {
     if let Some(turn) = event.turn_id() {
         let current: Option<String> =
@@ -311,6 +326,10 @@ async fn project(
                 TurnStatus::Interrupted => ("cancelled", None),
                 TurnStatus::Failed => ("failed", Some(Code::NativeTurnFailed)),
             };
+            if *status == TurnStatus::Completed {
+                // After the replies' last updates, which would clear what is recorded here.
+                outputs::record(tx, lease, run, shared).await?;
+            }
             runs::finish(tx, lease, run, state, error).await?;
             return Ok(true);
         }
@@ -318,6 +337,62 @@ async fn project(
         HarnessEvent::TurnStarted { .. } => {}
     }
     Ok(false)
+}
+
+/// Publish the files the replies of `run`'s finishing turn link to, when `events` complete it.
+async fn hand_over(
+    app: &App,
+    lease: &Lease,
+    run: Uuid,
+    sandbox: Uuid,
+    events: &[GuestEvent],
+) -> anyhow::Result<Vec<SharedFile>> {
+    let mut finishing = None;
+    let mut texts = Vec::new();
+    for event in events.iter().filter(|event| event.op_id == "native") {
+        let Ok(harness) = serde_json::from_value::<HarnessEvent>(event.result.clone()) else {
+            continue;
+        };
+        match harness {
+            HarnessEvent::TurnCompleted {
+                turn_id,
+                status: TurnStatus::Completed,
+            } => finishing = Some(turn_id),
+            HarnessEvent::Item {
+                phase: ItemPhase::Completed,
+                kind: ItemKind::Assistant,
+                content,
+                ..
+            } => texts.push(content.text),
+            _ => {}
+        }
+    }
+    let Some(turn) = finishing else {
+        return Ok(Vec::new());
+    };
+    let mut tx = app.store.tx(lease.org_id).await?;
+    let current: Option<Option<String>> = sqlx::query_scalar(
+        "SELECT native_turn_id FROM runs WHERE org_id=$1 AND id=$2 AND state='running'",
+    )
+    .bind(lease.org_id)
+    .bind(run)
+    .fetch_optional(&mut *tx)
+    .await?;
+    // Another run's turn, or one not registered yet: its own pass hands over.
+    if current.is_none() || turn.is_some_and(|turn| current.flatten().as_deref() != Some(&turn)) {
+        return Ok(Vec::new());
+    }
+    let earlier = outputs::unhanded(&mut tx, lease.org_id, run).await?;
+    tx.commit().await?;
+    let texts = earlier
+        .iter()
+        .map(|item| item.text.as_str())
+        .chain(texts.iter().map(String::as_str));
+    let targets = outputs::gather(texts);
+    if targets.is_empty() {
+        return Ok(Vec::new());
+    }
+    Ok(outputs::publish(app, lease, Some(sandbox), &targets).await)
 }
 
 /// A harness approval or question: answered automatically, or shown to the user.

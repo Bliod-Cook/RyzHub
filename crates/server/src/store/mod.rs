@@ -125,6 +125,18 @@ impl Store {
         auth_row(row)
     }
 
+    /// Whether session `id` was revoked or its user disabled; an expired session was not.
+    pub async fn session_revoked(&self, id: Uuid) -> anyhow::Result<bool> {
+        let revoked: Option<bool> = sqlx::query_scalar(
+            "SELECT s.revoked_at IS NOT NULL OR u.status<>'active'
+             FROM auth_sessions s JOIN users u ON u.id=s.user_id WHERE s.id=$1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(revoked.unwrap_or(true))
+    }
+
     /// The user's live membership in `org`.
     pub async fn context(&self, user: Uuid, org: Uuid) -> anyhow::Result<OrgContext> {
         let mut tx = self.tx(org).await?;

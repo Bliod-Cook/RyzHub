@@ -42,6 +42,7 @@ macro_rules! run_times {
 }
 
 pub mod app;
+pub mod attachments;
 pub mod chat;
 pub mod config;
 pub mod conversation_commands;

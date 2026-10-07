@@ -6,7 +6,7 @@ use axum::{
     extract::{Path, State},
     http::HeaderMap,
 };
-use ryzhub_proto::{Item, event_envelope::Event};
+use ryzhub_proto::{Item, ItemDetail, event_envelope::Event};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -372,7 +372,7 @@ pub async fn export(
     let (ctx, mut tx) = crate::http::member_tx(&app, &headers, org).await?;
     let c = conversation_in(&mut tx, &ctx, conv).await?;
     let items: Vec<Value> = sqlx::query_scalar(
-        "SELECT jsonb_build_object('kind',kind,'state',state,'text',text,'seq',first_seq)
+        "SELECT jsonb_build_object('kind',kind,'state',state,'text',text,'seq',first_seq,'detail',detail)
          FROM items WHERE org_id=$1 AND conversation_id=$2 ORDER BY first_seq",
     )
     .bind(org)
@@ -567,6 +567,23 @@ async fn fork(
     .bind(source.temporary)
     .execute(&mut *tx)
     .await?;
+    // A Chat seed refers to the images its model viewed and the files messages carried; the
+    // files keep their names under /attachments.
+    for statement in [
+        "INSERT INTO chat_images(org_id,conversation_id,sha256,media_type,data,width,height)
+         SELECT org_id,$3,sha256,media_type,data,width,height FROM chat_images
+         WHERE org_id=$1 AND conversation_id=$2",
+        "INSERT INTO conversation_files(org_id,conversation_id,attachment_id,path_name)
+         SELECT org_id,$3,attachment_id,path_name FROM conversation_files
+         WHERE org_id=$1 AND conversation_id=$2",
+    ] {
+        sqlx::query(statement)
+            .bind(lease.org_id)
+            .bind(lease.conversation_id)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+    }
     let child = Lease {
         conversation_id: id,
         org_id: lease.org_id,
@@ -584,8 +601,14 @@ async fn fork(
     .bind(lease.owner_id)
     .execute(&mut *tx)
     .await?;
-    let items: Vec<(String, String, String)> = sqlx::query_as(
-        "SELECT kind,state,text FROM items WHERE org_id=$1 AND conversation_id=$2 AND last_seq<=$3
+    type Copied = (
+        String,
+        String,
+        String,
+        Option<sqlx::types::Json<ItemDetail>>,
+    );
+    let items: Vec<Copied> = sqlx::query_as(
+        "SELECT kind,state,text,detail FROM items WHERE org_id=$1 AND conversation_id=$2 AND last_seq<=$3
          AND state='completed' ORDER BY first_seq",
     )
     .bind(lease.org_id)
@@ -593,7 +616,7 @@ async fn fork(
     .bind(payload["seq"].as_i64().context(Code::InvalidFork)?)
     .fetch_all(&mut *tx)
     .await?;
-    for (kind, state, text) in items {
+    for (kind, state, text, detail) in items {
         append(
             &mut tx,
             lease.org_id,
@@ -606,6 +629,7 @@ async fn fork(
                 kind,
                 state,
                 text,
+                detail: detail.map(|sqlx::types::Json(detail)| detail),
                 ..Default::default()
             }),
         )

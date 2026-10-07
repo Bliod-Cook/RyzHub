@@ -11,6 +11,9 @@ import 'storage/prefs_store.dart';
 class AppPrefs extends ChangeNotifier {
   String language = 'auto', theme = 'system', accent = 'orange';
   bool enterToSend = true, sidebarCollapsed = false;
+
+  /// The file library shows rows instead of a grid of cards.
+  bool libraryList = false;
   String defaultMode = 'chat', defaultHarness = 'codex';
 
   /// Null follows the server's default model.
@@ -48,6 +51,7 @@ class AppPrefs extends ChangeNotifier {
       // A new key: `enter_to_send` was false by default, not by choice.
       enterToSend = v['enter_sends'] ?? enterToSend;
       sidebarCollapsed = v['sidebar_collapsed'] ?? sidebarCollapsed;
+      libraryList = v['library_list'] ?? libraryList;
       defaultMode = v['default_mode'] ?? defaultMode;
       defaultChatModel = v['default_chat_model'];
       defaultWorkModel = v['default_work_model'];
@@ -79,6 +83,7 @@ class AppPrefs extends ChangeNotifier {
               'accent': accent,
               'enter_sends': enterToSend,
               'sidebar_collapsed': sidebarCollapsed,
+              'library_list': libraryList,
               'default_mode': defaultMode,
               'default_chat_model': defaultChatModel,
               'default_work_model': defaultWorkModel,

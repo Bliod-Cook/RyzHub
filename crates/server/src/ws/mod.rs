@@ -253,8 +253,9 @@ async fn connection(app: App, mut socket: WebSocket, auth: Auth) -> anyhow::Resu
             Some(_) = commands.join_next(), if !commands.is_empty() => {}
         }
     }
-    // A revoked session loses every channel at once.
-    if !session_valid(&app, &auth_rx).await {
+    // A revoked session loses every channel at once. One that merely ran out loses nothing:
+    // the client renews it and reconnects with its channels and queued commands intact.
+    if session_revoked(&app, &auth_rx).await {
         for channel in subscriptions.0.keys() {
             let revoked = SubscriptionRevoked {
                 reason: "permission revoked".into(),
@@ -278,6 +279,13 @@ fn expiry_warning(auth: &Auth) -> Instant {
 async fn session_valid(app: &App, auth: &watch::Receiver<Auth>) -> bool {
     let session = auth.borrow().session_id;
     app.store.auth_by_session(session).await.is_ok()
+}
+
+/// Whether the session was taken away (signed out, revoked, or its user disabled), as opposed
+/// to expiring. Unknown when the database cannot say, which revokes nothing.
+async fn session_revoked(app: &App, auth: &watch::Receiver<Auth>) -> bool {
+    let session = auth.borrow().session_id;
+    app.store.session_revoked(session).await.unwrap_or(false)
 }
 
 fn affects_session(notice: &Result<Notice, broadcast::error::RecvError>, user: Uuid) -> bool {

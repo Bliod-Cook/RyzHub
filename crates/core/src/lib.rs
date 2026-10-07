@@ -1,13 +1,14 @@
 //! Deterministic client projection. No clocks, sockets, filesystem, or platform APIs.
 use ryzhub_proto::{event_envelope::Event, frame::Body, *};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 const MAX_BUFFERED: usize = 256;
 const MAX_BUFFERED_BYTES: usize = 1024 * 1024;
 
-/// Bumped when cached projections may lack fields clients now read. 1: item `detail`.
-pub const CACHE_SCHEMA: u32 = 1;
+/// Bumped when cached projections may lack fields clients now read. 1: item `detail`; 2: the
+/// files user messages carry.
+pub const CACHE_SCHEMA: u32 = 3;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -42,6 +43,58 @@ pub struct Engine {
 pub struct Effects {
     pub outbound: Vec<Frame>,
     pub changed: bool,
+    /// Channels whose projection changed, with what changed in each.
+    pub touched: BTreeMap<String, Touched>,
+    /// Channels taken away from this client.
+    pub revoked: Vec<String>,
+    /// Commands the server has finished with.
+    pub results: Vec<CommandResult>,
+    /// When the session ends unless refreshed, in milliseconds since the epoch.
+    pub auth_expiring: Option<i64>,
+}
+
+/// What changed in a channel.
+#[derive(Debug, Default)]
+pub struct Touched {
+    /// Items that changed.
+    pub items: BTreeSet<String>,
+    /// A snapshot replaced the whole projection.
+    pub reset: bool,
+}
+
+impl Effects {
+    fn touch(&mut self, channel: &str) -> &mut Touched {
+        self.touched.entry(channel.to_owned()).or_default()
+    }
+}
+
+/// A command the server accepted or refused.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct CommandResult {
+    pub cid: String,
+    pub channel: String,
+    pub accepted: bool,
+    /// Why it was refused.
+    pub code: String,
+    /// A refusal the same command may retry.
+    pub retryable: bool,
+}
+
+/// The engine apart from its channels: channels persist one record each, so a change to one
+/// rewrites only it.
+#[derive(Serialize)]
+struct MetaRef<'a> {
+    resume_token: &'a str,
+    pending_commands: &'a BTreeMap<String, Frame>,
+    schema: u32,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct Meta {
+    resume_token: String,
+    pending_commands: BTreeMap<String, Frame>,
+    schema: u32,
 }
 
 impl Engine {
@@ -49,18 +102,64 @@ impl Engine {
     /// items but resubscribe without a cursor, so a fresh snapshot replaces them; pending
     /// commands survive.
     pub fn restore(cache_json: &str) -> serde_json::Result<Self> {
-        let mut engine: Engine = if cache_json.is_empty() {
+        let engine: Engine = if cache_json.is_empty() {
             Engine::default()
         } else {
             serde_json::from_str(cache_json)?
         };
-        if engine.schema < CACHE_SCHEMA {
-            for state in engine.channels.values_mut() {
+        Ok(engine.upgraded())
+    }
+
+    /// The engine from its records: [`Engine::meta_json`] and each channel's
+    /// [`Engine::channel_json`]. No meta is a fresh engine.
+    pub fn from_records(
+        meta: Option<&str>,
+        channels: impl IntoIterator<Item = (String, String)>,
+    ) -> serde_json::Result<Self> {
+        let Some(meta) = meta else {
+            return Ok(Engine::default().upgraded());
+        };
+        let meta: Meta = serde_json::from_str(meta)?;
+        let mut engine = Engine {
+            resume_token: meta.resume_token,
+            pending_commands: meta.pending_commands,
+            schema: meta.schema,
+            ..Default::default()
+        };
+        for (name, json) in channels {
+            engine.channels.insert(name, serde_json::from_str(&json)?);
+        }
+        Ok(engine.upgraded())
+    }
+
+    /// What persists beside the channels: the resume token and the commands not yet
+    /// acknowledged.
+    pub fn meta_json(&self) -> String {
+        serde_json::to_string(&MetaRef {
+            resume_token: &self.resume_token,
+            pending_commands: &self.pending_commands,
+            schema: self.schema,
+        })
+        .unwrap()
+    }
+
+    /// A channel's record, or None once the channel is gone.
+    pub fn channel_json(&self, channel: &str) -> Option<String> {
+        self.channels
+            .get(channel)
+            .map(|state| serde_json::to_string(state).unwrap())
+    }
+
+    /// Channels cached under an older schema keep their items but resubscribe without a
+    /// cursor, so a fresh snapshot replaces them.
+    fn upgraded(mut self) -> Self {
+        if self.schema < CACHE_SCHEMA {
+            for state in self.channels.values_mut() {
                 state.initialized = false;
             }
-            engine.schema = CACHE_SCHEMA;
+            self.schema = CACHE_SCHEMA;
         }
-        Ok(engine)
+        self
     }
 
     /// History fills older projections without advancing the live replay cursor.
@@ -147,16 +246,37 @@ impl Engine {
                 .outbound
                 .push(frame("", Body::Pong(Pong { nonce: p.nonce }))),
             Body::CommandAck(a) => {
-                self.pending_commands.remove(&a.cid);
+                let channel = self
+                    .pending_commands
+                    .remove(&a.cid)
+                    .map_or(input.channel, |f| f.channel);
+                effects.results.push(CommandResult {
+                    cid: a.cid,
+                    channel,
+                    accepted: true,
+                    code: String::new(),
+                    retryable: false,
+                });
                 effects.changed = true;
             }
             Body::CommandRejected(r) => {
+                let channel = self
+                    .pending_commands
+                    .get(&r.cid)
+                    .map_or(input.channel, |f| f.channel.clone());
                 if !r.retryable {
                     self.pending_commands.remove(&r.cid);
                 }
-                self.last_error = Some(r.code);
+                effects.results.push(CommandResult {
+                    cid: r.cid,
+                    channel,
+                    accepted: false,
+                    code: r.code,
+                    retryable: r.retryable,
+                });
                 effects.changed = true;
             }
+            Body::AuthExpiring(a) => effects.auth_expiring = Some(a.expires_at_ms),
             Body::ProtocolError(e) => {
                 self.last_error = Some(e.code);
                 effects.changed = true;
@@ -165,6 +285,7 @@ impl Engine {
                 self.channels.remove(&input.channel);
                 self.pending_commands
                     .retain(|_, f| f.channel != input.channel);
+                effects.revoked.push(input.channel);
                 effects.changed = true;
             }
             Body::ChannelLagged(_) => {
@@ -181,6 +302,8 @@ impl Engine {
                     return effects;
                 };
                 let mut resync = false;
+                let mut touched = Touched::default();
+                let mut changed = false;
                 match body {
                     Body::Snapshot(s) => {
                         // A delayed snapshot cannot roll a live channel backward.
@@ -202,16 +325,17 @@ impl Engine {
                                 .collect();
                             state.waiting_events.retain(|seq, _| *seq > s.head_seq);
                             state.waiting_streams.clear();
-                            drain_events(state);
-                            effects.changed = true;
+                            drain_events(state, &mut touched.items);
+                            touched.reset = true;
+                            changed = true;
                         }
                     }
                     Body::Event(event) => {
                         if event.seq > state.cursor {
                             if event.seq == state.cursor.saturating_add(1) {
-                                apply_event(state, event);
-                                drain_events(state);
-                                effects.changed = true;
+                                touched.items.extend(apply_event(state, event));
+                                drain_events(state, &mut touched.items);
+                                changed = true;
                             } else {
                                 if state.waiting_events.len() < MAX_BUFFERED {
                                     state.waiting_events.insert(event.seq, event);
@@ -222,7 +346,10 @@ impl Engine {
                     }
                     body @ (Body::Delta(_) | Body::ItemFold(_)) => {
                         match apply_stream(state, &body) {
-                            StreamResult::Applied => effects.changed = true,
+                            StreamResult::Applied => {
+                                touched.items.extend(stream_item(&body));
+                                changed = true;
+                            }
                             StreamResult::Future => {
                                 if state.waiting_streams.len() < MAX_BUFFERED
                                     && buffered_bytes(state) + body_bytes(&body)
@@ -247,10 +374,19 @@ impl Engine {
                 for body in pending {
                     match apply_stream(state, &body) {
                         StreamResult::Future => state.waiting_streams.push(body),
-                        StreamResult::Applied => effects.changed = true,
+                        StreamResult::Applied => {
+                            touched.items.extend(stream_item(&body));
+                            changed = true;
+                        }
                         StreamResult::Gap => resync = true,
                         StreamResult::Ignored => {}
                     }
+                }
+                if changed {
+                    let entry = effects.touch(&input.channel);
+                    entry.items.extend(touched.items);
+                    entry.reset |= touched.reset;
+                    effects.changed = true;
                 }
                 if resync {
                     effects.outbound.push(self.subscribe(input.channel));
@@ -261,7 +397,8 @@ impl Engine {
     }
 }
 
-fn apply_event(state: &mut Channel, event: EventEnvelope) {
+/// Apply `event`, returning the item it changed, if any.
+fn apply_event(state: &mut Channel, event: EventEnvelope) -> Option<String> {
     state.cursor = event.seq;
     state.initialized = true;
     match event.event {
@@ -271,7 +408,9 @@ fn apply_event(state: &mut Channel, event: EventEnvelope) {
                 .get(&item.id)
                 .is_none_or(|old| item.revision > old.revision)
             {
-                state.items.insert(item.id.clone(), item);
+                let id = item.id.clone();
+                state.items.insert(id.clone(), item);
+                return Some(id);
             }
         }
         Some(Event::PendingActionChanged(action)) => {
@@ -286,14 +425,25 @@ fn apply_event(state: &mut Channel, event: EventEnvelope) {
         }
         None => {}
     }
+    None
 }
 
-fn drain_events(state: &mut Channel) {
+/// Apply the buffered events that now follow the cursor, noting the items they change.
+fn drain_events(state: &mut Channel, items: &mut BTreeSet<String>) {
     while let Some(event) = state
         .waiting_events
         .remove(&(state.cursor.saturating_add(1)))
     {
-        apply_event(state, event);
+        items.extend(apply_event(state, event));
+    }
+}
+
+/// The item a delta or fold streams into.
+fn stream_item(body: &Body) -> Option<String> {
+    match body {
+        Body::Delta(d) => Some(d.item_id.clone()),
+        Body::ItemFold(f) => Some(f.item_id.clone()),
+        _ => None,
     }
 }
 

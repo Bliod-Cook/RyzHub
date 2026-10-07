@@ -766,7 +766,7 @@ async fn acceptance(h: &Harness) -> anyhow::Result<()> {
         &mut tx,
         &lease,
         &command,
-        "M4 MCP memory",
+        ryzhub_server::runs::Input::text("M4 MCP memory"),
         ryzhub_server::runs::RunKind::Main,
         ryzhub_server::owner::Engine::Mock,
         &h.app.config,

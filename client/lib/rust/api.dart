@@ -7,7 +7,8 @@ import 'frb_generated.dart';
 
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `command`
+// These functions are ignored because they are not marked as `pub`: `channel_key`, `command`, `committed`, `dirty`, `sendable`, `update`, `writes`
+// These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `State`
 
 int reconnectDelay({required int attempt, required int random}) => RustLib
     .instance
@@ -23,7 +24,13 @@ abstract class ClientCore implements RustOpaqueInterface {
     required String answer,
   });
 
+  /// Continue the connection under a refreshed access token.
+  Uint8List authRefresh({required String token});
+
   Update cancel({required String channel});
+
+  /// The last update's cache writes are stored.
+  void committed();
 
   Update compact({required String channel});
 
@@ -40,52 +47,117 @@ abstract class ClientCore implements RustOpaqueInterface {
 
   Uint8List hello({required String deviceId});
 
-  /// Flutter batches incoming frames for one display tick, then receives item diffs.
+  /// Flutter batches incoming frames for one display tick, then receives what changed: only
+  /// the channels and items these frames touched.
   Update ingest({required List<Uint8List> frames});
 
   Update mergeHistory({required String channel, required String itemsJson});
 
-  factory ClientCore({required String cacheJson}) =>
-      RustLib.instance.api.crateApiClientCoreNew(cacheJson: cacheJson);
+  factory ClientCore({required List<CacheRecord> records}) =>
+      RustLib.instance.api.crateApiClientCoreNew(records: records);
 
+  /// Stored commands not acknowledged yet, to send again.
   List<Uint8List> retryPending();
 
   /// `config_json` carries settings not yet confirmed by the server, so they
-  /// apply to this message's run regardless of command ordering.
+  /// apply to this message's run regardless of command ordering. `attachment_ids`
+  /// name files of the sender's library; the text may then be empty.
   Update sendText({
     required String channel,
     required String text,
     String? configJson,
+    required List<String> attachmentIds,
   });
 
   Update sideQuery({required String channel, required String text});
 
-  Update steer({required String channel, required String text});
+  Update steer({
+    required String channel,
+    required String text,
+    required List<String> attachmentIds,
+  });
 
   Update subscribe({required String channel});
 
   String viewJson();
 }
 
+/// A record of the client cache. The empty key is a whole engine cached before channels had
+/// records of their own.
+class CacheRecord {
+  final String key;
+  final String value;
+
+  const CacheRecord({required this.key, required this.value});
+
+  @override
+  int get hashCode => key.hashCode ^ value.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is CacheRecord &&
+          runtimeType == other.runtimeType &&
+          key == other.key &&
+          value == other.value;
+}
+
+/// A change to the client cache: a record to store, or without a value one to remove.
+class CacheWrite {
+  final String key;
+  final String? value;
+
+  const CacheWrite({required this.key, this.value});
+
+  @override
+  int get hashCode => key.hashCode ^ value.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is CacheWrite &&
+          runtimeType == other.runtimeType &&
+          key == other.key &&
+          value == other.value;
+}
+
 class Update {
   final String changesJson;
-  final String? cacheJson;
+
+  /// Store these in one local transaction before sending any outbound frame, then call
+  /// [`ClientCore::committed`].
+  final List<CacheWrite> cacheWrites;
   final List<Uint8List> outboundFrames;
   final String? error;
 
+  /// The commands the server finished with: `[{cid, channel, accepted, code, retryable}]`.
+  final String resultsJson;
+
+  /// The session ends soon: refresh it, then send [`ClientCore::auth_refresh`].
+  final bool authExpiring;
+
+  /// The command this update queued.
+  final String? cid;
+
   const Update({
     required this.changesJson,
-    this.cacheJson,
+    required this.cacheWrites,
     required this.outboundFrames,
     this.error,
+    required this.resultsJson,
+    required this.authExpiring,
+    this.cid,
   });
 
   @override
   int get hashCode =>
       changesJson.hashCode ^
-      cacheJson.hashCode ^
+      cacheWrites.hashCode ^
       outboundFrames.hashCode ^
-      error.hashCode;
+      error.hashCode ^
+      resultsJson.hashCode ^
+      authExpiring.hashCode ^
+      cid.hashCode;
 
   @override
   bool operator ==(Object other) =>
@@ -93,7 +165,10 @@ class Update {
       other is Update &&
           runtimeType == other.runtimeType &&
           changesJson == other.changesJson &&
-          cacheJson == other.cacheJson &&
+          cacheWrites == other.cacheWrites &&
           outboundFrames == other.outboundFrames &&
-          error == other.error;
+          error == other.error &&
+          resultsJson == other.resultsJson &&
+          authExpiring == other.authExpiring &&
+          cid == other.cid;
 }

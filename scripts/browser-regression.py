@@ -16,6 +16,8 @@ API = os.environ.get('RYZHUB_API_URL', 'http://127.0.0.1:8080')
 
 
 def cache(page):
+    """The client's cached engine: its `engine` record and one record per channel, under
+    `<partition>\\0<key>`; a single record without a key is a cache from before records."""
     return page.evaluate('''async () => {
       const db = await new Promise((resolve,reject) => {
         const r=indexedDB.open('ryzhub-core');
@@ -23,9 +25,20 @@ def cache(page):
       });
       try { return await new Promise((resolve,reject) => {
         if (!db.objectStoreNames.contains('cache')) return resolve({});
-        const r=db.transaction('cache').objectStore('cache').getAll();
-        r.onsuccess=()=>resolve(r.result.length ? JSON.parse(r.result[0]) : {});
-        r.onerror=reject;
+        const store=db.transaction('cache').objectStore('cache');
+        const keys=store.getAllKeys(), values=store.getAll();
+        values.onsuccess=()=>{
+          const engine={channels:{}};
+          keys.result.forEach((key,i)=>{
+            const [, record]=String(key).split('\\u0000');
+            const value=JSON.parse(values.result[i]);
+            if (record===undefined) Object.assign(engine,value);
+            else if (record==='engine') Object.assign(engine,value,{channels:engine.channels});
+            else if (record.startsWith('channel:')) engine.channels[record.slice(8)]=value;
+          });
+          resolve(engine);
+        };
+        values.onerror=reject;
       }); } finally { db.close(); }
     }''')
 

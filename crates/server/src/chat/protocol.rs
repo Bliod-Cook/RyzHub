@@ -33,7 +33,7 @@ pub fn continue_with(
         }
         for (id, result) in results {
             target.push(
-                json!({"type":"function_call_output","call_id":id,"output":result.to_string()}),
+                json!({"type":"function_call_output","call_id":id,"output":output(protocol, result)}),
             );
         }
     } else {
@@ -82,7 +82,7 @@ pub fn continue_with(
                         "type": "tool_result",
                         "tool_use_id": id,
                         "is_error": result.get("error").is_some(),
-                        "content": result.to_string(),
+                        "content": output(protocol, result),
                     })
                 })
                 .collect();
@@ -90,6 +90,11 @@ pub fn continue_with(
         }
     }
     Ok(())
+}
+
+/// A tool result as model context: its JSON text, or an image reference with that text.
+fn output(protocol: &str, result: &Value) -> Value {
+    super::media::tool_content(protocol, result).unwrap_or_else(|| result.to_string().into())
 }
 
 /// Ids of server tool calls in an assistant message's content that have no result block yet.

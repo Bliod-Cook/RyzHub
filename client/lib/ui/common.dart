@@ -12,6 +12,7 @@ abstract class HubActions {
   RunAction get run;
   void newChat();
   void openSearch();
+  void openLibrary();
   void toggleSidebar();
   void openSettings([String? section]);
   void openConversation(String id);

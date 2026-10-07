@@ -22,7 +22,10 @@ use crate::{
 use ryzhub_domain::OrgContext;
 
 pub fn router(app: App) -> Router {
-    use crate::{conversation_commands as conversations, llm, memory, projects, search, workspace};
+    use crate::{
+        attachments::http as attachments, conversation_commands as conversations, llm, memory,
+        projects, search, workspace,
+    };
     let origins: Vec<axum::http::HeaderValue> = app
         .config
         .allowed_origins
@@ -37,6 +40,19 @@ pub fn router(app: App) -> Router {
         .allow_credentials(true);
     Router::new()
         .route("/orgs/{org}/search", get(search::endpoint))
+        .route(
+            "/orgs/{org}/attachments",
+            get(attachments::list).post(attachments::upload),
+        )
+        .route("/orgs/{org}/attachments/{id}", delete(attachments::remove))
+        .route(
+            "/orgs/{org}/attachments/{id}/content",
+            get(attachments::content),
+        )
+        .route(
+            "/orgs/{org}/attachments/{id}/preview",
+            get(attachments::preview),
+        )
         .route("/orgs/{org}/memories", get(memory::list).post(memory::put))
         .route(
             "/orgs/{org}/memories/preferences",
@@ -218,6 +234,11 @@ async fn capabilities(State(app): State<App>) -> Json<Value> {
         "memory": config.search.enabled,
         "conversation_temporary": config.search.enabled,
         "conversation_delete": config.search.enabled,
+        "attachments": {
+            "max_bytes": config.policy.attachment_bytes.unwrap_or(crate::attachments::DEFAULT_BYTES)
+                .min(crate::attachments::MAX_BYTES),
+            "max_per_message": crate::attachments::MAX_PER_MESSAGE,
+        },
     }))
 }
 

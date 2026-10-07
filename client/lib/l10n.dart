@@ -105,6 +105,32 @@ String errorText(Object error) {
     ),
     'PROJECT_DELETED' => tr('项目已删除。', 'The project was deleted.'),
     'FORK_POINT_UNAVAILABLE' => tr('无法从此处分叉。', 'Cannot fork from here.'),
+    'ATTACHMENT_TOO_LARGE' => tr('文件太大。', 'The file is too large.'),
+    'ATTACHMENT_QUOTA_EXCEEDED' => tr(
+      '文件库空间已满，请先删除一些文件。',
+      'Your file library is full. Delete some files first.',
+    ),
+    'ATTACHMENT_UNAVAILABLE' => tr('文件不可用。', 'The file is not available.'),
+    'ATTACHMENT_DELETED' => tr('文件已删除。', 'The file was deleted.'),
+    'FILE_NOT_FOUND' => tr(
+      '回答完成时沙箱里没有这个文件。',
+      'The sandbox had no such file when the reply completed.',
+    ),
+    'NOT_A_FILE' => tr('链接指向的不是文件。', 'The link does not point to a file.'),
+    'FILE_TOO_LARGE' => tr('文件太大，无法提供。', 'The file is too large to hand over.'),
+    'INVALID_PATH' => tr('文件路径无效。', 'The file path is not valid.'),
+    'FILE_UNAVAILABLE' => tr(
+      '暂时无法提供这个文件。',
+      'The file could not be handed over.',
+    ),
+    'TOO_MANY_ATTACHMENTS' => tr(
+      '一条消息最多附带 10 个文件。',
+      'A message carries at most 10 files.',
+    ),
+    'UPLOAD_BUSY' => tr(
+      '上传的人太多了，请稍后重试。',
+      'Too many uploads right now. Try again shortly.',
+    ),
     _ => code,
   };
 }

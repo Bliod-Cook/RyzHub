@@ -1,6 +1,8 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
 
+import 'package:desktop_drop/desktop_drop.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -12,12 +14,15 @@ import '../l10n.dart';
 import '../link.dart';
 import '../prefs.dart';
 import '../theme.dart';
+import 'attachments.dart';
 import 'common.dart';
 import 'composer.dart';
 import 'dialogs.dart';
 import 'icons.dart';
+import 'library.dart';
 import 'login.dart';
 import 'messages.dart';
+import 'preview.dart';
 import 'settings.dart';
 import 'sidebar.dart';
 
@@ -35,10 +40,18 @@ class _HubPageState extends State<HubPage>
   HubController hub = HubController();
   final composerKey = GlobalKey();
   final composerFocus = FocusNode();
+
+  /// The message field's text, so a refused message can be put back.
+  final composerText = TextEditingController();
   final scaffoldKey = GlobalKey<ScaffoldState>();
+  final libraryKey = GlobalKey<LibraryViewState>();
 
   /// Signing back in with the device's refresh cookie; the login page waits.
   bool restoring = keepsSession;
+
+  /// Files are being dragged over the window.
+  bool dragging = false;
+  late final void Function() _stopPaste;
 
   @override
   void initState() {
@@ -48,20 +61,75 @@ class _HubPageState extends State<HubPage>
     prefs.addListener(_changed);
     widget.link?.requested.addListener(_follow);
     HardwareKeyboard.instance.addHandler(_shortcut);
+    _stopPaste = listenForPastedFiles((name, bytes) {
+      // Nothing takes files while a preview covers the composer.
+      if (!hub.signedIn || !hub.canAttach || hub.previewFiles != null) return;
+      if (hub.libraryOpen) {
+        libraryKey.currentState?.upload([
+          (name: name, size: bytes.length, open: () => Stream.value(bytes)),
+        ]);
+      } else {
+        attachBytes(hub, name, bytes);
+      }
+    });
     if (restoring) _restore();
   }
 
   void _changed() {
     if (!mounted) return;
+    // Not while the old controller is still notifying: it is disposed.
+    if (hub.sessionEnded) return scheduleMicrotask(_sessionEnded);
     setState(() {});
     _report();
   }
 
+  /// The session ran out and could not be renewed: back to signing in.
+  void _sessionEnded() {
+    if (!mounted || !hub.sessionEnded) return;
+    Navigator.of(context).popUntil((route) => route.isFirst);
+    final old = hub;
+    old.removeListener(_changed);
+    setState(() => hub = HubController()..addListener(_changed));
+    old.dispose();
+    _report();
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(
+          tr('登录已过期，请重新登录。', 'Your session has ended. Sign in again.'),
+        ),
+      ),
+    );
+  }
+
+  /// Put a refused message back into the field, with its files, in its
+  /// conversation.
+  void restoreFailed() {
+    final failed = hub.takeFailedSend();
+    if (failed == null) return;
+    final conv = failed.channel.startsWith('conv:')
+        ? failed.channel.substring(5)
+        : '';
+    if (conv.isNotEmpty && conv != hub.selected && hub.has(conv)) {
+      openConversation(conv);
+    }
+    final typed = composerText.text;
+    composerText.text = typed.isEmpty ? failed.text : '${failed.text}\n$typed';
+    hub.attachFromLibrary(failed.files);
+    focusComposer();
+  }
+
   String get _lastKey => '${hub.base} ${hub.org}';
 
-  /// The address shows the open conversation; a native build remembers it.
+  /// The address shows the open conversation or the library; a native build
+  /// remembers the conversation.
   void _report() {
-    widget.link?.show(hub.signedIn ? hub.selected : '');
+    widget.link?.show(
+      !hub.signedIn
+          ? ''
+          : hub.libraryOpen
+          ? libraryLink
+          : hub.selected,
+    );
     if (!kIsWeb &&
         hub.signedIn &&
         prefs.lastConversations[_lastKey] != hub.selected) {
@@ -89,7 +157,9 @@ class _HubPageState extends State<HubPage>
         ? asked
         : prefs.lastConversations[_lastKey] ?? '';
     if (id.isEmpty) return;
-    if (hub.has(id)) {
+    if (id == libraryLink) {
+      openLibrary();
+    } else if (hub.has(id)) {
       openConversation(id);
     } else {
       widget.link?.refuse();
@@ -101,8 +171,11 @@ class _HubPageState extends State<HubPage>
     final id = widget.link?.requested.value;
     if (id == null || !hub.signedIn) return;
     widget.link!.requested.value = null;
-    if (id == hub.selected) return;
-    if (id.isEmpty) {
+    if (id == libraryLink) {
+      if (!hub.libraryOpen) openLibrary();
+    } else if (id == hub.selected && !hub.libraryOpen) {
+      return;
+    } else if (id.isEmpty) {
       newChat();
     } else if (hub.has(id)) {
       openConversation(id);
@@ -124,9 +197,11 @@ class _HubPageState extends State<HubPage>
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     HardwareKeyboard.instance.removeHandler(_shortcut);
+    _stopPaste();
     prefs.removeListener(_changed);
     widget.link?.requested.removeListener(_follow);
     composerFocus.dispose();
+    composerText.dispose();
     hub.dispose();
     super.dispose();
   }
@@ -214,6 +289,49 @@ class _HubPageState extends State<HubPage>
         openProject(id);
       case null:
     }
+  }
+
+  @override
+  void openLibrary() {
+    closeDrawer();
+    hub.openLibrary();
+  }
+
+  /// A previewed file as a message carries it.
+  Map<String, dynamic> carried(Map<String, dynamic> file) => {
+    'id': file['id'],
+    'name': file['name'],
+    'size': file['size'],
+    'kind': file['kind'],
+  };
+
+  /// A question about a file of the library starts a new chat with it.
+  Future<void> askAbout(Map<String, dynamic> file, String question) async {
+    newChat();
+    await action(() => hub.send(question, only: [carried(file)]));
+  }
+
+  /// A question about a file previewed over the conversation goes on in it,
+  /// with the file; the conversation shows again once it is sent.
+  Future<void> followUp(Map<String, dynamic> file, String question) async {
+    await action(
+      () => hub.send(question, only: [carried(file)]),
+      rethrowError: true,
+    );
+    hub.closePreview();
+  }
+
+  /// A file of the library goes with the first message of a new chat.
+  void useFile(Map<String, dynamic> file) {
+    newChat();
+    if (hub.pendingFiles.length >= hub.maxFiles &&
+        !hub.pendingFiles.any((f) => f.id == file['id'])) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(errorText('TOO_MANY_ATTACHMENTS'))),
+      );
+      return;
+    }
+    hub.attachFromLibrary([file]);
   }
 
   @override
@@ -309,6 +427,27 @@ class _HubPageState extends State<HubPage>
       hub.startDraft(mode: mode, project: hub.contextProject);
     }
   }
+
+  /// Above the library only the drawer's button, where there is one.
+  Widget libraryHeader() => SizedBox(
+    height: wide ? 28 : 56,
+    child: Row(
+      children: [
+        const SizedBox(width: 8),
+        if (!wide)
+          IconButton(
+            tooltip: tr('打开侧边栏', 'Open sidebar'),
+            icon: const HubIcon(HubIcons.sidebarCollapsed),
+            onPressed: () => scaffoldKey.currentState?.openDrawer(),
+          ),
+        if (!wide && hub.connection != 'online')
+          ConnectionStatus(
+            connection: hub.connection,
+            onReconnect: hub.reconnect,
+          ),
+      ],
+    ),
+  );
 
   Widget header() {
     final c = HubColors.of(context);
@@ -417,6 +556,45 @@ class _HubPageState extends State<HubPage>
     );
   }
 
+  /// A refused message: why, and a way back to editing it.
+  Widget failedBar(SentInput failed) {
+    final c = HubColors.of(context);
+    return Center(
+      child: Container(
+        constraints: const BoxConstraints(maxWidth: contentWidth),
+        margin: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+        padding: const EdgeInsets.fromLTRB(14, 6, 6, 6),
+        decoration: BoxDecoration(
+          color: c.danger.withValues(alpha: .08),
+          borderRadius: BorderRadius.circular(12),
+        ),
+        child: Row(
+          children: [
+            Icon(Icons.error_outline, size: 18, color: c.danger),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Text(
+                tr(
+                  '消息未发送：${errorText(failed.code)}',
+                  'Message not sent: ${errorText(failed.code)}',
+                ),
+                style: TextStyle(fontSize: 13, color: c.text),
+              ),
+            ),
+            TextButton(
+              onPressed: restoreFailed,
+              child: Text(tr('恢复编辑', 'Edit again')),
+            ),
+            TextButton(
+              onPressed: hub.takeFailedSend,
+              child: Text(tr('关闭', 'Dismiss')),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   Widget errorBar() {
     final c = HubColors.of(context);
     return Center(
@@ -448,18 +626,29 @@ class _HubPageState extends State<HubPage>
     );
   }
 
+  /// The conversation's run is going, as its composers show.
+  bool get running => !hub.isDraft && hub.running;
+
+  /// What is sent while the run goes instructs it.
+  bool get steerable =>
+      !hub.isDraft && (hub.realChat || hub.realWork) && hub.mainlineRunning;
+
   Widget composer() {
     final draft = hub.isDraft;
     return Composer(
       key: composerKey,
+      controller: composerText,
       onSend: (text) => action(() => hub.send(text), rethrowError: true),
-      running: !draft && hub.running,
+      running: running,
       onCancel: () => action(hub.cancel),
       // Side questions and the approval mode are off the composer for now;
       // they are meant to come back as commands.
-      steer: !draft && (hub.realChat || hub.realWork) && hub.mainlineRunning,
+      steer: steerable,
       enterToSend: prefs.enterToSend,
       focusNode: composerFocus,
+      attachments: hub.pendingFiles.isEmpty ? null : PendingFiles(hub: hub),
+      canSendEmpty: hub.readyFiles.isNotEmpty,
+      blocked: hub.filesBusy,
       leading: plusMenu(context, hub, action, onNewProject: manageProjects),
       tools: runTools(hub, action),
       trailing: modelControl(hub, action),
@@ -701,6 +890,7 @@ class _HubPageState extends State<HubPage>
             (i['first_seq'] as int) <= hub.searchFocusSeq!,
       ),
     );
+
     // Found by key, a row keeps its state (an opened steps group) as rows
     // arrive below it.
     final positions = {for (final (i, row) in rows.indexed) row['id']: i};
@@ -724,6 +914,38 @@ class _HubPageState extends State<HubPage>
         launchUrl(uri, mode: LaunchMode.externalApplication);
       }
     }
+
+    /// A file a reply links to opens in the preview once handed over; the
+    /// reply holding the link is looked in first, then newer replies.
+    void openFile(String href, Iterable<dynamic> scope) {
+      final found = linkedFile(href, [...scope, ...hub.items.reversed]);
+      if (found != null && found.error == null) {
+        return hub.openPreview(
+          found.files,
+          index: found.index,
+          inConversation: true,
+        );
+      }
+      final waiting =
+          found == null &&
+          (scope.any((item) => item is Map && item['state'] == 'streaming') ||
+              hub.running);
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            waiting
+                ? tr(
+                    '回答完成后即可打开这个文件。',
+                    'The file opens once the reply completes.',
+                  )
+                : errorText(found?.error ?? 'FILE_NOT_FOUND'),
+          ),
+        ),
+      );
+    }
+
+    void openLink(String href, Iterable<dynamic> scope) =>
+        isFileLink(href) ? openFile(href, scope) : openSource(href);
 
     Widget centered(Widget child, {Key? key}) => Center(
       key: key,
@@ -771,7 +993,8 @@ class _HubPageState extends State<HubPage>
                             running: hub.runActive(item['run_id']),
                             latest: item['latest'] == true,
                             worked: hub.workedFor(item['run_id']),
-                            onSource: openSource,
+                            onSource: (href) =>
+                                openLink(href, item['steps'] as List),
                           ),
                         );
                       }
@@ -780,7 +1003,14 @@ class _HubPageState extends State<HubPage>
                         MessageCard(
                           item: item,
                           agentLabel: hub.agentLabel,
-                          onSource: openSource,
+                          onSource: (href) => openLink(href, [item]),
+                          files: (files) => MessageFiles(
+                            hub: hub,
+                            files: files,
+                            alignment: item['kind'] == 'user'
+                                ? WrapAlignment.end
+                                : WrapAlignment.start,
+                          ),
                           onMemoryUndo: item['kind'] == 'memory_notice'
                               ? () => action(() async {
                                   final notice = jsonDecode(item['text']);
@@ -843,6 +1073,8 @@ class _HubPageState extends State<HubPage>
     if (!hub.signedIn) return LoginPage(onLogin: login);
     final c = HubColors.of(context);
     final collapsed = wide && prefs.sidebarCollapsed;
+    final previewing = hub.previewFiles != null;
+    final floating = previewing && hub.previewInConversation;
     return Scaffold(
       key: scaffoldKey,
       drawer: wide
@@ -850,32 +1082,140 @@ class _HubPageState extends State<HubPage>
           : Drawer(
               child: Sidebar(hub: hub, app: this, drawer: true),
             ),
-      body: Row(
+      body: Stack(
+        fit: StackFit.expand,
         children: [
-          if (wide)
-            Container(
-              width: collapsed ? 56 : 260,
-              decoration: BoxDecoration(
-                border: Border(right: BorderSide(color: c.border)),
-              ),
-              child: collapsed
-                  ? SidebarRail(hub: hub, app: this)
-                  : Sidebar(hub: hub, app: this),
-            ),
-          Expanded(
-            child: SafeArea(
-              left: !wide,
-              child: Column(
-                children: [
-                  header(),
-                  if (hub.error.isNotEmpty) errorBar(),
-                  Expanded(
-                    child: hub.isDraft ? draftHome() : conversationView(),
-                  ),
-                ],
+          // Under a preview over the conversation, the whole page, sidebar
+          // too, is out of reach.
+          ExcludeFocus(
+            excluding: floating,
+            child: ExcludeSemantics(
+              excluding: floating,
+              child: IgnorePointer(
+                ignoring: floating,
+                child: Row(
+                  children: [
+                    if (wide)
+                      Container(
+                        width: collapsed ? 56 : 260,
+                        decoration: BoxDecoration(
+                          border: Border(right: BorderSide(color: c.border)),
+                        ),
+                        child: collapsed
+                            ? SidebarRail(hub: hub, app: this)
+                            : Sidebar(hub: hub, app: this),
+                      ),
+                    Expanded(
+                      // Files dropped anywhere on the conversation go with the next message.
+                      child: DropTarget(
+                        enable: hub.canAttach && !previewing,
+                        onDragEntered: (_) => setState(() => dragging = true),
+                        onDragExited: (_) => setState(() => dragging = false),
+                        onDragDone: (details) async {
+                          setState(() => dragging = false);
+                          if (hub.libraryOpen) {
+                            final files = await droppedFiles(details.files);
+                            await libraryKey.currentState?.upload(files);
+                          } else {
+                            await attachDropped(hub, details.files);
+                          }
+                        },
+                        child: Stack(
+                          children: [
+                            // Under a preview the page keeps its state but is out of
+                            // reach: no taps, no keyboard focus, nothing for assistive
+                            // tech.
+                            ExcludeFocus(
+                              excluding: previewing,
+                              child: ExcludeSemantics(
+                                excluding: previewing,
+                                child: IgnorePointer(
+                                  ignoring: previewing,
+                                  child: SafeArea(
+                                    left: !wide,
+                                    child: Column(
+                                      children: [
+                                        hub.libraryOpen
+                                            ? libraryHeader()
+                                            : header(),
+                                        if (hub.failedSend case final failed?)
+                                          failedBar(failed),
+                                        if (hub.error.isNotEmpty) errorBar(),
+                                        Expanded(
+                                          child: hub.libraryOpen
+                                              ? LibraryView(
+                                                  key: libraryKey,
+                                                  hub: hub,
+                                                  onUse: useFile,
+                                                )
+                                              : hub.isDraft
+                                              ? draftHome()
+                                              : conversationView(),
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            ),
+                            // The library's, over everything right of the sidebar,
+                            // even its header.
+                            if (previewing && !floating)
+                              Positioned.fill(
+                                child: FilePreviewView(
+                                  hub: hub,
+                                  onAsk: askAbout,
+                                ),
+                              ),
+                            if (dragging)
+                              Positioned.fill(
+                                child: IgnorePointer(
+                                  child: Container(
+                                    margin: const EdgeInsets.all(12),
+                                    decoration: BoxDecoration(
+                                      color: c.background.withValues(
+                                        alpha: .85,
+                                      ),
+                                      borderRadius: BorderRadius.circular(16),
+                                      border: Border.all(
+                                        color: c.accent,
+                                        width: 2,
+                                      ),
+                                    ),
+                                    alignment: Alignment.center,
+                                    child: Text(
+                                      hub.libraryOpen
+                                          ? tr(
+                                              '松开以上传到文件库',
+                                              'Drop to upload to your library',
+                                            )
+                                          : tr('松开以添加文件', 'Drop to add files'),
+                                      style: TextStyle(
+                                        fontSize: 16,
+                                        color: c.text,
+                                      ),
+                                    ),
+                                  ),
+                                ),
+                              ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
               ),
             ),
           ),
+          if (floating)
+            FilePreviewView(
+              hub: hub,
+              onAsk: followUp,
+              floating: true,
+              running: running,
+              steer: steerable,
+              onCancel: () => action(hub.cancel),
+            ),
         ],
       ),
     );

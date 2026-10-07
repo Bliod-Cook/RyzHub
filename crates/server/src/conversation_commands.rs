@@ -17,7 +17,7 @@ use crate::{
     error::{ApiResult, Code},
     owner::OwnerLink,
     run_config::{self, RunConfig},
-    store::{Lease, Tx, append, conversation_in, effective_policy},
+    store::{Lease, Tx, append, conversation_in, conversation_item, effective_policy},
 };
 
 /// `UpdateRunConfig`: merge a settings patch into the conversation's run configuration.
@@ -282,10 +282,12 @@ pub async fn catalog(
 pub struct Platform {
     title: Option<String>,
     archive: Option<bool>,
+    pinned: Option<bool>,
 }
 
-/// `PATCH /orgs/{org}/conversations/{conv}/settings`: rename or (un)archive. Chat only for
-/// archiving; a Work workspace is archived through its workspace job.
+/// `PATCH /orgs/{org}/conversations/{conv}/settings`: rename, (un)archive or (un)pin. Chat
+/// only for archiving; a Work workspace is archived through its workspace job. Pinning again
+/// keeps the original pin time; a temporary conversation cannot be pinned.
 pub async fn platform(
     State(app): State<App>,
     headers: HeaderMap,
@@ -302,7 +304,7 @@ pub async fn platform(
         .await?
         .context(Code::Forbidden)?;
     let c = conversation_in(&mut tx, &ctx, conv).await?;
-    let changed = input.title.is_some() || input.archive.is_some();
+    let changed = input.title.is_some() || input.archive.is_some() || input.pinned.is_some();
     if let Some(title) = input.title {
         require!(
             !title.trim().is_empty() && title.len() <= 256,
@@ -325,13 +327,27 @@ pub async fn platform(
             .execute(&mut *tx)
             .await?;
     }
+    if let Some(pinned) = input.pinned {
+        require!(!(pinned && c.temporary), Code::InvalidConversation);
+        sqlx::query(
+            "UPDATE conversations SET pinned_at=CASE WHEN $3 THEN COALESCE(pinned_at,now()) END
+             WHERE org_id=$1 AND id=$2",
+        )
+        .bind(org)
+        .bind(conv)
+        .bind(pinned)
+        .execute(&mut *tx)
+        .await?;
+    }
     if changed {
-        let (title, state): (String, String) =
-            sqlx::query_as("SELECT title,state FROM conversations WHERE org_id=$1 AND id=$2")
-                .bind(org)
-                .bind(conv)
-                .fetch_one(&mut *tx)
-                .await?;
+        let (title, state, pinned_at_ms): (String, String, Option<i64>) = sqlx::query_as(
+            "SELECT title,state,(extract(epoch FROM pinned_at)*1000)::bigint
+             FROM conversations WHERE org_id=$1 AND id=$2",
+        )
+        .bind(org)
+        .bind(conv)
+        .fetch_one(&mut *tx)
+        .await?;
         let channel = format!("user:{org}:{}", c.creator_id);
         // A user-channel sequence is also a monotonic metadata revision. Lock
         // before allocating it so concurrent conversations cannot reuse it.
@@ -348,14 +364,13 @@ pub async fn platform(
             &channel,
             None,
             "",
-            Event::ItemUpserted(Item {
-                id: conv.to_string(),
-                revision: revision as u64,
-                kind: "conversation".into(),
+            Event::ItemUpserted(conversation_item(
+                conv,
+                revision as u64,
                 state,
-                text: title,
-                ..Default::default()
-            }),
+                title,
+                pinned_at_ms,
+            )),
         )
         .await?;
     }
@@ -646,14 +661,7 @@ async fn fork(
         &format!("user:{}:{}", lease.org_id, source.creator_id),
         None,
         "",
-        Event::ItemUpserted(Item {
-            id: id.to_string(),
-            revision: 1,
-            kind: "conversation".into(),
-            state: "active".into(),
-            text: title,
-            ..Default::default()
-        }),
+        Event::ItemUpserted(conversation_item(id, 1, "active".into(), title, None)),
     )
     .await?;
     tx.commit().await?;

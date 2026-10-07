@@ -234,6 +234,7 @@ async fn capabilities(State(app): State<App>) -> Json<Value> {
         "memory": config.search.enabled,
         "conversation_temporary": config.search.enabled,
         "conversation_delete": config.search.enabled,
+        "conversation_pin": true,
         "attachments": {
             "max_bytes": config.policy.attachment_bytes.unwrap_or(crate::attachments::DEFAULT_BYTES)
                 .min(crate::attachments::MAX_BYTES),

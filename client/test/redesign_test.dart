@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:ryzhub/controller.dart';
@@ -89,12 +91,55 @@ void main() {
       {'id': 'a', 'state': 'active', 'project_id': null},
       {'id': 'b', 'state': 'active', 'project_id': 'p'},
       {'id': 'c', 'state': 'archived', 'project_id': null},
-      {'id': 'd', 'state': 'active', 'project_id': null, 'pinned': true},
+      {'id': 'd', 'state': 'active', 'project_id': null, 'pinned_at_ms': 5},
+      {'id': 'e', 'state': 'active', 'project_id': null, 'pinned_at_ms': 9},
+      {'id': 'f', 'state': 'archived', 'project_id': null, 'pinned_at_ms': 7},
     ]);
     expect(hub.recents.map((c) => c['id']), ['a']);
     expect(hub.projectConversations('p').map((c) => c['id']), ['b']);
-    expect(hub.archived.map((c) => c['id']), ['c']);
-    expect(hub.pinned.map((c) => c['id']), ['d']);
+    expect(hub.archived.map((c) => c['id']), ['c', 'f']);
+    // Most recently pinned first; an archived pin waits until it returns.
+    expect(hub.pinned.map((c) => c['id']), ['e', 'd']);
+  });
+
+  test('a pin from another device moves the chat as it arrives', () async {
+    final hub = HubController()
+      ..org = 'o'
+      ..user = 'u';
+    addTearDown(hub.dispose);
+    hub.conversations.addAll([
+      {'id': 'a', 'title': 'A', 'state': 'active', 'project_id': null},
+      {'id': 'b', 'title': 'B', 'state': 'active', 'project_id': null},
+    ]);
+    String item(String id, int pinnedAt, {bool detail = true}) => jsonEncode([
+      {
+        'channel': 'user:o:u',
+        'items': [
+          {
+            'id': id,
+            'kind': 'conversation',
+            'state': 'active',
+            'text': id.toUpperCase(),
+            if (detail)
+              'detail': {
+                'kind': {
+                  'Conversation': {'pinned_at_ms': pinnedAt},
+                },
+              },
+          },
+        ],
+        'actions': [],
+      },
+    ]);
+    await hub.debugChanges(item('b', 42));
+    expect(hub.pinned.map((c) => c['id']), ['b']);
+    expect(hub.recents.map((c) => c['id']), ['a']);
+    // An item cached before pins were carried leaves the pin alone.
+    await hub.debugChanges(item('b', 0, detail: false));
+    expect(hub.pinned.map((c) => c['id']), ['b']);
+    await hub.debugChanges(item('b', 0));
+    expect(hub.pinned, isEmpty);
+    expect(hub.recents.map((c) => c['id']), ['a', 'b']);
   });
 
   Map<String, dynamic> m(

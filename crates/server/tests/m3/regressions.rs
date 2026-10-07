@@ -357,3 +357,123 @@ async fn conversation_metadata_replays_to_online_and_offline_clients() -> anyhow
     h.close().await?;
     outcome
 }
+
+#[tokio::test]
+#[ignore = "requires local PostgreSQL and NATS"]
+async fn a_pin_stays_listed_and_reaches_every_client() -> anyhow::Result<()> {
+    let h = Harness::new().await?;
+    let user = h.user().await?;
+    let org = id(&user, "org_id");
+    let outcome = async {
+        let ctx = h.app.store.context(id(&user, "user_id"), org).await?;
+        let older = h.configured(&user, "chat", json!({}), None).await?;
+        let newer = h
+            .configured(&user, "work", json!({"harness":"codex"}), None)
+            .await?;
+        let channel = format!("user:{org}:{}", id(&user, "user_id"));
+        let order = || async {
+            let list = h
+                .json(
+                    &user,
+                    &format!("/orgs/{org}/conversations"),
+                    reqwest::Method::GET,
+                    json!({}),
+                )
+                .await?;
+            anyhow::Ok(list.as_array().context("list")?.clone())
+        };
+        let pinned_at = |client: &ryzhub_core::Engine, conv: Uuid| {
+            let item = &client.channels[&channel].items[&conv.to_string()];
+            match item.detail.as_ref().and_then(|d| d.kind.as_ref()) {
+                Some(item_detail::Kind::Conversation(c)) => Ok(c.pinned_at_ms),
+                other => Err(anyhow::anyhow!("no conversation detail: {other:?}")),
+            }
+        };
+        let mut client = ryzhub_core::Engine::default();
+        client.subscribe(channel.clone());
+        for frame in h.app.store.replay(&ctx, &channel, None).await?.0 {
+            client.apply(frame);
+        }
+        ensure!(pinned_at(&client, older)? == 0);
+        let pin = |conv: Uuid, pinned: bool| {
+            let path = format!("/orgs/{org}/conversations/{conv}/settings");
+            let (h, user) = (&h, &user);
+            async move {
+                h.json(
+                    user,
+                    &path,
+                    reqwest::Method::PATCH,
+                    json!({ "pinned": pinned }),
+                )
+                .await
+            }
+        };
+        let catch_up = |cursor: u64| {
+            let (h, ctx, channel) = (&h, &ctx, &channel);
+            async move {
+                let (frames, _) = h.app.store.replay(ctx, channel, Some(cursor)).await?;
+                ensure!(frames.len() == 1, "a pin must produce one durable event");
+                anyhow::Ok(frames)
+            }
+        };
+        pin(older, true).await?;
+        for frame in catch_up(client.channels[&channel].cursor).await? {
+            client.apply(frame);
+        }
+        let first = pinned_at(&client, older)?;
+        ensure!(first > 0, "the online client must see the pin");
+        // The list stays newest first and carries the pin; clients order pins themselves.
+        let list = order().await?;
+        ensure!(list.iter().map(|c| id(c, "id")).collect::<Vec<_>>() == [newer, older]);
+        ensure!(list[1]["pinned_at_ms"] == first && list[0]["pinned_at_ms"].is_null());
+        // A pin outlasts the list's limit.
+        sqlx::query(
+            "INSERT INTO conversations(id,org_id,creator_id,mode,title,created_at)
+             SELECT gen_random_uuid(),$1,$2,'chat','filler',now()+n*interval '1 second'
+             FROM generate_series(1,200) n",
+        )
+        .bind(org)
+        .bind(id(&user, "user_id"))
+        .execute(&h.db)
+        .await?;
+        let list = order().await?;
+        ensure!(list.len() == 200 && list[199]["id"] == older.to_string());
+        sqlx::query("DELETE FROM conversations WHERE org_id=$1 AND title='filler'")
+            .bind(org)
+            .execute(&h.db)
+            .await?;
+        // A client starting afresh reads it from the snapshot.
+        let mut fresh = ryzhub_core::Engine::default();
+        fresh.subscribe(channel.clone());
+        for frame in h.app.store.replay(&ctx, &channel, None).await?.0 {
+            fresh.apply(frame);
+        }
+        ensure!(pinned_at(&fresh, older)? == first);
+        // Pinning again keeps the original time.
+        pin(older, true).await?;
+        for frame in catch_up(client.channels[&channel].cursor).await? {
+            client.apply(frame);
+        }
+        ensure!(pinned_at(&client, older)? == first);
+        pin(older, false).await?;
+        for frame in catch_up(client.channels[&channel].cursor).await? {
+            client.apply(frame);
+        }
+        ensure!(pinned_at(&client, older)? == 0);
+        ensure!(order().await?[1]["pinned_at_ms"].is_null());
+        let temporary = h
+            .configured(&user, "chat", json!({"temporary":true}), None)
+            .await?;
+        let refused = pin(temporary, true).await;
+        ensure!(
+            refused
+                .as_ref()
+                .is_err_and(|e| e.to_string().contains("INVALID_CONVERSATION")),
+            "a temporary conversation must not be pinned: {refused:?}"
+        );
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    h.close().await?;
+    outcome
+}

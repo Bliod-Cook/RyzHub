@@ -33,6 +33,29 @@ pub fn truncate_utf8(text: &mut String, limit: usize) -> bool {
     true
 }
 
+/// A conversation as its creator's user channel carries it: title, state and pin.
+pub fn conversation_item(
+    id: Uuid,
+    revision: u64,
+    state: String,
+    title: String,
+    pinned_at_ms: Option<i64>,
+) -> Item {
+    Item {
+        id: id.to_string(),
+        revision,
+        kind: "conversation".into(),
+        state,
+        text: title,
+        detail: Some(ItemDetail {
+            kind: Some(item_detail::Kind::Conversation(ConversationDetail {
+                pinned_at_ms: pinned_at_ms.unwrap_or(0) as u64,
+            })),
+        }),
+        ..Default::default()
+    }
+}
+
 fn bound_item(item: &mut Item) {
     item.truncated |= truncate_utf8(&mut item.text, MAX_ITEM_TEXT);
     let Some(detail) = item.detail.as_mut() else {
@@ -103,7 +126,7 @@ fn bound_item(item: &mut Item) {
                 }
             }
         }
-        None => {}
+        Some(Kind::Conversation(_)) | None => {}
     }
     item.truncated |= cut;
 }
@@ -594,7 +617,7 @@ async fn user_snapshot(tx: &mut Tx<'_>, ctx: &OrgContext) -> anyhow::Result<Snap
         "SELECT ",
         conversation_columns!(),
         " FROM conversations WHERE org_id=$1 AND creator_id=$2 AND state IN ('active','archived')
-          ORDER BY created_at DESC LIMIT 200"
+          ORDER BY pinned_at DESC NULLS LAST, created_at DESC LIMIT 200"
     ))
     .bind(ctx.org_id)
     .bind(ctx.user_id)
@@ -610,14 +633,7 @@ async fn user_snapshot(tx: &mut Tx<'_>, ctx: &OrgContext) -> anyhow::Result<Snap
     Ok(Snapshot {
         items: conversations
             .into_iter()
-            .map(|c| Item {
-                id: c.id.to_string(),
-                revision: 1,
-                kind: "conversation".into(),
-                state: c.state,
-                text: c.title,
-                ..Default::default()
-            })
+            .map(|c| conversation_item(c.id, 1, c.state, c.title, c.pinned_at_ms))
             .collect(),
         read_states: read_states
             .into_iter()

@@ -122,7 +122,8 @@ message Item {
   // `text` was cut at the server's per-item size limit; the full content is not replayed.
   bool truncated = 9;
   // Structured content for tool and file-change items (minor version 1), the sources an
-  // assistant reply cites (minor version 2) and the files a message carries (minor version 3).
+  // assistant reply cites (minor version 2), the files a message carries (minor version 3)
+  // and whether a conversation is pinned (minor version 5).
   ItemDetail detail = 10;
 }
 message ItemDetail {
@@ -131,7 +132,13 @@ message ItemDetail {
     FileChangeDetail file_change = 2;
     AnswerDetail answer = 3;
     AttachmentsDetail attachments = 4;
+    ConversationDetail conversation = 5;
   }
+}
+// A conversation in its creator's user channel (minor version 5).
+message ConversationDetail {
+  // When it was pinned, in Unix milliseconds; 0 while it is not pinned.
+  uint64 pinned_at_ms = 1;
 }
 // Files a user message or steer carries, in order.
 message AttachmentsDetail { repeated Attachment files = 1; }

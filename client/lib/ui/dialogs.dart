@@ -80,7 +80,7 @@ Future<bool> confirmDialog(
 }
 
 /// Pins or unpins a conversation, beside the header and sidebar row menus.
-/// Reserved: disabled until the server advertises `conversation_pin`.
+/// Disabled on servers that do not advertise `conversation_pin`.
 class PinButton extends StatelessWidget {
   final HubController hub;
   final Map<String, dynamic> conv;
@@ -99,7 +99,7 @@ class PinButton extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final c = HubColors.of(context);
-    final pinned = conv['pinned'] == true;
+    final pinned = HubController.pinnedAt(conv) > 0;
     final size = compact ? 17.0 : 20.0;
     return IconButton(
       tooltip: !hub.canPin

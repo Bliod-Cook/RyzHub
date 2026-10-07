@@ -192,25 +192,31 @@ class HubController extends ChangeNotifier {
   bool get isDraft => selected.isEmpty;
   String get channel => 'conv:$selected';
 
-  // Reserved: the server does not implement pin or delete yet. The instance
-  // capabilities must advertise them before the UI offers either action.
+  // The instance capabilities must advertise each action before the UI offers it.
   bool get canPin => capabilities['conversation_pin'] == true;
   bool get canDelete => capabilities['conversation_delete'] == true;
   bool get canTemporary => capabilities['conversation_temporary'] == true;
 
-  List<Map<String, dynamic>> get pinned => conversations
-      .where(
-        (c) =>
-            c['pinned'] == true &&
-            c['state'] == 'active' &&
-            c['temporary'] != true,
-      )
-      .toList();
+  /// When the conversation was pinned, in Unix milliseconds; 0 if it is not.
+  static int pinnedAt(Map<String, dynamic> c) =>
+      (c['pinned_at_ms'] as num?)?.toInt() ?? 0;
+
+  /// Most recently pinned first.
+  List<Map<String, dynamic>> get pinned =>
+      conversations
+          .where(
+            (c) =>
+                pinnedAt(c) > 0 &&
+                c['state'] == 'active' &&
+                c['temporary'] != true,
+          )
+          .toList()
+        ..sort((a, b) => pinnedAt(b).compareTo(pinnedAt(a)));
   List<Map<String, dynamic>> get recents => conversations
       .where(
         (c) =>
             c['state'] == 'active' &&
-            c['pinned'] != true &&
+            pinnedAt(c) == 0 &&
             c['temporary'] != true &&
             c['project_id'] == null,
       )
@@ -497,7 +503,6 @@ class HubController extends ChangeNotifier {
   Future<dynamic> exportConversation(String conv) =>
       request('/orgs/$org/conversations/$conv/export');
 
-  /// Reserved contract: `PATCH .../settings {pinned}`.
   Future<void> pin(String conv, bool value) async {
     if (!canPin) throw Exception(tr('服务器暂不支持置顶', 'Pinning is not available'));
     await request(
@@ -1206,6 +1211,17 @@ class HubController extends ChangeNotifier {
   void debugResults(String json) => _results(json);
 
   @visibleForTesting
+  Future<void> debugChanges(String json) => _apply(
+    Update(
+      changesJson: json,
+      cacheWrites: const [],
+      outboundFrames: const [],
+      resultsJson: '[]',
+      authExpiring: false,
+    ),
+  );
+
+  @visibleForTesting
   void debugPendingConfig(String channel, Map<String, dynamic> patch) =>
       (_pendingConfig[channel] ??= {}).addAll(patch);
 
@@ -1373,8 +1389,12 @@ class HubController extends ChangeNotifier {
             // User-channel items carry a title, but not the conversation mode.
             needsConversationRefresh = true;
           } else {
-            conversations[index]['title'] = item['text'];
-            conversations[index]['state'] = item['state'];
+            final conversation = conversations[index];
+            conversation['title'] = item['text'];
+            conversation['state'] = item['state'];
+            // Items cached before pins were carried leave the pin alone.
+            final pin = item['detail']?['kind']?['Conversation'];
+            if (pin != null) conversation['pinned_at_ms'] = pin['pinned_at_ms'];
           }
         }
       }

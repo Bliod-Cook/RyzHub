@@ -165,7 +165,7 @@ rustup toolchain install nightly-2026-09-25 --profile minimal --component rust-s
 python3 scripts/serve-web.py
 ```
 
-打开 `http://127.0.0.1:3000`。界面参照 ChatGPT 网页版：侧栏包含新建对话、已归档、项目和最近对话，底部账户菜单进入设置；顶部切换 Chat/Work；“新建对话”只是草稿，发送第一条消息时才在服务端创建对话并以其作为标题。设置页提供语言、外观（浅色/深色/强调色）、新对话默认值、快捷键、账户与退出登录、用量、已归档对话、模型凭据和服务器策略。界面支持中文和英文：首次进入按浏览器或设备语言选择，识别不到时使用英文，选择只保存在本机（Web 为 IndexedDB `ryzhub-prefs`）。置顶、删除和临时对话（右上角按钮）只预留了界面，服务端在 `/capabilities` 声明 `conversation_pin` / `conversation_delete` / `conversation_temporary` 后才会启用；临时对话创建时发送 `temporary: true`，列表中带该标记的对话不显示。输入框右侧显示所选模型及其推理强度（0xProto 字体），点击后在同一菜单中切换。
+打开 `http://127.0.0.1:3000`。界面参照 ChatGPT 网页版：侧栏包含新建对话、已归档、项目和最近对话，底部账户菜单进入设置；顶部切换 Chat/Work；“新建对话”只是草稿，发送第一条消息时才在服务端创建对话并以其作为标题。设置页提供语言、外观（浅色/深色/强调色）、新对话默认值、快捷键、账户与退出登录、用量、已归档对话、模型凭据和服务器策略。界面支持中文和英文：首次进入按浏览器或设备语言选择，识别不到时使用英文，选择只保存在本机（Web 为 IndexedDB `ryzhub-prefs`）。对话可以置顶（侧栏行或对话顶部的图钉按钮，Chat 和 Work 都可以，临时对话除外）：置顶的对话按置顶时间排在侧栏“已置顶”分组，归档期间暂不显示；置顶状态随用户频道同步，其他设备即时更新。删除和临时对话（右上角按钮）在服务端启用搜索、`/capabilities` 声明 `conversation_delete` / `conversation_temporary` 后才会出现；临时对话创建时发送 `temporary: true`，列表中带该标记的对话不显示。输入框右侧显示所选模型及其推理强度（0xProto 字体），点击后在同一菜单中切换。
 
 静态服务器必须发送 COOP `same-origin` 和 COEP `require-corp`，FRB 的共享 Wasm 内存需要 `crossOriginIsolated`。脚本提供这些头，并将 CanvasKit 与字体保存在本站。Rust 内核产物在 `client/web/pkg`，可重建、不提交二进制。
 

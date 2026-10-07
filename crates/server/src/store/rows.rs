@@ -19,6 +19,8 @@ pub struct Conversation {
     pub project_id: Option<Uuid>,
     pub run_config: serde_json::Value,
     pub temporary: bool,
+    /// When it was pinned, in Unix milliseconds.
+    pub pinned_at_ms: Option<i64>,
 }
 
 #[derive(sqlx::FromRow)]

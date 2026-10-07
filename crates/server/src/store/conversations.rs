@@ -1,11 +1,13 @@
 //! Conversation creation and listing.
 use anyhow::{Context, ensure};
 use ryzhub_domain::{Action, OrgContext, Principal, Resource, authorize};
-use ryzhub_proto::{Item, event_envelope::Event};
+use ryzhub_proto::event_envelope::Event;
 use serde_json::{Map, Value, json};
 use uuid::Uuid;
 
-use super::{Conversation, Store, Tx, append, audit, context_in, effective_policy};
+use super::{
+    Conversation, Store, Tx, append, audit, context_in, conversation_item, effective_policy,
+};
 use crate::{config::Config, error::Code, run_config::RunConfig};
 
 impl Store {
@@ -99,14 +101,13 @@ impl Store {
             &format!("user:{}:{}", ctx.org_id, ctx.user_id),
             None,
             "",
-            Event::ItemUpserted(Item {
-                id: id.to_string(),
-                revision: 1,
-                kind: "conversation".into(),
-                state: "active".into(),
-                text: title.into(),
-                ..Default::default()
-            }),
+            Event::ItemUpserted(conversation_item(
+                id,
+                1,
+                "active".into(),
+                title.into(),
+                None,
+            )),
         )
         .await?;
         audit(
@@ -124,11 +125,15 @@ impl Store {
     pub async fn list_conversations(&self, ctx: &OrgContext) -> anyhow::Result<Vec<Conversation>> {
         let mut tx = self.tx(ctx.org_id).await?;
         context_in(&mut tx, ctx.user_id, ctx.org_id).await?;
+        // Pins are kept within the limit, but the list stays newest first: clients order pins
+        // themselves, and an unpinned conversation returns to its place among the others.
         let list = sqlx::query_as(concat!(
-            "SELECT ",
+            "SELECT * FROM (SELECT ",
             conversation_columns!(),
-            " FROM conversations WHERE org_id=$1 AND creator_id=$2 AND state IN ('active','archived')
-              ORDER BY created_at DESC LIMIT 200"
+            ",created_at FROM conversations
+              WHERE org_id=$1 AND creator_id=$2 AND state IN ('active','archived')
+              ORDER BY pinned_at DESC NULLS LAST, created_at DESC LIMIT 200) c
+             ORDER BY created_at DESC"
         ))
         .bind(ctx.org_id)
         .bind(ctx.user_id)

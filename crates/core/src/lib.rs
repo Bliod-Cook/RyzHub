@@ -7,8 +7,8 @@ const MAX_BUFFERED: usize = 256;
 const MAX_BUFFERED_BYTES: usize = 1024 * 1024;
 
 /// Bumped when cached projections may lack fields clients now read. 1: item `detail`; 2: the
-/// files user messages carry.
-pub const CACHE_SCHEMA: u32 = 3;
+/// files user messages carry; 3: the files a reply links to; 4: whether a conversation is pinned.
+pub const CACHE_SCHEMA: u32 = 4;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]

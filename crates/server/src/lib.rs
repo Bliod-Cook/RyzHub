@@ -31,7 +31,8 @@ macro_rules! action_columns {
 }
 macro_rules! conversation_columns {
     () => {
-        "id,org_id,creator_id,title,mode,state,project_id,run_config,temporary"
+        "id,org_id,creator_id,title,mode,state,project_id,run_config,temporary,\
+         (extract(epoch FROM pinned_at)*1000)::bigint AS pinned_at_ms"
     };
 }
 /// A run's start and end in Unix milliseconds, as `RunState` carries them.

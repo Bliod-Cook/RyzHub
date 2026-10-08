@@ -80,6 +80,19 @@ class PendingFile {
 
 /// Platform IO only. Protobuf, ordering, deduplication and projection live in Rust.
 class HubController extends ChangeNotifier {
+  HubController() : _connect = _openSocket;
+
+  @visibleForTesting
+  HubController.testing({
+    required ClientCore this._core,
+    required LocalCache this._cache,
+    required this._connect,
+  });
+
+  final WebSocketChannel Function(Uri) _connect;
+  static WebSocketChannel _openSocket(Uri uri) =>
+      WebSocketChannel.connect(uri, protocols: ['ryzhub.v1.protobuf']);
+
   String base = defaultServerUrl;
   String token = '', user = '', org = '', selected = '', email = '';
   int expiresAtMs = 0;
@@ -142,7 +155,8 @@ class HubController extends ChangeNotifier {
   final List<Uint8List> _frames = [];
   Future<void> _serial = Future.value();
   int _generation = 0, _attempt = 0;
-  bool _closed = false, _connecting = false;
+  bool _closed = false;
+  int? _connecting;
   DateTime _lastFrame = DateTime.now();
   final http.Client _http = sessionClient();
   Future<bool>? _renewing;
@@ -879,7 +893,13 @@ class HubController extends ChangeNotifier {
   /// token, keeping its channels. Without a renewal the server closes the
   /// connection at expiry, and reconnecting ends the session.
   Future<void> _carryOver() async {
-    if (await _renew()) _socket?.sink.add(_core!.authRefresh(token: token));
+    final generation = _generation, socket = _socket;
+    if (await _renew() &&
+        _current(generation) &&
+        socket != null &&
+        identical(socket, _socket)) {
+      _sendFrames([_core!.authRefresh(token: token)]);
+    }
   }
 
   /// The session ran out and could not be renewed. The page signs in afresh;
@@ -903,7 +923,7 @@ class HubController extends ChangeNotifier {
     return _renewing ??= () async {
       try {
         final result = await request('/auth/refresh', body: {});
-        if (result['user_id'] != user) return false;
+        if (_closed || result['user_id'] != user) return false;
         token = result['token'];
         expiresAtMs = (result['expires_at_ms'] as num?)?.toInt() ?? 0;
         return true;
@@ -986,15 +1006,10 @@ class HubController extends ChangeNotifier {
       if (!_suspended) reconnect();
     });
     _resend = Timer.periodic(const Duration(seconds: 5), (_) {
-      if (connection == 'online' && !_suspended) {
-        for (final frame in _core!.retryPending()) {
-          _socket?.sink.add(frame);
-        }
-      }
+      if (_canSend) _sendFrames(_core!.retryPending());
     });
     _heartbeat = Timer.periodic(const Duration(seconds: 5), (_) {
-      if (connection == 'online' &&
-          DateTime.now().difference(_lastFrame).inSeconds > 55) {
+      if (_canSend && _heartbeatExpired) {
         reconnect();
       }
     });
@@ -1343,8 +1358,11 @@ class HubController extends ChangeNotifier {
   }
 
   Future<void> _schedule(Update Function() update) {
-    final task = _serial.then((_) => _apply(update()));
+    final task = _serial.then((_) async {
+      if (!_closed) await _apply(update());
+    });
     _serial = task.catchError((Object e) {
+      if (_closed) return;
       error = '$e';
       notifyListeners();
     });
@@ -1356,8 +1374,10 @@ class HubController extends ChangeNotifier {
     // stored commands are ever sent again.
     if (update.cacheWrites.isNotEmpty) {
       await _cache!.write({for (final w in update.cacheWrites) w.key: w.value});
+      if (_closed) return;
       _core!.committed();
     }
+    if (_closed) return;
     var needsConversationRefresh = false;
     var needsCommandRefresh = false;
     for (final diff in jsonDecode(update.changesJson) as List) {
@@ -1418,15 +1438,12 @@ class HubController extends ChangeNotifier {
       _runs[name] = runs;
     }
     if (needsConversationRefresh) await refreshConversations();
+    if (_closed) return;
     if (needsCommandRefresh) unawaited(refreshCommands().catchError((_) {}));
     if (update.error != null) error = update.error!;
     _results(update.resultsJson);
     if (update.authExpiring) unawaited(_carryOver());
-    if (connection == 'online') {
-      for (final bytes in update.outboundFrames) {
-        _socket?.sink.add(bytes);
-      }
-    }
+    _sendFrames(update.outboundFrames);
     notifyListeners();
   }
 
@@ -1442,74 +1459,108 @@ class HubController extends ChangeNotifier {
   };
 
   void _drain() {
+    _batch?.cancel();
     _batch = null;
     if (_frames.isEmpty || _closed) return;
     final batch = List<Uint8List>.of(_frames);
     _frames.clear();
     _serial = _serial
-        .then((_) => _apply(_core!.ingest(frames: batch)))
+        .then((_) async {
+          if (!_closed) await _apply(_core!.ingest(frames: batch));
+        })
         .catchError((Object e) {
+          if (_closed) return;
           error = '$e';
           notifyListeners();
         });
   }
 
+  bool _current(int generation) =>
+      !_closed && !_suspended && generation == _generation;
+
+  bool get _canSend =>
+      !_closed && !_suspended && connection == 'online' && _socket != null;
+
+  bool get _heartbeatExpired =>
+      DateTime.now().difference(_lastFrame).inSeconds > 55;
+
+  void _sendFrames(Iterable<Uint8List> frames) {
+    if (!_canSend) return;
+    final socket = _socket!;
+    for (final frame in frames) {
+      socket.sink.add(frame);
+    }
+  }
+
+  /// Detach before awaiting cancellation or close: queued work must not see
+  /// a socket being closed, and an old close must not touch a new connection.
+  Future<void> _closeSocket() async {
+    final subscription = _subscription, socket = _socket;
+    _subscription = null;
+    _socket = null;
+    try {
+      await subscription?.cancel();
+    } finally {
+      await socket?.sink.close();
+    }
+  }
+
   Future<void> reconnect() async {
-    if (_closed || _suspended || !signedIn || _connecting) return;
-    _connecting = true;
+    if (_closed || _suspended || !signedIn || _connecting != null) return;
     _retry?.cancel();
     final generation = ++_generation;
-    await _subscription?.cancel();
-    await _socket?.sink.close();
-    _drain();
-    await _serial;
+    _connecting = generation;
     connection = 'connecting';
     notifyListeners();
     try {
+      await _closeSocket();
+      if (!_current(generation)) return;
+      _drain();
+      await _serial;
+      if (!_current(generation)) return;
       final ticket = await request('/auth/ticket', body: {});
+      if (!_current(generation)) return;
       final uri = Uri.parse('$base/ws').replace(
         scheme: base.startsWith('https:') ? 'wss' : 'ws',
         queryParameters: {'ticket': ticket['ticket']},
       );
-      final socket = WebSocketChannel.connect(
-        uri,
-        protocols: ['ryzhub.v1.protobuf'],
-      );
+      final socket = _connect(uri);
       _socket = socket;
       await socket.ready;
-      if (_closed || generation != _generation) {
+      if (!_current(generation)) {
         await socket.sink.close();
         return;
       }
       connection = 'online';
       _attempt = 0;
       _lastFrame = DateTime.now();
-      socket.sink.add(_core!.hello(deviceId: _device));
       _subscription = socket.stream.listen(
         (dynamic message) {
-          if (generation != _generation) return;
+          if (!_current(generation)) return;
           _lastFrame = DateTime.now();
           _frames.add(Uint8List.fromList((message as List).cast<int>()));
           _batch ??= Timer(const Duration(milliseconds: 32), _drain);
         },
         onError: (Object e) {
+          if (!_current(generation)) return;
           _connectionError(e);
           _disconnected(generation);
         },
         onDone: () => _disconnected(generation),
       );
+      _sendFrames([_core!.hello(deviceId: _device)]);
     } catch (e) {
+      if (!_current(generation)) return;
       // The ticket request renews an expired token itself; refused still, the
       // session is over rather than the network down.
       if ('$e'.contains('UNAUTHORIZED')) {
-        _connecting = false;
         return _endSession();
       }
       _connectionError(e);
       _disconnected(generation);
     } finally {
-      _connecting = false;
-      notifyListeners();
+      if (_connecting == generation) _connecting = null;
+      if (_current(generation)) notifyListeners();
     }
   }
 
@@ -1525,7 +1576,7 @@ class HubController extends ChangeNotifier {
   }
 
   void _disconnected(int generation) {
-    if (_closed || _suspended || generation != _generation) return;
+    if (!_current(generation)) return;
     connection = 'retrying';
     _retry?.cancel();
     _retry = Timer(
@@ -1541,19 +1592,23 @@ class HubController extends ChangeNotifier {
   }
 
   Future<void> suspend() async {
+    if (_closed || _suspended) return;
     _suspended = true;
     _generation++;
+    _connecting = null;
     _retry?.cancel();
-    _drain();
-    await _serial;
-    await _subscription?.cancel();
-    await _socket?.sink.close();
     connection = 'background';
+    final closing = _closeSocket();
+    _drain();
     notifyListeners();
+    await closing;
+    await _serial;
   }
 
   Future<void> resume() async {
     _suspended = false;
+    // Web focus/visibility changes also resume a page whose socket stayed open.
+    if (_canSend && !_heartbeatExpired) return;
     await reconnect();
   }
 
@@ -1567,9 +1622,9 @@ class HubController extends ChangeNotifier {
     _batch?.cancel();
     _resend?.cancel();
     _heartbeat?.cancel();
+    final closing = _closeSocket();
     await _network?.cancel();
-    await _subscription?.cancel();
-    await _socket?.sink.close();
+    await closing;
     _frames.clear();
     await _serial;
     try {
@@ -1588,9 +1643,8 @@ class HubController extends ChangeNotifier {
     _batch?.cancel();
     _resend?.cancel();
     _heartbeat?.cancel();
-    _subscription?.cancel();
     _network?.cancel();
-    _socket?.sink.close();
+    unawaited(_closeSocket());
     _cache?.close();
     _core?.dispose();
     super.dispose();

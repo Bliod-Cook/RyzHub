@@ -25,6 +25,7 @@ import 'messages.dart';
 import 'preview.dart';
 import 'settings.dart';
 import 'sidebar.dart';
+import 'unfold.dart';
 
 class HubPage extends StatefulWidget {
   /// The address that names the open conversation.
@@ -45,6 +46,9 @@ class _HubPageState extends State<HubPage>
   final composerText = TextEditingController();
   final scaffoldKey = GlobalKey<ScaffoldState>();
   final libraryKey = GlobalKey<LibraryViewState>();
+
+  /// Folds in the timeline open downward instead of pushing what is above.
+  final unfold = UnfoldAnchor();
 
   /// Signing back in with the device's refresh cookie; the login page waits.
   bool restoring = keepsSession;
@@ -968,64 +972,68 @@ class _HubPageState extends State<HubPage>
               // composer; shrink-wrapped so a short chat starts at the top.
               : Align(
                   alignment: Alignment.topCenter,
-                  child: ListView.builder(
-                    reverse: true,
-                    shrinkWrap: true,
-                    padding: const EdgeInsets.fromLTRB(24, 16, 24, 8),
-                    itemCount: rows.length + 1,
-                    findChildIndexCallback: (key) {
-                      final i = key is ValueKey ? positions[key.value] : null;
-                      return i == null ? null : rows.length - 1 - i;
-                    },
-                    itemBuilder: (context, index) {
-                      if (index == rows.length) {
-                        return OlderLoader(
-                          key: ValueKey('older:${hub.selected}'),
-                          hub: hub,
-                        );
-                      }
-                      final item = rows[rows.length - 1 - index];
-                      if (item['kind'] == 'steps') {
+                  child: UnfoldScope(
+                    anchor: unfold,
+                    child: ListView.builder(
+                      reverse: true,
+                      shrinkWrap: true,
+                      physics: unfold.physics,
+                      padding: const EdgeInsets.fromLTRB(24, 16, 24, 8),
+                      itemCount: rows.length + 1,
+                      findChildIndexCallback: (key) {
+                        final i = key is ValueKey ? positions[key.value] : null;
+                        return i == null ? null : rows.length - 1 - i;
+                      },
+                      itemBuilder: (context, index) {
+                        if (index == rows.length) {
+                          return OlderLoader(
+                            key: ValueKey('older:${hub.selected}'),
+                            hub: hub,
+                          );
+                        }
+                        final item = rows[rows.length - 1 - index];
+                        if (item['kind'] == 'steps') {
+                          return centered(
+                            key: ValueKey(item['id']),
+                            StepsGroup(
+                              steps: item['steps'],
+                              running: hub.runActive(item['run_id']),
+                              latest: item['latest'] == true,
+                              worked: hub.workedFor(item['run_id']),
+                              onSource: (href) =>
+                                  openLink(href, item['steps'] as List),
+                            ),
+                          );
+                        }
                         return centered(
                           key: ValueKey(item['id']),
-                          StepsGroup(
-                            steps: item['steps'],
-                            running: hub.runActive(item['run_id']),
-                            latest: item['latest'] == true,
-                            worked: hub.workedFor(item['run_id']),
-                            onSource: (href) =>
-                                openLink(href, item['steps'] as List),
+                          MessageCard(
+                            item: item,
+                            agentLabel: hub.agentLabel,
+                            onSource: (href) => openLink(href, [item]),
+                            files: (files) => MessageFiles(
+                              hub: hub,
+                              files: files,
+                              alignment: item['kind'] == 'user'
+                                  ? WrapAlignment.end
+                                  : WrapAlignment.start,
+                            ),
+                            onMemoryUndo: item['kind'] == 'memory_notice'
+                                ? () => action(() async {
+                                    final notice = jsonDecode(item['text']);
+                                    await hub.request(
+                                      '/orgs/${hub.org}/memory-events/${notice['event_id']}/undo',
+                                      body: {},
+                                    );
+                                  })
+                                : null,
+                            onFork: hub.canFork(item)
+                                ? () => action(() => hub.fork(item['id']))
+                                : null,
                           ),
                         );
-                      }
-                      return centered(
-                        key: ValueKey(item['id']),
-                        MessageCard(
-                          item: item,
-                          agentLabel: hub.agentLabel,
-                          onSource: (href) => openLink(href, [item]),
-                          files: (files) => MessageFiles(
-                            hub: hub,
-                            files: files,
-                            alignment: item['kind'] == 'user'
-                                ? WrapAlignment.end
-                                : WrapAlignment.start,
-                          ),
-                          onMemoryUndo: item['kind'] == 'memory_notice'
-                              ? () => action(() async {
-                                  final notice = jsonDecode(item['text']);
-                                  await hub.request(
-                                    '/orgs/${hub.org}/memory-events/${notice['event_id']}/undo',
-                                    body: {},
-                                  );
-                                })
-                              : null,
-                          onFork: hub.canFork(item)
-                              ? () => action(() => hub.fork(item['id']))
-                              : null,
-                        ),
-                      );
-                    },
+                      },
+                    ),
                   ),
                 ),
         ),

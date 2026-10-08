@@ -9,6 +9,7 @@ import 'package:markdown/markdown.dart' as md;
 import '../l10n.dart';
 import '../theme.dart';
 import 'common.dart';
+import 'unfold.dart';
 
 /// Message actions keep a 16px glyph in a compact highlight.
 const _actionSize = 28.0;
@@ -763,7 +764,7 @@ class MessageCard extends StatelessWidget {
                     child: Container(
                       padding: const EdgeInsets.fromLTRB(18, 10, 18, 10),
                       decoration: BoxDecoration(
-                        color: c.bubble,
+                        color: c.userBubble,
                         borderRadius: BorderRadius.circular(22),
                       ),
                       child: Column(
@@ -948,10 +949,11 @@ class _DisclosureState extends State<_Disclosure> {
               const SizedBox(width: 10),
               Flexible(child: widget.label(active)),
               if (widget.onTap != null)
-                Icon(
-                  widget.open ? Icons.expand_more : Icons.chevron_right,
-                  size: 18,
-                  color: ink,
+                AnimatedRotation(
+                  turns: widget.open ? .25 : 0,
+                  duration: unfoldDuration,
+                  curve: Curves.easeOutCubic,
+                  child: Icon(Icons.chevron_right, size: 18, color: ink),
                 ),
             ],
           ),
@@ -1051,28 +1053,27 @@ class _StepsGroupState extends State<StepsGroup> {
             ),
           ),
           Divider(height: 9, thickness: 1, color: c.border),
-          AnimatedSize(
-            duration: const Duration(milliseconds: 160),
-            alignment: Alignment.topCenter,
-            child: expanded
-                ? Padding(
-                    padding: const EdgeInsets.only(top: 6),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.stretch,
-                      children: [
-                        for (final (i, block) in blocks.indexed)
-                          spoke && _folds(block[0])
-                              ? _StepFold(
-                                  key: ValueKey('fold:${block[0]['id']}'),
-                                  steps: block,
-                                  active: working && i == blocks.length - 1,
-                                  step: (item) => step(context, item),
-                                )
-                              : step(context, block[0]),
-                      ],
-                    ),
-                  )
-                : const SizedBox(width: double.infinity),
+          Unfold(
+            open: expanded,
+            // Following the run, it opens and folds in place of the newest.
+            anchored: open != null,
+            builder: (context) => Padding(
+              padding: const EdgeInsets.only(top: 6),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  for (final (i, block) in blocks.indexed)
+                    spoke && _folds(block[0])
+                        ? _StepFold(
+                            key: ValueKey('fold:${block[0]['id']}'),
+                            steps: block,
+                            active: working && i == blocks.length - 1,
+                            step: (item) => step(context, item),
+                          )
+                        : step(context, block[0]),
+                ],
+              ),
+            ),
           ),
         ],
       ),
@@ -1287,19 +1288,17 @@ class _StepFoldState extends State<_StepFold> {
             style: TextStyle(fontSize: 13.5, color: active ? c.text : c.muted),
           ),
         ),
-        AnimatedSize(
-          duration: const Duration(milliseconds: 160),
-          alignment: Alignment.topCenter,
+        Unfold(
+          open: expanded,
+          anchored: open != null,
           // Indented so the calls' icons line up under the fold's text.
-          child: expanded
-              ? Padding(
-                  padding: const EdgeInsets.only(left: 25),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.stretch,
-                    children: [for (final s in widget.steps) widget.step(s)],
-                  ),
-                )
-              : const SizedBox(width: double.infinity),
+          builder: (context) => Padding(
+            padding: const EdgeInsets.only(left: 25),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [for (final s in widget.steps) widget.step(s)],
+            ),
+          ),
         ),
       ],
     );
@@ -1589,8 +1588,9 @@ class _ToolStepState extends State<_ToolStep> {
             style: TextStyle(fontSize: 13.5, color: active ? c.text : c.muted),
           ),
         ),
-        if (open)
-          Padding(
+        Unfold(
+          open: open,
+          builder: (context) => Padding(
             padding: const EdgeInsets.fromLTRB(0, 2, 0, 6),
             child: Container(
               constraints: const BoxConstraints(maxHeight: 280),
@@ -1627,6 +1627,7 @@ class _ToolStepState extends State<_ToolStep> {
               ),
             ),
           ),
+        ),
       ],
     );
   }

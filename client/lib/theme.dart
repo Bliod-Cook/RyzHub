@@ -15,6 +15,9 @@ class HubColors extends ThemeExtension<HubColors> {
   final Color background, sidebar, border, hover, selected, text, muted, subtle;
   final Color bubble, composer, menu, code, accent, onAccent, danger, success;
   final Color warning;
+
+  /// The user's messages, tinted with the accent.
+  final Color userBubble;
   const HubColors({
     required this.background,
     required this.sidebar,
@@ -33,6 +36,7 @@ class HubColors extends ThemeExtension<HubColors> {
     required this.danger,
     required this.success,
     required this.warning,
+    required this.userBubble,
   });
 
   factory HubColors.light(Color accent) => HubColors(
@@ -53,6 +57,10 @@ class HubColors extends ThemeExtension<HubColors> {
     danger: const Color(0xffd93025),
     success: const Color(0xff10a37f),
     warning: const Color(0xffe8a317),
+    userBubble: Color.alphaBlend(
+      accent.withValues(alpha: .12),
+      const Color(0xffffffff),
+    ),
   );
 
   factory HubColors.dark(Color accent) => HubColors(
@@ -73,6 +81,10 @@ class HubColors extends ThemeExtension<HubColors> {
     danger: const Color(0xffff6b5e),
     success: const Color(0xff3ecf9e),
     warning: const Color(0xfff2c14e),
+    userBubble: Color.alphaBlend(
+      accent.withValues(alpha: .24),
+      const Color(0xff212121),
+    ),
   );
 
   /// Falls back for widgets pumped under a bare MaterialApp (widget tests).
@@ -109,6 +121,7 @@ class HubColors extends ThemeExtension<HubColors> {
       danger: l(danger, other.danger),
       success: l(success, other.success),
       warning: l(warning, other.warning),
+      userBubble: l(userBubble, other.userBubble),
     );
   }
 }

@@ -49,21 +49,24 @@ class _UnfoldPhysics extends ScrollPhysics {
     required bool isScrolling,
     required double velocity,
   }) {
-    final pixels = super.adjustPositionForNewDimensions(
-      oldPosition: oldPosition,
-      newPosition: newPosition,
-      isScrolling: isScrolling,
-      velocity: velocity,
-    );
     final grown = anchor._take();
-    if (grown == 0) return pixels;
+    if (grown == 0) {
+      return super.adjustPositionForNewDimensions(
+        oldPosition: oldPosition,
+        newPosition: newPosition,
+        isScrolling: isScrolling,
+        velocity: velocity,
+      );
+    }
     // Reversed, a fold grows away from the viewport's bottom edge. Scrolling
     // by its growth keeps its top in place, less what a shrink-wrapped
     // viewport took up by growing downward itself. (The extents cannot tell:
-    // a lazy list only estimates them.)
+    // a lazy list only estimates them.) Not after the parent physics: folding
+    // near the top, they would already have pulled the old offset into the
+    // smaller range, and the page would move by that much twice.
     final taken = newPosition.viewportDimension - oldPosition.viewportDimension;
     return clampDouble(
-      pixels + grown - taken,
+      newPosition.pixels + grown - taken,
       newPosition.minScrollExtent,
       newPosition.maxScrollExtent,
     );

@@ -8,11 +8,16 @@ import 'package:ryzhub/ui/unfold.dart';
 void main() {
   tearDown(() => prefs.language = 'zh');
 
-  final thought = 'A long line of thought. ' * 60;
+  final short = 'A long line of thought. ' * 60;
 
-  /// A reversed timeline, like a conversation's, with a folded group above
-  /// five rows.
-  Future<void> timeline(WidgetTester tester, {bool shrinkWrap = false}) async {
+  /// A reversed timeline, like a conversation's, with a folded group between
+  /// [below] rows and, unless shrink-wrapped like a short chat, many above.
+  Future<void> timeline(
+    WidgetTester tester, {
+    bool shrinkWrap = false,
+    String? thought,
+    int below = 5,
+  }) async {
     prefs.language = 'en';
     final anchor = UnfoldAnchor();
     await tester.pumpWidget(
@@ -26,15 +31,15 @@ void main() {
                 reverse: true,
                 shrinkWrap: shrinkWrap,
                 physics: anchor.physics,
-                itemCount: shrinkWrap ? 7 : 30,
-                itemBuilder: (context, i) => i == 5
+                itemCount: below + (shrinkWrap ? 2 : 25),
+                itemBuilder: (context, i) => i == below
                     ? StepsGroup(
                         steps: [
                           {
                             'id': 'r',
                             'kind': 'reasoning',
                             'state': 'completed',
-                            'text': thought,
+                            'text': thought ?? short,
                           },
                         ],
                       )
@@ -91,6 +96,44 @@ void main() {
     expect(top(tester, 'Reasoned'), moreOrLessEquals(header));
     await tester.pumpAndSettle();
     expect(top(tester, 'Reasoned'), moreOrLessEquals(header));
+    await tester.tap(find.text('Reasoned'));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 100));
+    expect(top(tester, 'Reasoned'), moreOrLessEquals(header));
+    await tester.pumpAndSettle();
+    expect(top(tester, 'Reasoned'), moreOrLessEquals(header));
+  });
+
+  testWidgets('near the top, folding a tall group back leaves the page still', (
+    tester,
+  ) async {
+    // Like the first exchange of a chat: a long answer below the group, and
+    // only the question above it to scroll to.
+    await timeline(
+      tester,
+      shrinkWrap: true,
+      thought: 'A long line of thought. ' * 600,
+      below: 20,
+    );
+    // Scrolled up to the question.
+    await tester.drag(find.byType(ListView), const Offset(0, 2000));
+    await tester.pumpAndSettle();
+    final header = top(tester, 'Reasoned');
+    final above = top(tester, 'row 21');
+    final below = top(tester, 'row 19');
+    await tester.tap(find.text('Reasoned'));
+    await tester.pumpAndSettle();
+    expect(top(tester, 'Reasoned'), moreOrLessEquals(header));
+    await tester.tap(find.text('Reasoned'));
+    await tester.pump();
+    for (var i = 0; i < 5; i++) {
+      await tester.pump(const Duration(milliseconds: 50));
+      expect(top(tester, 'Reasoned'), moreOrLessEquals(header));
+      expect(top(tester, 'row 21'), moreOrLessEquals(above));
+    }
+    await tester.pumpAndSettle();
+    expect(top(tester, 'Reasoned'), moreOrLessEquals(header));
+    expect(top(tester, 'row 19'), moreOrLessEquals(below));
   });
 
   testWidgets("the user's bubble takes the accent", (tester) async {

@@ -11,6 +11,7 @@ import '../l10n.dart';
 import '../prefs.dart';
 import '../theme.dart';
 import 'attachments.dart';
+import 'code.dart';
 import 'common.dart';
 import 'composer.dart';
 import 'messages.dart';
@@ -356,7 +357,7 @@ class TextPreviewer extends FilePreviewer {
               )
             : _markdown(file)
             ? _Paper(maxWidth: contentWidth + 64, child: MarkdownText(text))
-            : _Paper(child: _Code(text)),
+            : _Paper(child: _Code(text, language: file.extension)),
       );
 }
 
@@ -389,17 +390,20 @@ class _Paper extends StatelessWidget {
   }
 }
 
-/// Source text: long lines scroll sideways rather than wrap.
+/// Source text: long lines scroll sideways rather than wrap. [language] is
+/// the file's extension.
 class _Code extends StatelessWidget {
   final String text;
-  const _Code(this.text);
+  final String language;
+  const _Code(this.text, {required this.language});
   @override
   Widget build(BuildContext context) {
     final c = HubColors.of(context);
     return SingleChildScrollView(
       scrollDirection: Axis.horizontal,
-      child: SelectableText(
+      child: CodeText(
         text,
+        language: language,
         style: TextStyle(
           fontFamily: '0xProto',
           fontFamilyFallback: const [fontFamily, ...fontFallback],

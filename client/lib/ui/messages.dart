@@ -8,6 +8,7 @@ import 'package:markdown/markdown.dart' as md;
 
 import '../l10n.dart';
 import '../theme.dart';
+import 'code.dart';
 import 'common.dart';
 import 'unfold.dart';
 
@@ -115,53 +116,7 @@ List<Widget> _blocks(
     if (code.start > cursor) {
       out.add(markdown(text.substring(cursor, code.start)));
     }
-    out.add(
-      Container(
-        margin: const EdgeInsets.symmetric(vertical: 10),
-        decoration: BoxDecoration(
-          color: c.code,
-          borderRadius: BorderRadius.circular(14),
-          border: Border.all(color: c.border),
-        ),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            Padding(
-              padding: const EdgeInsets.fromLTRB(14, 2, 4, 0),
-              child: Row(
-                children: [
-                  Expanded(
-                    child: Text(
-                      code.group(1)!,
-                      style: TextStyle(fontSize: 12, color: c.subtle),
-                    ),
-                  ),
-                  IconButton(
-                    tooltip: tr('复制代码', 'Copy code'),
-                    icon: const Icon(Icons.copy_rounded, size: 15),
-                    onPressed: () =>
-                        Clipboard.setData(ClipboardData(text: code.group(2)!)),
-                  ),
-                ],
-              ),
-            ),
-            Padding(
-              padding: const EdgeInsets.fromLTRB(14, 0, 14, 14),
-              child: SelectableText(
-                code.group(2)!,
-                style: TextStyle(
-                  fontFamily: 'monospace',
-                  fontFamilyFallback: const ['RyzHub Sans'],
-                  fontSize: 13.5,
-                  height: 1.5,
-                  color: ink,
-                ),
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
+    out.add(CodeBlock(code: code.group(2)!, info: code.group(1)!, color: ink));
     cursor = code.end;
   }
   if (cursor < text.length) {
@@ -1513,15 +1468,17 @@ class _ToolCall {
   }
 
   /// What the user can open: the call itself and what came back.
-  List<(String, String)> get details {
+  /// Each with the language its body is coloured in, if any.
+  List<(String, String, String?)> get details {
     const pretty = JsonEncoder.withIndent('  ');
     return [
-      if (name.isNotEmpty) (tr('工具', 'Tool'), name),
-      if (args.isNotEmpty) (tr('参数', 'Arguments'), pretty.convert(args)),
+      if (name.isNotEmpty) (tr('工具', 'Tool'), name, null),
+      if (args.isNotEmpty)
+        (tr('参数', 'Arguments'), pretty.convert(args), 'json'),
       if (output.isNotEmpty)
-        (tr('输出', 'Output'), output)
+        (tr('输出', 'Output'), output, null)
       else if (result != null)
-        (tr('结果', 'Result'), pretty.convert(result)),
+        (tr('结果', 'Result'), pretty.convert(result), 'json'),
     ];
   }
 }
@@ -1604,15 +1561,17 @@ class _ToolStepState extends State<_ToolStep> {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.stretch,
                   children: [
-                    for (final (i, (title, body)) in details.indexed) ...[
+                    for (final (i, (title, body, language))
+                        in details.indexed) ...[
                       if (i > 0) const SizedBox(height: 10),
                       Text(
                         title,
                         style: TextStyle(fontSize: 12, color: c.subtle),
                       ),
                       const SizedBox(height: 2),
-                      SelectableText(
+                      CodeText(
                         body,
+                        language: language,
                         style: TextStyle(
                           fontFamily: 'monospace',
                           fontFamilyFallback: const ['RyzHub Sans'],

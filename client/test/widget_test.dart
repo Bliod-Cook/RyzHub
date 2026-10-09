@@ -123,6 +123,95 @@ void main() {
       expect(tester.takeException(), isNull);
     },
   );
+  testWidgets('long code blocks open folded beside line numbers', (
+    tester,
+  ) async {
+    Future<void> reply(
+      int lines, {
+      String state = 'completed',
+    }) => tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: ListView(
+            children: [
+              MessageCard(
+                item: {
+                  'id': 'i',
+                  'kind': 'assistant',
+                  'state': state,
+                  'text':
+                      '```python\n${[for (var i = 1; i <= lines; i++) 'x = $i'].join('\n')}\n```',
+                },
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+    Size block() => tester.getSize(find.byType(Container).first);
+
+    await reply(30);
+    expect(
+      find.text([for (var i = 1; i <= 30; i++) i].join('\n')),
+      findsOneWidget,
+    );
+    final folded = block().height;
+    await tester.tap(find.text('展开全部 · 共 30 行'));
+    await tester.pumpAndSettle();
+    expect(find.text('展开全部 · 共 30 行'), findsNothing);
+    expect(block().height, greaterThan(folded + 300));
+    await tester.tap(find.byTooltip('折叠代码'));
+    await tester.pumpAndSettle();
+    expect(block().height, folded);
+
+    // Short code has nothing to fold.
+    await tester.pumpWidget(const SizedBox());
+    await reply(5, state: 'streaming');
+    expect(find.byTooltip('折叠代码'), findsNothing);
+    expect(find.byTooltip('展开代码'), findsNothing);
+    // Code that grows long while it streams stays open, and can fold.
+    await reply(30, state: 'streaming');
+    expect(find.text('展开全部 · 共 30 行'), findsNothing);
+    expect(find.byTooltip('折叠代码'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+  testWidgets('code blocks are coloured by their language', (tester) async {
+    Future<SelectableText> block(String fence) async {
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: MessageCard(
+              item: {
+                'id': 'i',
+                'kind': 'assistant',
+                'state': 'completed',
+                'text': '```$fence\n{"type": "tool_search", "limit": 10}\n```',
+              },
+            ),
+          ),
+        ),
+      );
+      return tester.widget<SelectableText>(
+        find.byWidgetPredicate(
+          (w) =>
+              w is SelectableText &&
+              (w.data ?? w.textSpan!.toPlainText()).contains('tool_search'),
+        ),
+      );
+    }
+
+    final json = await block('json title=x');
+    final colours = <Color?>{};
+    json.textSpan!.visitChildren((span) {
+      colours.add(span.style?.color);
+      return true;
+    });
+    expect(colours.whereType<Color>().length, greaterThanOrEqualTo(2));
+    final unknown = await block('foobar');
+    expect(unknown.textSpan, isNull);
+    expect(unknown.data, '{"type": "tool_search", "limit": 10}');
+    expect(tester.takeException(), isNull);
+  });
   testWidgets('ten thousand messages remain lazily built', (tester) async {
     await tester.pumpWidget(
       MaterialApp(

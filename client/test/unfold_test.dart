@@ -17,6 +17,7 @@ void main() {
     bool shrinkWrap = false,
     String? thought,
     int below = 5,
+    Widget? fold,
   }) async {
     prefs.language = 'en';
     final anchor = UnfoldAnchor();
@@ -33,16 +34,17 @@ void main() {
                 physics: anchor.physics,
                 itemCount: below + (shrinkWrap ? 2 : 25),
                 itemBuilder: (context, i) => i == below
-                    ? StepsGroup(
-                        steps: [
-                          {
-                            'id': 'r',
-                            'kind': 'reasoning',
-                            'state': 'completed',
-                            'text': thought ?? short,
-                          },
-                        ],
-                      )
+                    ? fold ??
+                          StepsGroup(
+                            steps: [
+                              {
+                                'id': 'r',
+                                'kind': 'reasoning',
+                                'state': 'completed',
+                                'text': thought ?? short,
+                              },
+                            ],
+                          )
                     : SizedBox(height: 60, child: Text('row $i')),
               ),
             ),
@@ -83,6 +85,42 @@ void main() {
     expect(find.textContaining('A long line of thought.'), findsNothing);
     expect(top(tester, 'Reasoned'), moreOrLessEquals(header));
     expect(top(tester, 'row 4'), moreOrLessEquals(below));
+  });
+
+  testWidgets('a long code block unfolds and folds without moving what is '
+      'above it', (tester) async {
+    final code = [for (var i = 1; i <= 30; i++) 'x = $i'].join('\n');
+    await timeline(
+      tester,
+      below: 2,
+      fold: MessageCard(
+        item: {
+          'id': 'a',
+          'kind': 'assistant',
+          'state': 'completed',
+          'text': '```python\n$code\n```',
+        },
+      ),
+    );
+    final header = top(tester, 'python');
+    final above = top(tester, 'row 3');
+    await tester.tap(find.text('Show all 30 lines'));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 100));
+    expect(top(tester, 'python'), moreOrLessEquals(header));
+    await tester.pumpAndSettle();
+    expect(top(tester, 'python'), moreOrLessEquals(header));
+    expect(top(tester, 'row 3'), moreOrLessEquals(above));
+    expect(find.text('Show all 30 lines'), findsNothing);
+
+    await tester.tap(find.byTooltip('Collapse code'));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 100));
+    expect(top(tester, 'python'), moreOrLessEquals(header));
+    await tester.pumpAndSettle();
+    expect(top(tester, 'python'), moreOrLessEquals(header));
+    expect(top(tester, 'row 3'), moreOrLessEquals(above));
+    expect(find.text('Show all 30 lines'), findsOneWidget);
   });
 
   testWidgets('in a short timeline the group still opens downward', (

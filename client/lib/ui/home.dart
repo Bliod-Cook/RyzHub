@@ -1,6 +1,5 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:math';
 
 import 'package:desktop_drop/desktop_drop.dart';
 import 'package:flutter/foundation.dart';
@@ -421,16 +420,10 @@ class _HubPageState extends State<HubPage>
     _opened();
   }
 
-  void setMode(String mode) {
-    if (hub.isDraft) {
-      hub.updateDraft(() {
-        hub.mode = mode;
-        hub.draftModel = null;
-      });
-    } else if (hub.selectedConversation['mode'] != mode) {
-      hub.startDraft(mode: mode, project: hub.contextProject);
-    }
-  }
+  void setMode(String mode) => hub.updateDraft(() {
+    hub.mode = mode;
+    hub.draftModel = null;
+  });
 
   /// Above the library only the drawer's button, where there is one.
   Widget libraryHeader() => SizedBox(
@@ -457,105 +450,104 @@ class _HubPageState extends State<HubPage>
     final c = HubColors.of(context);
     final conv = hub.selectedConversation;
     final title = hub.isDraft ? null : (conv['title'] ?? '') as String;
-    final showPill = wide || hub.isDraft;
     return SizedBox(
       height: 56,
       width: double.infinity,
-      child: LayoutBuilder(
-        builder: (context, box) {
-          final titleMax = showPill
-              ? box.maxWidth / 2 - 120
-              : box.maxWidth - 160;
-          return Stack(
-            alignment: Alignment.center,
-            children: [
-              Positioned.fill(
-                child: Row(
-                  children: [
-                    const SizedBox(width: 8),
-                    if (!wide)
-                      IconButton(
-                        tooltip: tr('打开侧边栏', 'Open sidebar'),
-                        icon: const HubIcon(HubIcons.sidebarCollapsed),
-                        onPressed: () => scaffoldKey.currentState?.openDrawer(),
-                      ),
-                    // The status lives in the sidebar; surface it here only
-                    // when the drawer hides it and a reconnect is needed.
-                    if (!wide && hub.connection != 'online')
-                      ConnectionStatus(
-                        connection: hub.connection,
-                        onReconnect: hub.reconnect,
-                      ),
-                    if (title != null)
-                      ConstrainedBox(
-                        constraints: BoxConstraints(maxWidth: max(0, titleMax)),
-                        child: Padding(
-                          padding: const EdgeInsets.symmetric(horizontal: 8),
-                          child: Semantics(
-                            container: true,
-                            header: true,
-                            child: Text(
-                              title,
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                              style: TextStyle(
-                                fontSize: 15.5,
-                                fontWeight: FontWeight.w500,
-                                color: c.text,
+      child: Stack(
+        alignment: Alignment.center,
+        children: [
+          Positioned.fill(
+            child: Row(
+              children: [
+                const SizedBox(width: 8),
+                if (!wide)
+                  IconButton(
+                    tooltip: tr('打开侧边栏', 'Open sidebar'),
+                    icon: const HubIcon(HubIcons.sidebarCollapsed),
+                    onPressed: () => scaffoldKey.currentState?.openDrawer(),
+                  ),
+                // The status lives in the sidebar; surface it here only
+                // when the drawer hides it and a reconnect is needed.
+                if (!wide && hub.connection != 'online')
+                  ConnectionStatus(
+                    connection: hub.connection,
+                    onReconnect: hub.reconnect,
+                  ),
+                if (title != null)
+                  Expanded(
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 8),
+                      // The mode trails the title the way a reasoning level
+                      // trails its model; it is set when the chat starts.
+                      child: Row(
+                        children: [
+                          Flexible(
+                            child: Semantics(
+                              container: true,
+                              header: true,
+                              child: Text(
+                                title,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: TextStyle(
+                                  fontSize: 15.5,
+                                  fontWeight: FontWeight.w500,
+                                  color: c.text,
+                                ),
                               ),
                             ),
                           ),
-                        ),
+                          const SizedBox(width: 6),
+                          Text(
+                            conv['mode'] == 'work' ? 'Work' : 'Chat',
+                            style: modelLabelStyle(size: 12, color: c.subtle),
+                          ),
+                        ],
                       ),
-                    const Spacer(),
-                    // Reserved like pin/delete: enabled once the server
-                    // advertises `conversation_temporary`.
-                    if (hub.isDraft)
-                      IconButton(
-                        tooltip: !hub.canTemporary
-                            ? tr('临时对话（即将支持）', 'Temporary chat (coming soon)')
-                            : hub.temporary
-                            ? tr('关闭临时对话', 'Turn off temporary chat')
-                            : tr('开启临时对话', 'Turn on temporary chat'),
-                        isSelected: hub.temporary,
-                        onPressed: hub.canTemporary
-                            ? () => hub.updateDraft(
-                                () => hub.temporary = !hub.temporary,
-                              )
-                            : null,
-                        icon: const HubIcon(HubIcons.temporaryChat),
-                        selectedIcon: HubIcon(
-                          HubIcons.temporaryChat,
-                          color: c.accent,
-                        ),
-                      ),
-                    if (!hub.isDraft)
-                      PinButton(hub: hub, conv: conv, run: action),
-                    if (!hub.isDraft)
-                      PopupMenuButton<String>(
-                        tooltip: tr('对话命令', 'Chat commands'),
-                        icon: const Icon(Icons.more_horiz),
-                        position: PopupMenuPosition.under,
-                        // Clear of the button and its highlight.
-                        offset: const Offset(0, 6),
-                        onSelected: (v) => action(
-                          () => conversationAction(context, hub, conv, v),
-                        ),
-                        itemBuilder: (_) =>
-                            conversationMenu(hub, conv, header: true),
-                      ),
-                    const SizedBox(width: 8),
-                  ],
-                ),
-              ),
-              if (showPill)
-                ModePill(
-                  mode: hub.isDraft ? hub.mode : (conv['mode'] ?? 'chat'),
-                  onChanged: setMode,
-                ),
-            ],
-          );
-        },
+                    ),
+                  )
+                else
+                  const Spacer(),
+                // Reserved like pin/delete: enabled once the server
+                // advertises `conversation_temporary`.
+                if (hub.isDraft)
+                  IconButton(
+                    tooltip: !hub.canTemporary
+                        ? tr('临时对话（即将支持）', 'Temporary chat (coming soon)')
+                        : hub.temporary
+                        ? tr('关闭临时对话', 'Turn off temporary chat')
+                        : tr('开启临时对话', 'Turn on temporary chat'),
+                    isSelected: hub.temporary,
+                    onPressed: hub.canTemporary
+                        ? () => hub.updateDraft(
+                            () => hub.temporary = !hub.temporary,
+                          )
+                        : null,
+                    icon: const HubIcon(HubIcons.temporaryChat),
+                    selectedIcon: HubIcon(
+                      HubIcons.temporaryChat,
+                      color: c.accent,
+                    ),
+                  ),
+                if (!hub.isDraft) PinButton(hub: hub, conv: conv, run: action),
+                if (!hub.isDraft)
+                  PopupMenuButton<String>(
+                    tooltip: tr('对话命令', 'Chat commands'),
+                    icon: const Icon(Icons.more_horiz),
+                    position: PopupMenuPosition.under,
+                    // Clear of the button and its highlight.
+                    offset: const Offset(0, 6),
+                    onSelected: (v) =>
+                        action(() => conversationAction(context, hub, conv, v)),
+                    itemBuilder: (_) =>
+                        conversationMenu(hub, conv, header: true),
+                  ),
+                const SizedBox(width: 8),
+              ],
+            ),
+          ),
+          if (hub.isDraft) ModePill(mode: hub.mode, onChanged: setMode),
+        ],
       ),
     );
   }
@@ -1230,7 +1222,7 @@ class _HubPageState extends State<HubPage>
   }
 }
 
-/// The centred Chat / Work switch.
+/// The centred Chat / Work switch of a new chat.
 class ModePill extends StatelessWidget {
   final String mode;
   final ValueChanged<String> onChanged;

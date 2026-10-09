@@ -1,3 +1,5 @@
+import 'dart:math';
+
 import 'package:flutter/foundation.dart';
 import 'package:flutter/rendering.dart';
 import 'package:flutter/scheduler.dart';
@@ -92,12 +94,16 @@ class UnfoldScope extends InheritedWidget {
 class Unfold extends StatefulWidget {
   final bool open;
   final bool anchored;
+
+  /// How much of the top shows while folded.
+  final double peek;
   final WidgetBuilder builder;
   const Unfold({
     super.key,
     required this.open,
     required this.builder,
     this.anchored = true,
+    this.peek = 0,
   });
 
   @override
@@ -137,23 +143,119 @@ class _UnfoldState extends State<Unfold> with SingleTickerProviderStateMixin {
   @override
   Widget build(BuildContext context) {
     final anchor = UnfoldScope.of(context);
+    bool hidden() => controller.isDismissed && widget.peek == 0;
     return AnimatedBuilder(
       animation: curve,
       builder: (context, child) => _Growth(
         anchor: anchored ? anchor : null,
         factor: curve.value,
-        child: controller.isDismissed
+        child: hidden()
             ? const SizedBox(width: double.infinity)
-            : ClipRect(
-                child: Align(
-                  alignment: Alignment.topCenter,
-                  heightFactor: curve.value,
-                  child: child,
-                ),
-              ),
+            : _Reveal(peek: widget.peek, factor: curve.value, child: child),
       ),
-      child: controller.isDismissed ? null : widget.builder(context),
+      child: hidden() ? null : widget.builder(context),
     );
+  }
+}
+
+/// Shows the top of its child: [peek] of it, and [factor] of the rest.
+class _Reveal extends SingleChildRenderObjectWidget {
+  final double peek, factor;
+  const _Reveal({required this.peek, required this.factor, super.child});
+
+  @override
+  _RenderReveal createRenderObject(BuildContext context) =>
+      _RenderReveal(peek, factor);
+
+  @override
+  void updateRenderObject(BuildContext context, _RenderReveal renderObject) =>
+      renderObject
+        ..peek = peek
+        ..factor = factor;
+}
+
+/// Sized and placed as a top-centre [Align] with a height factor would be,
+/// clipped to what shows.
+class _RenderReveal extends RenderShiftedBox {
+  _RenderReveal(this._peek, this._factor) : super(null);
+
+  double _peek, _factor;
+  set peek(double value) {
+    if (value == _peek) return;
+    _peek = value;
+    markNeedsLayout();
+  }
+
+  set factor(double value) {
+    if (value == _factor) return;
+    _factor = value;
+    markNeedsLayout();
+  }
+
+  final _clip = LayerHandle<ClipRectLayer>();
+
+  double _shown(double height) {
+    final top = min(_peek, height);
+    return top + (height - top) * _factor;
+  }
+
+  Size _sizeFor(BoxConstraints constraints, Size? child) =>
+      constraints.constrain(
+        Size(
+          constraints.hasBoundedWidth
+              ? constraints.maxWidth
+              : child?.width ?? 0,
+          child == null ? 0 : _shown(child.height),
+        ),
+      );
+
+  @override
+  double computeMinIntrinsicHeight(double width) =>
+      _shown(super.computeMinIntrinsicHeight(width));
+
+  @override
+  double computeMaxIntrinsicHeight(double width) =>
+      _shown(super.computeMaxIntrinsicHeight(width));
+
+  @override
+  Size computeDryLayout(covariant BoxConstraints constraints) =>
+      _sizeFor(constraints, child?.getDryLayout(constraints.loosen()));
+
+  @override
+  void performLayout() {
+    final child = this.child;
+    child?.layout(constraints.loosen(), parentUsesSize: true);
+    size = _sizeFor(constraints, child?.size);
+    if (child != null) {
+      (child.parentData! as BoxParentData).offset = Offset(
+        (size.width - child.size.width) / 2,
+        0,
+      );
+    }
+  }
+
+  @override
+  void paint(PaintingContext context, Offset offset) {
+    final child = this.child;
+    if (child == null ||
+        child.size.height <= size.height && child.size.width <= size.width) {
+      _clip.layer = null;
+      super.paint(context, offset);
+      return;
+    }
+    _clip.layer = context.pushClipRect(
+      needsCompositing,
+      offset,
+      Offset.zero & size,
+      super.paint,
+      oldLayer: _clip.layer,
+    );
+  }
+
+  @override
+  void dispose() {
+    _clip.layer = null;
+    super.dispose();
   }
 }
 

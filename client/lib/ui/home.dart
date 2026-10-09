@@ -49,6 +49,11 @@ class _HubPageState extends State<HubPage>
   /// Folds in the timeline open downward instead of pushing what is above.
   final unfold = UnfoldAnchor();
 
+  /// Another conversation, a search result or a message sent from here
+  /// shows the timeline from its newest row.
+  final timelineScroll = ScrollController();
+  Object? _timelineShows;
+
   /// Signing back in with the device's refresh cookie; the login page waits.
   bool restoring = keepsSession;
 
@@ -83,6 +88,11 @@ class _HubPageState extends State<HubPage>
     // Not while the old controller is still notifying: it is disposed.
     if (hub.sessionEnded) return scheduleMicrotask(_sessionEnded);
     setState(() {});
+    final shows = (hub.selected, hub.searchFocusSeq, hub.sends);
+    if (shows != _timelineShows) {
+      _timelineShows = shows;
+      if (timelineScroll.hasClients) timelineScroll.jumpTo(0);
+    }
     _report();
   }
 
@@ -205,6 +215,7 @@ class _HubPageState extends State<HubPage>
     widget.link?.requested.removeListener(_follow);
     composerFocus.dispose();
     composerText.dispose();
+    timelineScroll.dispose();
     hub.dispose();
     super.dispose();
   }
@@ -950,6 +961,53 @@ class _HubPageState extends State<HubPage>
         child: child,
       ),
     );
+
+    Widget row(BuildContext context, int index) {
+      if (index == rows.length) {
+        return OlderLoader(key: ValueKey('older:${hub.selected}'), hub: hub);
+      }
+      final item = rows[rows.length - 1 - index];
+      if (item['kind'] == 'steps') {
+        return centered(
+          key: ValueKey(item['id']),
+          StepsGroup(
+            steps: item['steps'],
+            running: hub.runActive(item['run_id']),
+            latest: item['latest'] == true,
+            worked: hub.workedFor(item['run_id']),
+            onSource: (href) => openLink(href, item['steps'] as List),
+          ),
+        );
+      }
+      return centered(
+        key: ValueKey(item['id']),
+        MessageCard(
+          item: item,
+          agentLabel: hub.agentLabel,
+          onSource: (href) => openLink(href, [item]),
+          files: (files) => MessageFiles(
+            hub: hub,
+            files: files,
+            alignment: item['kind'] == 'user'
+                ? WrapAlignment.end
+                : WrapAlignment.start,
+          ),
+          onMemoryUndo: item['kind'] == 'memory_notice'
+              ? () => action(() async {
+                  final notice = jsonDecode(item['text']);
+                  await hub.request(
+                    '/orgs/${hub.org}/memory-events/${notice['event_id']}/undo',
+                    body: {},
+                  );
+                })
+              : null,
+          onFork: hub.canFork(item)
+              ? () => action(() => hub.fork(item['id']))
+              : null,
+        ),
+      );
+    }
+
     return Column(
       children: [
         Expanded(
@@ -966,65 +1024,30 @@ class _HubPageState extends State<HubPage>
                   alignment: Alignment.topCenter,
                   child: UnfoldScope(
                     anchor: unfold,
-                    child: ListView.builder(
+                    child: CustomScrollView(
+                      controller: timelineScroll,
                       reverse: true,
                       shrinkWrap: true,
                       physics: unfold.physics,
-                      padding: const EdgeInsets.fromLTRB(24, 16, 24, 8),
-                      itemCount: rows.length + 1,
-                      findChildIndexCallback: (key) {
-                        final i = key is ValueKey ? positions[key.value] : null;
-                        return i == null ? null : rows.length - 1 - i;
-                      },
-                      itemBuilder: (context, index) {
-                        if (index == rows.length) {
-                          return OlderLoader(
-                            key: ValueKey('older:${hub.selected}'),
-                            hub: hub,
-                          );
-                        }
-                        final item = rows[rows.length - 1 - index];
-                        if (item['kind'] == 'steps') {
-                          return centered(
-                            key: ValueKey(item['id']),
-                            StepsGroup(
-                              steps: item['steps'],
-                              running: hub.runActive(item['run_id']),
-                              latest: item['latest'] == true,
-                              worked: hub.workedFor(item['run_id']),
-                              onSource: (href) =>
-                                  openLink(href, item['steps'] as List),
+                      semanticChildCount: rows.length + 1,
+                      slivers: [
+                        SliverPadding(
+                          padding: const EdgeInsets.fromLTRB(24, 16, 24, 8),
+                          sliver: TimelineRows(
+                            loader: true,
+                            delegate: SliverChildBuilderDelegate(
+                              row,
+                              childCount: rows.length + 1,
+                              findChildIndexCallback: (key) {
+                                final i = key is ValueKey
+                                    ? positions[key.value]
+                                    : null;
+                                return i == null ? null : rows.length - 1 - i;
+                              },
                             ),
-                          );
-                        }
-                        return centered(
-                          key: ValueKey(item['id']),
-                          MessageCard(
-                            item: item,
-                            agentLabel: hub.agentLabel,
-                            onSource: (href) => openLink(href, [item]),
-                            files: (files) => MessageFiles(
-                              hub: hub,
-                              files: files,
-                              alignment: item['kind'] == 'user'
-                                  ? WrapAlignment.end
-                                  : WrapAlignment.start,
-                            ),
-                            onMemoryUndo: item['kind'] == 'memory_notice'
-                                ? () => action(() async {
-                                    final notice = jsonDecode(item['text']);
-                                    await hub.request(
-                                      '/orgs/${hub.org}/memory-events/${notice['event_id']}/undo',
-                                      body: {},
-                                    );
-                                  })
-                                : null,
-                            onFork: hub.canFork(item)
-                                ? () => action(() => hub.fork(item['id']))
-                                : null,
                           ),
-                        );
-                      },
+                        ),
+                      ],
                     ),
                   ),
                 ),

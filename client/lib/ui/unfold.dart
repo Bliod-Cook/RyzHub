@@ -11,7 +11,8 @@ const unfoldDuration = Duration(milliseconds: 220);
 /// Keeps what is above a fold in place while the fold opens or closes in a
 /// reversed timeline. A reversed list grows an item upward, pushing everything
 /// above it; with [physics] the scroll offset follows the extent the fold adds
-/// or removes instead, so the fold opens downward.
+/// or removes instead, so the fold opens downward. Scrolled back from the
+/// newest row, [TimelineRows] keeps the page in place itself.
 class UnfoldAnchor {
   /// How much the folds grew in the layout under way.
   double _grown = 0;
@@ -72,6 +73,128 @@ class _UnfoldPhysics extends ScrollPhysics {
       newPosition.minScrollExtent,
       newPosition.maxScrollExtent,
     );
+  }
+}
+
+/// The rows of a reversed timeline, newest first. While the newest row ends
+/// on screen, what grows or arrives there pushes the older rows up, so the
+/// newest stays in view. Scrolled back from there, the topmost row on screen
+/// keeps its place instead, whatever grows, arrives or folds below it.
+class TimelineRows extends SliverList {
+  /// The last child loads older rows rather than being one. They arrive below
+  /// it, so it never keeps its place.
+  final bool loader;
+  const TimelineRows({super.key, required super.delegate, this.loader = false});
+
+  @override
+  RenderSliverList createRenderObject(BuildContext context) =>
+      _RenderTimelineRows(
+        childManager: context as SliverMultiBoxAdaptorElement,
+        unfold: UnfoldScope.of(context),
+        loader: loader,
+      );
+
+  @override
+  void updateRenderObject(
+    BuildContext context,
+    RenderSliverList renderObject,
+  ) => (renderObject as _RenderTimelineRows)
+    ..unfold = UnfoldScope.of(context)
+    ..loader = loader;
+}
+
+class _RenderTimelineRows extends RenderSliverList {
+  _RenderTimelineRows({
+    required super.childManager,
+    required this.unfold,
+    required this.loader,
+  });
+  UnfoldAnchor? unfold;
+  bool loader;
+
+  /// The topmost row on screen as last laid out, and the scroll offset of its
+  /// top then.
+  RenderBox? _held;
+  double _top = 0;
+
+  /// Where the held row's top went if the list dropped it in this layout.
+  double? _dropped;
+
+  double _topOf(RenderBox child) =>
+      childScrollOffset(child)! + paintExtentOf(child);
+
+  @override
+  void performLayout() {
+    _dropped = null;
+    super.performLayout();
+    final reading = constraints.scrollOffset > precisionErrorTolerance;
+    // The held row already moves the page by what a fold below it adds;
+    // the fold's own anchor would add it again.
+    if (reading) unfold?._take();
+    final listCorrection = geometry!.scrollOffsetCorrection;
+    if (listCorrection != null) {
+      // The list renumbered its offsets and moves the page by as much.
+      _top += listCorrection;
+      return;
+    }
+    final held = _held;
+    final top = held == null
+        ? null
+        : _laidOut(held)
+        ? _topOf(held)
+        : _dropped;
+    if (reading && top != null) {
+      final moved = top - _top;
+      if (moved.abs() > precisionErrorTolerance) {
+        _top += moved;
+        // Not past the newest row's end.
+        final back =
+            constraints.precedingScrollExtent + constraints.scrollOffset;
+        geometry = SliverGeometry(scrollOffsetCorrection: max(moved, -back));
+        return;
+      }
+    }
+    final end = constraints.scrollOffset + constraints.remainingPaintExtent;
+    _held = null;
+    for (var child = firstChild; child != null; child = childAfter(child)) {
+      if (childScrollOffset(child)! >= end ||
+          loader && indexOf(child) == childManager.childCount - 1) {
+        break;
+      }
+      _held = child;
+    }
+    if (_held case final held?) _top = _topOf(held);
+  }
+
+  /// What grew below the held row can push it out of the rows the list keeps
+  /// laid out; the list drops it then, and the page has to follow it all the
+  /// same.
+  @override
+  void collectGarbage(int leadingGarbage, int trailingGarbage) {
+    // The rows dropped past the end were not laid out again: the held one
+    // follows the last that was, by the extents they had.
+    final kept = childCount - trailingGarbage;
+    var i = 0;
+    double? end;
+    for (var child = firstChild; child != null; child = childAfter(child)) {
+      final offset = i < kept ? childScrollOffset(child) : end;
+      end = offset == null || !child.hasSize
+          ? null
+          : offset + paintExtentOf(child);
+      if (child == _held) {
+        if (i < leadingGarbage || i >= kept) _dropped = end;
+        break;
+      }
+      i++;
+    }
+    super.collectGarbage(leadingGarbage, trailingGarbage);
+  }
+
+  bool _laidOut(RenderBox box) {
+    for (var child = firstChild; child != null; child = childAfter(child)) {
+      if (child == box) return true;
+    }
+    return false;
   }
 }
 

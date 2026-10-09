@@ -1142,6 +1142,9 @@ class HubController extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Counts the messages sent from here; the timeline shows each one.
+  int sends = 0;
+
   /// Send [text] with the files picked in the composer, or with the files
   /// in [only], leaving the composer's other files for the next message.
   Future<void> send(String text, {List<Map<String, dynamic>>? only}) async {
@@ -1158,6 +1161,8 @@ class HubController extends ChangeNotifier {
       return;
     }
     searchFocusSeq = null;
+    sends++;
+    notifyListeners();
     if (isDraft) return _createAndSend(text, carried, picked: picked);
     final ch = channel, steerable = realChat || realWork;
     final pending = _pendingConfig[ch]?.isNotEmpty == true

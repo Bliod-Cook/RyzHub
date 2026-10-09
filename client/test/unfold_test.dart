@@ -28,24 +28,30 @@ void main() {
             alignment: Alignment.topCenter,
             child: UnfoldScope(
               anchor: anchor,
-              child: ListView.builder(
+              child: CustomScrollView(
                 reverse: true,
                 shrinkWrap: shrinkWrap,
                 physics: anchor.physics,
-                itemCount: below + (shrinkWrap ? 2 : 25),
-                itemBuilder: (context, i) => i == below
-                    ? fold ??
-                          StepsGroup(
-                            steps: [
-                              {
-                                'id': 'r',
-                                'kind': 'reasoning',
-                                'state': 'completed',
-                                'text': thought ?? short,
-                              },
-                            ],
-                          )
-                    : SizedBox(height: 60, child: Text('row $i')),
+                slivers: [
+                  TimelineRows(
+                    delegate: SliverChildBuilderDelegate(
+                      (context, i) => i == below
+                          ? fold ??
+                                StepsGroup(
+                                  steps: [
+                                    {
+                                      'id': 'r',
+                                      'kind': 'reasoning',
+                                      'state': 'completed',
+                                      'text': thought ?? short,
+                                    },
+                                  ],
+                                )
+                          : SizedBox(height: 60, child: Text('row $i')),
+                      childCount: below + (shrinkWrap ? 2 : 25),
+                    ),
+                  ),
+                ],
               ),
             ),
           ),
@@ -154,7 +160,7 @@ void main() {
       below: 20,
     );
     // Scrolled up to the question.
-    await tester.drag(find.byType(ListView), const Offset(0, 2000));
+    await tester.drag(find.byType(Scrollable), const Offset(0, 2000));
     await tester.pumpAndSettle();
     final header = top(tester, 'Reasoned');
     final above = top(tester, 'row 21');
@@ -172,6 +178,151 @@ void main() {
     await tester.pumpAndSettle();
     expect(top(tester, 'Reasoned'), moreOrLessEquals(header));
     expect(top(tester, 'row 19'), moreOrLessEquals(below));
+  });
+
+  /// Lays out a conversation's timeline as the app does: [rows] newest first,
+  /// by name and height, and past the oldest a loader for older rows.
+  Future<void> Function(List<(String, double)> rows) conversation(
+    WidgetTester tester,
+    ScrollController scroll,
+  ) {
+    final anchor = UnfoldAnchor();
+    return (rows) {
+      final index = {
+        for (final (i, (name, _)) in rows.indexed) name: i,
+        'older': rows.length,
+      };
+      return tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: Align(
+              alignment: Alignment.topCenter,
+              child: UnfoldScope(
+                anchor: anchor,
+                child: CustomScrollView(
+                  controller: scroll,
+                  reverse: true,
+                  shrinkWrap: true,
+                  physics: anchor.physics,
+                  slivers: [
+                    SliverPadding(
+                      padding: const EdgeInsets.fromLTRB(24, 16, 24, 8),
+                      sliver: TimelineRows(
+                        loader: true,
+                        delegate: SliverChildBuilderDelegate(
+                          (context, i) => i == rows.length
+                              ? const SizedBox(
+                                  key: ValueKey('older'),
+                                  height: 40,
+                                )
+                              : SizedBox(
+                                  key: ValueKey(rows[i].$1),
+                                  height: rows[i].$2,
+                                  child: Text(rows[i].$1),
+                                ),
+                          childCount: rows.length + 1,
+                          findChildIndexCallback: (key) =>
+                              key is ValueKey ? index[key.value] : null,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ),
+      );
+    };
+  }
+
+  final history = [for (var i = 1; i <= 20; i++) ('row $i', 120.0)];
+
+  testWidgets('scrolled back, a reply growing below leaves the page still', (
+    tester,
+  ) async {
+    final scroll = ScrollController();
+    final show = conversation(tester, scroll);
+    await show([('reply', 200), ...history]);
+    scroll.jumpTo(180);
+    await tester.pump();
+    final above = top(tester, 'row 1'), reply = top(tester, 'reply');
+    await show([('reply', 225), ...history]);
+    expect(top(tester, 'row 1'), moreOrLessEquals(above));
+    expect(top(tester, 'reply'), moreOrLessEquals(reply));
+    expect(scroll.offset, moreOrLessEquals(205));
+
+    // Back at the newest, the reply pushes the older rows up again.
+    scroll.jumpTo(0);
+    await tester.pump();
+    final bottom = tester.getBottomLeft(find.byKey(const ValueKey('reply')));
+    final pushed = top(tester, 'row 1');
+    await show([('reply', 250), ...history]);
+    expect(scroll.offset, 0);
+    expect(
+      tester.getBottomLeft(find.byKey(const ValueKey('reply'))).dy,
+      moreOrLessEquals(bottom.dy),
+    );
+    expect(top(tester, 'row 1'), moreOrLessEquals(pushed - 25));
+  });
+
+  testWidgets('scrolled back into a long reply, what shows of it stays as it '
+      'grows', (tester) async {
+    final scroll = ScrollController();
+    final show = conversation(tester, scroll);
+    await show([('reply', 2000), ...history]);
+    scroll.jumpTo(180);
+    await tester.pump();
+    final reply = top(tester, 'reply');
+    await show([('reply', 2025), ...history]);
+    expect(top(tester, 'reply'), moreOrLessEquals(reply));
+    expect(scroll.offset, moreOrLessEquals(205));
+  });
+
+  testWidgets('scrolled back, rows arriving below leave the page still', (
+    tester,
+  ) async {
+    final scroll = ScrollController();
+    final show = conversation(tester, scroll);
+    await show([('reply', 200), ...history]);
+    scroll.jumpTo(180);
+    await tester.pump();
+    final above = top(tester, 'row 1');
+    await show([('steps', 80), ('reply', 200), ...history]);
+    expect(top(tester, 'row 1'), moreOrLessEquals(above));
+    expect(scroll.offset, moreOrLessEquals(260));
+  });
+
+  testWidgets('older rows loading in at the top leave the page still', (
+    tester,
+  ) async {
+    final scroll = ScrollController();
+    final show = conversation(tester, scroll);
+    await show([('reply', 200), ...history]);
+    scroll.jumpTo(scroll.position.maxScrollExtent);
+    await tester.pump();
+    final oldest = top(tester, 'row 20');
+    await show([
+      ('reply', 200),
+      ...history,
+      for (var i = 21; i <= 25; i++) ('row $i', 120.0),
+    ]);
+    expect(top(tester, 'row 20'), moreOrLessEquals(oldest));
+  });
+
+  testWidgets('what shrinks below by more than the page is scrolled back '
+      'lands it at the newest', (tester) async {
+    final scroll = ScrollController();
+    final show = conversation(tester, scroll);
+    await show([('reply', 400), ...history]);
+    scroll.jumpTo(180);
+    await tester.pump();
+    final above = top(tester, 'row 1');
+    await show([('reply', 100), ...history]);
+    expect(scroll.offset, 0);
+    expect(top(tester, 'row 1'), moreOrLessEquals(above + 120));
+    await tester.pumpAndSettle();
+    expect(scroll.offset, 0);
   });
 
   testWidgets("the user's bubble takes the accent", (tester) async {

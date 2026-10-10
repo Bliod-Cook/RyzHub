@@ -1,3 +1,5 @@
+import 'dart:async';
+import 'dart:convert';
 import 'dart:typed_data';
 
 import 'package:flutter/gestures.dart';
@@ -58,6 +60,24 @@ class _Hub extends HubController {
 
   @override
   Future<void> deleteFile(String id) async => deleted.add(id);
+
+  /// Library files by their content's hash.
+  final contents = <String, Map<String, dynamic>>{};
+  final uploaded = <String>[];
+
+  @override
+  Future<Map<String, dynamic>?> fileWithHash(String sha256) async =>
+      contents[sha256];
+
+  @override
+  Future<Map<String, dynamic>> uploadFile(
+    String name,
+    int size,
+    Stream<List<int>> Function() open,
+  ) async {
+    uploaded.add(name);
+    return _file('f${files.length + 1}', name, 'image');
+  }
 }
 
 Future<void> _show(
@@ -203,6 +223,46 @@ void main() {
     expect(find.text('Report.pdf'), findsOneWidget);
     expect(find.text('notes.md'), findsNothing);
   });
+
+  testWidgets(
+    'an upload the library holds is kept unless the member says not',
+    (tester) async {
+      final hub = _Hub();
+      final bytes = utf8.encode('chart');
+      hub.contents[await contentHash(() => Stream.value(bytes))] =
+          hub.files.last;
+      await _show(tester, hub);
+      final library = tester.state<LibraryViewState>(find.byType(LibraryView));
+      final copy = (
+        name: 'chart copy.png',
+        size: bytes.length,
+        open: () => Stream.value(bytes),
+      );
+      unawaited(library.upload([copy]));
+      // The upload button spins meanwhile, so nothing settles.
+      await tester.pump();
+      await tester.pump(const Duration(seconds: 1));
+      expect(find.text('Already in your library'), findsOneWidget);
+      expect(
+        find.text('"chart copy.png" has the same content.'),
+        findsOneWidget,
+      );
+      // One file: no answer for the rest.
+      expect(find.byType(CheckboxListTile), findsNothing);
+      await tester.tap(find.text('Keep existing'));
+      await tester.pumpAndSettle();
+      expect(hub.uploaded, isEmpty);
+      expect(find.text('chart copy.png'), findsNothing);
+
+      unawaited(library.upload([copy]));
+      await tester.pump();
+      await tester.pump(const Duration(seconds: 1));
+      await tester.tap(find.text('Upload anyway'));
+      await tester.pumpAndSettle();
+      expect(hub.uploaded, ['chart copy.png']);
+      expect(find.text('chart copy.png'), findsOneWidget);
+    },
+  );
 
   testWidgets('rows show size and use, and a file is deleted after asking', (
     tester,

@@ -116,11 +116,18 @@ class LibraryViewState extends State<LibraryView> {
         '${file['name']}'.toLowerCase().contains(words);
   }
 
-  /// Upload files of this device into the library, one after another.
+  /// Upload files of this device into the library, one after another; one
+  /// the library already holds is uploaded again only if the member says so.
   Future<void> upload(List<LocalFile> chosen) async {
     final messenger = ScaffoldMessenger.of(context);
     void refuse(String name, Object error) => messenger.showSnackBar(
       SnackBar(content: Text('$name: ${errorText(error)}')),
+    );
+    final prompt = DuplicatePrompt(
+      context: context,
+      hub: hub,
+      many: chosen.length > 1,
+      keep: tr('保留已有', 'Keep existing'),
     );
     final limit = hub.maxFileBytes;
     for (final file in chosen) {
@@ -130,6 +137,10 @@ class LibraryViewState extends State<LibraryView> {
       }
       _set(() => uploading++);
       try {
+        final existing = await hub.sameFile(file.open);
+        if (existing != null && await prompt.reuse(file.name, existing)) {
+          continue;
+        }
         final added = await hub.uploadFile(file.name, file.size, file.open);
         if (_shows(added)) _set(() => files.insert(0, added));
       } catch (e) {

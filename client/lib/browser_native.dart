@@ -28,3 +28,6 @@ Future<void> saveFile(String name, Uint8List bytes) async {
 void Function() listenForPastedFiles(
   void Function(String name, Uint8List bytes) onFile,
 ) => () {};
+
+/// Native builds hash with Dart; [open] is not read.
+Future<String?> platformSha256(Stream<List<int>> Function() open) async => null;

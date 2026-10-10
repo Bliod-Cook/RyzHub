@@ -1357,6 +1357,30 @@ async fn library_files_reach_models_and_sandboxes_until_deleted() -> anyhow::Res
 
     // A second entry with the same content, then deleting the first removes it everywhere.
     let copy = h.upload(&user, "dot-copy.png", png.clone()).await?;
+    // Both are found by their content, the newest first, before anything is uploaded again.
+    let content_hash = {
+        use sha2::{Digest, Sha256};
+        format!("{:x}", Sha256::digest(&png))
+    };
+    assert_eq!(copy["sha256"], content_hash.as_str());
+    assert_eq!(
+        names(format!("/orgs/{org}/attachments?sha256={content_hash}")).await?,
+        ["dot-copy.png", "dot.png"]
+    );
+    assert_eq!(
+        names(format!(
+            "/orgs/{org}/attachments?sha256={}",
+            content_hash.to_uppercase()
+        ))
+        .await?,
+        ["dot-copy.png", "dot.png"]
+    );
+    assert_eq!(
+        get(format!("/orgs/{org}/attachments?sha256=xyz"), token.clone())
+            .await?
+            .status(),
+        400
+    );
     let deleted = http
         .delete(format!("{}/orgs/{org}/attachments/{image_id}", h.base))
         .bearer_auth(&token)
@@ -1369,6 +1393,10 @@ async fn library_files_reach_models_and_sandboxes_until_deleted() -> anyhow::Res
     )
     .await?;
     assert_eq!(gone.status(), 410);
+    assert_eq!(
+        names(format!("/orgs/{org}/attachments?sha256={content_hash}")).await?,
+        ["dot-copy.png"]
+    );
     h.send(&user, conv, message("attachls")).await?;
     let mut later = None;
     for _ in 0..400 {

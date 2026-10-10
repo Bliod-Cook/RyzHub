@@ -144,34 +144,196 @@ Future<Uint8List?> _thumbnail(LocalFile file) async {
   return bytes.takeBytes();
 }
 
-/// Upload files for the next message.
-Future<void> attachLocal(HubController hub, List<LocalFile> files) async {
+/// Upload files for the next message; one the library already holds may go
+/// as that file instead.
+Future<void> attachLocal(
+  BuildContext context,
+  HubController hub,
+  List<LocalFile> files,
+) async {
+  final prompt = DuplicatePrompt(
+    context: context,
+    hub: hub,
+    many: files.length > 1,
+    keep: tr('使用已有文件', 'Use existing'),
+  );
   for (final file in files) {
     final thumbnail = await _thumbnail(file);
     unawaited(
-      hub.attach(file.name, file.size, file.open, thumbnail: thumbnail),
+      hub.attach(
+        file.name,
+        file.size,
+        file.open,
+        thumbnail: thumbnail,
+        reuse: (existing) => prompt.reuse(file.name, existing),
+      ),
     );
   }
 }
 
 /// Pick files with the platform's dialog and upload them for the next message.
-Future<void> pickFiles(HubController hub) async =>
-    attachLocal(hub, await chooseLocalFiles());
+Future<void> pickFiles(BuildContext context, HubController hub) async {
+  final files = await chooseLocalFiles();
+  if (context.mounted) await attachLocal(context, hub, files);
+}
 
 /// Upload files dropped on the window for the next message.
-Future<void> attachDropped(HubController hub, List<XFile> files) async =>
-    attachLocal(hub, await droppedFiles(files));
+Future<void> attachDropped(
+  BuildContext context,
+  HubController hub,
+  List<XFile> files,
+) async {
+  final dropped = await droppedFiles(files);
+  if (context.mounted) await attachLocal(context, hub, dropped);
+}
 
 /// Upload bytes already in memory, e.g. a pasted screenshot.
-void attachBytes(HubController hub, String name, Uint8List bytes) {
+void attachBytes(
+  BuildContext context,
+  HubController hub,
+  String name,
+  Uint8List bytes,
+) {
+  final prompt = DuplicatePrompt(
+    context: context,
+    hub: hub,
+    keep: tr('使用已有文件', 'Use existing'),
+  );
   unawaited(
     hub.attach(
       name,
       bytes.length,
       () => Stream.value(bytes),
       thumbnail: _looksLikeImage(name) ? bytes : null,
+      reuse: (existing) => prompt.reuse(name, existing),
     ),
   );
+}
+
+/// Asks, one file at a time, whether a file the library already holds is
+/// uploaded again or the library's file [keep]s its place. With [many] files
+/// in the batch, one answer can do for the rest.
+class DuplicatePrompt {
+  final BuildContext context;
+  final HubController hub;
+  final bool many;
+
+  /// The label of the answer that takes the library's file.
+  final String keep;
+  DuplicatePrompt({
+    required this.context,
+    required this.hub,
+    required this.keep,
+    this.many = false,
+  });
+
+  /// The answer for the rest of the batch, once given.
+  bool? _rest;
+
+  /// The question being asked: the next waits for it.
+  Future<void> _turn = Future.value();
+
+  /// Whether [name], with the content of the library's [existing], should be
+  /// that file rather than uploaded again.
+  Future<bool> reuse(String name, Map<String, dynamic> existing) {
+    final answer = _turn.then((_) => _ask(name, existing));
+    _turn = answer.then((_) {}, onError: (_) {});
+    return answer;
+  }
+
+  Future<bool> _ask(String name, Map<String, dynamic> existing) async {
+    if (_rest != null) return _rest!;
+    // Nowhere to ask any more: upload as before.
+    if (!context.mounted) return false;
+    var rest = false;
+    final upload = await showDialog<bool>(
+      context: context,
+      builder: (context) => StatefulBuilder(
+        builder: (context, setState) {
+          final c = HubColors.of(context);
+          final known = existing['name'] as String;
+          final details = [
+            uploadedOn(
+              existing['created_at'],
+              generated: existing['direction'] == 'output',
+            ),
+            fileSize(existing['size'] as num),
+          ].where((part) => part.isNotEmpty).join(' · ');
+          return AlertDialog(
+            title: Text(tr('文件库里已有相同的文件', 'Already in your library')),
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    FileThumbnail(
+                      hub: hub,
+                      name: known,
+                      id: existing['id'] as String,
+                      kind: existing['kind'] as String?,
+                      size: 44,
+                    ),
+                    const SizedBox(width: 14),
+                    Flexible(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            known,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(fontSize: 14.5, color: c.text),
+                          ),
+                          const SizedBox(height: 3),
+                          Text(
+                            details,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(fontSize: 12.5, color: c.subtle),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+                if (name != known) ...[
+                  const SizedBox(height: 14),
+                  Text(tr('“$name” 与它内容相同。', '"$name" has the same content.')),
+                ],
+                if (many) ...[
+                  const SizedBox(height: 8),
+                  CheckboxListTile(
+                    contentPadding: EdgeInsets.zero,
+                    controlAffinity: ListTileControlAffinity.leading,
+                    title: Text(
+                      tr('其余重复文件也这样处理', 'Do the same for other duplicates'),
+                    ),
+                    value: rest,
+                    onChanged: (value) => setState(() => rest = value ?? false),
+                  ),
+                ],
+              ],
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(context, true),
+                child: Text(tr('仍然上传', 'Upload anyway')),
+              ),
+              FilledButton(
+                onPressed: () => Navigator.pop(context, false),
+                child: Text(keep),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+    // Dismissed: the library's file, which uploads nothing.
+    final reuse = upload != true;
+    if (rest) _rest = reuse;
+    return reuse;
+  }
 }
 
 /// Let the member pick files of their library for the next message.

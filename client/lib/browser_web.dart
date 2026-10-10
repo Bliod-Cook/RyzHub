@@ -69,3 +69,21 @@ void Function() listenForPastedFiles(
   web.document.addEventListener('paste', listener);
   return () => web.document.removeEventListener('paste', listener);
 }
+
+/// The SHA-256 of the stream [open] gives, as lowercase hex, worked out by the
+/// browser off the page's thread; null where the page is not a secure context
+/// and the browser offers none.
+Future<String?> platformSha256(Stream<List<int>> Function() open) async {
+  if (!web.window.isSecureContext) return null;
+  final bytes = BytesBuilder(copy: false);
+  await for (final chunk in open()) {
+    bytes.add(chunk);
+  }
+  final digest = await web.window.crypto.subtle
+      .digest('SHA-256'.toJS, bytes.takeBytes().toJS)
+      .toDart;
+  return [
+    for (final byte in (digest as JSArrayBuffer).toDart.asUint8List())
+      byte.toRadixString(16).padLeft(2, '0'),
+  ].join();
+}

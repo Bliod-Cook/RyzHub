@@ -84,7 +84,8 @@ pub async fn upload(
 macro_rules! file_fields {
     () => {
         "jsonb_build_object('id',a.id,'name',a.name,'media_type',a.media_type,'direction',a.direction,
-         'kind',a.kind,'size',a.size,'width',a.width,'height',a.height,'created_at',a.created_at,
+         'kind',a.kind,'size',a.size,'sha256',a.sha256,'width',a.width,'height',a.height,
+         'created_at',a.created_at,
          'preview',a.model_data IS NOT NULL,
          'conversations',(SELECT count(*) FROM conversation_files f JOIN conversations c
              ON c.org_id=f.org_id AND c.id=f.conversation_id
@@ -115,13 +116,15 @@ pub struct Page {
     kind: Option<String>,
     /// Only files the member uploaded (`upload`) or models published (`output`).
     direction: Option<String>,
+    /// Only files with this content: its SHA-256 in hex.
+    sha256: Option<String>,
 }
 
 /// Longest search accepted, in characters.
 const QUERY_CHARS: usize = 200;
 
-/// `GET /orgs/{org}/attachments?before=&limit=&q=&kind=&direction=`: the caller's files, newest
-/// first.
+/// `GET /orgs/{org}/attachments?before=&limit=&q=&kind=&direction=&sha256=`: the caller's files,
+/// newest first.
 pub async fn list(
     State(app): State<App>,
     headers: HeaderMap,
@@ -147,6 +150,13 @@ pub async fn list(
     {
         return Err(Code::InvalidInput.into());
     }
+    let sha256 = page.sha256.as_deref().map(|hex| hex.trim().to_ascii_lowercase());
+    if sha256
+        .as_deref()
+        .is_some_and(|hex| hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()))
+    {
+        return Err(Code::InvalidInput.into());
+    }
     let (ctx, mut tx) = member_tx(&app, &headers, org).await?;
     let files: Vec<Value> = sqlx::query_scalar(concat!(
         "SELECT ",
@@ -156,6 +166,7 @@ pub async fn list(
            AND ($5::text IS NULL OR strpos(lower(a.name),lower($5))>0)
            AND ($6::text[] IS NULL OR a.kind=ANY($6))
            AND ($7::text IS NULL OR a.direction=$7)
+           AND ($8::text IS NULL OR a.sha256=$8)
          ORDER BY a.id DESC LIMIT $4"
     ))
     .bind(org)
@@ -165,6 +176,7 @@ pub async fn list(
     .bind(query)
     .bind(kinds)
     .bind(page.direction.as_deref())
+    .bind(sha256)
     .fetch_all(&mut *tx)
     .await?;
     tx.commit().await?;

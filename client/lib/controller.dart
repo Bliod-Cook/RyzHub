@@ -3,6 +3,7 @@ import 'dart:collection';
 import 'dart:convert';
 import 'dart:math';
 
+import 'package:crypto/crypto.dart';
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 import 'package:connectivity_plus/connectivity_plus.dart';
@@ -30,6 +31,37 @@ String conversationTitle(String text) {
         : '${String.fromCharCodes(runes.take(40))}…';
   }
   return tr('新对话', 'New chat');
+}
+
+/// What [contentHash] hashes at once before letting frames through.
+const _hashSlice = 1024 * 1024;
+
+/// The SHA-256 of the stream [open] gives, as lowercase hex: how the server
+/// names content.
+Future<String> contentHash(Stream<List<int>> Function() open) async {
+  final hex = await platformSha256(open);
+  if (hex != null) return hex;
+  late Digest digest;
+  final sink = sha256.startChunkedConversion(
+    ChunkedConversionSink<Digest>.withCallback((d) => digest = d.single),
+  );
+  await for (final chunk in open()) {
+    if (chunk.length <= _hashSlice) {
+      sink.add(chunk);
+      continue;
+    }
+    // A browser hands over a whole file as one chunk: hashed at once, it
+    // would hold the page for seconds.
+    final bytes = chunk is Uint8List ? chunk : Uint8List.fromList(chunk);
+    for (var at = 0; at < bytes.length; at += _hashSlice) {
+      sink.add(
+        Uint8List.sublistView(bytes, at, min(at + _hashSlice, bytes.length)),
+      );
+      await Future<void>.delayed(Duration.zero);
+    }
+  }
+  sink.close();
+  return '$digest';
 }
 
 /// A message on its way to the server: what it said and carried, kept until
@@ -820,6 +852,30 @@ class HubController extends ChangeNotifier {
     ];
   }
 
+  /// The member's newest file with the content [sha256] names, if any.
+  Future<Map<String, dynamic>?> fileWithHash(String sha256) async {
+    final data = await request('/orgs/$org/attachments?sha256=$sha256&limit=1');
+    for (final file in data['files'] as List) {
+      // A server that does not know the filter lists every file.
+      if (file is Map && file['sha256'] == sha256) {
+        return Map<String, dynamic>.from(file);
+      }
+    }
+    return null;
+  }
+
+  /// The member's file with the same content as the one [open] reads, if
+  /// any. A failed check finds none: the file is uploaded as before.
+  Future<Map<String, dynamic>?> sameFile(
+    Stream<List<int>> Function() open,
+  ) async {
+    try {
+      return await fileWithHash(await contentHash(open));
+    } catch (_) {
+      return null;
+    }
+  }
+
   /// Delete a file everywhere: every conversation that carried it loses it,
   /// and so does the next message.
   Future<void> deleteFile(String id) async {
@@ -831,12 +887,15 @@ class HubController extends ChangeNotifier {
     if (pendingFiles.length != before) notifyListeners();
   }
 
-  /// Upload a file for the next message.
+  /// Upload a file for the next message. Given [reuse], a file of the library
+  /// with the same content is found first, and [reuse] decides whether the
+  /// message takes that file instead.
   Future<void> attach(
     String name,
     int size,
     Stream<List<int>> Function() open, {
     Uint8List? thumbnail,
+    Future<bool> Function(Map<String, dynamic> existing)? reuse,
   }) async {
     final file = PendingFile(name: name, size: size, thumbnail: thumbnail);
     pendingFiles.add(file);
@@ -848,6 +907,22 @@ class HubController extends ChangeNotifier {
       file.error = 'ATTACHMENT_TOO_LARGE';
     } else {
       try {
+        final existing = reuse == null ? null : await sameFile(open);
+        if (existing != null &&
+            pendingFiles.contains(file) &&
+            await reuse!(existing)) {
+          final at = pendingFiles.indexOf(file);
+          if (at < 0) return;
+          if (pendingFiles.any((f) => f.id == existing['id'])) {
+            pendingFiles.removeAt(at);
+          } else {
+            pendingFiles[at] = _fromLibrary(existing, thumbnail: thumbnail);
+          }
+          notifyListeners();
+          return;
+        }
+        // Removed while it was checked: nothing will send it.
+        if (!pendingFiles.contains(file)) return;
         final uploaded = await uploadFile(name, size, open);
         file.id = uploaded['id'] as String;
         file.kind = uploaded['kind'] as String?;
@@ -866,18 +941,20 @@ class HubController extends ChangeNotifier {
   void attachFromLibrary(Iterable<Map<String, dynamic>> files) {
     for (final file in files) {
       if (pendingFiles.any((f) => f.id == file['id'])) continue;
-      pendingFiles.add(
-        PendingFile(
-          name: file['name'] as String,
-          size: (file['size'] as num).toInt(),
-          fromLibrary: true,
-          id: file['id'] as String,
-          kind: file['kind'] as String?,
-        ),
-      );
+      pendingFiles.add(_fromLibrary(file));
     }
     notifyListeners();
   }
+
+  PendingFile _fromLibrary(Map<String, dynamic> file, {Uint8List? thumbnail}) =>
+      PendingFile(
+        name: file['name'] as String,
+        size: (file['size'] as num).toInt(),
+        thumbnail: thumbnail,
+        fromLibrary: true,
+        id: file['id'] as String,
+        kind: file['kind'] as String?,
+      );
 
   /// Take a file off the next message. A file uploaded for it is deleted; one
   /// from the library stays there.

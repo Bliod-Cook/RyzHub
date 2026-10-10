@@ -699,7 +699,7 @@ Widget? plusMenu(
           Icons.attach_file,
           tr('上传文件', 'Upload files'),
           tr('图片、PDF、文本或任意文件', 'Images, PDFs, text or any file'),
-          () => pickFiles(hub),
+          () => pickFiles(page, hub),
         ),
         row(
           Icons.folder_copy_outlined,

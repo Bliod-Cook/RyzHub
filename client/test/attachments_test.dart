@@ -1,7 +1,9 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:typed_data';
 import 'dart:ui' as ui;
 
+import 'package:crypto/crypto.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:ryzhub/controller.dart';
@@ -34,6 +36,27 @@ class _Hub extends HubController {
   }) async {
     requests.add('${method ?? 'GET'} $path');
     return {};
+  }
+
+  /// Library files by their content's hash.
+  final contents = <String, Map<String, dynamic>>{};
+
+  @override
+  Future<Map<String, dynamic>?> fileWithHash(String sha256) async =>
+      contents[sha256];
+
+  /// [bytes] as the library's file [id], named [name].
+  Future<void> holds(String id, String name, List<int> bytes) async {
+    final hash = await contentHash(() => Stream.value(bytes));
+    contents[hash] = {
+      'id': id,
+      'name': name,
+      'size': bytes.length,
+      'kind': 'text',
+      'direction': 'upload',
+      'sha256': hash,
+      'created_at': '2026-09-18T10:00:00Z',
+    };
   }
 }
 
@@ -120,6 +143,107 @@ void main() {
     await Future<void>.delayed(Duration.zero);
     expect(hub.requests, ['DELETE /orgs/org/attachments/late']);
     expect(hub.pendingFiles, isEmpty);
+  });
+
+  test(
+    'content is hashed as the server names it, however it arrives',
+    () async {
+      const abc =
+          'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad';
+      expect(await contentHash(() => Stream.value(utf8.encode('abc'))), abc);
+      expect(
+        await contentHash(
+          () => Stream.fromIterable([utf8.encode('a'), utf8.encode('bc')]),
+        ),
+        abc,
+      );
+      // A whole file in one chunk, as a browser reads it, is hashed in slices.
+      final large = Uint8List.fromList(
+        List.generate(3 * 1024 * 1024 + 7, (i) => i * 31 % 251),
+      );
+      expect(
+        await contentHash(() => Stream.value(large)),
+        '${sha256.convert(large)}',
+      );
+    },
+  );
+
+  test(
+    'a file the library holds goes as that file if the member says so',
+    () async {
+      final hub = _Hub();
+      final bytes = utf8.encode('same');
+      await hub.holds('old', 'kept.txt', bytes);
+      final asked = <String>[];
+      Future<bool> keep(Map<String, dynamic> existing) async {
+        asked.add(existing['id'] as String);
+        return true;
+      }
+
+      await hub.attach('copy.txt', 4, () => Stream.value(bytes), reuse: keep);
+      expect(asked, ['old']);
+      expect(hub.uploads, isEmpty);
+      expect(hub.readyFiles, ['old']);
+      final reused = hub.pendingFiles.single;
+      expect(reused.fromLibrary, isTrue);
+      expect(reused.name, 'kept.txt');
+      // Already on the message: it goes once.
+      await hub.attach('again.txt', 4, () => Stream.value(bytes), reuse: keep);
+      expect(hub.pendingFiles, [reused]);
+      // Taking it off the message keeps it in the library.
+      hub.detach(reused);
+      await Future<void>.delayed(Duration.zero);
+      expect(hub.requests, isEmpty);
+
+      // Uploaded again when the member wants a copy.
+      final upload = hub.attach(
+        'copy.txt',
+        4,
+        () => Stream.value(bytes),
+        reuse: (_) async => false,
+      );
+      while (!hub.uploads.containsKey('copy.txt')) {
+        await Future<void>.delayed(Duration.zero);
+      }
+      hub.uploads['copy.txt']!.complete({'id': 'new', 'kind': 'text'});
+      await upload;
+      expect(hub.readyFiles, ['new']);
+      expect(hub.pendingFiles.single.fromLibrary, isFalse);
+    },
+  );
+
+  testWidgets('one answer can do for every duplicate of a batch', (
+    tester,
+  ) async {
+    final hub = _Hub();
+    final first = utf8.encode('first'), second = utf8.encode('second');
+    await hub.holds('l1', 'first.txt', first);
+    await hub.holds('l2', 'second.txt', second);
+    late BuildContext context;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Builder(
+          builder: (c) {
+            context = c;
+            return const SizedBox();
+          },
+        ),
+      ),
+    );
+    await attachLocal(context, hub, [
+      (name: 'first.txt', size: 5, open: () => Stream.value(first)),
+      (name: 'b.txt', size: 6, open: () => Stream.value(second)),
+    ]);
+    await tester.pumpAndSettle();
+    expect(find.text('Already in your library'), findsOneWidget);
+    expect(find.textContaining('has the same content'), findsNothing);
+    await tester.tap(find.text('Do the same for other duplicates'));
+    await tester.pump();
+    await tester.tap(find.text('Use existing'));
+    await tester.pumpAndSettle();
+    expect(find.text('Already in your library'), findsNothing);
+    expect(hub.readyFiles, ['l1', 'l2']);
+    expect(hub.uploads, isEmpty);
   });
 
   testWidgets(

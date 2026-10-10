@@ -77,7 +77,7 @@ class _HubPageState extends State<HubPage>
           (name: name, size: bytes.length, open: () => Stream.value(bytes)),
         ]);
       } else {
-        attachBytes(hub, name, bytes);
+        attachBytes(context, hub, name, bytes);
       }
     });
     if (restoring) _restore();
@@ -1140,7 +1140,7 @@ class _HubPageState extends State<HubPage>
                             final files = await droppedFiles(details.files);
                             await libraryKey.currentState?.upload(files);
                           } else {
-                            await attachDropped(hub, details.files);
+                            await attachDropped(context, hub, details.files);
                           }
                         },
                         child: Stack(

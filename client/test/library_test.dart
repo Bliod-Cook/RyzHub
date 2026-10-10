@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:ryzhub/controller.dart';
 import 'package:ryzhub/main.dart';
+import 'package:ryzhub/ui/attachments.dart';
 import 'package:ryzhub/ui/library.dart';
 
 Map<String, dynamic> _file(String id, String name, String kind) => {
@@ -87,6 +88,74 @@ void main() {
     expect(uploadedOn('2026-09-18T10:00:00', now: now), 'Uploaded Sep 18');
     expect(uploadedOn('2025-01-02T10:00:00', now: now), 'Uploaded Jan 2, 2025');
     expect(uploadedOn(null, now: now), '');
+  });
+
+  test(
+    'a file time is to the minute, with the year only when it is not this one',
+    () {
+      final now = DateTime(2026, 10, 6);
+      expect(fileTime('2026-09-13T21:09:00', now: now), 'Sep 13, 9:09 PM');
+      expect(fileTime('2026-09-13T00:05:00', now: now), 'Sep 13, 12:05 AM');
+      expect(
+        fileTime('2025-01-02T12:30:00', now: now),
+        'Jan 2, 2025, 12:30 PM',
+      );
+      expect(fileTime(null, now: now), '');
+    },
+  );
+
+  testWidgets('library files are picked by tapping them, up to the limit', (
+    tester,
+  ) async {
+    final hub = _Hub();
+    tester.view.physicalSize = const Size(1200, 900);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.reset);
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: Builder(
+            builder: (context) => TextButton(
+              onPressed: () => chooseFromLibrary(context, hub),
+              child: const Text('open'),
+            ),
+          ),
+        ),
+      ),
+    );
+    await tester.tap(find.text('open'));
+    await tester.pumpAndSettle();
+    expect(find.text('Add from library'), findsOneWidget);
+    expect(find.byType(Checkbox), findsNothing);
+    // The actions wait for a pick.
+    expect(find.text('Add to chat'), findsNothing);
+    expect(find.textContaining('2.0 KB'), findsNWidgets(3));
+
+    await tester.tap(find.text('notes.md'));
+    await tester.pumpAndSettle();
+    expect(find.text('1 selected'), findsOneWidget);
+    expect(find.byIcon(Icons.check), findsOneWidget);
+    expect(find.text('Add to chat'), findsOneWidget);
+
+    await tester.tap(find.text('chart.png'));
+    await tester.pumpAndSettle();
+    expect(find.text('2 selected · limit reached'), findsOneWidget);
+    // The message holds two files, so a third cannot be picked.
+    await tester.tap(find.text('Report.pdf'));
+    await tester.pumpAndSettle();
+    expect(find.byIcon(Icons.check), findsNWidgets(2));
+
+    await tester.tap(find.text('notes.md'));
+    await tester.pumpAndSettle();
+    expect(find.text('1 selected'), findsOneWidget);
+    await tester.tap(find.text('Report.pdf'));
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.text('Add to chat'));
+    await tester.pumpAndSettle();
+    expect(find.text('Add from library'), findsNothing);
+    expect(hub.pendingFiles.map((f) => f.id), ['f1', 'f3']);
+    expect(hub.pendingFiles.every((f) => f.fromLibrary), isTrue);
   });
 
   test('the library replaces the conversation until one opens', () {

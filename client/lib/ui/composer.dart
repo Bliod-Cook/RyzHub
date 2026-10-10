@@ -703,7 +703,7 @@ Widget? plusMenu(
         ),
         row(
           Icons.folder_copy_outlined,
-          tr('从文件库选择', 'Choose from library'),
+          tr('从文件库添加', 'Add from library'),
           tr('用过的文件可以再次附带', 'Reuse files you uploaded before'),
           () => chooseFromLibrary(page, hub),
         ),

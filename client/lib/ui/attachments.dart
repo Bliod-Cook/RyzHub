@@ -13,6 +13,7 @@ import '../browser.dart';
 import '../controller.dart';
 import '../l10n.dart';
 import '../theme.dart';
+import 'common.dart';
 
 const _imageExtensions = {'png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp'};
 
@@ -42,6 +43,56 @@ IconData fileIcon(String? kind, String name) {
   }
   if (kind == 'text') return Icons.description_outlined;
   return Icons.insert_drive_file_outlined;
+}
+
+const _months = [
+  'Jan',
+  'Feb',
+  'Mar',
+  'Apr',
+  'May',
+  'Jun',
+  'Jul',
+  'Aug',
+  'Sep',
+  'Oct',
+  'Nov',
+  'Dec',
+];
+
+/// A file's date, e.g. "Sep 18"; the year only when it is not this one.
+({String zh, String en})? _fileDate(Object? value, DateTime? now) {
+  final t = DateTime.tryParse('$value')?.toLocal();
+  if (t == null) return null;
+  final thisYear = t.year == (now ?? DateTime.now()).year;
+  return (
+    zh: '${thisYear ? '' : '${t.year}年'}${t.month}月${t.day}日',
+    en: '${_months[t.month - 1]} ${t.day}${thisYear ? '' : ', ${t.year}'}',
+  );
+}
+
+/// When a file was uploaded, e.g. "Uploaded Sep 18", or made by a model; the
+/// year only when it is not this one.
+String uploadedOn(Object? value, {DateTime? now, bool generated = false}) {
+  final date = _fileDate(value, now);
+  if (date == null) return '';
+  return generated
+      ? tr('AI 生成于 ${date.zh}', 'Made by AI ${date.en}')
+      : tr('上传于 ${date.zh}', 'Uploaded ${date.en}');
+}
+
+/// When a file was added, to the minute, e.g. "Sep 18, 9:05 PM"; the year
+/// only when it is not this one.
+String fileTime(Object? value, {DateTime? now}) {
+  final date = _fileDate(value, now);
+  if (date == null) return '';
+  final t = DateTime.parse('$value').toLocal();
+  final minute = '${t.minute}'.padLeft(2, '0');
+  final hour = t.hour % 12 == 0 ? 12 : t.hour % 12;
+  return tr(
+    '${date.zh} ${t.hour}:$minute',
+    '${date.en}, $hour:$minute ${t.hour < 12 ? 'AM' : 'PM'}',
+  );
 }
 
 bool _deleted(Object? error) => '$error'.contains('ATTACHMENT_DELETED');
@@ -257,10 +308,14 @@ class PendingFiles extends StatelessWidget {
   /// Step through the message's uploaded files from [file].
   void preview(PendingFile file) {
     final uploaded = hub.pendingFiles.where((f) => f.id != null).toList();
-    hub.openPreview([
-      for (final f in uploaded)
-        {'id': f.id, 'name': f.name, 'kind': f.kind, 'size': f.size},
-    ], index: uploaded.indexOf(file), inConversation: true);
+    hub.openPreview(
+      [
+        for (final f in uploaded)
+          {'id': f.id, 'name': f.name, 'kind': f.kind, 'size': f.size},
+      ],
+      index: uploaded.indexOf(file),
+      inConversation: true,
+    );
   }
 
   @override
@@ -587,19 +642,45 @@ class _LibraryDialogState extends State<_LibraryDialog> {
   @override
   Widget build(BuildContext context) {
     final c = HubColors.of(context);
-    return AlertDialog(
-      title: Text(tr('从文件库选择', 'Choose from library')),
-      content: SizedBox(
-        width: 440,
-        height: 420,
+    final full = chosen.length >= room;
+    return Dialog(
+      insetPadding: const EdgeInsets.all(24),
+      child: ConstrainedBox(
+        constraints: const BoxConstraints(maxWidth: 600, maxHeight: 620),
         child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            FileSearchField(
-              autofocus: true,
-              onSearch: (query) {
-                this.query = query;
-                load();
-              },
+            Padding(
+              padding: const EdgeInsets.fromLTRB(24, 16, 12, 12),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      tr('从文件库添加', 'Add from library'),
+                      style: TextStyle(
+                        fontSize: 20,
+                        fontWeight: FontWeight.w600,
+                        color: c.text,
+                      ),
+                    ),
+                  ),
+                  IconButton(
+                    tooltip: tr('关闭', 'Close'),
+                    icon: const Icon(Icons.close),
+                    onPressed: () => Navigator.pop(context),
+                  ),
+                ],
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 24),
+              child: FileSearchField(
+                autofocus: true,
+                onSearch: (query) {
+                  this.query = query;
+                  load();
+                },
+              ),
             ),
             const SizedBox(height: 8),
             Expanded(
@@ -617,50 +698,176 @@ class _LibraryDialogState extends State<_LibraryDialog> {
                       ),
                     )
                   : ListView(
+                      padding: const EdgeInsets.fromLTRB(14, 4, 14, 8),
                       children: [
                         for (final file in files)
-                          CheckboxListTile(
-                            value: chosen.containsKey(file['id']),
-                            onChanged:
-                                chosen.containsKey(file['id']) ||
-                                    chosen.length < room
-                                ? (value) => setState(
-                                    () => value == true
+                          _LibraryRow(
+                            key: ValueKey(file['id']),
+                            hub: widget.hub,
+                            file: file,
+                            chosen: chosen.containsKey(file['id']),
+                            onTap: chosen.containsKey(file['id']) || !full
+                                ? () => setState(
+                                    () => chosen.remove(file['id']) == null
                                         ? chosen[file['id'] as String] = file
-                                        : chosen.remove(file['id']),
+                                        : null,
                                   )
                                 : null,
-                            secondary: FileThumbnail(
-                              hub: widget.hub,
-                              name: file['name'] as String,
-                              id: file['id'] as String,
-                              kind: file['kind'] as String?,
-                            ),
-                            title: Text(
-                              file['name'] as String,
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                            ),
-                            subtitle: Text(fileSize(file['size'] as num)),
                           ),
                       ],
+                    ),
+            ),
+            // The actions show once a file is picked.
+            AnimatedSize(
+              duration: const Duration(milliseconds: 180),
+              curve: Curves.easeOut,
+              alignment: Alignment.topCenter,
+              child: chosen.isEmpty
+                  ? const SizedBox(height: 12)
+                  : Container(
+                      decoration: BoxDecoration(
+                        border: Border(top: BorderSide(color: c.border)),
+                      ),
+                      padding: const EdgeInsets.fromLTRB(24, 12, 20, 16),
+                      child: Row(
+                        children: [
+                          Expanded(
+                            child: Text(
+                              tr(
+                                    '已选 ${chosen.length} 个',
+                                    '${chosen.length} selected',
+                                  ) +
+                                  (full
+                                      ? tr(' · 已达上限', ' · limit reached')
+                                      : ''),
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: TextStyle(fontSize: 13.5, color: c.subtle),
+                            ),
+                          ),
+                          TextButton(
+                            onPressed: () => Navigator.pop(context),
+                            child: Text(tr('取消', 'Cancel')),
+                          ),
+                          const SizedBox(width: 8),
+                          FilledButton(
+                            onPressed: () =>
+                                Navigator.pop(context, chosen.values.toList()),
+                            child: Text(tr('添加到对话', 'Add to chat')),
+                          ),
+                        ],
+                      ),
                     ),
             ),
           ],
         ),
       ),
-      actions: [
-        TextButton(
-          onPressed: () => Navigator.pop(context),
-          child: Text(tr('取消', 'Cancel')),
+    );
+  }
+}
+
+/// A file of the library dialog: tapping picks it or puts it back; [onTap] is
+/// null while no more files fit the message.
+class _LibraryRow extends StatelessWidget {
+  final HubController hub;
+  final Map<String, dynamic> file;
+  final bool chosen;
+  final VoidCallback? onTap;
+  const _LibraryRow({
+    super.key,
+    required this.hub,
+    required this.file,
+    required this.chosen,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final c = HubColors.of(context);
+    final name = file['name'] as String;
+    final details = [
+      fileTime(file['created_at']),
+      fileSize(file['size'] as num),
+    ].where((part) => part.isNotEmpty).join(' · ');
+    return Semantics(
+      button: true,
+      selected: chosen,
+      enabled: onTap != null,
+      child: Opacity(
+        opacity: onTap == null ? .45 : 1,
+        child: Hover(
+          builder: (context, hovered) => Material(
+            color: chosen
+                ? c.selected
+                : hovered && onTap != null
+                ? c.hover
+                : Colors.transparent,
+            borderRadius: BorderRadius.circular(12),
+            child: InkWell(
+              borderRadius: BorderRadius.circular(12),
+              onTap: onTap,
+              child: Padding(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 10,
+                  vertical: 9,
+                ),
+                child: Row(
+                  children: [
+                    FileThumbnail(
+                      hub: hub,
+                      name: name,
+                      id: file['id'] as String,
+                      kind: file['kind'] as String?,
+                      size: 44,
+                    ),
+                    const SizedBox(width: 14),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            name,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(fontSize: 14.5, color: c.text),
+                          ),
+                          const SizedBox(height: 3),
+                          Text(
+                            details,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(fontSize: 12.5, color: c.subtle),
+                          ),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(width: 12),
+                    // Keeps its place so the text does not shift on picking.
+                    SizedBox(
+                      width: 22,
+                      height: 22,
+                      child: chosen
+                          ? DecoratedBox(
+                              decoration: BoxDecoration(
+                                color: c.text,
+                                shape: BoxShape.circle,
+                              ),
+                              child: Icon(
+                                Icons.check,
+                                size: 15,
+                                color: c.background,
+                              ),
+                            )
+                          : null,
+                    ),
+                    const SizedBox(width: 4),
+                  ],
+                ),
+              ),
+            ),
+          ),
         ),
-        FilledButton(
-          onPressed: chosen.isEmpty
-              ? null
-              : () => Navigator.pop(context, chosen.values.toList()),
-          child: Text(tr('添加', 'Add')),
-        ),
-      ],
+      ),
     );
   }
 }

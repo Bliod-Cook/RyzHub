@@ -27,34 +27,6 @@ final _filters = <String, (String Function(), List<String>?, String?)>{
   'generated': (() => tr('AI 生成', 'AI-made'), null, 'output'),
 };
 
-const _months = [
-  'Jan',
-  'Feb',
-  'Mar',
-  'Apr',
-  'May',
-  'Jun',
-  'Jul',
-  'Aug',
-  'Sep',
-  'Oct',
-  'Nov',
-  'Dec',
-];
-
-/// When a file was uploaded, e.g. "Uploaded Sep 18", or made by a model; the
-/// year only when it is not this one.
-String uploadedOn(Object? value, {DateTime? now, bool generated = false}) {
-  final t = DateTime.tryParse('$value')?.toLocal();
-  if (t == null) return '';
-  final thisYear = t.year == (now ?? DateTime.now()).year;
-  final zh = '${thisYear ? '' : '${t.year}年'}${t.month}月${t.day}日';
-  final en = '${_months[t.month - 1]} ${t.day}${thisYear ? '' : ', ${t.year}'}';
-  return generated
-      ? tr('AI 生成于 $zh', 'Made by AI $en')
-      : tr('上传于 $zh', 'Uploaded $en');
-}
-
 /// The member's file library in place of a conversation: browse, search,
 /// upload and delete.
 class LibraryView extends StatefulWidget {

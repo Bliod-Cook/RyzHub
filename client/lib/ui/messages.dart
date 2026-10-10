@@ -10,6 +10,7 @@ import '../l10n.dart';
 import '../theme.dart';
 import 'code.dart';
 import 'common.dart';
+import 'math.dart';
 import 'unfold.dart';
 
 /// Message actions keep a 16px glyph in a compact highlight.
@@ -102,8 +103,10 @@ List<Widget> _blocks(
     },
     selectable: true,
     styleSheet: sheet,
-    inlineSyntaxes: [if (chips) _ChipSyntax(), _FileLinkSyntax()],
+    blockSyntaxes: const [MathBlockSyntax()],
+    inlineSyntaxes: [MathSyntax(), if (chips) _ChipSyntax(), _FileLinkSyntax()],
     builders: {
+      'math': MathBuilder(style: sheet.p!, fallback: sheet.code!),
       if (chips) 'cite': _ChipBuilder(citations, onSource),
       'file': _FileLinkBuilder(onSource),
     },

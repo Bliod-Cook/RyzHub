@@ -2,8 +2,6 @@
 //! `[report](sandbox:/workspace/report.pdf)`. When the reply completes, each linked file is
 //! copied out of the sandbox into the conversation owner's library and bound to the
 //! conversation: it outlives the sandbox, and later sandboxes find it under `/attachments`.
-use std::path::Path;
-
 use anyhow::Context;
 use ryzhub_execution::HostCommand;
 use ryzhub_proto::{AnswerDetail, Attachment, Item, ItemDetail, SharedFile, item_detail};
@@ -331,8 +329,8 @@ async fn from_sandbox(
         exec_epoch: lease.epoch as u64,
         path: path.to_owned(),
     };
-    let socket = Path::new(&app.config.sandbox.host_socket);
-    let (size, reader) = ryzhub_execution::download(socket, &command).await?;
+    let socket = crate::sandbox::endpoint(app, lease.org_id, sandbox).await?;
+    let (size, reader) = ryzhub_execution::download(&socket, &command).await?;
     let spool = Spool::read(reader, size, owner.limit).await?;
     let name = path
         .rsplit('/')

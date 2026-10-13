@@ -1,5 +1,7 @@
-//! Native-protocol model proxy. Requests pass through unchanged apart from authentication;
-//! usage is read from the stream as it is forwarded.
+//! Native-protocol model proxy. Requests pass through unchanged apart from authentication
+//! (and the model id where an upstream names it differently); usage is read from the stream as
+//! it is forwarded. Anthropic Messages, OpenAI Responses, OpenAI Chat Completions and Gemini
+//! are spoken; each model's route says where it is served.
 use anyhow::{Context, ensure};
 use axum::{
     Router,
@@ -7,11 +9,12 @@ use axum::{
     extract::{Path, State},
     http::HeaderMap,
     response::Response,
-    routing::post,
+    routing::{get, post},
 };
 use futures_util::StreamExt;
 use ryzhub_domain::{Action, Policy, Principal, Resource, authorize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use sqlx::Row;
 use std::time::Duration;
 use uuid::Uuid;
@@ -22,6 +25,7 @@ use super::{
 };
 use crate::{
     app::App,
+    config::{LlmConfig, Upstream},
     error::{ApiResult, Code},
     provider::{NativeMessage, ResponsesUsage, SseDecoder},
     store::{Tx, context_in, effective_policy},
@@ -29,13 +33,19 @@ use crate::{
 
 /// Fallback re-validation of an accepted stream when no revocation notice arrives.
 const STREAM_RECHECK: Duration = Duration::from_secs(5);
+/// Largest response kept when a policy retains model content.
+const RETAINED_BYTES: usize = 8 * 1024 * 1024;
 
 pub fn router(app: App) -> Router {
     Router::new()
         .route("/mcp", post(crate::mcp::endpoint))
         .route("/v1/messages", post(messages))
+        .route("/v1/messages/count_tokens", post(count_tokens))
         .route("/v1/responses", post(responses))
         .route("/v1/responses/compact", post(compact))
+        .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1beta/models/{target}", post(gemini))
+        .route("/v1/models", get(list_models))
         .layer(axum::extract::DefaultBodyLimit::max(32 * 1024 * 1024))
         .with_state(app)
 }
@@ -181,37 +191,321 @@ async fn rate_limit(app: &App, tx: &mut Tx<'_>, key: &GatewayKey) -> anyhow::Res
 }
 
 async fn messages(State(app): State<App>, headers: HeaderMap, body: Bytes) -> ApiResult<Response> {
-    Ok(proxy(app, headers, body, Provider::Anthropic, "/v1/messages").await?)
+    let call = Call::of(Protocol::Messages, "/v1/messages", &body)?;
+    Ok(proxy(app, headers, body, call).await?)
 }
 
 async fn responses(State(app): State<App>, headers: HeaderMap, body: Bytes) -> ApiResult<Response> {
-    Ok(proxy(app, headers, body, Provider::OpenAi, "/v1/responses").await?)
+    let call = Call::of(Protocol::Responses, "/v1/responses", &body)?;
+    Ok(proxy(app, headers, body, call).await?)
 }
 
 async fn compact(State(app): State<App>, headers: HeaderMap, body: Bytes) -> ApiResult<Response> {
-    Ok(proxy(
-        app,
-        headers,
-        body,
-        Provider::OpenAi,
-        "/v1/responses/compact",
-    )
-    .await?)
+    let call = Call::of(Protocol::Responses, "/v1/responses/compact", &body)?;
+    Ok(proxy(app, headers, body, call).await?)
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Provider {
-    Anthropic,
-    OpenAi,
+async fn chat_completions(
+    State(app): State<App>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult<Response> {
+    let mut call = Call::of(Protocol::ChatCompletions, "/v1/chat/completions", &body)?;
+    // Usage arrives in a stream only when asked for.
+    let body = if call.streaming {
+        let mut request = call.request.clone();
+        request["stream_options"]["include_usage"] = json!(true);
+        call.request = request;
+        Bytes::from(serde_json::to_vec(&call.request)?)
+    } else {
+        body
+    };
+    Ok(proxy(app, headers, body, call).await?)
 }
 
-impl Provider {
+/// `POST /v1beta/models/{model}:generateContent` and `:streamGenerateContent?alt=sse`.
+async fn gemini(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Path(target): Path<String>,
+    body: Bytes,
+) -> ApiResult<Response> {
+    let (model, action) = target.rsplit_once(':').context(Code::InvalidInput)?;
+    let streaming = match action {
+        "generateContent" => false,
+        "streamGenerateContent" => true,
+        _ => return Err(Code::InvalidInput.into()),
+    };
+    let request: Value = serde_json::from_slice(&body).map_err(|_| Code::InvalidInput)?;
+    let call = Call {
+        protocol: Protocol::Gemini,
+        // Streams come as server-sent events.
+        path: format!(
+            "/v1beta/models/{model}:{action}{}",
+            if streaming { "?alt=sse" } else { "" }
+        ),
+        model: model.to_owned(),
+        streaming,
+        request,
+        count_only: false,
+    };
+    Ok(proxy(app, headers, body, call).await?)
+}
+
+/// `POST /v1/messages/count_tokens`: answered by the upstream, no usage recorded.
+async fn count_tokens(
+    State(app): State<App>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult<Response> {
+    let mut call = Call::of(Protocol::Messages, "/v1/messages/count_tokens", &body)?;
+    call.count_only = true;
+    call.streaming = false;
+    Ok(proxy(app, headers, body, call).await?)
+}
+
+/// `GET /v1/models`: the models this key may use, in the caller's format (Anthropic's when it
+/// sends `anthropic-version`, else OpenAI's).
+async fn list_models(State(app): State<App>, headers: HeaderMap) -> ApiResult<axum::Json<Value>> {
+    let key = keys::resolve(&app.store, bearer(&headers)?).await?;
+    let mut tx = app.store.tx(key.org_id).await?;
+    validate_key(&mut tx, &key, false).await?;
+    let policy = effective_policy(&mut tx, &app.config.policy, key.org_id).await?;
+    tx.commit().await?;
+    let models: Vec<&String> = key
+        .models
+        .iter()
+        .filter(|m| policy.models.as_ref().is_none_or(|p| p.contains(*m)))
+        .collect();
+    Ok(axum::Json(if headers.contains_key("anthropic-version") {
+        json!({
+            "data": models.iter().map(|id| json!({"type":"model","id":id,"display_name":id,"created_at":"1970-01-01T00:00:00Z"})).collect::<Vec<_>>(),
+            "has_more": false,
+            "first_id": models.first(),
+            "last_id": models.last(),
+        })
+    } else {
+        json!({
+            "object": "list",
+            "data": models.iter().map(|id| json!({"id":id,"object":"model","created":0,"owned_by":"ryzhub"})).collect::<Vec<_>>(),
+        })
+    }))
+}
+
+/// A model protocol the gateway speaks.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Protocol {
+    Messages,
+    Responses,
+    ChatCompletions,
+    Gemini,
+}
+
+impl Protocol {
+    /// The kind of member credential it takes.
     fn credential(self) -> &'static str {
         match self {
-            Self::Anthropic => "anthropic",
-            Self::OpenAi => "openai",
+            Self::Messages => "anthropic",
+            Self::Responses | Self::ChatCompletions => "openai",
+            Self::Gemini => "gemini",
         }
     }
+
+    /// Its name in `llm.models` routes.
+    fn route(self) -> &'static str {
+        match self {
+            Self::Messages => "anthropic",
+            Self::Responses => "responses",
+            Self::ChatCompletions => "chat_completions",
+            Self::Gemini => "gemini",
+        }
+    }
+
+    /// Where it is served when a route names no upstream, and the variable of its key.
+    fn default_upstream(self, llm: &LlmConfig) -> (&str, &str) {
+        match self {
+            Self::Messages => (&llm.upstream_url, &llm.platform_key_env),
+            Self::Responses => (&llm.responses_url, &llm.responses_key_env),
+            Self::ChatCompletions => (&llm.chat_completions_url, &llm.chat_completions_key_env),
+            Self::Gemini => (&llm.gemini_url, &llm.gemini_key_env),
+        }
+    }
+
+    /// The request's reasoning level, when it asks for one, ranked like policy levels.
+    fn reasoning(self, request: &Value) -> Option<String> {
+        // Thinking budgets in tokens, as the least level that allows them.
+        let budget = |tokens: Option<i64>| {
+            tokens.filter(|t| *t > 0).map(|t| {
+                match t {
+                    ..=1024 => "minimal",
+                    1025..=4096 => "low",
+                    4097..=16384 => "medium",
+                    16385..=32768 => "high",
+                    32769..=65536 => "xhigh",
+                    _ => "max",
+                }
+                .to_owned()
+            })
+        };
+        // `none` asks for no reasoning at all.
+        let named = |value: &Value| {
+            value
+                .as_str()
+                .filter(|level| *level != "none")
+                .map(str::to_owned)
+        };
+        match self {
+            Self::Messages => named(&request["output_config"]["effort"])
+                .or_else(|| budget(request["thinking"]["budget_tokens"].as_i64())),
+            Self::Responses => named(&request["reasoning"]["effort"]),
+            Self::ChatCompletions => named(&request["reasoning_effort"]),
+            Self::Gemini => {
+                let thinking = &request["generationConfig"]["thinkingConfig"];
+                named(&thinking["thinkingLevel"])
+                    .map(|l| l.to_lowercase())
+                    .or_else(|| budget(thinking["thinkingBudget"].as_i64()))
+            }
+        }
+    }
+}
+
+/// One request to forward.
+struct Call {
+    protocol: Protocol,
+    /// The upstream path, with its query.
+    path: String,
+    model: String,
+    streaming: bool,
+    request: Value,
+    /// Answered without recording usage (token counting).
+    count_only: bool,
+}
+
+impl Call {
+    fn of(protocol: Protocol, path: &str, body: &[u8]) -> anyhow::Result<Self> {
+        let request: Value = serde_json::from_slice(body).map_err(|_| Code::InvalidInput)?;
+        let model = request["model"]
+            .as_str()
+            .context(Code::InvalidInput)?
+            .to_owned();
+        Ok(Self {
+            protocol,
+            path: path.to_owned(),
+            model,
+            streaming: request["stream"].as_bool().unwrap_or(false),
+            request,
+            count_only: false,
+        })
+    }
+}
+
+/// Where a request may go: an upstream, the key it takes there and the model's id there.
+struct Target {
+    url: String,
+    secret: String,
+    model: Option<String>,
+}
+
+/// The upstreams `call` may go to, in the order to try them, and the member credential used.
+/// A member's own credential goes to the protocol's default upstream alone: their key is not
+/// good elsewhere.
+async fn targets(
+    app: &App,
+    tx: &mut Tx<'_>,
+    key: &GatewayKey,
+    policy: &Policy,
+    explicit: Option<Uuid>,
+    call: &Call,
+) -> anyhow::Result<(Option<Uuid>, Vec<Target>)> {
+    let llm = &app.config.llm;
+    let (default_url, default_env) = call.protocol.default_upstream(llm);
+    let credential = call.protocol.credential();
+    if let Some((id, secret)) = credentials::member_key(
+        app,
+        tx,
+        key.org_id,
+        key.user_id,
+        explicit,
+        policy,
+        credential,
+    )
+    .await?
+    {
+        let target = Target {
+            url: default_url.to_owned(),
+            secret,
+            model: None,
+        };
+        return Ok((Some(id), vec![target]));
+    }
+    ensure!(explicit.is_none(), Code::CredentialUnavailable);
+    ensure!(
+        policy.allow_platform_credentials != Some(false),
+        Code::PlatformCredentialDenied
+    );
+    let route = llm
+        .models
+        .iter()
+        .find(|r| r.id == call.model && r.protocol == call.protocol.route());
+    let configured = route.map(|r| r.upstreams.clone()).unwrap_or_default();
+    let upstreams = if configured.is_empty() {
+        vec![Upstream {
+            url: default_url.to_owned(),
+            ..Default::default()
+        }]
+    } else {
+        configured
+    };
+    let targets: Vec<Target> = order(upstreams, rand::random)
+        .into_iter()
+        .filter_map(|u| {
+            let env = if u.key_env.is_empty() {
+                default_env
+            } else {
+                &u.key_env
+            };
+            Some(Target {
+                secret: std::env::var(env).ok()?,
+                model: (!u.model.is_empty()).then(|| u.model.clone()),
+                url: u.url,
+            })
+        })
+        .collect();
+    ensure!(!targets.is_empty(), Code::CredentialUnavailable);
+    Ok((None, targets))
+}
+
+/// Upstreams in the order to try them: by priority, and within one at random, each in
+/// proportion to its weight.
+fn order(mut upstreams: Vec<Upstream>, mut random: impl FnMut() -> u64) -> Vec<Upstream> {
+    upstreams.sort_by_key(|u| u.priority);
+    let mut ordered = Vec::with_capacity(upstreams.len());
+    while !upstreams.is_empty() {
+        let priority = upstreams[0].priority;
+        let tier = upstreams
+            .iter()
+            .take_while(|u| u.priority == priority)
+            .count();
+        let total: u64 = upstreams[..tier]
+            .iter()
+            .map(|u| u.weight.max(1) as u64)
+            .sum();
+        let mut pick = random() % total;
+        let index = upstreams[..tier]
+            .iter()
+            .position(|u| {
+                let weight = u.weight.max(1) as u64;
+                if pick < weight {
+                    true
+                } else {
+                    pick -= weight;
+                    false
+                }
+            })
+            .unwrap_or(0);
+        ordered.push(upstreams.remove(index));
+    }
+    ordered
 }
 
 /// Headers forwarded to the provider unchanged.
@@ -223,116 +517,152 @@ const FORWARDED: [&str; 5] = [
     "x-claude-code-parent-agent-id",
 ];
 
-async fn proxy(
-    app: App,
-    headers: HeaderMap,
-    body: Bytes,
-    provider: Provider,
-    path: &str,
-) -> anyhow::Result<Response> {
+async fn proxy(app: App, headers: HeaderMap, body: Bytes, call: Call) -> anyhow::Result<Response> {
     ensure!(app.config.llm.enabled, Code::ModelGatewayDisabled);
     let key = keys::resolve(&app.store, bearer(&headers)?).await?;
-    let request: Value = serde_json::from_slice(&body).map_err(|_| Code::InvalidInput)?;
-    let model = request["model"]
-        .as_str()
-        .context(Code::InvalidInput)?
-        .to_owned();
-    let streaming = request["stream"].as_bool().unwrap_or(false);
     let mut tx = app.store.tx(key.org_id).await?;
     let binding = validate_key(&mut tx, &key, false).await?;
-    let policy = authorize_model(&app, &mut tx, &key, &model).await?;
-    let (credential, secret) = credentials::resolve(
-        &app,
-        &mut tx,
-        key.org_id,
-        key.user_id,
-        binding.credential,
-        &policy,
-        provider.credential(),
-    )
-    .await?;
-    rate_limit(&app, &mut tx, &key).await?;
+    let policy = authorize_model(&app, &mut tx, &key, &call.model).await?;
+    if let (Some(limit), Some(asked)) = (
+        &policy.max_reasoning,
+        call.protocol.reasoning(&call.request),
+    ) {
+        ensure!(
+            ryzhub_domain::reasoning_rank(&asked) <= ryzhub_domain::reasoning_rank(limit),
+            Code::ReasoningDenied
+        );
+    }
+    let (credential, targets) =
+        targets(&app, &mut tx, &key, &policy, binding.credential, &call).await?;
     let request_id = Uuid::now_v7();
-    let metadata = |name: &str| {
-        headers
-            .get(name)
-            .and_then(|h| h.to_str().ok())
-            .map(|h| h.chars().take(256).collect::<String>())
-    };
-    sqlx::query(
-        "INSERT INTO usage_records(id,org_id,user_id,run_id,virtual_key_id,model,credential_id,session_id,
-             agent_id,parent_agent_id,provider)
-         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
-    )
-    .bind(request_id)
-    .bind(key.org_id)
-    .bind(key.user_id)
-    .bind(key.run_id)
-    .bind((key.kind() == KeyKind::Sandbox).then_some(key.id))
-    .bind(&model)
-    .bind(credential)
-    .bind(metadata("x-claude-code-session-id"))
-    .bind(metadata("x-claude-code-agent-id"))
-    .bind(metadata("x-claude-code-parent-agent-id"))
-    .bind(provider.credential())
-    .execute(&mut *tx)
-    .await?;
-    crate::store::audit_as(
-        &mut tx,
-        key.org_id,
-        key.user_id,
-        if key.kind() == KeyKind::Loop {
-            "loop"
-        } else {
-            "sandbox"
-        },
-        "model.request",
-        &request_id.to_string(),
-        "accepted",
-    )
-    .await?;
+    if !call.count_only {
+        rate_limit(&app, &mut tx, &key).await?;
+        let metadata = |name: &str| {
+            headers
+                .get(name)
+                .and_then(|h| h.to_str().ok())
+                .map(|h| h.chars().take(256).collect::<String>())
+        };
+        sqlx::query(
+            "INSERT INTO usage_records(id,org_id,user_id,run_id,virtual_key_id,model,credential_id,session_id,
+                 agent_id,parent_agent_id,provider)
+             VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
+        )
+        .bind(request_id)
+        .bind(key.org_id)
+        .bind(key.user_id)
+        .bind(key.run_id)
+        .bind((key.kind() == KeyKind::Sandbox).then_some(key.id))
+        .bind(&call.model)
+        .bind(credential)
+        .bind(metadata("x-claude-code-session-id"))
+        .bind(metadata("x-claude-code-agent-id"))
+        .bind(metadata("x-claude-code-parent-agent-id"))
+        .bind(call.protocol.credential())
+        .execute(&mut *tx)
+        .await?;
+        crate::store::audit_as(
+            &mut tx,
+            key.org_id,
+            key.user_id,
+            if key.kind() == KeyKind::Loop {
+                "loop"
+            } else {
+                "sandbox"
+            },
+            "model.request",
+            &request_id.to_string(),
+            "accepted",
+        )
+        .await?;
+    }
     tx.commit().await?;
 
-    let base = match provider {
-        Provider::OpenAi => &app.config.llm.responses_url,
-        Provider::Anthropic => &app.config.llm.upstream_url,
-    };
-    let mut outgoing = app
-        .http
-        .upstream
-        .post(format!("{}{path}", base.trim_end_matches('/')))
-        .header("content-type", "application/json")
-        .body(body.clone());
-    outgoing = match provider {
-        Provider::OpenAi => outgoing.bearer_auth(secret),
-        Provider::Anthropic => outgoing.header("x-api-key", secret),
-    };
-    for name in FORWARDED {
-        if let Some(value) = headers.get(name) {
-            outgoing = outgoing.header(name, value);
-        }
-    }
-    if provider == Provider::Anthropic && !headers.contains_key("anthropic-version") {
-        outgoing = outgoing.header("anthropic-version", "2023-06-01");
-    }
+    // Content never outlives its usage record, whose month is dropped after `usage_days`.
+    let usage_days = app.config.retention.usage_days;
+    let retain_days = policy
+        .retain_model_content_days
+        .filter(|_| !call.count_only)
+        .map(|days| {
+            if usage_days > 0 {
+                days.min(usage_days)
+            } else {
+                days
+            }
+        });
     let meter = Meter {
         app: app.clone(),
         key,
-        model,
+        model: call.model.clone(),
         credential,
         request_id,
+        request: retain_days.map(|_| body.clone()),
+        retain_days,
         input_bytes: body.len(),
-        provider,
-        streaming,
+        protocol: call.protocol,
+        streaming: call.streaming,
+        count_only: call.count_only,
     };
-    let upstream = match outgoing.send().await {
-        Ok(response) => response,
-        Err(_) => {
-            meter
-                .finish(Value::Null, 0, false, "upstream_unreachable", None)
-                .await?;
-            anyhow::bail!(Code::UpstreamUnavailable);
+    // Each upstream in turn until one answers with something other than an outage.
+    let mut upstream = None;
+    let last = targets.len() - 1;
+    for (n, target) in targets.into_iter().enumerate() {
+        let body = match &target.model {
+            Some(model) if call.protocol != Protocol::Gemini => {
+                let mut request = call.request.clone();
+                request["model"] = json!(model);
+                Bytes::from(serde_json::to_vec(&request)?)
+            }
+            _ => body.clone(),
+        };
+        let path = match (&target.model, call.protocol) {
+            (Some(model), Protocol::Gemini) => call.path.replacen(&call.model, model, 1),
+            _ => call.path.clone(),
+        };
+        let mut outgoing = app
+            .http
+            .upstream
+            .post(format!("{}{path}", target.url.trim_end_matches('/')))
+            .header("content-type", "application/json")
+            .body(body);
+        outgoing = match call.protocol {
+            Protocol::Responses | Protocol::ChatCompletions => outgoing.bearer_auth(&target.secret),
+            Protocol::Messages => outgoing.header("x-api-key", &target.secret),
+            Protocol::Gemini => outgoing.header("x-goog-api-key", &target.secret),
+        };
+        for name in FORWARDED {
+            if let Some(value) = headers.get(name) {
+                outgoing = outgoing.header(name, value);
+            }
         }
+        if call.protocol == Protocol::Messages && !headers.contains_key("anthropic-version") {
+            outgoing = outgoing.header("anthropic-version", "2023-06-01");
+        }
+        match outgoing.send().await {
+            Ok(response)
+                if n < last
+                    && (response.status().is_server_error()
+                        || response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS) =>
+            {
+                tracing::info!(status = %response.status(), url = %target.url, "upstream refused; trying the next");
+            }
+            Ok(response) => {
+                upstream = Some(response);
+                break;
+            }
+            Err(error) if n < last => {
+                tracing::info!(%error, url = %target.url, "upstream unreachable; trying the next");
+            }
+            Err(_) => {}
+        }
+    }
+    let Some(upstream) = upstream else {
+        if !call.count_only {
+            meter
+                .finish(Value::Null, 0, false, "upstream_unreachable", None, None)
+                .await?;
+        }
+        anyhow::bail!(Code::UpstreamUnavailable);
     };
     let status = upstream.status();
     let mut response = Response::builder().status(status);
@@ -380,9 +710,86 @@ struct Meter {
     model: String,
     credential: Option<Uuid>,
     request_id: Uuid,
+    /// The request, kept with the response when the policy retains model content.
+    request: Option<Bytes>,
+    retain_days: Option<u32>,
     input_bytes: usize,
-    provider: Provider,
+    protocol: Protocol,
     streaming: bool,
+    /// Token counting: nothing to record.
+    count_only: bool,
+}
+
+/// Usage as the protocols' streams report it.
+#[derive(Default)]
+struct StreamUsage {
+    anthropic: NativeMessage,
+    openai: ResponsesUsage,
+    /// Chat Completions' and Gemini's usage so far, and whether the stream has finished.
+    usage: Value,
+    finished: bool,
+}
+
+impl StreamUsage {
+    fn apply(&mut self, protocol: Protocol, event: &Value) -> anyhow::Result<()> {
+        match protocol {
+            Protocol::Responses => self.openai.apply(event)?,
+            Protocol::Messages => {
+                self.anthropic.apply(event)?;
+            }
+            // The last chunk carries the usage the request asked for.
+            Protocol::ChatCompletions => {
+                if event["usage"].is_object() {
+                    self.usage = event["usage"].clone();
+                    self.finished = true;
+                }
+            }
+            // Every chunk carries the usage so far.
+            Protocol::Gemini => {
+                if event["usageMetadata"].is_object() {
+                    self.usage = event["usageMetadata"].clone();
+                }
+                if event["candidates"][0]["finishReason"].is_string() {
+                    self.finished = true;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// `usage` as input and output tokens, whatever the protocol calls them. Gemini counts thoughts
+/// apart from the answer; both are output.
+fn tokens(protocol: Protocol, usage: &Value) -> (Option<i64>, Option<i64>) {
+    match protocol {
+        // A compaction is billed apart from the message: each is an iteration, and the
+        // top-level counts leave the compaction out.
+        Protocol::Messages if usage["iterations"].is_array() => {
+            let sum = |field: &str| {
+                usage["iterations"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|i| i[field].as_i64())
+                    .sum::<Option<i64>>()
+            };
+            (sum("input_tokens"), sum("output_tokens"))
+        }
+        Protocol::Messages | Protocol::Responses => (
+            usage["input_tokens"].as_i64(),
+            usage["output_tokens"].as_i64(),
+        ),
+        Protocol::ChatCompletions => (
+            usage["prompt_tokens"].as_i64(),
+            usage["completion_tokens"].as_i64(),
+        ),
+        Protocol::Gemini => (
+            usage["promptTokenCount"].as_i64(),
+            usage["candidatesTokenCount"]
+                .as_i64()
+                .map(|candidates| candidates + usage["thoughtsTokenCount"].as_i64().unwrap_or(0)),
+        ),
+    }
 }
 
 impl Meter {
@@ -394,13 +801,13 @@ impl Meter {
         let status = upstream.status();
         let mut stream = upstream.bytes_stream();
         let mut decoder = SseDecoder::default();
-        let mut anthropic = NativeMessage::default();
-        let mut openai = ResponsesUsage::default();
+        let mut parsed = StreamUsage::default();
         let mut notices = self.app.revocations.subscribe();
         let mut recheck = tokio::time::interval(STREAM_RECHECK);
         recheck.tick().await;
         let (mut parse_ok, mut completed, mut received) = (true, true, 0usize);
         let mut json_body = Vec::new();
+        let mut kept = self.request.as_ref().map(|_| Vec::new());
         loop {
             let chunk = tokio::select! {
                 () = sender.closed() => { completed = false; break; }
@@ -432,13 +839,17 @@ impl Meter {
                 break;
             };
             received += bytes.len();
+            if let Some(kept) = &mut kept
+                && kept.len() + bytes.len() <= RETAINED_BYTES
+            {
+                kept.extend_from_slice(&bytes);
+            }
             if self.streaming && status.is_success() {
                 if parse_ok {
                     parse_ok = decoder.push(&bytes).is_ok_and(|events| {
-                        events.iter().all(|event| match self.provider {
-                            Provider::OpenAi => openai.apply(event).is_ok(),
-                            Provider::Anthropic => anthropic.apply(event).is_ok(),
-                        })
+                        events
+                            .iter()
+                            .all(|event| parsed.apply(self.protocol, event).is_ok())
                     });
                 }
             } else if json_body.len() + bytes.len() <= 4 * 1024 * 1024 {
@@ -451,27 +862,37 @@ impl Meter {
                 break;
             }
         }
-        let (usage, final_usage, output_bytes) = match (self.streaming, self.provider) {
-            (true, Provider::OpenAi) => (
-                openai.usage.clone(),
-                completed && parse_ok && openai.finished,
+        if self.count_only {
+            return;
+        }
+        let (usage, final_usage, output_bytes) = match (self.streaming, self.protocol) {
+            (true, Protocol::Responses) => (
+                parsed.openai.usage.clone(),
+                completed && parse_ok && parsed.openai.finished,
                 received,
             ),
-            (true, Provider::Anthropic) => (
-                anthropic.response["usage"].clone(),
-                completed && parse_ok && anthropic.stopped,
-                anthropic.text_bytes,
+            (true, Protocol::Messages) => (
+                parsed.anthropic.response["usage"].clone(),
+                completed && parse_ok && parsed.anthropic.stopped,
+                parsed.anthropic.text_bytes,
             ),
-            (false, _) => {
+            (true, _) => (
+                parsed.usage.clone(),
+                completed && parse_ok && parsed.finished && parsed.usage.is_object(),
+                received,
+            ),
+            (false, protocol) => {
                 let value: Value = serde_json::from_slice(&json_body).unwrap_or(Value::Null);
-                (
-                    value["usage"].clone(),
-                    completed && parse_ok && value["usage"].is_object(),
-                    received,
-                )
+                let usage = if protocol == Protocol::Gemini {
+                    value["usageMetadata"].clone()
+                } else {
+                    value["usage"].clone()
+                };
+                let final_usage = completed && parse_ok && usage.is_object();
+                (usage, final_usage, received)
             }
         };
-        let outcome = if !status.is_success() || openai.failed {
+        let outcome = if !status.is_success() || parsed.openai.failed {
             "upstream_error"
         } else if completed && final_usage {
             "completed"
@@ -485,6 +906,7 @@ impl Meter {
                 final_usage,
                 outcome,
                 Some(status.as_u16() as i32),
+                kept,
             )
             .await
         {
@@ -536,7 +958,8 @@ impl Meter {
         Ok(())
     }
 
-    /// Record usage. Without final provider usage, tokens are estimated from bytes.
+    /// Record usage. Without final provider usage, tokens are estimated from bytes. A policy
+    /// that retains model content keeps the request and `response` for review.
     async fn finish(
         &self,
         usage: Value,
@@ -544,18 +967,30 @@ impl Meter {
         final_usage: bool,
         status: &str,
         upstream_status: Option<i32>,
+        response: Option<Vec<u8>>,
     ) -> anyhow::Result<()> {
-        let input = usage["input_tokens"]
-            .as_i64()
-            .unwrap_or(self.input_bytes.div_ceil(4) as i64);
-        let output = usage["output_tokens"]
-            .as_i64()
-            .unwrap_or(output_bytes.div_ceil(4) as i64);
+        let (input, output) = tokens(self.protocol, &usage);
+        let input = input.unwrap_or(self.input_bytes.div_ceil(4) as i64);
+        let output = output.unwrap_or(output_bytes.div_ceil(4) as i64);
         let raw = if usage.is_object() { usage } else { json!({}) };
+        let (mut expires, mut retained) = (None, None);
+        if let (Some(request), Some(response), Some(days)) =
+            (&self.request, response, self.retain_days)
+        {
+            let store = model_content(&self.app, self.key.org_id, self.request_id)?;
+            let mut keys = json!({});
+            for (part, bytes) in [("request", &request[..]), ("response", &response[..])] {
+                let key = format!("{:x}", Sha256::digest(bytes));
+                store.put(&key, bytes).await?;
+                keys[part] = json!(key);
+            }
+            expires = Some(chrono::Utc::now() + chrono::Duration::days(days.into()));
+            retained = Some(keys);
+        }
         let mut tx = self.app.store.tx(self.key.org_id).await?;
         sqlx::query(
             "UPDATE usage_records SET input_tokens=$3,output_tokens=$4,raw_usage=$5,estimated=$6,status=$7,
-                 upstream_status=$8,finished_at=now()
+                 upstream_status=$8,content_expires_at=$9,retained_content=$10,finished_at=now()
              WHERE org_id=$1 AND id=$2",
         )
         .bind(self.key.org_id)
@@ -566,11 +1001,57 @@ impl Meter {
         .bind(!final_usage)
         .bind(status)
         .bind(upstream_status)
+        .bind(expires)
+        .bind(retained)
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
         Ok(())
     }
+}
+
+/// Where a request's retained content is kept: `llm/<usage record id>/` in the organization's
+/// primary store, by content address. The record's `retained_content` names the request's and
+/// the response's.
+pub fn model_content(
+    app: &App,
+    org: Uuid,
+    id: Uuid,
+) -> anyhow::Result<crate::workspace::blob::BlobStore> {
+    Ok(
+        crate::workspace::blob::BlobStore::configured(&app.config.work.storage_root)?
+            .scoped(org)
+            .within("llm")
+            .within(&id.to_string()),
+    )
+}
+
+/// Deletes retained model content once its days are over.
+pub async fn purge_model_content(app: &App, worker: &sqlx::PgPool) -> anyhow::Result<()> {
+    let expired: Vec<(Uuid, Uuid, Option<Value>)> = sqlx::query_as(
+        "SELECT org_id,id,retained_content FROM usage_records WHERE content_expires_at<now() LIMIT 1000",
+    )
+    .fetch_all(worker)
+    .await?;
+    for (org, id, retained) in expired {
+        let store = model_content(app, org, id)?;
+        for part in ["request", "response"] {
+            if let Some(key) = retained.as_ref().and_then(|r| r[part].as_str()) {
+                store.delete(key).await?;
+            }
+        }
+        let mut tx = app.store.tx(org).await?;
+        sqlx::query(
+            "UPDATE usage_records SET content_expires_at=NULL,retained_content=NULL
+             WHERE org_id=$1 AND id=$2",
+        )
+        .bind(org)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+    }
+    Ok(())
 }
 
 /// `GET /orgs/{org}/usage`: the caller's records, or the organization's for owners/admins.
@@ -603,4 +1084,180 @@ pub async fn usage(
     .await?;
     tx.commit().await?;
     Ok(axum::Json(rows))
+}
+
+/// `GET /orgs/{org}/usage/{id}/content`: a request's retained content, for owners and admins.
+pub async fn usage_content(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Path((org, id)): Path<(Uuid, Uuid)>,
+) -> ApiResult<axum::Json<Value>> {
+    let ctx = crate::http::member(&app, &headers, org).await?;
+    authorize(
+        &Principal::User(ctx),
+        Action::ViewOrgUsage,
+        &Resource {
+            org_id: org,
+            id: org,
+            owner_user_id: None,
+            target_role: None,
+        },
+    )
+    .map_err(|_| Code::Forbidden)?;
+    let mut tx = app.store.tx(org).await?;
+    let retained: Option<Value> = sqlx::query_scalar(
+        "SELECT retained_content FROM usage_records WHERE org_id=$1 AND id=$2 AND content_expires_at>now()",
+    )
+    .bind(org)
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .flatten();
+    tx.commit().await?;
+    let retained = retained.ok_or(Code::ContentNotRetained)?;
+    let store = model_content(&app, org, id)?;
+    let mut content = json!({});
+    for part in ["request", "response"] {
+        let key = retained[part].as_str().context(Code::ContentNotRetained)?;
+        let bytes = store.get(key).await?;
+        content[part] = json!(String::from_utf8_lossy(&bytes));
+    }
+    Ok(axum::Json(content))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn upstream(url: &str, priority: u32, weight: u32) -> Upstream {
+        Upstream {
+            url: url.into(),
+            priority,
+            weight,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn upstreams_go_by_priority_then_weight() {
+        let upstreams = vec![
+            upstream("c", 1, 1),
+            upstream("a", 0, 3),
+            upstream("b", 0, 1),
+        ];
+        let urls = |random: u64| -> Vec<String> {
+            order(upstreams.clone(), || random)
+                .into_iter()
+                .map(|u| u.url)
+                .collect()
+        };
+        // Within priority 0, picks below 3 land on `a`, the fourth on `b`.
+        assert_eq!(urls(0), ["a", "b", "c"]);
+        assert_eq!(urls(2), ["a", "b", "c"]);
+        assert_eq!(urls(3), ["b", "a", "c"]);
+        let mut first = std::collections::BTreeMap::<String, usize>::new();
+        let mut seed = 7u64;
+        for _ in 0..4000 {
+            let ordered = order(upstreams.clone(), || {
+                seed = seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                seed >> 33
+            });
+            assert_eq!(ordered[2].url, "c");
+            *first.entry(ordered[0].url.clone()).or_default() += 1;
+        }
+        assert!((2700..3300).contains(&first["a"]), "{first:?}");
+    }
+
+    #[test]
+    fn reasoning_reads_each_protocol() {
+        let level = |protocol: Protocol, request: Value| protocol.reasoning(&request);
+        assert_eq!(
+            level(
+                Protocol::Messages,
+                json!({"output_config":{"effort":"high"}})
+            )
+            .as_deref(),
+            Some("high")
+        );
+        assert_eq!(
+            level(
+                Protocol::Messages,
+                json!({"thinking":{"type":"enabled","budget_tokens":2048}})
+            )
+            .as_deref(),
+            Some("low")
+        );
+        assert_eq!(level(Protocol::Messages, json!({})), None);
+        assert_eq!(
+            level(Protocol::Responses, json!({"reasoning":{"effort":"xhigh"}})).as_deref(),
+            Some("xhigh")
+        );
+        assert_eq!(
+            level(
+                Protocol::ChatCompletions,
+                json!({"reasoning_effort":"none"})
+            ),
+            None
+        );
+        assert_eq!(
+            level(
+                Protocol::Gemini,
+                json!({"generationConfig":{"thinkingConfig":{"thinkingLevel":"HIGH"}}})
+            )
+            .as_deref(),
+            Some("high")
+        );
+        assert_eq!(
+            level(
+                Protocol::Gemini,
+                json!({"generationConfig":{"thinkingConfig":{"thinkingBudget":100000}}})
+            )
+            .as_deref(),
+            Some("max")
+        );
+        // Off, and the model's own choice, ask for no level.
+        for budget in [0, -1] {
+            assert_eq!(
+                level(
+                    Protocol::Gemini,
+                    json!({"generationConfig":{"thinkingConfig":{"thinkingBudget":budget}}})
+                ),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn usage_reads_as_input_and_output_tokens() {
+        assert_eq!(
+            tokens(
+                Protocol::ChatCompletions,
+                &json!({"prompt_tokens":11,"completion_tokens":3})
+            ),
+            (Some(11), Some(3))
+        );
+        assert_eq!(
+            tokens(
+                Protocol::Gemini,
+                &json!({"promptTokenCount":20,"candidatesTokenCount":2,"thoughtsTokenCount":5})
+            ),
+            (Some(20), Some(7))
+        );
+        assert_eq!(
+            tokens(
+                Protocol::Messages,
+                &json!({"input_tokens":25,"output_tokens":8})
+            ),
+            (Some(25), Some(8))
+        );
+        let compacted = json!({"input_tokens":0,"output_tokens":0,"iterations":[
+            {"type":"compaction","input_tokens":180000,"output_tokens":3000},
+            {"type":"message","input_tokens":4000,"output_tokens":200}]});
+        assert_eq!(
+            tokens(Protocol::Messages, &compacted),
+            (Some(184000), Some(3200))
+        );
+    }
 }

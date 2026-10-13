@@ -234,7 +234,7 @@ class _ImagePreviewState extends State<_ImagePreview> {
       maxScale: 8,
       child: Center(
         child: Padding(
-          padding: const EdgeInsets.all(24),
+          padding: const EdgeInsets.all(Space.s24),
           child: PreviewContent(
             child: DecoratedBox(
               // Lifted off the blurred page, which may be as white.
@@ -370,13 +370,23 @@ class _Paper extends StatelessWidget {
   Widget build(BuildContext context) {
     final c = HubColors.of(context);
     return SingleChildScrollView(
-      padding: const EdgeInsets.fromLTRB(16, 8, 16, 24),
+      padding: const EdgeInsets.fromLTRB(
+        Space.s16,
+        Space.s8,
+        Space.s16,
+        Space.s24,
+      ),
       child: Center(
         child: PreviewContent(
           child: Container(
             width: double.infinity,
             constraints: BoxConstraints(maxWidth: maxWidth),
-            padding: const EdgeInsets.fromLTRB(32, 28, 32, 32),
+            padding: const EdgeInsets.fromLTRB(
+              Space.s32,
+              Space.s28,
+              Space.s32,
+              Space.s32,
+            ),
             decoration: BoxDecoration(
               color: c.background,
               borderRadius: BorderRadius.circular(16),
@@ -436,7 +446,7 @@ class UnavailablePreview extends StatelessWidget {
     final c = HubColors.of(context);
     return Center(
       child: SingleChildScrollView(
-        padding: const EdgeInsets.all(24),
+        padding: const EdgeInsets.all(Space.s24),
         child: PreviewContent(
           child: Column(
             mainAxisSize: MainAxisSize.min,
@@ -482,7 +492,7 @@ class UnavailablePreview extends StatelessWidget {
                 OutlinedButton(
                   style: OutlinedButton.styleFrom(
                     visualDensity: VisualDensity.compact,
-                    padding: const EdgeInsets.symmetric(horizontal: 14),
+                    padding: const EdgeInsets.symmetric(horizontal: Space.s14),
                     shape: const StadiumBorder(),
                     side: BorderSide(color: c.border),
                     backgroundColor: c.background,
@@ -660,7 +670,12 @@ class _FilePreviewViewState extends State<FilePreviewView> {
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           Padding(
-            padding: const EdgeInsets.fromLTRB(12, 10, 12, 6),
+            padding: const EdgeInsets.fromLTRB(
+              Space.s12,
+              Space.s10,
+              Space.s12,
+              Space.s6,
+            ),
             child: Row(
               children: [
                 Flexible(
@@ -668,7 +683,12 @@ class _FilePreviewViewState extends State<FilePreviewView> {
                     alignment: Alignment.centerLeft,
                     child: _Raised(
                       child: Padding(
-                        padding: const EdgeInsets.fromLTRB(14, 0, 18, 0),
+                        padding: const EdgeInsets.fromLTRB(
+                          Space.s14,
+                          0,
+                          Space.s18,
+                          0,
+                        ),
                         child: Row(
                           mainAxisSize: MainAxisSize.min,
                           children: [
@@ -719,7 +739,12 @@ class _FilePreviewViewState extends State<FilePreviewView> {
           ),
           Expanded(child: stage),
           Padding(
-            padding: const EdgeInsets.fromLTRB(16, 6, 16, 14),
+            padding: const EdgeInsets.fromLTRB(
+              Space.s16,
+              Space.s6,
+              Space.s16,
+              Space.s14,
+            ),
             child: Center(
               child: ConstrainedBox(
                 constraints: const BoxConstraints(maxWidth: contentWidth),

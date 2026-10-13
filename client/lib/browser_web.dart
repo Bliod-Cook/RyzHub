@@ -87,3 +87,35 @@ Future<String?> platformSha256(Stream<List<int>> Function() open) async {
       byte.toRadixString(16).padLeft(2, '0'),
   ].join();
 }
+
+/// Signs in with another account: the page goes to the provider and comes back to itself,
+/// with the result in its address (see [takeSignInResult]). Returns nothing here.
+Future<Map<String, String>> signInElsewhere(
+  String Function(String returnTo) start,
+) async {
+  final location = web.window.location;
+  web.window.location.assign(start('${location.origin}${location.pathname}'));
+  return const {};
+}
+
+/// The result of a sign-in elsewhere that this page's address carries, taken out of the
+/// address so a reload does not use it again.
+Map<String, String> takeSignInResult() {
+  final uri = Uri.parse(web.window.location.href);
+  const keys = {'login_code', 'login_linked', 'login_error'};
+  final result = {
+    for (final MapEntry(:key, :value) in uri.queryParameters.entries)
+      if (keys.contains(key)) key: value,
+  };
+  if (result.isNotEmpty) {
+    final rest = Map.of(uri.queryParameters)
+      ..removeWhere((k, _) => keys.contains(k));
+    final clean = uri.replace(queryParameters: rest.isEmpty ? null : rest);
+    web.window.history.replaceState(
+      null,
+      '',
+      clean.toString().replaceAll('?#', '#'),
+    );
+  }
+  return result;
+}

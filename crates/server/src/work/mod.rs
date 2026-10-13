@@ -343,15 +343,16 @@ async fn deliver(
             .await?;
         tx.commit().await?;
     }
-    let claude = settings.harness == "claude";
+    // Codex steers its turn and compacts on request; the others take steers in the next turn
+    // of the same run, and compaction as a `/compact` turn.
+    let codex = settings.harness == "codex";
     // Files sent since the sandbox started must be in /attachments before the turn names them.
     if inputs.iter().any(|input| input.4) {
         crate::attachments::sandbox::sync(app, lease, sandbox_id).await?;
     }
     for (seq, text, kind, item, _, images) in inputs {
         let steer = kind == "steer";
-        // Claude has no native steer: steers wait for the next turn of the same run.
-        let queued = steer && claude;
+        let queued = steer && !codex;
         if steer && (queued == turn.is_some()) {
             set_steer_state(app, lease, item, "waiting").await?;
             continue;
@@ -364,7 +365,7 @@ async fn deliver(
             } else {
                 text
             };
-            if compact && !claude {
+            if compact && codex {
                 HarnessRequest::Compact {
                     thread_id: thread.into(),
                 }

@@ -25,7 +25,7 @@ use crate::{
 };
 
 /// Uploads received at once; more are turned away rather than queued.
-static UPLOADS: Semaphore = Semaphore::const_new(8);
+pub(super) static UPLOADS: Semaphore = Semaphore::const_new(8);
 /// Library page size.
 const PAGE: i64 = 50;
 
@@ -93,7 +93,12 @@ macro_rules! file_fields {
     };
 }
 
-async fn describe(tx: &mut Tx<'_>, org: Uuid, user: Uuid, id: Uuid) -> anyhow::Result<Value> {
+pub(super) async fn describe(
+    tx: &mut Tx<'_>,
+    org: Uuid,
+    user: Uuid,
+    id: Uuid,
+) -> anyhow::Result<Value> {
     Ok(sqlx::query_scalar(concat!(
         "SELECT ",
         file_fields!(),
@@ -150,7 +155,10 @@ pub async fn list(
     {
         return Err(Code::InvalidInput.into());
     }
-    let sha256 = page.sha256.as_deref().map(|hex| hex.trim().to_ascii_lowercase());
+    let sha256 = page
+        .sha256
+        .as_deref()
+        .map(|hex| hex.trim().to_ascii_lowercase());
     if sha256
         .as_deref()
         .is_some_and(|hex| hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()))
@@ -326,7 +334,7 @@ pub(crate) async fn delete(tx: &mut Tx<'_>, org: Uuid, id: Uuid) -> anyhow::Resu
 }
 
 /// RFC 8187 `filename*` value.
-fn encode_filename(name: &str) -> String {
+pub(crate) fn encode_filename(name: &str) -> String {
     name.bytes()
         .map(|b| match b {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'.' | b'-' | b'_' | b'~' => {

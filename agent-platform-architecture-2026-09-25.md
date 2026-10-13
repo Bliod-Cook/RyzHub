@@ -26,7 +26,7 @@
 | 记忆 | 参照 ChatGPT：显式记忆 + 历史引用（对话摘要、conversation_search）+ 合成画像（v1.5）；写入直接生效，轻量提示、可撤销（§10） |
 | 项目 | v1 支持：指令、文件、默认设置、插件集合、记忆模式（default / project_only）；共享项目预留（§2.3） |
 | 组织与权限 | 实例 → 组织 → 成员三级；所有资源归属组织，统一 `authorize` 检查，策略三层合并；v1 只实现后端与个人组织（§2.1） |
-| 客户端 | Flutter 一套 UI（Windows、Android、Web，未来 Apple）+ Rust 共享内核（sans-IO 状态机 + 驱动层），经 flutter_rust_bridge 接入 |
+| 客户端 | Flutter 一套 UI（Windows、Android、Web，未来 Apple）+ Rust 共享内核（sans-IO 状态机），经 flutter_rust_bridge 接入；WebSocket 与本地缓存由 Flutter 外壳注入（§11.3） |
 | 传输 | WSS over HTTP/1.1，Protobuf 帧（`proto`）；持久事件按频道 seq 重放；流式 Delta 不占 seq、按偏移幂等；重连用 ItemFold 折叠进行中内容；命令带幂等 cid；事件表即事务 outbox；conv 频道由 Owner 单点发布，Delta 带 `base_seq` 保证不早于其 item 事件生效（§12.2） |
 
 ---
@@ -95,6 +95,8 @@ flowchart TB
 | 文件存储 | hot / archiving / cold / restoring / purging / deleted |
 
 三个时间配置分别存：`compute_idle_ttl`、`auto_archive_after`、`archive_retention`。用户在组织策略给出的上限内自行设置。
+
+v1 实现说明（2026-10-12）：`auto_archive_after_secs`、`archive_retention_secs` 目前只在策略（实例与组织）里设置，没有成员级设置。保留期过后删除的是工作区的检查点与执行节点上的副本，时间线保留；工作区状态记在 `workspace_heads.storage_state`（没有单独的 `workspaces` 表）。
 
 ### 2.1 组织、成员与权限
 
@@ -615,17 +617,17 @@ steer 在 UI 上展示四个状态：已接收 → 等待注入点 → 已转交
 |---|---|---|---|---|---|
 | 停止 | 按钮 | 原生 | `turn/interrupt` | `interrupt()` | `session/cancel` |
 | 切换模型 | 下拉框 | 原生 | `turn/start` 的 `model` 参数（下一轮生效） | `setModel()` | config option `model`（若提供） |
-| 推理强度 | 下拉框 | 原生 | `turn/start` 的 `effort` 参数 | `effort` 选项（会话级）/ `setMaxThinkingTokens()` | config option `thought_level`（若提供） |
-| 审批模式 | 下拉框：每次询问 / 自动允许编辑 / 全部自动 | 平台审批策略 | `turn/start` 的 `approvalPolicy` | `setPermissionMode()` | config option `mode`（若提供） |
-| 计划模式 | 开关 | 不提供 | `collaborationMode` 预设 | permission mode `plan` | config option `mode`（若提供） |
-| 压缩上下文 | 菜单项 | provider 原生 compaction | `thread/compact/start` | 发送 `/compact` | 若命令列表中存在则透传 |
-| 从此处分叉 | 消息菜单 | 平台事件复制 | `thread/fork`（可排除之后的轮次） | `resume` + `forkSession` + `resumeSessionAt` | unstable fork（若提供） |
+| 推理强度 | 下拉框 | 原生 | `turn/start` 的 `effort` 参数 | `effort` 选项（会话级）/ `setMaxThinkingTokens()` | 不提供（v1 实现：agent 自定） |
+| 审批模式 | 下拉框：每次询问 / 自动允许编辑 / 全部自动 | 平台审批策略 | `turn/start` 的 `approvalPolicy` | `setPermissionMode()` | guest 按模式应答 `session/request_permission`：全部自动全允许，自动允许编辑时允许 edit/delete/move 类，其余交给用户 |
+| 计划模式 | 开关 | 不提供 | `collaborationMode` 预设 | permission mode `plan` | config option / mode `plan`（若提供） |
+| 压缩上下文 | 菜单项 | provider 原生 compaction，不可用时自研摘要 | `thread/compact/start` | 发送 `/compact` | 发送 `/compact`（OpenCode 支持） |
+| 从此处分叉 | 消息菜单 | 平台事件复制 | `thread/fork`（可排除之后的轮次） | `resume` + `forkSession` + `resumeSessionAt` | v1 不提供（unstable fork 待稳定） |
 
 - 模型列表 = 组织策略允许 ∩ LLM Gateway 可路由 ∩ harness 支持；推理强度的可选值按 harness 与模型给出（Codex 由 `model/list` 返回，Claude 为 low / medium / high / xhigh / max）[核]。
 - 只能在下一轮生效的设置，控件上标注"下一轮生效"；不支持的命令直接隐藏。
 - 审批模式与组织策略叠加：组织可以禁用"全部自动"。
 
-**harness 专属命令**：从 `supportedCommands()`、`skills/list`、`available_commands_update` 等动态发现，放在输入框 `/` 菜单的"harness 命令"分组，按 prompt 原样透传，不承诺跨 harness 同名同效。典型如 Codex 的 `review/start`、`thread/goal/*`，Claude 的 `/init`、`/review`。插件 commands 单独分组（§8）。
+**harness 专属命令**：从 `supportedCommands()`、`skills/list`、`available_commands_update` 等动态发现，放在输入框 `/` 菜单的"harness 命令"分组，以 `/name` 文本经 SendMessage 原样透传（不经 `InvokeMenuCommand`），不承诺跨 harness 同名同效。典型如 Codex 的 `review/start`、`thread/goal/*`，Claude 的 `/init`、`/review`。插件 commands 单独分组（§8）。
 
 **暂缓**：回退到某条消息并恢复文件（Codex `thread/rollback` 已弃用，Claude 依赖 `enableFileCheckpointing` + `rewindFiles()`，两家机制差异大）[核]。后续由平台基于 workspace 检查点统一实现。
 
@@ -735,7 +737,7 @@ Work 容器内有 root，进程可以直接调用本地代理或读取 guest dae
 | turn_runner | 状态机：awaiting_model → running_tools → awaiting_approval / awaiting_user → …；steer 队列、interrupt |
 | provider | 规范化消息 IR（text、tool_call、tool_result、thinking+签名、compaction 块）；每家一个 adapter，reqwest + SSE |
 | tool_registry | 内置工具、MCP 工具、插件工具；支持 defer_loading / tool search |
-| context | 旧工具结果落盘只留引用 → provider 原生 compaction → 自研摘要兜底 |
+| context | 旧工具结果超出预算时只留占位（原文留在 `tool_calls`，模型用 `read_tool_output` 取回）→ provider 原生 compaction（Anthropic 阈值压缩与按需压缩、Responses compact）→ 自研摘要兜底 |
 | approval | 策略引擎（叠加组织默认审批策略）+ PendingAction 持久化 |
 | sandbox | 调 Scheduler 获取 VM 租约，经 guest daemon 执行 |
 | mcp_gateway | rmcp 客户端、OAuth、token vault、出站代理；同时向 Work 沙箱暴露 MCP 端点（§8.3） |
@@ -965,6 +967,13 @@ elicitation：form 模式用 Flutter 原生表单；url 模式交给系统浏览
 
 推迟：沙箱内 MCP、子 agent、hooks、组织级安装界面、公开插件市场的评分与审核流程。
 
+v1 实现说明（2026-10-12）：
+- **MCP 客户端**：自行实现，没有用 rmcp 3.x。它先用 `server/discover` 识别 2026-07-28 的无状态协议，对更早的服务回退到 `initialize` 握手。理由是 rmcp 3.x 依赖 reqwest 0.13，而拉取必须使用平台自己的、固定解析地址的客户端。
+- **运行快照**：不另建 `plugin_revisions`。插件集合记在 `runs.plugins`，运行中仍以安装的当前版本为准。
+- **令牌刷新**：在使用时进行（提前 60 秒），不经 jobs。
+- **MCP Apps**：只在 Chat 的工具卡片上打开。Work 的工具条目来自 harness，暂不关联页面。
+- **授权签发**：Claude Code 的批准会签发 `approval_grants`（它的审批请求带工具名与参数）。Codex 与 ACP agent 的 MCP 调用由 Gateway 自己审批，同一操作同样只问一次。
+
 ---
 
 ## 9. 搜索
@@ -1038,6 +1047,8 @@ elicitation：form 模式用 Flutter 原生表单；url 模式交给系统浏览
 | 自部署离线 | 本地 Qwen3-Embedding-0.6B（fastembed-rs，candle 后端） | Apache-2.0，支持截断维度 [核] |
 
 每行记录 `embedding_model` 与 `dim`，不同模型的向量不混用。
+
+v1 实现说明（2026-10-12）：本地 provider 在 cargo feature `local-embedding` 后面（`search.embedding_provider = "local"`），用 fastembed-rs 的 `Qwen3TextEmbedding`（candle，CPU），模型从 Hugging Face 缓存加载，向量截到 1024 维并重新归一化。fastembed 仍依赖 ort，但以 `load-dynamic` 构建，不链接 ONNX Runtime。
 
 ### 9.7 接口
 
@@ -1167,12 +1178,12 @@ crates/
   proto          帧与事件类型（prost 生成），纯数据
   core           sans-IO 状态机：连接状态、订阅、seq 游标、命令队列、投影、
                  Markdown 块级增量、diff/高亮 span。输入=事件，输出=副作用请求
-  driver-native  tokio + tungstenite + SQLite + 网络/电源事件，驱动 core
-  driver-web     wasm；WebSocket 与 IndexedDB/OPFS 通过 web-sys 或 Dart 注入
-  bridge         flutter_rust_bridge 导出的 API
+  bridge         flutter_rust_bridge 导出的 API；原生编译为动态库，Web 编译为 wasm
 ```
 
-放进内核：协议编解码、重连与退避、心跳、token 刷新、本地缓存、同步游标、消息投影（会话列表、时间线）、草稿与离线发送队列、流式合批、Markdown 块解析、代码高亮 span（syntect/tree-sitter）、diff hunk（similar）、ANSI 解析（vte）。
+已定（2026-10-11）：IO 由 Flutter 外壳实现后注入内核，三端共用同一个 bridge，不另写 driver-native / driver-web。WebSocket 用 `web_socket_channel`，本地缓存原生用 SQLite、Web 用 IndexedDB，内核只产出要发送的帧和要持久化的记录。连接可靠性所需的逻辑（协议、游标、命令队列与重发、退避）都在 sans-IO 内核里，Rust 驱动只能省掉每帧一次过桥，主要收益是无界面客户端，目前不需要。
+
+放进内核：协议编解码、重连退避计算、心跳应答、token 刷新时机、本地缓存记录、同步游标、消息投影（会话列表、时间线）、草稿与离线发送队列、流式合批、Markdown 块解析、代码高亮 span（syntect/tree-sitter）、diff hunk（similar）、ANSI 解析（vte）。
 
 内核按"用户 × 组织"分区本地缓存；切换组织不需要重连 WS，只切换订阅与投影。
 
@@ -1185,6 +1196,12 @@ crates/
 - **流式**：内核按 16–50ms 合批后再过桥，不逐 token 回调。
 - **Markdown**：内核输出块级 AST 增量，已完成块冻结，只有末尾块变化，未闭合语法在内核内补全；Flutter 只渲染块。社区的 streamdown（Flutter）采用同样的 append-only AST 思路 [核]。
 - Element X 的教训：列表更新过频导致抖动、锁竞争导致内存暴涨 [核]；投影层从一开始按批量 diff 设计。
+
+已定（2026-10-11 实现时）：
+- **合批**：内核不读时钟，由外壳在每帧到达时把它连同当前时间交给内核。协议状态立即推进，要发的帧（Pong、重订阅）立即交回；视图变化攒到 32ms 一批，内核告诉外壳多久后取。空闲后的第一批立即交出。
+- **时间线**：只为当前打开的对话维护。行按 ID 用公共前缀和后缀做 diff，中间部分替换；条目只在 revision 变化时整条下发，否则下发追加的文本和从某块起的块列表。
+- **Markdown**：最后一块之前的块，一旦后面那块的第一行完整就冻结。含链接引用定义或脚注的消息不冻结，每次整条重解析。按块增量与整条解析的结果一致，由随机分块的性质测试保证。
+- **代码高亮**：用 bat 的语法集（two-face，约 200 种语言），按需由 Flutter 调用并按代码块增量着色。原生端随库内置；Web 端在第一次出现代码时单独下载语法文件（约 960 KB），之前先显示纯文本，以免增大首屏 wasm。
 
 ### 11.5 维护与构建
 
@@ -1241,25 +1258,27 @@ Delta 与持久事件的顺序：
 
 编码 Protobuf（buf 管理 schema；服务端与客户端内核都用 prost，Web 端内核同为 Rust wasm，Dart 侧只接触 flutter_rust_bridge 生成的类型）；调试可协商 JSON 子协议。
 
-压缩：浏览器用 permessage-deflate 并调小窗口（默认约 300KB/连接，调参后约 30KB）[核]；原生端协商 zstd 流式压缩，参照 Discord（压缩比约 10，比 zlib 更省 CPU，总带宽降约 40%）[核]。
+压缩：三端统一协商 `ryzhub.v1.protobuf+zstd` 子协议，只压缩服务端到客户端方向，参照 Discord（压缩比约 10，比 zlib 更省 CPU，总带宽降约 40%）[核]。内核在 bridge 内解压，Web 端同为 Rust wasm，用纯 Rust 解码器（ruzstd）。（2026-10-11 复核：axum 0.8 / tungstenite 0.29 不支持 permessage-deflate，不再采用。）
+
+已定（2026-10-11 实现时）：不维持每连接一个流式上下文，改为每条不小于 256 字节的消息各自是一个完整的 zstd frame，小消息原样发送，客户端按 zstd 魔数区分。原因是 ruzstd 在一个 frame 结束前保留最后一个窗口的数据不交出，整条连接一个流就无法逐条解码。快照、历史、长回复这些大帧占了绝大部分流量，仍然各自压缩；流式 Delta 帧很小，跨消息上下文对它们的收益在每秒几 KB 的量级。
 
 ### 12.3 连接与重连
 
 1. **鉴权**：浏览器先用 REST 换一次性短期 ticket 放 query；原生端用 Authorization 头。连接中 `AuthRefresh` 续期，服务端过期前发 `AuthExpiring`。
-2. **握手**：`Hello{protocol_major, protocol_minor, device_id, capabilities, resume_token?}` → `Welcome{connection_id, resume_token, heartbeat_ms, limits, resumed}`。
+2. **握手**：`Hello{protocol_major, protocol_minor, device_id, capabilities}` → `Welcome{connection_id, heartbeat_ms, limits}`。
 3. **订阅**：`Subscribe{since_seq}`（频道在 `Frame.channel`），一条连接多路订阅，每次订阅都经 `authorize` 检查。连接只绑定用户，可同时订阅多个组织的频道。
    - 频道：`conv:<id>`（对话）、`user:<org_id>:<user_id>`（会话列表摘要、已读）、`org:<id>`（策略、成员、插件变更）。
    - since_seq 在保留窗口内 → 按序补发 `EventEnvelope`；超出窗口或首次订阅 → `Snapshot{head_seq}`。
    - 随后对每个进行中的 item 下发 `ItemFold`，再发 `SubscriptionSynced{head_seq}`，之后为实时流（Ably 同类做法 [核]）。
    - 权限被撤销时下发 `SubscriptionRevoked` 并停止推送。
-4. **resume_token**：2–5 分钟内有效，`Welcome.resumed = true` 时恢复原订阅集合，各频道仍按 since_seq 补发。
+4. **重连**：服务端不保存订阅集合，客户端按本地持久游标逐个重新 Subscribe。已定（2026-10-11）：不实现 resume_token。它要求服务端在每次订阅、退订时写入订阅集合，重连时多一次查询，并让 Gateway 有状态；而客户端仍需提供各频道的 since_seq，省下的只是几个 Subscribe 帧。proto 中 `resume_token` / `resumed` 标为 deprecated。
 5. **心跳**：服务端每 20–25s 发 `Ping`，同时满足阿里 DCDN 30s 默认值和 CloudFront"只计源站方向"的空闲规则 [核]。
 6. **主动重连**：Android `NetworkCallback`、Windows 电源恢复/网络变化事件触发，不等心跳超时；可先建新连接再关旧连接。
 7. 退避：指数 + 抖动。关闭码约定见 `wire-protocol-v1.md` §8。
 
 ### 12.4 命令语义
 
-- 命令（`command.proto`）：`SendMessage`、`CreateRun`（Work 首条消息，含 harness 与 RunConfig）、`Steer`、`SideQuestion`（btw）、`Cancel`、`DecideApproval`、`AnswerQuestion`、`UpdateRunConfig`（模型、推理强度、审批模式、计划模式）、`Compact`、`Fork`、`InvokeMenuCommand`、`MarkRead`、`UndoMemoryUpdate`。
+- 命令（`wire.proto`）：`SendMessage`、`CreateRun`（新对话的首条消息，含模式、RunConfig 与项目；客户端生成对话 ID，可离线排队）、`Steer`、`SideQuery`（btw）、`Cancel`、`DecideApproval`、`AnswerQuestion`、`UpdateRunConfig`（模型、推理强度、审批模式、计划模式）、`Compact`、`Fork`、`InvokeMenuCommand`（仅插件命令；harness 命令按文本透传，见 §5.6）、`MarkRead`、`UndoMemoryUpdate`。
 - 服务端事务内持久化 `cid` 后回 `CommandAck{cid, accepted_seq, result}`；重复 cid 返回首次结果；失败回 `CommandRejected{code, retryable}`。客户端未收到 Ack 时，重连后用同一 cid 重发。
 - Ack 只表示平台已可靠接收。harness 是否采用由后续事件表达（事件带 `cause_cid`；steer 另有 `SteerStatusChanged`）。
 - 事件不逐条 ack，客户端在订阅时上报 `since_seq`。
@@ -1280,6 +1299,8 @@ Delta 与持久事件的顺序：
 ### 12.7 移动端后台
 
 推送内容带 `org_id`，点击后切换到对应组织。后台断开 WS。需要用户处理的事件（审批、提问、任务完成）用 FCM 高优先级推送，并且必须产生可见通知，否则会被降级 [核]；用户点开后重连并按 cursor 补齐。推送不作为业务状态来源。
+
+v1 实现说明（2026-10-12）：推送作业与业务写入同一事务（jobs 即 outbox），投递时跳过有活跃 WS 的设备，设备登记绑定登录会话，退出即停止。客户端没有用 firebase_messaging 插件（它的 Windows 版会拉取 Firebase C++ SDK），改为 Android 工程里的一个 FirebaseMessagingService 加 MethodChannel；没有 `google-services.json` 的构建照常运行，只是没有推送。组织切换未做，点击通知打开当前组织里的对话。
 
 ### 12.8 REST 与 WS 分工
 
@@ -1320,6 +1341,8 @@ ACK 丢失后重发；两台设备同时审批；流式输出中切换 Wi-Fi；G
 ## 14. 待你决定
 
 已定（2026-09-25）：组织模型按 §2.1 实现，v1 只做后端与个人组织；不为订阅登录做专门设计；所有 harness 上游经 LLM Gateway，BYOK 经 gateway 视同企业内部 gateway；不支持改上游的 harness（Cursor CLI、ACP 模式的 Gemini CLI）暂不支持；默认沙箱后端为 runc（可信模式），不可信场景由管理员切换 gVisor；客户端采用 Flutter + Rust 内核；插件规范 v0 见 §8；数据库、搜索、记忆见 §2.2、§9、§10；预算推迟；归档写入管理员指定的二级存储；Work 容器内允许 root 与任意系统改动（隔离由沙箱保证，归档整个 upper）；记忆写入不设待确认环节；项目功能进入 v1（§2.3）；统一命令按 §5.6 定稿；2026-09-25 评审后补充执行 fencing（§3.5）、频道与 outbox（§2.2）、检查点与 RPO（§4.3）、执行检查点（§7.3）、必须审批的 gateway 授权（§8.3）、搜索权限实时核对（§9.5）、里程碑（§13）；第二轮评审（2026-09-25）补充：containerd 托管与 gVisor 固定 `--overlay2=none`（§3.1）、overlay 关闭 `redirect_dir` / `metacopy`（§4.1）、guest 上行事件按 `gseq` 可靠投递（§3.4）、virtual key 绑定沙箱租约并经 guest 本地代理注入（§6.5）、conv 频道由 Owner 单点发布且 Delta 带 `base_seq`（§2.2、§12.2）。
+
+2026-10-11 对照实现复核后补充：IO 由 Flutter 外壳注入、不写 Rust 驱动（§11.3）；不实现 resume_token，重连按游标重订阅（§12.3）；WS 压缩改为 zstd 子协议，逐条消息压缩（§12.2）；harness 命令按文本透传，`InvokeMenuCommand` 只用于插件命令（§5.6、§12.4）；新对话由 `CreateRun` 命令创建（§12.4）；Chat loop 不做交互式审批，Chat 中的插件工具同样直接执行（覆盖 §7.1 approval 模块与 §8.3 中 Chat 部分）；组织功能（策略编辑、组织删除与切换、org 频道）暂不实现。
 
 | 问题 | 影响 |
 |---|---|

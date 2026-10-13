@@ -44,13 +44,8 @@ fn rules(app: &App) -> Vec<(&'static str, String)> {
         "model_rate_limits",
         "minute<floor(extract(epoch FROM now())/60)::bigint-1440".to_owned(),
     ));
-    if retention.usage_days > 0 {
-        let days = retention.usage_days;
-        rules.push((
-            "usage_records",
-            format!("created_at<now()-interval '{days} days'"),
-        ));
-    }
+    // `usage_records` is partitioned; maintenance drops its expired months. A ctid is not
+    // unique across partitions, so the batched delete below must not be used on it.
     rules
 }
 
@@ -81,6 +76,7 @@ async fn sweep(app: &App, worker: &sqlx::PgPool) -> anyhow::Result<()> {
             }
         }
     }
+    crate::llm::gateway::purge_model_content(app, worker).await?;
     Ok(())
 }
 

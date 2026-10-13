@@ -35,6 +35,7 @@ codes! {
     RateLimited = "RATE_LIMITED" => TOO_MANY_REQUESTS,
     PolicyDenied = "POLICY_DENIED" => BAD_REQUEST,
     ModelDenied = "MODEL_DENIED" => FORBIDDEN,
+    ReasoningDenied = "REASONING_DENIED" => FORBIDDEN,
     PlatformCredentialDenied = "PLATFORM_CREDENTIAL_DENIED" => FORBIDDEN,
     CredentialUnavailable = "CREDENTIAL_UNAVAILABLE" => SERVICE_UNAVAILABLE,
     CredentialRevoked = "CREDENTIAL_REVOKED" => SERVICE_UNAVAILABLE,
@@ -47,6 +48,11 @@ codes! {
     InvalidCommand = "INVALID_COMMAND" => BAD_REQUEST,
     InvalidChannel = "INVALID_CHANNEL" => BAD_REQUEST,
     CidReused = "CID_REUSED" => CONFLICT,
+    ConversationIdTaken = "CONVERSATION_ID_TAKEN" => CONFLICT,
+    UnknownStream = "UNKNOWN_STREAM" => NOT_FOUND,
+    ContentNotRetained = "CONTENT_NOT_RETAINED" => NOT_FOUND,
+    MemoryUndoUnavailable = "MEMORY_UNDO_UNAVAILABLE" => CONFLICT,
+    MemoryCategoryForbidden = "MEMORY_CATEGORY_FORBIDDEN" => BAD_REQUEST,
     UnsupportedCommand = "UNSUPPORTED_COMMAND" => BAD_REQUEST,
     InvalidDecision = "INVALID_DECISION" => BAD_REQUEST,
     InvalidAction = "INVALID_ACTION" => BAD_REQUEST,
@@ -66,11 +72,17 @@ codes! {
     InvalidDefaults = "INVALID_DEFAULTS" => BAD_REQUEST,
     MemoryModeImmutable = "MEMORY_MODE_IMMUTABLE" => BAD_REQUEST,
     ProjectFileLimit = "PROJECT_FILE_LIMIT" => BAD_REQUEST,
+    UnsupportedProjectFile = "UNSUPPORTED_PROJECT_FILE" => BAD_REQUEST,
+    DocumentUnreadable = "DOCUMENT_UNREADABLE" => BAD_REQUEST,
     ProjectDeleted = "PROJECT_DELETED" => BAD_REQUEST,
     AttachmentTooLarge = "ATTACHMENT_TOO_LARGE" => PAYLOAD_TOO_LARGE,
     AttachmentQuotaExceeded = "ATTACHMENT_QUOTA_EXCEEDED" => BAD_REQUEST,
     AttachmentUnavailable = "ATTACHMENT_UNAVAILABLE" => BAD_REQUEST,
     AttachmentDeleted = "ATTACHMENT_DELETED" => GONE,
+    UploadNotFound = "UPLOAD_NOT_FOUND" => NOT_FOUND,
+    UploadIncomplete = "UPLOAD_INCOMPLETE" => CONFLICT,
+    UploadClosed = "UPLOAD_CLOSED" => CONFLICT,
+    InvalidUploadPart = "INVALID_UPLOAD_PART" => BAD_REQUEST,
     TooManyAttachments = "TOO_MANY_ATTACHMENTS" => BAD_REQUEST,
     InvalidAttachmentName = "INVALID_ATTACHMENT_NAME" => BAD_REQUEST,
     RestoreExpired = "RESTORE_EXPIRED" => BAD_REQUEST,
@@ -88,6 +100,8 @@ codes! {
     Fenced = "FENCED" => CONFLICT,
     ConversationArchived = "CONVERSATION_ARCHIVED" => CONFLICT,
     ConversationBusy = "CONVERSATION_BUSY" => CONFLICT,
+    WorkspaceNotRunning = "WORKSPACE_NOT_RUNNING" => CONFLICT,
+    NoExecutionNode = "NO_EXECUTION_NODE" => SERVICE_UNAVAILABLE,
     RunBusy = "RUN_BUSY" => CONFLICT,
     RunBusyUseSteer = "RUN_BUSY_USE_STEER" => CONFLICT,
     NoActiveRun = "NO_ACTIVE_RUN" => CONFLICT,
@@ -98,6 +112,7 @@ codes! {
     NoCheckpoint = "NO_CHECKPOINT" => CONFLICT,
     CheckpointIncompatible = "CHECKPOINT_INCOMPATIBLE" => CONFLICT,
     OldWriterNotFenced = "OLD_WRITER_NOT_FENCED" => CONFLICT,
+    WorkspacePurged = "WORKSPACE_PURGED" => CONFLICT,
     // Availability.
     Busy = "BUSY" => SERVICE_UNAVAILABLE,
     UploadBusy = "UPLOAD_BUSY" => TOO_MANY_REQUESTS,
@@ -118,6 +133,31 @@ codes! {
     ApprovalDeniedOrExpired = "APPROVAL_DENIED_OR_EXPIRED" => FORBIDDEN,
     OutcomeUnknownDoNotRetry = "OUTCOME_UNKNOWN_DO_NOT_RETRY" => CONFLICT,
     McpUpstreamFailed = "MCP_UPSTREAM_FAILED" => BAD_GATEWAY,
+    // Signing in with other accounts.
+    ProviderUnknown = "PROVIDER_UNKNOWN" => NOT_FOUND,
+    LoginFailed = "LOGIN_FAILED" => BAD_GATEWAY,
+    IdentityTaken = "IDENTITY_TAKEN" => CONFLICT,
+    IdentityEmailRequired = "IDENTITY_EMAIL_REQUIRED" => BAD_REQUEST,
+    AccountExists = "ACCOUNT_EXISTS" => CONFLICT,
+    LastSignInMethod = "LAST_SIGN_IN_METHOD" => CONFLICT,
+    NotFoundIdentity = "IDENTITY_NOT_FOUND" => NOT_FOUND,
+    NoDocument = "DOCUMENT_NOT_FOUND" => NOT_FOUND,
+    // Plugins.
+    PluginsDisabled = "PLUGINS_DISABLED" => SERVICE_UNAVAILABLE,
+    PluginNotFound = "PLUGIN_NOT_FOUND" => NOT_FOUND,
+    PluginExists = "PLUGIN_EXISTS" => CONFLICT,
+    PluginInvalid = "PLUGIN_INVALID" => BAD_REQUEST,
+    PluginTooLarge = "PLUGIN_TOO_LARGE" => PAYLOAD_TOO_LARGE,
+    PluginFetchFailed = "PLUGIN_FETCH_FAILED" => BAD_GATEWAY,
+    UnsafeDestination = "UNSAFE_DESTINATION" => FORBIDDEN,
+    PluginBlocked = "PLUGIN_BLOCKED" => FORBIDDEN,
+    PluginUnverifiedDenied = "PLUGIN_UNVERIFIED_DENIED" => FORBIDDEN,
+    PluginSettingRequired = "PLUGIN_SETTING_REQUIRED" => BAD_REQUEST,
+    PluginUpdateUnavailable = "PLUGIN_UPDATE_UNAVAILABLE" => BAD_REQUEST,
+    PluginAuthRequired = "PLUGIN_AUTH_REQUIRED" => CONFLICT,
+    PluginAuthNotRequired = "PLUGIN_AUTH_NOT_REQUIRED" => BAD_REQUEST,
+    PluginOAuthFailed = "PLUGIN_OAUTH_FAILED" => BAD_GATEWAY,
+    PluginInputRequired = "PLUGIN_INPUT_REQUIRED" => CONFLICT,
     // Terminal run failures shown in the timeline.
     LoopLimitReached = "LOOP_LIMIT_REACHED" => CONFLICT,
     TooManyToolCalls = "TOO_MANY_TOOL_CALLS" => BAD_GATEWAY,
@@ -194,6 +234,11 @@ pub fn public_code(error: &anyhow::Error) -> Code {
     })
 }
 
+/// A message for the user, in an error's chain beside its code: why a package was refused.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct Detail(pub String);
+
 /// Axum error: stable code in the body, HTTP status from the code table.
 pub struct ApiError(pub anyhow::Error);
 impl<E: Into<anyhow::Error>> From<E> for ApiError {
@@ -205,7 +250,15 @@ impl<E: Into<anyhow::Error>> From<E> for ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let code = public_code(&self.0);
-        (code.status(), Json(json!({"error": code.as_str()}))).into_response()
+        let mut body = json!({"error": code.as_str()});
+        if let Some(detail) = self
+            .0
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<Detail>())
+        {
+            body["message"] = json!(detail.0);
+        }
+        (code.status(), Json(body)).into_response()
     }
 }
 

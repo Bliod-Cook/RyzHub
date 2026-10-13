@@ -4,6 +4,8 @@
 Implements the object and multipart-upload calls the server's object store client makes. AWS
 botocore independently recomputes every SigV4 signature over the headers the client signed, so
 a request with a wrong key, a tampered body or an unsigned header is rejected with 403.
+Presigned URLs (query signatures, as handed to clients for direct part uploads) are checked
+the same way, including their expiry.
 """
 import hashlib
 import hmac
@@ -13,9 +15,9 @@ from datetime import datetime, timezone
 from email.utils import formatdate
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import patch
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, parse_qsl, urlencode, urlsplit
 
-from botocore.auth import S3SigV4Auth
+from botocore.auth import S3SigV4Auth, S3SigV4QueryAuth
 from botocore.awsrequest import AWSRequest
 from botocore.credentials import Credentials
 
@@ -36,8 +38,37 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *_):
         pass
 
+    def presigned(self):
+        """Recompute a query signature with botocore over the URL without it."""
+        try:
+            url = urlsplit(self.path)
+            pairs = parse_qsl(url.query, keep_blank_values=True)
+            given = dict(pairs)
+            stamp = datetime.strptime(given["X-Amz-Date"], "%Y%m%dT%H%M%SZ").replace(
+                tzinfo=timezone.utc
+            )
+            expires = int(given["X-Amz-Expires"])
+            if (datetime.now(timezone.utc) - stamp).total_seconds() > expires:
+                return False
+            if given["X-Amz-SignedHeaders"] != "host":
+                return False
+            rest = [(k, v) for k, v in pairs if not k.startswith("X-Amz-")]
+            request = AWSRequest(
+                method=self.command,
+                url="http://" + self.headers["host"] + url.path + ("?" + urlencode(rest) if rest else ""),
+                headers={"host": self.headers["host"]},
+            )
+            with patch("botocore.auth.get_current_datetime", return_value=stamp):
+                S3SigV4QueryAuth(CREDENTIALS, "s3", REGION, expires=expires).add_auth(request)
+            expected = dict(parse_qsl(urlsplit(request.url).query))["X-Amz-Signature"]
+            return hmac.compare_digest(expected, given["X-Amz-Signature"])
+        except (IndexError, KeyError, TypeError, ValueError):
+            return False
+
     def authorized(self, body):
         """Recompute the signature with botocore from exactly the headers the client signed."""
+        if "X-Amz-Signature=" in self.path:
+            return self.presigned()
         if self.headers.get("x-amz-content-sha256") != hashlib.sha256(body).hexdigest():
             return False
         try:

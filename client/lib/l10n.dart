@@ -30,6 +30,49 @@ String approvalLabel(String value) => switch (value) {
   _ => value,
 };
 
+/// What each approval mode leaves to the member.
+String approvalDescription(String value) => switch (value) {
+  'ask' => tr(
+    '执行命令、修改文件前都先询问',
+    'Asks before running commands or changing files',
+  ),
+  'allow_edits' => tr(
+    '修改工作区文件不再询问，执行命令仍会询问',
+    'Edits files without asking; still asks before commands',
+  ),
+  'full_auto' => tr(
+    '不再询问，Agent 在沙箱里自行执行',
+    'Never asks; the agent acts on its own inside the sandbox',
+  ),
+  _ => '',
+};
+
+/// How the platform stands in for a capability the harness lacks
+/// (`emulated` in the command catalog); null for the others.
+String? emulatedNote(String capability) => switch (capability) {
+  'steer' => tr(
+    '这个 Agent 不能在回合中途接收指令：补充指令排到下一轮发送。',
+    "This agent can't take instructions mid-turn: they're sent as the next turn.",
+  ),
+  'plan_mode' => tr(
+    '由平台在提示中要求 Agent 先给出计划。',
+    'The platform asks the agent for a plan in its prompt.',
+  ),
+  'fork' => tr(
+    '由平台复制对话与工作区来分叉，Agent 从检查点重新开始。',
+    'The platform copies the conversation and workspace; the agent restarts from the checkpoint.',
+  ),
+  'compact' => tr(
+    '由平台用摘要替换较早的上下文。',
+    'The platform replaces older context with a summary.',
+  ),
+  'side_query' => tr(
+    '由平台另发一次只读请求回答，不进入主线。',
+    'The platform answers in a separate read-only request, off the main thread.',
+  ),
+  _ => null,
+};
+
 String reasoningLabel(String value) => switch (value) {
   'low' => tr('低', 'Low'),
   'medium' => tr('中', 'Medium'),
@@ -39,15 +82,25 @@ String reasoningLabel(String value) => switch (value) {
   _ => value,
 };
 
+/// Names of the Work harnesses the server configures beyond Codex and Claude Code,
+/// from its model catalog.
+final Map<String, String> harnessLabels = {};
+
 String pathLabel(String value) => switch (value) {
   'codex' => 'Codex',
   'claude' => 'Claude Code',
-  _ => value,
+  _ => harnessLabels[value] ?? value,
 };
 
 String errorText(Object error) {
   var code = '$error';
   if (code.startsWith('Exception: ')) code = code.substring(11);
+  // A code, then the server's explanation (a refused plugin package says why).
+  final split = code.indexOf('\n');
+  if (split > 0) {
+    final detail = code.substring(split + 1);
+    return '${errorText(Exception(code.substring(0, split)))}\n$detail';
+  }
   if (error is TimeoutException) {
     return tr(
       '请求超时，请检查网络后重试。',
@@ -62,6 +115,18 @@ String errorText(Object error) {
     'WORKSPACE_RECOVERY_REQUIRED' => tr(
       '工作区需要恢复，请先点击“恢复工作区”。',
       'The workspace needs recovery. Click "Restore workspace" first.',
+    ),
+    'UNSUPPORTED_PROJECT_FILE' => tr(
+      '只支持 UTF-8 文本、PDF 和 DOCX 文件。',
+      'Only UTF-8 text, PDF and DOCX files can be added.',
+    ),
+    'DOCUMENT_UNREADABLE' => tr(
+      '无法从这个文档中读出文字。',
+      'No text could be read from this document.',
+    ),
+    'WORKSPACE_PURGED' => tr(
+      '归档已超过保留期，工作区文件已删除；对话记录仍可查看。',
+      'The archive outlived its retention period and the workspace files were deleted. The conversation is still readable.',
     ),
     'WORKSPACE_BUSY' => tr(
       '工作区正忙，请稍后重试。',
@@ -130,6 +195,64 @@ String errorText(Object error) {
     'UPLOAD_BUSY' => tr(
       '上传的人太多了，请稍后重试。',
       'Too many uploads right now. Try again shortly.',
+    ),
+    'LOGIN_FAILED' => tr(
+      '登录没有完成，请重试。',
+      'Signing in did not finish. Try again.',
+    ),
+    'ACCOUNT_EXISTS' => tr(
+      '该邮箱已有账号。请用原方式登录后，在设置中连接此账号。',
+      'This email has an account. Sign in as before, then connect this account in Settings.',
+    ),
+    'IDENTITY_TAKEN' => tr(
+      '这个外部账号已连接到另一个 RyzHub 账号。',
+      'This account is connected to another RyzHub account.',
+    ),
+    'IDENTITY_EMAIL_REQUIRED' => tr(
+      '外部账号没有已验证的邮箱。',
+      'The account has no verified email.',
+    ),
+    'LAST_SIGN_IN_METHOD' => tr(
+      '这是你唯一的登录方式，不能移除。',
+      'This is your only way to sign in and cannot be removed.',
+    ),
+    'UNSAFE_DESTINATION' => tr(
+      '只能访问 HTTPS 的公网地址。',
+      'Only public HTTPS addresses can be reached.',
+    ),
+    'PLUGIN_INVALID' => tr('插件包无效。', 'The plugin package is invalid.'),
+    'PLUGIN_FETCH_FAILED' => tr(
+      '无法获取插件，请检查地址。',
+      'The plugin could not be fetched. Check the address.',
+    ),
+    'PLUGIN_TOO_LARGE' => tr('插件包太大。', 'The plugin package is too large.'),
+    'PLUGIN_BLOCKED' => tr(
+      '该插件已被管理员停用。',
+      'An administrator has stopped this plugin.',
+    ),
+    'PLUGIN_EXISTS' => tr(
+      '已安装同名插件，请使用更新。',
+      'A plugin of that name is installed. Update it instead.',
+    ),
+    'PLUGIN_UNVERIFIED_DENIED' => tr(
+      '组织策略不允许安装未验证的插件。',
+      'Your organization does not allow unverified plugins.',
+    ),
+    'PLUGIN_SETTING_REQUIRED' => tr(
+      '请填写插件的必填设置。',
+      'Fill in the plugin\'s required settings.',
+    ),
+    'PLUGIN_OAUTH_FAILED' => tr(
+      '账号连接失败。',
+      'The account could not be connected.',
+    ),
+    'PLUGIN_AUTH_NOT_REQUIRED' => tr(
+      '该服务不需要连接账号。',
+      'This server does not need an account.',
+    ),
+    'PLUGIN_INPUT_REQUIRED' => tr(
+      '该工具需要先回答它的问题。',
+      'The tool needs answers to its questions first.',
     ),
     _ => code,
   };

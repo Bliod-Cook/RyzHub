@@ -37,23 +37,24 @@ impl Store {
         )
         .execute(&mut *tx)
         .await?;
-        // The first command with this cid, which a retry must match exactly.
-        let first = sqlx::query!(
-            "SELECT conversation_id,payload,result FROM commands WHERE org_id=$1 AND user_id=$2 AND cid=$3",
-            ctx.org_id,
-            ctx.user_id,
-            cid
-        )
-        .fetch_optional(&mut *tx)
-        .await?
-        .context(Code::CidReused)?;
+        // The first command with this cid, which a retry must match exactly. A command on a
+        // user channel may name no conversation.
+        let (first_conv, first_payload, result): (Option<Uuid>, Vec<u8>, Option<Vec<u8>>) =
+            sqlx::query_as(
+                "SELECT conversation_id,payload,result FROM commands WHERE org_id=$1 AND user_id=$2 AND cid=$3",
+            )
+            .bind(ctx.org_id)
+            .bind(ctx.user_id)
+            .bind(cid)
+            .fetch_optional(&mut *tx)
+            .await?
+            .context(Code::CidReused)?;
         ensure!(
-            first.conversation_id == conv && first.payload == payload,
+            first_conv == Some(conv) && first_payload == payload,
             Code::CidReused
         );
         tx.commit().await?;
-        first
-            .result
+        result
             .map(|bytes| Frame::decode(bytes.as_slice()).map_err(Into::into))
             .transpose()
     }

@@ -43,6 +43,7 @@ pub async fn drive(app: App, lease: Lease, run: Uuid, link: OwnerLink) -> anyhow
     if offset > 0 {
         link.send(WorkerEvent::Append {
             item: live.clone(),
+            stream: crate::owner::TEXT,
             offset: 0,
             text: reply[..offset].into(),
         })
@@ -57,6 +58,7 @@ pub async fn drive(app: App, lease: Lease, run: Uuid, link: OwnerLink) -> anyhow
             .map_or(reply.len(), |(index, _)| offset + index);
         link.send(WorkerEvent::Append {
             item: live.clone(),
+            stream: crate::owner::TEXT,
             offset,
             text: reply[offset..end].into(),
         })

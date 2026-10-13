@@ -38,6 +38,9 @@ struct Harness {
 }
 impl Harness {
     async fn new() -> anyhow::Result<Self> {
+        Self::with(|_| {}).await
+    }
+    async fn with(configure: impl FnOnce(&mut Config)) -> anyhow::Result<Self> {
         let admin_url = std::env::var("TEST_ADMIN_URL").unwrap_or_else(|_| {
             "postgres://postgres:local-development-only@127.0.0.1:55432/postgres".into()
         });
@@ -56,7 +59,9 @@ impl Harness {
         let nats = async_nats::connect("nats://127.0.0.1:54222").await?;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let base = format!("http://{}", listener.local_addr()?);
-        let app = App::new(store.clone(), nats.clone(), Config::default())?;
+        let mut config = Config::default();
+        configure(&mut config);
+        let app = App::new(store.clone(), nats.clone(), config)?;
         let task = tokio::spawn(async move {
             axum::serve(listener, router(app)).await.unwrap();
         });
@@ -1429,4 +1434,683 @@ async fn owner_discovery_applies_the_organization_idle_limit() -> anyhow::Result
     worker.close().await;
     h.close().await?;
     outcome
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL 18 and NATS"]
+async fn usage_partitions_move_stranded_rows_and_retention_drops_whole_months() -> anyhow::Result<()>
+{
+    let h = Harness::new().await?;
+    let user = h.user().await?;
+    let (org, uid) = (id(&user, "org_id"), id(&user, "user_id"));
+    let insert =
+        "INSERT INTO usage_records(id,org_id,user_id,model,created_at) VALUES($1,$2,$3,'m',$4)";
+    let (old, current) = (Uuid::now_v7(), Uuid::now_v7());
+    // No partition covers January 2025, so the row lands in the default partition.
+    let old_at = chrono::DateTime::parse_from_rfc3339("2025-01-15T12:00:00Z")?;
+    sqlx::query(insert)
+        .bind(old)
+        .bind(org)
+        .bind(uid)
+        .bind(old_at)
+        .execute(&h.db)
+        .await?;
+    sqlx::query(insert)
+        .bind(current)
+        .bind(org)
+        .bind(uid)
+        .bind(chrono::Utc::now())
+        .execute(&h.db)
+        .await?;
+    let partition = |row: Uuid| {
+        sqlx::query_scalar::<_, String>(
+            "SELECT tableoid::regclass::text FROM usage_records WHERE id=$1",
+        )
+        .bind(row)
+        .fetch_optional(&h.db)
+    };
+    assert_eq!(
+        partition(old).await?.as_deref(),
+        Some("usage_records_default")
+    );
+    // Runtime roles reach rows only through the parent table and its row-level security.
+    let app = PgPool::connect(&h.app_url).await?;
+    let leaf = sqlx::query("SELECT 1 FROM usage_records_default")
+        .execute(&app)
+        .await;
+    assert!(leaf.is_err(), "leaf partitions must not be granted");
+    app.close().await;
+
+    let mut config = Config::default();
+    ryzhub_server::maintenance::maintain(&h.db, &config).await?;
+    assert_eq!(
+        partition(old).await?.as_deref(),
+        Some("usage_records_2025_01")
+    );
+    config.retention.usage_days = 30;
+    ryzhub_server::maintenance::maintain(&h.db, &config).await?;
+    assert_eq!(partition(old).await?, None, "expired month is dropped");
+    assert!(partition(current).await?.is_some(), "current month is kept");
+    h.close().await
+}
+
+static JOBS_RUN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn job_succeeds<'a>(
+    _: &'a App,
+    _: &'a ryzhub_server::jobs::Job,
+) -> futures_util::future::BoxFuture<'a, anyhow::Result<()>> {
+    Box::pin(async {
+        JOBS_RUN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    })
+}
+
+fn job_fails<'a>(
+    _: &'a App,
+    _: &'a ryzhub_server::jobs::Job,
+) -> futures_util::future::BoxFuture<'a, anyhow::Result<()>> {
+    Box::pin(async { anyhow::bail!("handler failed") })
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL 18 and NATS"]
+async fn jobs_deduplicate_retry_fence_stale_claims_and_die_after_their_attempts()
+-> anyhow::Result<()> {
+    use ryzhub_server::jobs::{self, Handler, Job, NewJob};
+    let h = Harness::new().await?;
+    let (user, other) = (h.user().await?, h.user().await?);
+    let (org, other_org) = (id(&user, "org_id"), id(&other, "org_id"));
+    let app = App::new(h.store.clone(), h.nats.clone(), Config::default())?;
+    let worker = PgPool::connect(&h.worker_url).await?;
+    let state = |job: Uuid| {
+        sqlx::query_as::<_, (String, i32)>("SELECT state,attempts FROM jobs WHERE id=$1")
+            .bind(job)
+            .fetch_one(&h.db)
+    };
+
+    let mut tx = h.store.tx(org).await?;
+    let later = chrono::Utc::now() + chrono::Duration::hours(1);
+    let first = jobs::enqueue(
+        &mut tx,
+        org,
+        NewJob {
+            dedupe_key: Some("k"),
+            run_at: Some(later),
+            ..NewJob::new("test.ok", json!({"n": 1}))
+        },
+    )
+    .await?;
+    // Merged into the queued job, which becomes due now; the first payload stays.
+    let merged = jobs::enqueue(
+        &mut tx,
+        org,
+        NewJob {
+            dedupe_key: Some("k"),
+            ..NewJob::new("test.ok", json!({"n": 2}))
+        },
+    )
+    .await?;
+    assert_eq!(first, merged);
+    let failing = jobs::enqueue(
+        &mut tx,
+        org,
+        NewJob {
+            max_attempts: 2,
+            ..NewJob::new("test.fail", json!({}))
+        },
+    )
+    .await?;
+    let unknown = jobs::enqueue(&mut tx, org, NewJob::new("test.unknown", json!({}))).await?;
+    tx.commit().await?;
+    let (payload, due): (Value, bool) =
+        sqlx::query_as("SELECT payload,run_at<=now() FROM jobs WHERE id=$1")
+            .bind(first)
+            .fetch_one(&h.db)
+            .await?;
+    assert!(payload == json!({"n": 1}) && due);
+    // A job enqueued by a transaction that rolls back never exists.
+    let mut tx = h.store.tx(org).await?;
+    let rolled_back = jobs::enqueue(&mut tx, org, NewJob::new("test.ok", json!({}))).await?;
+    tx.rollback().await?;
+    // Organizations see only their own jobs.
+    let mut tx = h.store.tx(other_org).await?;
+    let visible: i64 = sqlx::query_scalar("SELECT count(*) FROM jobs")
+        .fetch_one(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    assert_eq!(visible, 0);
+
+    let lease = Duration::from_secs(30);
+    let handlers = vec![
+        Handler {
+            kind: "test.ok",
+            lease,
+            run: job_succeeds,
+        },
+        Handler {
+            kind: "test.fail",
+            lease,
+            run: job_fails,
+        },
+    ];
+    assert_eq!(jobs::run_due(&app, &worker, &handlers).await?, 2);
+    assert_eq!(JOBS_RUN.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(state(first).await?, ("completed".into(), 1));
+    assert_eq!(
+        state(failing).await?,
+        ("queued".into(), 1),
+        "retried with backoff"
+    );
+    assert_eq!(
+        state(unknown).await?,
+        ("queued".into(), 0),
+        "no handler: left queued"
+    );
+    let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM jobs WHERE id=$1)")
+        .bind(rolled_back)
+        .fetch_one(&h.db)
+        .await?;
+    assert!(!exists);
+    assert_eq!(
+        jobs::run_due(&app, &worker, &handlers).await?,
+        0,
+        "backoff not over"
+    );
+    sqlx::query("UPDATE jobs SET run_at=now() WHERE id=$1")
+        .bind(failing)
+        .execute(&h.db)
+        .await?;
+    jobs::run_due(&app, &worker, &handlers).await?;
+    assert_eq!(state(failing).await?, ("dead".into(), 2));
+
+    // A worker whose lease expired loses the job: another worker reclaims and completes it,
+    // and the first worker's token no longer completes anything.
+    let mut tx = h.store.tx(org).await?;
+    let taken = jobs::enqueue(&mut tx, org, NewJob::new("test.ok", json!({}))).await?;
+    tx.commit().await?;
+    let stale = Uuid::now_v7();
+    sqlx::query(
+        "UPDATE jobs SET state='running',attempts=1,claim_token=$2,lease_until=now()-interval '1 second'
+         WHERE id=$1",
+    )
+    .bind(taken)
+    .bind(stale)
+    .execute(&h.db)
+    .await?;
+    assert_eq!(jobs::run_due(&app, &worker, &handlers).await?, 1);
+    assert_eq!(state(taken).await?, ("completed".into(), 2));
+    let mut tx = h.store.tx(org).await?;
+    let late = Job {
+        id: taken,
+        org_id: org,
+        kind: "test.ok".into(),
+        payload: json!({}),
+        attempts: 1,
+        claim_token: stale,
+    };
+    assert!(!jobs::finish(&mut tx, &late).await?);
+    tx.commit().await?;
+
+    // A job whose last attempt's lease ran out (its handler took the process down) is dead
+    // rather than retried forever.
+    let mut tx = h.store.tx(org).await?;
+    let crashed = jobs::enqueue(
+        &mut tx,
+        org,
+        NewJob {
+            max_attempts: 1,
+            ..NewJob::new("test.ok", json!({}))
+        },
+    )
+    .await?;
+    tx.commit().await?;
+    sqlx::query(
+        "UPDATE jobs SET state='running',attempts=1,claim_token=$2,lease_until=now()-interval '1 second'
+         WHERE id=$1",
+    )
+    .bind(crashed)
+    .bind(Uuid::now_v7())
+    .execute(&h.db)
+    .await?;
+    assert_eq!(jobs::run_due(&app, &worker, &handlers).await?, 0);
+    jobs::sweep(&app, &worker).await?;
+    assert_eq!(state(crashed).await?, ("dead".into(), 1));
+    worker.close().await;
+    h.close().await
+}
+
+fn create_run(cid: Uuid, conv: Uuid, text: &str) -> CommandEnvelope {
+    CommandEnvelope {
+        cid: cid.to_string(),
+        command: Some(Command::CreateRun(CreateRun {
+            conversation_id: conv.to_string(),
+            mode: "chat".into(),
+            first_message: Some(SendMessage {
+                text: text.into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })),
+    }
+}
+
+/// The result the gateway or the conversation's Owner sent for `cid`.
+async fn result_of(socket: &mut Socket, cid: Uuid) -> anyhow::Result<Body> {
+    let cid = cid.to_string();
+    let f = until(socket, |f| match &f.body {
+        Some(Body::CommandAck(a)) => a.cid == cid,
+        Some(Body::CommandRejected(r)) => r.cid == cid,
+        _ => false,
+    })
+    .await?;
+    Ok(f.body.unwrap())
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL/NATS: scripts/test-integration.sh"]
+async fn conversations_are_created_by_command_and_users_sync_drafts_reads_and_undos()
+-> anyhow::Result<()> {
+    let h = Harness::new().await?;
+    let user = h.user().await?;
+    let other = h.user().await?;
+    let org = id(&user, "org_id");
+    let user_channel = format!("user:{org}:{}", id(&user, "user_id"));
+    let mut owner = h.owner()?;
+    let mut socket = connect(&h.base, &user, "phone").await?;
+    subscribe(&mut socket, &user_channel, None).await?;
+    // CreateRun makes the conversation and queues its first message; a retry gets the same
+    // answer, and the id is no one else's to take.
+    let (cid, conv) = (Uuid::now_v7(), Uuid::now_v7());
+    send(
+        &mut socket,
+        frame(
+            &user_channel,
+            Body::Command(create_run(cid, conv, "离线写下的第一句")),
+        ),
+    )
+    .await?;
+    let first = result_of(&mut socket, cid).await?;
+    assert!(matches!(first, Body::CommandAck(_)), "{first:?}");
+    send(
+        &mut socket,
+        frame(
+            &user_channel,
+            Body::Command(create_run(cid, conv, "离线写下的第一句")),
+        ),
+    )
+    .await?;
+    assert_eq!(result_of(&mut socket, cid).await?, first);
+    let taken = Uuid::now_v7();
+    send(
+        &mut socket,
+        frame(
+            &user_channel,
+            Body::Command(create_run(taken, conv, "again")),
+        ),
+    )
+    .await?;
+    assert!(matches!(
+        result_of(&mut socket, taken).await?,
+        Body::CommandRejected(r) if r.code == "CONVERSATION_ID_TAKEN" && !r.retryable
+    ));
+    let mut stranger = connect(&h.base, &other, "laptop").await?;
+    let stranger_channel = format!("user:{}:{}", id(&other, "org_id"), id(&other, "user_id"));
+    let theirs = Uuid::now_v7();
+    send(
+        &mut stranger,
+        frame(
+            &stranger_channel,
+            Body::Command(create_run(theirs, conv, "mine")),
+        ),
+    )
+    .await?;
+    assert!(matches!(
+        result_of(&mut stranger, theirs).await?,
+        Body::CommandRejected(r) if r.code == "CONVERSATION_ID_TAKEN"
+    ));
+    let titled: String = sqlx::query_scalar("SELECT title FROM conversations WHERE id=$1")
+        .bind(conv)
+        .fetch_one(&h.db)
+        .await?;
+    assert_eq!(titled, "离线写下的第一句");
+    // The run starts as for SendMessage; its end marks the conversation as news.
+    let channel = format!("conv:{conv}");
+    subscribe(&mut socket, &channel, None).await?;
+    let mut engine = Engine::default();
+    engine.subscribe(channel.clone());
+    engine.subscribe(user_channel.clone());
+    let mut activity = 0;
+    for _ in 0..500 {
+        let f = next(&mut socket).await?;
+        if let Some(Body::Event(e)) = &f.body
+            && let Some(Event::ItemUpserted(item)) = &e.event
+            && item.id == conv.to_string()
+            && let Some(item_detail::Kind::Conversation(c)) =
+                item.detail.as_ref().and_then(|d| d.kind.as_ref())
+        {
+            activity = c.activity_seq;
+        }
+        engine.apply(f);
+        if activity > 0 {
+            break;
+        }
+    }
+    assert!(
+        activity > 0,
+        "the run's end is published to the user channel"
+    );
+    let items = &engine.channels[&channel].items;
+    assert!(
+        items
+            .values()
+            .any(|i| i.kind == "user" && i.text == "离线写下的第一句")
+    );
+    // Reading it moves the read position on every device.
+    let read = Uuid::now_v7();
+    send(
+        &mut socket,
+        frame(
+            &channel,
+            Body::Command(CommandEnvelope {
+                cid: read.to_string(),
+                command: Some(Command::MarkRead(MarkRead { read_seq: activity })),
+            }),
+        ),
+    )
+    .await?;
+    let read_state = until(&mut socket, |f| {
+        matches!(&f.body, Some(Body::Event(e)) if matches!(&e.event, Some(Event::ReadStateChanged(r)) if r.read_seq == activity))
+    })
+    .await?;
+    assert_eq!(read_state.channel, user_channel);
+    // A draft reaches the other devices, and the channel's snapshot until cleared.
+    let http = reqwest::Client::new();
+    let draft_url = format!("{}/orgs/{org}/conversations/{conv}/draft", h.base);
+    http.put(&draft_url)
+        .bearer_auth(user["token"].as_str().unwrap())
+        .json(&json!({"text":"未发送的半句","device_id":"phone"}))
+        .send()
+        .await?
+        .error_for_status()?;
+    until(&mut socket, |f| {
+        matches!(&f.body, Some(Body::Event(e)) if matches!(&e.event, Some(Event::DraftChanged(d)) if d.text == "未发送的半句" && d.device_id == "phone"))
+    })
+    .await?;
+    let mut tablet = connect(&h.base, &user, "tablet").await?;
+    subscribe(&mut tablet, &user_channel, None).await?;
+    let snapshot = until(&mut tablet, |f| matches!(f.body, Some(Body::Snapshot(_)))).await?;
+    let Some(Body::Snapshot(snapshot)) = snapshot.body else {
+        unreachable!()
+    };
+    assert_eq!(snapshot.drafts[0].text, "未发送的半句");
+    assert_eq!(snapshot.read_states[0].read_seq, activity);
+    http.put(&draft_url)
+        .bearer_auth(user["token"].as_str().unwrap())
+        .json(&json!({"text":"","device_id":"tablet"}))
+        .send()
+        .await?
+        .error_for_status()?;
+    let stranger_put = http
+        .put(&draft_url)
+        .bearer_auth(other["token"].as_str().unwrap())
+        .json(&json!({"text":"x"}))
+        .send()
+        .await?;
+    assert!(!stranger_put.status().is_success());
+    let mut later = connect(&h.base, &user, "later").await?;
+    subscribe(&mut later, &user_channel, None).await?;
+    let snapshot = until(&mut later, |f| matches!(f.body, Some(Body::Snapshot(_)))).await?;
+    assert!(matches!(snapshot.body, Some(Body::Snapshot(s)) if s.drafts.is_empty()));
+    // A memory change is undone once, whatever retries its command.
+    http.patch(format!("{}/orgs/{org}/memories/preferences", h.base))
+        .bearer_auth(user["token"].as_str().unwrap())
+        .json(&json!({"enabled":true,"reference_history":true}))
+        .send()
+        .await?
+        .error_for_status()?;
+    let saved: Value = http
+        .post(format!("{}/orgs/{org}/memories", h.base))
+        .bearer_auth(user["token"].as_str().unwrap())
+        .json(&json!({"content":"喜欢简洁的回答"}))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let undo = |cid: Uuid| {
+        frame(
+            &user_channel,
+            Body::Command(CommandEnvelope {
+                cid: cid.to_string(),
+                command: Some(Command::UndoMemoryUpdate(UndoMemoryUpdate {
+                    event_id: saved["event_id"].as_str().unwrap().into(),
+                })),
+            }),
+        )
+    };
+    let once = Uuid::now_v7();
+    send(&mut socket, undo(once)).await?;
+    let undone = result_of(&mut socket, once).await?;
+    assert!(matches!(&undone, Body::CommandAck(a) if a.result == "undone"));
+    send(&mut socket, undo(once)).await?;
+    assert_eq!(result_of(&mut socket, once).await?, undone);
+    let again = Uuid::now_v7();
+    send(&mut socket, undo(again)).await?;
+    assert!(matches!(
+        result_of(&mut socket, again).await?,
+        Body::CommandRejected(r) if r.code == "MEMORY_UNDO_UNAVAILABLE" && !r.retryable
+    ));
+    let status: String = sqlx::query_scalar("SELECT status FROM memory_items WHERE id=$1")
+        .bind(Uuid::parse_str(saved["id"].as_str().unwrap())?)
+        .fetch_one(&h.db)
+        .await?;
+    assert_eq!(status, "deleted");
+    owner.kill().await?;
+    owner.wait().await?;
+    h.close().await
+}
+
+/// Opens a WebSocket offering `protocols`; returns it and the protocol the server chose.
+async fn connect_with(
+    base: &str,
+    user: &Value,
+    protocols: &str,
+) -> anyhow::Result<(Socket, Option<String>)> {
+    let mut request = format!("{}/ws", base.replace("http:", "ws:")).into_client_request()?;
+    request.headers_mut().insert(
+        "Authorization",
+        format!("Bearer {}", user["token"].as_str().unwrap()).parse()?,
+    );
+    request
+        .headers_mut()
+        .insert("Sec-WebSocket-Protocol", protocols.parse()?);
+    let (socket, response) = tokio_tungstenite::connect_async(request).await?;
+    let chosen = response
+        .headers()
+        .get("sec-websocket-protocol")
+        .map(|p| p.to_str().unwrap().to_owned());
+    Ok((socket, chosen))
+}
+
+fn hello(device: &str) -> Frame {
+    frame(
+        "",
+        Body::Hello(Hello {
+            protocol_major: 1,
+            device_id: device.into(),
+            ..Default::default()
+        }),
+    )
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL/NATS: scripts/test-integration.sh"]
+async fn connections_compress_speak_json_fall_back_to_events_and_ride_http2() -> anyhow::Result<()>
+{
+    let h = Harness::with(|config| config.json_protocol = true).await?;
+    let user = h.user().await?;
+    let org = id(&user, "org_id");
+    let user_channel = format!("user:{org}:{}", id(&user, "user_id"));
+    // A long title makes the user channel's snapshot worth compressing.
+    reqwest::Client::new()
+        .post(format!("{}/orgs/{org}/conversations", h.base))
+        .bearer_auth(user["token"].as_str().unwrap())
+        .json(&json!({"title": "压缩".repeat(40), "mode": "chat"}))
+        .send()
+        .await?
+        .error_for_status()?;
+
+    // zstd: preferred when offered; large frames come compressed, small ones plain.
+    let (mut socket, chosen) = connect_with(
+        &h.base,
+        &user,
+        &format!("{SUBPROTOCOL_ZSTD}, {SUBPROTOCOL}"),
+    )
+    .await?;
+    assert_eq!(chosen.as_deref(), Some(SUBPROTOCOL_ZSTD));
+    send(&mut socket, hello("zstd")).await?;
+    subscribe(&mut socket, &user_channel, None).await?;
+    let mut saw_compressed = false;
+    let mut snapshot = None;
+    for _ in 0..20 {
+        let WsMessage::Binary(bytes) = socket.next().await.context("closed")?? else {
+            continue;
+        };
+        saw_compressed |= bytes.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]);
+        let f = Frame::decode(&*ryzhub_core::frame_bytes(&bytes).map_err(anyhow::Error::msg)?)?;
+        if let Some(Body::Snapshot(s)) = f.body {
+            snapshot = Some(s);
+            break;
+        }
+    }
+    assert!(saw_compressed, "the snapshot came compressed");
+    assert!(snapshot.unwrap().items[0].text.starts_with("压缩"));
+
+    // JSON, where the server offers it: text frames both ways.
+    let (mut socket, chosen) = connect_with(&h.base, &user, SUBPROTOCOL_JSON).await?;
+    assert_eq!(chosen.as_deref(), Some(SUBPROTOCOL_JSON));
+    socket
+        .send(WsMessage::Text(
+            serde_json::to_string(&hello("json"))?.into(),
+        ))
+        .await?;
+    let WsMessage::Text(text) = socket.next().await.context("closed")?? else {
+        anyhow::bail!("a text Welcome")
+    };
+    let welcome: Frame = serde_json::from_str(&text)?;
+    assert!(matches!(welcome.body, Some(Body::Welcome(_))));
+
+    // Server-sent events where WebSockets do not get through, frames posted back.
+    let http = reqwest::Client::new();
+    let mut events = http
+        .get(format!("{}/stream?device_id=events", h.base))
+        .bearer_auth(user["token"].as_str().unwrap())
+        .send()
+        .await?
+        .error_for_status()?
+        .bytes_stream();
+    let mut buffer = String::new();
+    let mut next_event = async || -> anyhow::Result<(String, String)> {
+        loop {
+            if let Some(end) = buffer.find("\n\n") {
+                let block: String = buffer.drain(..end + 2).collect();
+                let (mut kind, mut data) = (String::from("message"), String::new());
+                for line in block.lines() {
+                    if let Some(v) = line.strip_prefix("event:") {
+                        kind = v.trim().into();
+                    } else if let Some(v) = line.strip_prefix("data:") {
+                        data.push_str(v.trim());
+                    }
+                }
+                if !data.is_empty() {
+                    return Ok((kind, data));
+                }
+                continue;
+            }
+            let chunk = tokio::time::timeout(Duration::from_secs(10), events.next())
+                .await?
+                .context("stream ended")??;
+            buffer.push_str(std::str::from_utf8(&chunk)?);
+        }
+    };
+    let (kind, connection) = next_event().await?;
+    assert_eq!(kind, "connection");
+    let decode = |data: &str| -> anyhow::Result<Frame> {
+        use base64::Engine as _;
+        Ok(Frame::decode(
+            base64::engine::general_purpose::STANDARD
+                .decode(data)?
+                .as_slice(),
+        )?)
+    };
+    let (_, welcome) = next_event().await?;
+    assert!(
+        matches!(decode(&welcome)?.body, Some(Body::Welcome(w)) if w.connection_id == connection)
+    );
+    let post = |f: Frame| {
+        http.post(format!("{}/stream/{connection}", h.base))
+            .bearer_auth(user["token"].as_str().unwrap())
+            .body(f.encode_to_vec())
+            .send()
+    };
+    post(frame(
+        &user_channel,
+        Body::Subscribe(Subscribe { since_seq: None }),
+    ))
+    .await?
+    .error_for_status()?;
+    let mut subscribed = false;
+    for _ in 0..10 {
+        let (_, data) = next_event().await?;
+        if matches!(decode(&data)?.body, Some(Body::Snapshot(_))) {
+            subscribed = true;
+            break;
+        }
+    }
+    assert!(subscribed, "the subscription answered over the stream");
+    let other = h.user().await?;
+    let stranger = http
+        .post(format!("{}/stream/{connection}", h.base))
+        .bearer_auth(other["token"].as_str().unwrap())
+        .body(frame("", Body::Pong(Pong { nonce: 1 })).encode_to_vec())
+        .send()
+        .await?;
+    assert_eq!(stranger.status(), 404, "a connection is only its user's");
+
+    // RFC 8441: the WebSocket over an HTTP/2 extended CONNECT.
+    let address = h.base.trim_start_matches("http://").to_owned();
+    let io = hyper_util::rt::TokioIo::new(TcpStream::connect(&address).await?);
+    let (mut sender, conn) =
+        hyper::client::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new())
+            .handshake(io)
+            .await?;
+    tokio::spawn(conn);
+    let request = hyper::Request::builder()
+        .method(hyper::Method::CONNECT)
+        .extension(hyper::ext::Protocol::from_static("websocket"))
+        .uri(format!("http://{address}/ws"))
+        .header("sec-websocket-version", "13")
+        .header("sec-websocket-protocol", SUBPROTOCOL)
+        .header(
+            "authorization",
+            format!("Bearer {}", user["token"].as_str().unwrap()),
+        )
+        .body(String::new())?;
+    let mut response = sender.send_request(request).await?;
+    assert_eq!(response.status(), 200);
+    let upgraded = hyper::upgrade::on(&mut response).await?;
+    let mut h2 = WebSocketStream::from_raw_socket(
+        hyper_util::rt::TokioIo::new(upgraded),
+        tokio_tungstenite::tungstenite::protocol::Role::Client,
+        None,
+    )
+    .await;
+    h2.send(WsMessage::Binary(hello("h2").encode_to_vec().into()))
+        .await?;
+    let WsMessage::Binary(bytes) = h2.next().await.context("closed")?? else {
+        anyhow::bail!("a binary Welcome")
+    };
+    assert!(matches!(Frame::decode(bytes)?.body, Some(Body::Welcome(_))));
+    h.close().await
 }

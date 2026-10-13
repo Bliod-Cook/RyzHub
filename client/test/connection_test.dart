@@ -56,7 +56,9 @@ class _Core implements ClientCore {
   @override
   Uint8List authRefresh({required String token}) => Uint8List.fromList([3]);
   @override
-  Update ingest({required List<Uint8List> frames}) {
+  Update flush({required double nowMs}) => _update();
+  @override
+  Update ingest({required List<Uint8List> frames, required double nowMs}) {
     expect(disposed, isFalse);
     // Incoming ping, welcome and auth-expiring events, respectively.
     return _update(
@@ -164,6 +166,7 @@ class _Hub extends HubController {
     String path, {
     Map<String, dynamic>? body,
     String? method,
+    Duration timeout = const Duration(seconds: 15),
   }) async {
     if (path == '/auth/ticket') {
       ticketRequests++;
@@ -181,7 +184,12 @@ class _Hub extends HubController {
 }
 
 void main() {
-  setUpAll(() => RustLib.initMock(api: _Api()));
+  setUpAll(() {
+    // This file drives the connection with a stand-in kernel.
+    // ignore: invalid_use_of_internal_member
+    RustLib.instance.resetState();
+    RustLib.initMock(api: _Api());
+  });
   tearDownAll(RustLib.dispose);
 
   late _Core core;

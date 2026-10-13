@@ -15,7 +15,7 @@ use super::{context, media, protocol, tools};
 use crate::attachments::outputs;
 use crate::{
     app::App,
-    error::{Code, code_of, or_code},
+    error::{Code, code_of, is_fenced, or_code},
     llm::keys,
     owner::{LiveRef, OwnerLink, WorkerEvent},
     provider::{NativeMessage, SseDecoder},
@@ -39,6 +39,9 @@ struct Step {
     config: RunConfig,
     instructions: String,
     compact: bool,
+    /// The run's plugin tools and skills (plugin, skill).
+    plugin_tools: Vec<crate::plugins::RunTool>,
+    skills: Vec<(String, crate::plugins::package::Skill)>,
 }
 
 pub async fn drive(app: App, lease: Lease, run: Uuid, link: OwnerLink) -> anyhow::Result<()> {
@@ -256,9 +259,13 @@ async fn prepare(
     .execute(&mut *tx)
     .await?;
     let instructions = crate::projects::instructions(&mut tx, lease, run, &app.config).await?;
+    let plugin_tools = crate::plugins::run_tools(app, &mut tx, org, run).await?;
+    let skills = crate::plugins::run_skills(&mut tx, org, run).await?;
     tx.commit().await?;
     link.committed().await;
     Ok(Some(Step {
+        plugin_tools,
+        skills,
         number,
         messages,
         item,
@@ -398,8 +405,20 @@ fn request_body(app: &App, step: &Step) -> Value {
     } else {
         String::new()
     };
+    let skills = if step.skills.is_empty() || step.read_only {
+        String::new()
+    } else {
+        let list: String = step
+            .skills
+            .iter()
+            .map(|(plugin, skill)| format!("\n- {plugin}/{}: {}", skill.name, skill.description))
+            .collect();
+        format!(
+            "\n\nSkills you can use (call load_skill with the plugin and skill name to read one before following it):{list}"
+        )
+    };
     let system = format!(
-        "You are a helpful assistant. Use ask_user when a decision is needed. Execution tools run only in a sandbox; only /workspace persists. Never claim a tool succeeded without its result.{files}{}",
+        "You are a helpful assistant. Use ask_user when a decision is needed. Execution tools run only in a sandbox; only /workspace persists. Never claim a tool succeeded without its result.{files}{}{skills}",
         step.instructions
     );
     let responses = step.config.protocol == "responses";
@@ -412,7 +431,32 @@ fn request_body(app: &App, step: &Step) -> Value {
                "messages":step.messages,"system":system})
     };
     if !step.read_only && !step.compact {
-        let definitions = tools::definitions();
+        let mut definitions = tools::definitions();
+        let list = definitions.as_array_mut().unwrap();
+        if !step.skills.is_empty() {
+            list.push(tools::load_skill_definition());
+        }
+        // Many plugin tools are found by search rather than read up front.
+        let defer = !responses
+            && step.plugin_tools.len() > app.config.plugins.defer_tools_above
+            && app
+                .config
+                .llm
+                .tool_search_models
+                .iter()
+                .any(|prefix| step.config.model.starts_with(prefix.as_str()));
+        list.extend(step.plugin_tools.iter().map(|tool| {
+            let mut definition = tool.chat_definition();
+            if defer {
+                definition["defer_loading"] = json!(true);
+            }
+            definition
+        }));
+        if defer {
+            list.push(
+                json!({"type": "tool_search_tool_bm25_20251119", "name": "tool_search_tool_bm25"}),
+            );
+        }
         let definitions = definitions.as_array().unwrap();
         let mut list: Vec<Value> = if responses {
             definitions
@@ -440,8 +484,130 @@ fn request_body(app: &App, step: &Step) -> Value {
         for key in ["stream", "store", "include", "reasoning"] {
             object.remove(key);
         }
+    } else if !responses && !step.read_only && compacts(app, &step.config.model) {
+        // The provider summarizes the context itself once it grows past the trigger.
+        body["context_management"] = json!({"edits": [{
+            "type": "compact_20260112",
+            "trigger": {"type": "input_tokens", "value": app.config.llm.compaction_trigger_tokens},
+        }]});
     }
+    let context = if responses { "input" } else { "messages" };
+    protocol::offload(
+        &step.config.protocol,
+        &mut body[context],
+        app.config.llm.context_budget_tokens as usize,
+    );
     body
+}
+
+/// Whether an Anthropic model compacts its own context.
+fn compacts(app: &App, model: &str) -> bool {
+    app.config
+        .llm
+        .compaction_models
+        .iter()
+        .any(|prefix| model.starts_with(prefix.as_str()))
+}
+
+/// Beta features a request body uses.
+fn betas(body: &Value) -> Option<&'static str> {
+    if body.get("compaction").is_some() {
+        Some("compact-2026-09-04")
+    } else if body.get("context_management").is_some() {
+        Some("compact-2026-01-12")
+    } else {
+        None
+    }
+}
+
+/// What the model is asked when its context is compacted by a summary.
+const SUMMARY_REQUEST: &str = "Summarize our conversation so far so that you can continue it from the summary alone: the user's goals and preferences, decisions made, facts and results you found (with file paths, commands and identifiers), work in progress and what remains. Write the summary only.";
+
+/// A gateway call that answers at once, as JSON.
+async fn call_model(app: &App, key: &str, path: &str, body: &Value) -> anyhow::Result<Value> {
+    let mut request = app
+        .http
+        .gateway
+        .post(format!(
+            "{}/v1/{path}",
+            app.config.llm.gateway_url.trim_end_matches('/')
+        ))
+        .bearer_auth(key)
+        .header("anthropic-version", "2023-06-01");
+    if let Some(beta) = betas(body) {
+        request = request.header("anthropic-beta", beta);
+    }
+    let response = request
+        .json(body)
+        .send()
+        .await
+        .context(Code::ModelConnectionFailed)?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body: Value = response.json().await.unwrap_or(Value::Null);
+        anyhow::bail!(gateway_error(status, &body));
+    }
+    Ok(response.json().await?)
+}
+
+/// Compact the context the provider's way: Responses' compaction endpoint, or Anthropic's
+/// compaction on demand.
+async fn provider_compaction(
+    app: &App,
+    step: &Step,
+    key: &str,
+    body: &Value,
+) -> anyhow::Result<Value> {
+    if step.config.protocol == "responses" {
+        let mut value = call_model(app, key, "responses/compact", body).await?;
+        ensure!(value["output"].is_array(), Code::ModelRequestFailed);
+        // The compacted context is stored; it must not keep inline media.
+        media::scrub(&mut value["output"]);
+        return Ok(value);
+    }
+    ensure!(compacts(app, &step.config.model), Code::CompactUnsupported);
+    let mut body = body.clone();
+    body["compaction"] = json!({"type": "summarize"});
+    let value = call_model(app, key, "messages", &body).await?;
+    // It may answer without a summary (a refusal, a context too long to read).
+    ensure!(
+        value["stop_reason"] == "compaction"
+            && value["content"]
+                .as_array()
+                .is_some_and(|c| c.iter().any(|b| b["type"] == "compaction")),
+        Code::ModelRequestFailed
+    );
+    Ok(value)
+}
+
+/// Compact the context by asking the model for a summary of it, without tools.
+async fn summarize(app: &App, step: &Step, key: &str, body: &Value) -> anyhow::Result<Value> {
+    let responses = step.config.protocol == "responses";
+    let context = if responses { "input" } else { "messages" };
+    let mut body = body.clone();
+    body.as_object_mut()
+        .context("request body")?
+        .remove("compaction");
+    body[context]
+        .as_array_mut()
+        .context("context is not a message list")?
+        .push(json!({"role": "user", "content": SUMMARY_REQUEST}));
+    let path = if responses { "responses" } else { "messages" };
+    let value = call_model(app, key, path, &body).await?;
+    let summary: String = protocol::reply(&step.config.protocol, &value)
+        .texts
+        .into_iter()
+        .map(|(text, _)| text)
+        .collect();
+    ensure!(!summary.trim().is_empty(), Code::ModelRequestFailed);
+    Ok(json!({
+        "object": protocol::SUMMARY,
+        "summary": summary,
+        // Read as either protocol's response: nothing more to do.
+        "content": [],
+        "output": [],
+        "usage": value["usage"],
+    }))
 }
 
 /// Map a gateway error response to a stable code without copying upstream payloads.
@@ -621,6 +787,7 @@ async fn cited(
     // The new revision streams on from the committed text.
     link.send(WorkerEvent::Replace {
         item: LiveRef::of(&item),
+        stream: crate::owner::TEXT,
         text: layout.streamed.clone(),
     })
     .await?;
@@ -716,22 +883,34 @@ async fn model(
         &options,
     )
     .await?;
-    let path = if step.compact {
-        "responses/compact"
-    } else if responses {
-        "responses"
-    } else {
-        "messages"
-    };
-    let response = app
+    if step.compact {
+        let value = match provider_compaction(app, step, &key, &body).await {
+            Ok(value) => value,
+            Err(error) if is_fenced(&error) => return Err(error),
+            Err(error) => {
+                tracing::info!(
+                    error = format!("{error:#}"),
+                    "provider compaction unavailable; summarizing"
+                );
+                summarize(app, step, &key, &body).await?
+            }
+        };
+        return Ok((value, layout));
+    }
+    let path = if responses { "responses" } else { "messages" };
+    let mut request = app
         .http
         .gateway
         .post(format!(
             "{}/v1/{path}",
             app.config.llm.gateway_url.trim_end_matches('/')
         ))
-        .bearer_auth(key)
-        .header("anthropic-version", "2023-06-01")
+        .bearer_auth(&key)
+        .header("anthropic-version", "2023-06-01");
+    if let Some(beta) = betas(&body) {
+        request = request.header("anthropic-beta", beta);
+    }
+    let response = request
         .json(&body)
         .send()
         .await
@@ -740,13 +919,6 @@ async fn model(
         let status = response.status();
         let body: Value = response.json().await.unwrap_or(Value::Null);
         anyhow::bail!(gateway_error(status, &body));
-    }
-    if step.compact {
-        let mut value: Value = response.json().await?;
-        ensure!(value["output"].is_array(), Code::ModelRequestFailed);
-        // The compacted context is stored; it must not keep inline media.
-        media::scrub(&mut value["output"]);
-        return Ok((value, layout));
     }
     mark_steers_handed(app, lease, run, step.number, link).await?;
     let mut stream = response.bytes_stream();
@@ -785,6 +957,7 @@ async fn model(
                 let live = layout.texts.last().context("layout without text")?;
                 link.send(WorkerEvent::Append {
                     item: LiveRef::of(live),
+                    stream: crate::owner::TEXT,
                     offset: layout.streamed.len(),
                     text: text.clone(),
                 })
@@ -928,10 +1101,15 @@ async fn complete(
                 text: format!("{name}\n{}", call["input"]),
                 run_id: run.to_string(),
                 detail: Some(ItemDetail {
-                    kind: Some(item_detail::Kind::Tool(ToolDetail {
-                        name: name.into(),
-                        arguments_json: call["input"].to_string(),
-                        ..Default::default()
+                    kind: Some(item_detail::Kind::Tool({
+                        let plugin = step.plugin_tools.iter().find(|tool| tool.name == name);
+                        ToolDetail {
+                            name: name.into(),
+                            arguments_json: call["input"].to_string(),
+                            plugin: plugin.map(|tool| tool.plugin.clone()).unwrap_or_default(),
+                            app: plugin.and_then(|tool| tool.ui.clone()).unwrap_or_default(),
+                            ..Default::default()
+                        }
                     })),
                 }),
                 ..Default::default()

@@ -1,6 +1,7 @@
 //! The public HTTP API: REST resources and the WebSocket endpoint.
 mod auth;
 mod orgs;
+pub mod sso;
 
 use anyhow::Context;
 use axum::{
@@ -8,7 +9,7 @@ use axum::{
     extract::State,
     http::{HeaderMap, Method, header},
     response::Html,
-    routing::{any, delete, get, patch, post},
+    routing::{any, delete, get, patch, post, put},
 };
 use serde_json::{Value, json};
 use tower_http::cors::CorsLayer;
@@ -23,8 +24,8 @@ use ryzhub_domain::OrgContext;
 
 pub fn router(app: App) -> Router {
     use crate::{
-        attachments::http as attachments, conversation_commands as conversations, llm, memory,
-        projects, search, workspace,
+        attachments::http as attachments, attachments::uploads,
+        conversation_commands as conversations, llm, memory, projects, search, workspace,
     };
     let origins: Vec<axum::http::HeaderValue> = app
         .config
@@ -34,17 +35,85 @@ pub fn router(app: App) -> Router {
         .collect();
     let cors = CorsLayer::new()
         .allow_origin(origins)
-        .allow_methods([Method::GET, Method::POST, Method::PATCH, Method::DELETE])
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::PATCH,
+            Method::DELETE,
+        ])
         .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
         // The refresh cookie travels with the web client's `/auth` requests.
         .allow_credentials(true);
+    use crate::plugins::{api as plugins, oauth};
     Router::new()
+        .route(
+            "/orgs/{org}/plugins",
+            get(plugins::list).post(plugins::install),
+        )
+        .route("/orgs/{org}/plugins/catalog", get(plugins::catalog))
+        .route(
+            "/orgs/{org}/plugins/preview",
+            post(plugins::preview).layer(axum::extract::DefaultBodyLimit::max(24 * 1024 * 1024)),
+        )
+        .route(
+            "/orgs/{org}/plugins/{id}",
+            patch(plugins::change).delete(plugins::remove),
+        )
+        .route("/orgs/{org}/plugins/{id}/update", post(plugins::update))
+        .route("/orgs/{org}/plugins/{id}/confirm", post(plugins::confirm))
+        .route("/orgs/{org}/plugins/{id}/refresh", post(plugins::refresh))
+        .route("/orgs/{org}/plugins/{id}/connect", post(plugins::connect))
+        .route(
+            "/orgs/{org}/plugins/{id}/connections/{server}",
+            delete(plugins::disconnect),
+        )
+        .route(
+            "/orgs/{org}/conversations/{conv}/plugins",
+            get(plugins::conversation_plugins),
+        )
+        .route(
+            "/orgs/{org}/conversations/{conv}/plugins/{id}",
+            put(plugins::conversation_toggle),
+        )
+        .route(
+            "/orgs/{org}/projects/{project}/plugins/{id}",
+            put(plugins::project_toggle),
+        )
+        .route(
+            "/orgs/{org}/conversations/{conv}/apps",
+            post(crate::plugins::apps::open),
+        )
+        .route(
+            "/orgs/{org}/conversations/{conv}/tool-calls",
+            post(crate::plugins::apps::call),
+        )
+        .route(
+            "/admin/plugin-blocks",
+            get(plugins::blocks).post(plugins::block),
+        )
+        .route("/admin/plugin-blocks/{id}", delete(plugins::unblock))
+        .route("/plugins/oauth/client.json", get(oauth::client_document))
+        .route("/plugins/oauth/callback", get(oauth::callback))
         .route("/orgs/{org}/search", get(search::endpoint))
         .route(
             "/orgs/{org}/attachments",
             get(attachments::list).post(attachments::upload),
         )
         .route("/orgs/{org}/attachments/{id}", delete(attachments::remove))
+        .route("/devices", post(crate::push::register))
+        .route("/devices/{device}", delete(crate::push::unregister))
+        .route("/orgs/{org}/uploads", post(uploads::start))
+        .route(
+            "/orgs/{org}/uploads/{id}",
+            get(uploads::show).delete(uploads::abort),
+        )
+        .route("/orgs/{org}/uploads/{id}/parts/{n}", put(uploads::part))
+        .route(
+            "/orgs/{org}/uploads/{id}/parts/{n}/sent",
+            post(uploads::sent),
+        )
+        .route("/orgs/{org}/uploads/{id}/complete", post(uploads::complete))
         .route(
             "/orgs/{org}/attachments/{id}/content",
             get(attachments::content),
@@ -76,6 +145,13 @@ pub fn router(app: App) -> Router {
         )
         .route("/admin/settings", get(admin_settings))
         .route("/ws", any(crate::ws::upgrade))
+        .route("/stream", get(crate::ws::sse::open))
+        .route("/stream/{connection}", post(crate::ws::sse::post))
+        .route("/auth/oauth/{provider}/start", get(sso::start))
+        .route("/auth/oauth/{provider}/callback", get(sso::callback))
+        .route("/auth/oauth/exchange", post(sso::exchange))
+        .route("/me/identities", get(sso::identities))
+        .route("/me/identities/{provider}/{subject}", delete(sso::unlink))
         .route("/auth/register", post(auth::register))
         .route("/auth/login", post(auth::login))
         .route("/auth/logout", post(auth::logout))
@@ -86,6 +162,10 @@ pub fn router(app: App) -> Router {
         .route("/orgs/{org}/models", get(orgs::models))
         .route("/orgs/{org}/audit", get(orgs::audit_log))
         .route("/orgs/{org}/usage", get(llm::gateway::usage))
+        .route(
+            "/orgs/{org}/usage/{id}/content",
+            get(llm::gateway::usage_content),
+        )
         .route("/orgs/{org}/members/{user}", delete(orgs::remove_member))
         .route(
             "/orgs/{org}/credentials",
@@ -109,6 +189,10 @@ pub fn router(app: App) -> Router {
             get(workspace::status).post(workspace::enqueue),
         )
         .route(
+            "/orgs/{org}/conversations/{conv}/terminal",
+            any(crate::terminal::upgrade),
+        )
+        .route(
             "/orgs/{org}/conversations/{conv}/project",
             post(projects::move_conversation),
         )
@@ -123,6 +207,10 @@ pub fn router(app: App) -> Router {
         .route(
             "/orgs/{org}/conversations/{conv}/export",
             get(conversations::export),
+        )
+        .route(
+            "/orgs/{org}/conversations/{conv}/draft",
+            put(crate::drafts::put),
         )
         .route(
             "/orgs/{org}/projects",
@@ -143,6 +231,14 @@ pub fn router(app: App) -> Router {
         .route(
             "/orgs/{org}/projects/{project}/files/{file}",
             delete(projects::remove_file),
+        )
+        .route(
+            "/orgs/{org}/projects/{project}/files/{file}/source",
+            get(projects::file_source),
+        )
+        .route(
+            "/orgs/{org}/projects/{project}/files/upload",
+            post(projects::upload_file),
         )
         .layer(axum::extract::DefaultBodyLimit::max(2 * 1024 * 1024))
         .layer(cors)
@@ -208,18 +304,14 @@ async fn healthz(State(app): State<App>) -> ApiResult<Json<Value>> {
 
 async fn capabilities(State(app): State<App>) -> Json<Value> {
     let config = &app.config;
-    let mut work = ryzhub_execution::native::capabilities("codex");
+    let mut work = ryzhub_execution::native::capabilities("codex", None);
     if let (Some(work), Some(extra)) = (
         work.as_object_mut(),
         crate::run_config::capabilities("codex", "responses").as_object(),
     ) {
         work.extend(extra.clone());
     }
-    let harnesses = if config.work.claude_model.is_empty() {
-        vec!["codex"]
-    } else {
-        vec!["codex", "claude"]
-    };
+    let harnesses = crate::run_config::work_harnesses(config);
     Json(json!({
         "chat": if config.llm.enabled { crate::run_config::default_chat_protocol(config) } else { "mock" },
         "model": if config.llm.enabled { config.llm.model.as_str() } else { "mock" },
@@ -235,10 +327,28 @@ async fn capabilities(State(app): State<App>) -> Json<Value> {
         "conversation_temporary": config.search.enabled,
         "conversation_delete": config.search.enabled,
         "conversation_pin": true,
+        // Minor version 6: conversations created by CreateRun, unread state, synced drafts,
+        // memory undo by command.
+        "create_run": true,
+        "unread": true,
+        "drafts": true,
+        "memory_undo_command": true,
+        // `GET /stream` + `POST /stream/{connection}` where WebSockets do not get through.
+        "event_stream": true,
+        // Sign-in with other accounts: `/auth/oauth/<id>/start?return_to=`.
+        "auth_providers": sso::providers(&app),
+        // Minor version 8: plugins, their commands (InvokeMenuCommand) and questions
+        // (PendingAction.form_json), MCP Apps from `plugin_content_origin`.
+        "plugins": config.plugins.enabled,
+        // Android notifications: `POST /devices` with an FCM token.
+        "push": config.push.enabled,
+        "plugin_content_origin": config.plugins.content_origin,
         "attachments": {
             "max_bytes": config.policy.attachment_bytes.unwrap_or(crate::attachments::DEFAULT_BYTES)
                 .min(crate::attachments::MAX_BYTES),
             "max_per_message": crate::attachments::MAX_PER_MESSAGE,
+            // Larger files go in parts of this size through `/orgs/{org}/uploads`.
+            "part_bytes": crate::attachments::uploads::PART_SIZE,
         },
     }))
 }
@@ -265,6 +375,7 @@ async fn admin_settings(State(app): State<App>, headers: HeaderMap) -> ApiResult
             "chat": if config.llm.enabled { "anthropic" } else { "mock" },
             "work": if config.work.enabled { "codex" } else { "mock" },
             "pty": false,
+            "terminal": config.work.enabled && config.sandbox.enabled,
         },
     })))
 }

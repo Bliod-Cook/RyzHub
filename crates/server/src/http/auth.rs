@@ -157,7 +157,7 @@ fn cookie(headers: &HeaderMap, name: &str) -> Option<String> {
 }
 
 /// Sign in a device: an access token, and the cookie that renews it.
-async fn sign_in(
+pub(super) async fn sign_in(
     store: &Store,
     headers: &HeaderMap,
     user: Uuid,
@@ -221,6 +221,20 @@ pub async fn register(
             .map_err(|e| anyhow::anyhow!(e.to_string()))
     })
     .await??;
+    let (user, org) = create_account(&app, &email, None, &password)
+        .await?
+        .ok_or(Code::InvalidInput)?;
+    sign_in(&app.store, &headers, user, Some(org)).await
+}
+
+/// A new user with their personal organization; None when the email has an account.
+/// `password` is a password hash, or `!` for a user who signs in only with other accounts.
+pub(super) async fn create_account(
+    app: &App,
+    email: &str,
+    name: Option<&str>,
+    password: &str,
+) -> anyhow::Result<Option<(Uuid, Uuid)>> {
     let user = Uuid::now_v7();
     let org = Uuid::now_v7();
     let mut tx = app.store.tx(org).await?;
@@ -228,13 +242,15 @@ pub async fn register(
         "INSERT INTO users(id,email,display_name,password_hash) VALUES($1,$2,$3,$4) ON CONFLICT(email) DO NOTHING",
     )
     .bind(user)
-    .bind(&email)
-    .bind(email.split('@').next().unwrap_or("User"))
+    .bind(email)
+    .bind(name.unwrap_or_else(|| email.split('@').next().unwrap_or("User")))
     .bind(password)
     .execute(&mut *tx)
     .await?
     .rows_affected();
-    require!(inserted == 1, Code::InvalidInput);
+    if inserted != 1 {
+        return Ok(None);
+    }
     sqlx::query("INSERT INTO organizations(id,kind,name) VALUES($1,'personal','个人空间')")
         .bind(org)
         .execute(&mut *tx)
@@ -258,7 +274,7 @@ pub async fn register(
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
-    sign_in(&app.store, &headers, user, Some(org)).await
+    Ok(Some((user, org)))
 }
 
 /// `POST /auth/login`

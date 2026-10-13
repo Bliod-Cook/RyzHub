@@ -22,6 +22,7 @@ class _Hub extends HubController {
     String path, {
     Map<String, dynamic>? body,
     String? method,
+    Duration timeout = const Duration(seconds: 15),
   }) => (answers[path] = Completer()).future;
 }
 

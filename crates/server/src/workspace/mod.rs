@@ -8,9 +8,9 @@ mod checkpoint;
 mod gc;
 mod restore;
 
-pub use checkpoint::{create, current};
+pub use checkpoint::{create, current, workspace as checkpoint_workspace};
 pub use gc::{collect_org, collector, gc};
-pub use restore::{restore, restore_into};
+pub use restore::{restore, restore_into, workspace_into as restore_workspace};
 
 use anyhow::{Context, ensure};
 use axum::{
@@ -102,16 +102,33 @@ pub async fn status(
     .bind(conv)
     .fetch_optional(&mut *tx)
     .await?;
-    let recovery: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM workspace_heads WHERE org_id=$1 AND conversation_id=$2 AND recovery_required)",
+    let (recovery, storage): (bool, Option<String>) = sqlx::query_as(
+        "SELECT coalesce(bool_or(recovery_required),false),max(storage_state)
+         FROM workspace_heads WHERE org_id=$1 AND conversation_id=$2",
     )
     .bind(org)
     .bind(conv)
     .fetch_one(&mut *tx)
     .await?;
+    // In use, yet its last committed checkpoint is older than the recovery point objective.
+    let stale: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM sandboxes s WHERE s.org_id=$1 AND s.conversation_id=$2
+           AND s.persistent AND s.state='running'
+           AND coalesce((SELECT max(c.created_at) FROM checkpoints c WHERE c.org_id=s.org_id
+               AND c.conversation_id=s.conversation_id AND c.state='committed'),s.created_at)
+               <now()-($3::bigint*interval '1 second')
+           AND EXISTS(SELECT 1 FROM runs r WHERE r.org_id=s.org_id AND r.conversation_id=s.conversation_id
+               AND coalesce(r.ended_at,'infinity')>now()-($3::bigint*interval '1 second')))",
+    )
+    .bind(org)
+    .bind(conv)
+    .bind(sandbox::CHECKPOINT_STALE_SECS)
+    .fetch_one(&mut *tx)
+    .await?;
     tx.commit().await?;
     Ok(Json(
-        json!({"checkpoint":head,"jobs":jobs,"sandbox":sandbox,"recovery_required":recovery}),
+        json!({"checkpoint":head,"jobs":jobs,"sandbox":sandbox,
+        "recovery_required":recovery,"stale":stale,"storage_state":storage}),
     ))
 }
 
@@ -141,6 +158,15 @@ pub async fn enqueue(
         .bind(conv)
         .fetch_one(&mut *tx)
         .await?;
+    let purged: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM workspace_heads WHERE org_id=$1 AND conversation_id=$2
+         AND storage_state IN ('purging','deleted'))",
+    )
+    .bind(org)
+    .bind(conv)
+    .fetch_one(&mut *tx)
+    .await?;
+    require!(!purged, Code::WorkspacePurged);
     if input.kind == "archive" {
         let busy: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM runs WHERE org_id=$1 AND conversation_id=$2 AND state IN ('running','requires_action'))",
@@ -250,6 +276,7 @@ async fn automatic_job(
     let suspend: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM sandboxes s WHERE s.org_id=$1 AND s.conversation_id=$2 AND s.persistent
              AND s.state='running' AND s.created_at<now()-($3::bigint*interval '1 second')
+             AND coalesce(s.terminal_seen_at<now()-interval '1 minute',true)
              AND NOT EXISTS(SELECT 1 FROM runs r WHERE r.org_id=s.org_id AND r.conversation_id=s.conversation_id
                             AND coalesce(r.ended_at,'infinity')>now()-($3::bigint*interval '1 second')))",
     )
@@ -311,6 +338,22 @@ pub async fn jobs(app: &App, lease: &Lease, link: &OwnerLink) -> anyhow::Result<
         .bind(id)
         .execute(&mut *tx)
         .await?;
+    // Where the files were, to return to if the job fails.
+    let stored: Option<String> = sqlx::query_scalar(
+        "SELECT storage_state FROM workspace_heads WHERE org_id=$1 AND conversation_id=$2",
+    )
+    .bind(lease.org_id)
+    .bind(lease.conversation_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let moving = match kind.as_str() {
+        "archive" => Some("archiving"),
+        "restore" => Some("restoring"),
+        _ => None,
+    };
+    if let Some(moving) = moving {
+        crate::lifecycle::storage(&mut tx, lease.org_id, lease.conversation_id, moving).await?;
+    }
     tx.commit().await?;
     let result = match kind.as_str() {
         "restore" => restore(app, lease, id, link).await,
@@ -326,6 +369,9 @@ pub async fn jobs(app: &App, lease: &Lease, link: &OwnerLink) -> anyhow::Result<
         tracing::warn!(job = %id, error = format!("{error:#}"), "workspace job failed");
     }
     let mut tx = app.store.fenced(lease).await?;
+    if let (Err(_), Some(_), Some(stored)) = (&result, moving, &stored) {
+        crate::lifecycle::storage(&mut tx, lease.org_id, lease.conversation_id, stored).await?;
+    }
     sqlx::query("UPDATE workspace_jobs SET state=$3,result=$4 WHERE org_id=$1 AND id=$2")
         .bind(lease.org_id)
         .bind(id)
@@ -388,6 +434,8 @@ async fn stop_after_checkpoint(
     }
     sandbox::host(
         app,
+        lease.org_id,
+        sandbox,
         HostCommand::Stop {
             sandbox_id: sandbox,
             exec_epoch: lease.epoch as u64,
@@ -416,10 +464,6 @@ async fn stop_after_checkpoint(
 }
 
 async fn archive_conversation(tx: &mut Tx<'_>, lease: &Lease) -> anyhow::Result<()> {
-    sqlx::query("UPDATE conversations SET state='archived' WHERE org_id=$1 AND id=$2")
-        .bind(lease.org_id)
-        .bind(lease.conversation_id)
-        .execute(&mut **tx)
-        .await?;
-    Ok(())
+    crate::lifecycle::archive(tx, lease.org_id, lease.conversation_id).await?;
+    crate::store::publish_conversation(tx, lease.org_id, lease.conversation_id).await
 }

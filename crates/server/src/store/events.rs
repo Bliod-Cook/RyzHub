@@ -34,26 +34,53 @@ pub fn truncate_utf8(text: &mut String, limit: usize) -> bool {
 }
 
 /// A conversation as its creator's user channel carries it: title, state and pin.
-pub fn conversation_item(
-    id: Uuid,
-    revision: u64,
-    state: String,
-    title: String,
-    pinned_at_ms: Option<i64>,
-) -> Item {
+pub fn conversation_item(conversation: &Conversation, revision: u64) -> Item {
     Item {
-        id: id.to_string(),
+        id: conversation.id.to_string(),
         revision,
         kind: "conversation".into(),
-        state,
-        text: title,
+        state: conversation.state.clone(),
+        text: conversation.title.clone(),
         detail: Some(ItemDetail {
             kind: Some(item_detail::Kind::Conversation(ConversationDetail {
-                pinned_at_ms: pinned_at_ms.unwrap_or(0) as u64,
+                pinned_at_ms: conversation.pinned_at_ms.unwrap_or(0) as u64,
+                activity_seq: conversation.activity_seq as u64,
             })),
         }),
         ..Default::default()
     }
+}
+
+/// Publishes the conversation's item to its creator's user channel as it now is.
+pub async fn publish_conversation(tx: &mut Tx<'_>, org: Uuid, conv: Uuid) -> anyhow::Result<()> {
+    let conversation: Conversation = sqlx::query_as(concat!(
+        "SELECT ",
+        conversation_columns!(),
+        " FROM conversations WHERE org_id=$1 AND id=$2"
+    ))
+    .bind(org)
+    .bind(conv)
+    .fetch_one(&mut **tx)
+    .await?;
+    let channel = format!("user:{org}:{}", conversation.creator_id);
+    // A user-channel sequence is also a monotonic metadata revision. Lock before allocating
+    // it so concurrent conversations cannot reuse it.
+    let revision: i64 =
+        sqlx::query_scalar("SELECT last_seq+1 FROM channels WHERE org_id=$1 AND id=$2 FOR UPDATE")
+            .bind(org)
+            .bind(&channel)
+            .fetch_one(&mut **tx)
+            .await?;
+    append(
+        tx,
+        org,
+        &channel,
+        None,
+        "",
+        Event::ItemUpserted(conversation_item(&conversation, revision as u64)),
+    )
+    .await?;
+    Ok(())
 }
 
 fn bound_item(item: &mut Item) {
@@ -159,10 +186,11 @@ pub async fn append(
         }
         if let Some(lease) = lease {
             sqlx::query(
-                "INSERT INTO items(id,org_id,conversation_id,run_id,revision,kind,state,text,first_seq,last_seq,truncated,detail)
-                 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+                "INSERT INTO items(id,org_id,conversation_id,run_id,revision,kind,state,text,first_seq,last_seq,truncated,detail,parent_item_id)
+                 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
                  ON CONFLICT(id) DO UPDATE SET revision=EXCLUDED.revision,state=EXCLUDED.state,text=EXCLUDED.text,
-                     last_seq=EXCLUDED.last_seq,truncated=EXCLUDED.truncated,detail=EXCLUDED.detail
+                     last_seq=EXCLUDED.last_seq,truncated=EXCLUDED.truncated,detail=EXCLUDED.detail,
+                     parent_item_id=EXCLUDED.parent_item_id
                  WHERE items.org_id=EXCLUDED.org_id AND items.revision<EXCLUDED.revision",
             )
             .bind(Uuid::parse_str(&item.id)?)
@@ -177,6 +205,7 @@ pub async fn append(
             .bind(seq)
             .bind(item.truncated)
             .bind(item.detail.as_ref().map(Json))
+            .bind(Uuid::parse_str(&item.parent_item_id).ok())
             .execute(&mut **tx)
             .await?;
         }
@@ -186,6 +215,7 @@ pub async fn append(
         Event::PendingActionChanged(_) => "pending_action_changed",
         Event::RunStateChanged(_) => "run_state_changed",
         Event::ReadStateChanged(_) => "read_state_changed",
+        Event::DraftChanged(_) => "draft_changed",
     };
     let envelope = EventEnvelope {
         seq: seq as u64,
@@ -574,7 +604,7 @@ async fn conversation_snapshot(tx: &mut Tx<'_>, org: Uuid, conv: Uuid) -> anyhow
     .fetch_all(&mut **tx)
     .await?;
     let actions: Vec<ActionRow> = sqlx::query_as(
-        "SELECT a.id,a.run_id,a.run_epoch,a.kind,a.summary,a.options,a.status,a.resolved_device,a.expires_at
+        "SELECT a.id,a.run_id,a.run_epoch,a.kind,a.summary,a.options,a.status,a.resolved_device,a.expires_at,a.form
          FROM pending_actions a JOIN runs r ON r.org_id=a.org_id AND r.id=a.run_id
          WHERE a.org_id=$1 AND r.conversation_id=$2 AND a.status='pending'",
     )
@@ -630,10 +660,12 @@ async fn user_snapshot(tx: &mut Tx<'_>, ctx: &OrgContext) -> anyhow::Result<Snap
     .bind(ctx.user_id)
     .fetch_all(&mut **tx)
     .await?;
+    let drafts = crate::drafts::of_user(tx, ctx).await?;
     Ok(Snapshot {
+        drafts,
         items: conversations
             .into_iter()
-            .map(|c| conversation_item(c.id, 1, c.state, c.title, c.pinned_at_ms))
+            .map(|c| conversation_item(&c, 1))
             .collect(),
         read_states: read_states
             .into_iter()

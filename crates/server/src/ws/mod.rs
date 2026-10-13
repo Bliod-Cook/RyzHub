@@ -3,7 +3,12 @@
 //! Authorization is checked when a subscription starts, whenever a revocation notice may
 //! affect it, and on a slow periodic fallback. Frames on the hot path are forwarded from the
 //! process-wide [`Hub`] without database work.
+//!
+//! A connection is the same whatever carries it: a WebSocket speaking protobuf, protobuf
+//! with server frames through one zstd stream, or JSON on development servers; or, where
+//! WebSockets do not get through, server-sent events with frames posted back ([`sse`]).
 mod hub;
+pub mod sse;
 
 pub use hub::{Feed, Hub};
 
@@ -16,7 +21,7 @@ use axum::{
     http::HeaderMap,
     response::Response,
 };
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{SinkExt, Stream, StreamExt, stream::SplitSink};
 use prost::Message as _;
 use ryzhub_proto::{frame::Body, *};
 use serde::Deserialize;
@@ -35,11 +40,12 @@ use crate::{
     owner::{fold_subject, result_subject, wake_subject},
     revocation::Notice,
     store::{Auth, hash_token},
+    user_commands::Intake,
 };
 
 const MAX_SUBSCRIPTIONS: usize = 16;
 const MAX_PENDING_COMMANDS: usize = 32;
-const SEND_QUEUE: usize = 256;
+pub(crate) const SEND_QUEUE: usize = 256;
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
 const HEARTBEAT: Duration = Duration::from_secs(22);
 const CLIENT_SILENCE: Duration = Duration::from_secs(55);
@@ -53,12 +59,13 @@ pub struct WsQuery {
     ticket: Option<String>,
 }
 
-pub async fn upgrade(
-    State(app): State<App>,
-    headers: HeaderMap,
-    Query(query): Query<WsQuery>,
-    ws: WebSocketUpgrade,
-) -> Result<Response, ApiError> {
+/// The session opening a WebSocket: an allowed Origin, and a one-time ticket (browsers) or a
+/// bearer token.
+pub async fn upgrade_auth(
+    app: &App,
+    headers: &HeaderMap,
+    ticket: Option<&str>,
+) -> Result<Auth, ApiError> {
     if let Some(origin) = headers.get("origin") {
         require!(
             app.config
@@ -68,22 +75,36 @@ pub async fn upgrade(
             Code::Forbidden
         );
     }
-    let auth = match query.ticket {
+    Ok(match ticket {
         Some(ticket) => {
             let session: Option<Uuid> = sqlx::query_scalar(
                 "DELETE FROM ws_tickets WHERE token_hash=$1 AND expires_at>now() RETURNING session_id",
             )
-            .bind(hash_token(&ticket))
+            .bind(hash_token(ticket))
             .fetch_optional(&app.store.pool)
             .await?;
             app.store
                 .auth_by_session(session.context(Code::Unauthorized)?)
                 .await?
         }
-        None => authenticate(&app, &headers).await?,
-    };
+        None => authenticate(app, headers).await?,
+    })
+}
+
+pub async fn upgrade(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Query(query): Query<WsQuery>,
+    ws: WebSocketUpgrade,
+) -> Result<Response, ApiError> {
+    let auth = upgrade_auth(&app, &headers, query.ticket.as_deref()).await?;
+    // The first protocol the client offers that this server speaks.
+    let mut protocols = vec![SUBPROTOCOL_ZSTD, SUBPROTOCOL];
+    if app.config.json_protocol {
+        protocols.push(SUBPROTOCOL_JSON);
+    }
     Ok(ws
-        .protocols([SUBPROTOCOL])
+        .protocols(protocols)
         .max_message_size(MAX_FRAME_BYTES)
         .max_frame_size(MAX_FRAME_BYTES)
         .on_upgrade(move |socket| async move {
@@ -91,6 +112,92 @@ pub async fn upgrade(
                 tracing::debug!(%error, "websocket closed");
             }
         }))
+}
+
+/// How a WebSocket carries frames.
+enum Codec {
+    Protobuf,
+    /// Frames to the client of at least [`ZSTD_FROM`] bytes as zstd frames, smaller ones as
+    /// they are: a protobuf frame never starts with zstd's magic number, so the client tells
+    /// them apart. Each message is a whole zstd frame (no context across messages: the pure
+    /// Rust decoder clients run holds back a stream's last window until it ends); the large
+    /// messages it shrinks (snapshots, history, long replies) carry nearly all the bytes.
+    Zstd,
+    Json,
+}
+
+/// Frames smaller than this gain nothing from compression.
+const ZSTD_FROM: usize = 256;
+const ZSTD_LEVEL: i32 = 3;
+
+impl Codec {
+    fn negotiated(protocol: Option<&str>) -> Self {
+        match protocol {
+            Some(SUBPROTOCOL_ZSTD) => Codec::Zstd,
+            Some(SUBPROTOCOL_JSON) => Codec::Json,
+            _ => Codec::Protobuf,
+        }
+    }
+
+    fn encode(&mut self, frame: &Frame) -> anyhow::Result<Message> {
+        Ok(match self {
+            Codec::Protobuf => Message::Binary(frame.encode_to_vec().into()),
+            Codec::Json => Message::Text(serde_json::to_string(frame)?.into()),
+            Codec::Zstd => {
+                let bytes = frame.encode_to_vec();
+                if bytes.len() < ZSTD_FROM {
+                    return Ok(Message::Binary(bytes.into()));
+                }
+                let compressed = zstd::bulk::compress(&bytes, ZSTD_LEVEL)?;
+                Message::Binary(if compressed.len() < bytes.len() {
+                    compressed.into()
+                } else {
+                    bytes.into()
+                })
+            }
+        })
+    }
+}
+
+/// A message from the client: frames come as protobuf, or as JSON text on the JSON protocol.
+fn decode(json: bool, message: Message) -> anyhow::Result<Inbound> {
+    Ok(match message {
+        Message::Binary(bytes) => Inbound::Frame(Box::new(Frame::decode(bytes)?)),
+        Message::Text(text) if json => Inbound::Frame(Box::new(serde_json::from_str(&text)?)),
+        Message::Close(_) => Inbound::Close,
+        _ => Inbound::Activity,
+    })
+}
+
+/// What arrives from the client.
+pub enum Inbound {
+    Frame(Box<Frame>),
+    /// Something that shows the client is there, but carries no frame.
+    Activity,
+    Close,
+}
+
+/// Where frames to the client go.
+pub trait Outbound: Send {
+    fn send(&mut self, frame: &Frame) -> impl Future<Output = anyhow::Result<()>> + Send;
+    fn close(&mut self) -> impl Future<Output = ()> + Send;
+}
+
+struct WebSocketOut {
+    sink: SplitSink<WebSocket, Message>,
+    codec: Codec,
+}
+
+impl Outbound for WebSocketOut {
+    async fn send(&mut self, frame: &Frame) -> anyhow::Result<()> {
+        let message = self.codec.encode(frame)?;
+        self.sink.send(message).await?;
+        Ok(())
+    }
+
+    async fn close(&mut self) {
+        let _ = self.sink.close().await;
+    }
 }
 
 /// Subscription tasks keyed by channel; aborted when the connection ends.
@@ -111,20 +218,8 @@ impl Drop for Subscriptions {
     }
 }
 
-fn encode(frame: &Frame) -> Message {
-    Message::Binary(frame.encode_to_vec().into())
-}
-
-async fn handshake(socket: &mut WebSocket) -> anyhow::Result<Option<Hello>> {
-    let message = tokio::time::timeout(Duration::from_secs(10), socket.recv())
-        .await?
-        .context("closed before Hello")??;
-    let Message::Binary(bytes) = message else {
-        anyhow::bail!("binary Hello required")
-    };
-    let Some(Body::Hello(hello)) = Frame::decode(bytes)?.body else {
-        anyhow::bail!("Hello required")
-    };
+/// The client's Hello, or None when it speaks another major version or names no device.
+fn valid_hello(hello: Hello) -> Result<Hello, Box<Frame>> {
     if hello.protocol_major != PROTOCOL_MAJOR
         || hello.device_id.is_empty()
         || hello.device_id.len() > 128
@@ -133,30 +228,58 @@ async fn handshake(socket: &mut WebSocket) -> anyhow::Result<Option<Hello>> {
             code: Code::IncompatibleProtocol.to_string(),
             message: format!("protocol major {PROTOCOL_MAJOR} and device_id required"),
         };
-        socket
-            .send(encode(&frame("", Body::ProtocolError(error))))
-            .await?;
-        return Ok(None);
+        return Err(Box::new(frame("", Body::ProtocolError(error))));
     }
-    Ok(Some(hello))
+    Ok(hello)
 }
 
-async fn connection(app: App, mut socket: WebSocket, auth: Auth) -> anyhow::Result<()> {
-    let Some(hello) = handshake(&mut socket).await? else {
-        return Ok(());
+async fn connection(app: App, socket: WebSocket, auth: Auth) -> anyhow::Result<()> {
+    let protocol = socket
+        .protocol()
+        .and_then(|p| p.to_str().ok())
+        .map(str::to_owned);
+    let codec = Codec::negotiated(protocol.as_deref());
+    let json = matches!(codec, Codec::Json);
+    let (sink, mut source) = socket.split();
+    let mut out = WebSocketOut { sink, codec };
+    let message = tokio::time::timeout(Duration::from_secs(10), source.next())
+        .await?
+        .context("closed before Hello")??;
+    let Inbound::Frame(first) = decode(json, message)? else {
+        anyhow::bail!("Hello required")
     };
+    let Some(Body::Hello(hello)) = first.body else {
+        anyhow::bail!("Hello required")
+    };
+    let hello = match valid_hello(hello) {
+        Ok(hello) => hello,
+        Err(refusal) => return out.send(&refusal).await,
+    };
+    let inbound = source.map(move |message| decode(json, message?));
+    serve(app, hello, auth, inbound, out, Uuid::now_v7()).await
+}
+
+/// A connection after its handshake: Welcome, then subscriptions and commands until the
+/// client leaves or its session ends.
+pub async fn serve(
+    app: App,
+    hello: Hello,
+    auth: Auth,
+    mut source: impl Stream<Item = anyhow::Result<Inbound>> + Unpin + Send,
+    mut sink: impl Outbound,
+    connection_id: Uuid,
+) -> anyhow::Result<()> {
     // Clients resubscribe from their own persisted cursors, so no server-side resume exists.
     let welcome = Welcome {
-        connection_id: Uuid::now_v7().to_string(),
-        resume_token: String::new(),
+        connection_id: connection_id.to_string(),
         heartbeat_ms: HEARTBEAT.as_millis() as u32,
         max_frame_bytes: MAX_FRAME_BYTES as u32,
-        resumed: false,
+        ..Default::default()
     };
-    socket
-        .send(encode(&frame("", Body::Welcome(welcome))))
-        .await?;
-    let (mut sink, mut source) = socket.split();
+    // Online before welcomed, so nothing notifies a device that is already told.
+    let user = auth.user_id;
+    crate::push::online(&app, user, &hello.device_id, true).await;
+    sink.send(&frame("", Body::Welcome(welcome))).await?;
     let (send, mut outgoing) = mpsc::channel::<Frame>(SEND_QUEUE);
     let (auth_tx, auth_rx) = watch::channel(auth);
     let mut subscriptions = Subscriptions(HashMap::new());
@@ -171,13 +294,12 @@ async fn connection(app: App, mut socket: WebSocket, auth: Auth) -> anyhow::Resu
         tokio::select! {
             message = source.next() => {
                 let Some(message) = message else { break };
-                let bytes = match message? {
-                    Message::Binary(bytes) => bytes,
-                    Message::Close(_) => break,
-                    _ => { last_seen = Instant::now(); continue; }
+                let input = match message? {
+                    Inbound::Frame(frame) => *frame,
+                    Inbound::Close => break,
+                    Inbound::Activity => { last_seen = Instant::now(); continue; }
                 };
                 last_seen = Instant::now();
-                let input = Frame::decode(bytes)?;
                 match input.body {
                     Some(Body::Subscribe(subscribe)) => {
                         subscriptions.stop(&input.channel);
@@ -218,7 +340,9 @@ async fn connection(app: App, mut socket: WebSocket, auth: Auth) -> anyhow::Resu
                         // Subscriptions re-authorize against the new session in place.
                         auth_tx.send_replace(refreshed);
                     }
-                    Some(Body::Pong(_)) => {}
+                    // A Hello again (the stream transport posts the one it opened with) is no
+                    // news.
+                    Some(Body::Pong(_) | Body::Hello(_)) => {}
                     _ => {
                         let error = ProtocolError {
                             code: Code::UnexpectedFrame.to_string(),
@@ -229,12 +353,13 @@ async fn connection(app: App, mut socket: WebSocket, auth: Auth) -> anyhow::Resu
                 }
             }
             Some(frame) = outgoing.recv() => {
-                tokio::time::timeout(Duration::from_secs(5), sink.send(encode(&frame))).await??;
+                tokio::time::timeout(Duration::from_secs(5), sink.send(&frame)).await??;
             }
             _ = heartbeat.tick() => {
                 ensure!(last_seen.elapsed() < CLIENT_SILENCE, "heartbeat timeout");
+                crate::push::online(&app, user, &hello.device_id, true).await;
                 let ping = Ping { nonce: chrono::Utc::now().timestamp_millis() as u64 };
-                sink.send(encode(&frame("", Body::Ping(ping)))).await?;
+                sink.send(&frame("", Body::Ping(ping))).await?;
             }
             notice = notices.recv() => {
                 let user = auth_rx.borrow().user_id;
@@ -247,12 +372,13 @@ async fn connection(app: App, mut socket: WebSocket, auth: Auth) -> anyhow::Resu
             }
             () = &mut expiring => {
                 let expires_at_ms = auth_rx.borrow().expires_at.timestamp_millis();
-                sink.send(encode(&frame("", Body::AuthExpiring(AuthExpiring { expires_at_ms })))).await?;
+                sink.send(&frame("", Body::AuthExpiring(AuthExpiring { expires_at_ms }))).await?;
                 expiring.as_mut().reset(Instant::now() + Duration::from_secs(24 * 3600));
             }
             Some(_) = commands.join_next(), if !commands.is_empty() => {}
         }
     }
+    crate::push::online(&app, user, &hello.device_id, false).await;
     // A revoked session loses every channel at once. One that merely ran out loses nothing:
     // the client renews it and reconnects with its channels and queued commands intact.
     if session_revoked(&app, &auth_rx).await {
@@ -261,11 +387,11 @@ async fn connection(app: App, mut socket: WebSocket, auth: Auth) -> anyhow::Resu
                 reason: "permission revoked".into(),
             };
             let _ = sink
-                .send(encode(&frame(channel, Body::SubscriptionRevoked(revoked))))
+                .send(&frame(channel, Body::SubscriptionRevoked(revoked)))
                 .await;
         }
     }
-    let _ = sink.close().await;
+    sink.close().await;
     Ok(())
 }
 
@@ -332,18 +458,26 @@ async fn handle_command(
 ) -> anyhow::Result<Frame> {
     app.store.auth_by_session(auth.session_id).await?;
     let ctx = app.store.authorize_channel(auth.user_id, channel).await?;
-    let conv = channel
-        .strip_prefix("conv:")
-        .and_then(|id| Uuid::parse_str(id).ok())
-        .context(Code::InvalidCommand)?;
     let cid = Uuid::parse_str(&command.cid).context(Code::InvalidCid)?;
     let mut results = app
         .nats
         .subscribe(result_subject(auth.user_id, cid))
         .await?;
-    if let Some(result) = app.store.accept(&ctx, conv, device, command).await? {
-        return Ok(result);
-    }
+    let conv = if channel.starts_with("user:") {
+        match crate::user_commands::accept(app, &ctx, channel, device, command).await? {
+            Intake::Done(result) => return Ok(*result),
+            Intake::Queued(conv) => conv,
+        }
+    } else {
+        let conv = channel
+            .strip_prefix("conv:")
+            .and_then(|id| Uuid::parse_str(id).ok())
+            .context(Code::InvalidCommand)?;
+        if let Some(result) = app.store.accept(&ctx, conv, device, command).await? {
+            return Ok(result);
+        }
+        conv
+    };
     app.nats
         .publish(wake_subject(ctx.org_id, conv), Default::default())
         .await?;

@@ -10,21 +10,30 @@ use std::{
     path::{Component, Path},
 };
 use tar::{Archive, Builder, EntryType, Header};
+/// What an archive holds: a sandbox's root upper layer, or one directory (a Chat
+/// `/workspace`) whose top level has no runtime paths.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Tree {
+    Upper,
+    Directory,
+}
+
 /// Paths never archived: caches and runtime state that can be rebuilt, and secrets that must
 /// not outlive the sandbox (`.env`, `.ssh`, `auth.json`). They are reported in the manifest so
 /// a restore can tell the user what to recreate.
-fn ignored(path: &Path) -> bool {
+fn ignored(path: &Path, tree: Tree) -> bool {
     path.components().any(|p| {
         matches!(
             p.as_os_str().to_str(),
             Some(".cache" | "auth.json" | ".env" | ".ssh")
         )
-    }) || matches!(
-        path.components()
-            .next()
-            .and_then(|c| c.as_os_str().to_str()),
-        Some("tmp" | "run" | "proc" | "dev" | "control" | "gateway")
-    )
+    }) || (tree == Tree::Upper
+        && matches!(
+            path.components()
+                .next()
+                .and_then(|c| c.as_os_str().to_str()),
+            Some("tmp" | "run" | "proc" | "dev" | "control" | "gateway")
+        ))
 }
 
 /// SHA-256 (hex) and size of a file, read in chunks.
@@ -48,6 +57,11 @@ pub fn digest(path: &Path) -> anyhow::Result<(String, u64)> {
 
 /// Secret files left out of an archive (caches and runtime paths are not listed), at most 50.
 pub fn excluded(root: &Path) -> anyhow::Result<Vec<String>> {
+    excluded_in(root, Tree::Upper)
+}
+
+/// Like [`excluded`], for `tree`; a directory's paths are reported under `/workspace`.
+pub fn excluded_in(root: &Path, tree: Tree) -> anyhow::Result<Vec<String>> {
     const SECRETS: [&str; 3] = [".env", ".ssh", "auth.json"];
     let mut found = vec![];
     let mut pending = vec![std::path::PathBuf::new()];
@@ -62,11 +76,16 @@ pub fn excluded(root: &Path) -> anyhow::Result<Vec<String>> {
                 .iter()
                 .any(|secret| name.as_bytes() == secret.as_bytes())
             {
-                found.push(format!("/{}", path.display()));
+                let base = if tree == Tree::Directory {
+                    "/workspace/"
+                } else {
+                    "/"
+                };
+                found.push(format!("{base}{}", path.display()));
                 if found.len() == 50 {
                     return Ok(found);
                 }
-            } else if !ignored(&path) && entry.file_type().is_ok_and(|t| t.is_dir()) {
+            } else if !ignored(&path, tree) && entry.file_type().is_ok_and(|t| t.is_dir()) {
                 pending.push(path);
             }
         }
@@ -76,18 +95,23 @@ pub fn excluded(root: &Path) -> anyhow::Result<Vec<String>> {
 }
 
 pub fn export(root: &Path, destination: &Path) -> anyhow::Result<()> {
+    export_tree(root, destination, Tree::Upper)
+}
+
+pub fn export_tree(root: &Path, destination: &Path, tree: Tree) -> anyhow::Result<()> {
     let encoder = zstd::Encoder::new(fs::File::create(destination)?, 3)?;
     let mut tar = Builder::new(encoder);
     fn walk<W: std::io::Write>(
         tar: &mut Builder<W>,
         root: &Path,
         rel: &Path,
+        tree: Tree,
     ) -> anyhow::Result<()> {
         let mut entries = fs::read_dir(root.join(rel))?.collect::<Result<Vec<_>, _>>()?;
         entries.sort_by_key(|e| e.file_name());
         for entry in entries {
             let path = rel.join(entry.file_name());
-            if ignored(&path) {
+            if ignored(&path, tree) {
                 continue;
             }
             let meta = entry.path().symlink_metadata()?;
@@ -168,12 +192,12 @@ pub fn export(root: &Path, destination: &Path) -> anyhow::Result<()> {
                     h.set_cksum();
                     tar.append_data(&mut h, path.join(".wh..wh..opq"), std::io::empty())?;
                 }
-                walk(tar, root, &path)?;
+                walk(tar, root, &path, tree)?;
             }
         }
         Ok(())
     }
-    walk(&mut tar, root, Path::new(""))?;
+    walk(&mut tar, root, Path::new(""), tree)?;
     tar.finish()?;
     tar.into_inner()?.finish()?.sync_all()?;
     Ok(())

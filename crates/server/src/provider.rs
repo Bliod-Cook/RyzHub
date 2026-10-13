@@ -89,6 +89,18 @@ impl NativeMessage {
                         ensure!(fragments.len() <= MAX_EVENT, "TOOL_INPUT_TOO_LARGE");
                         return Ok(None);
                     }
+                    // A context compaction's summary, whole in one delta; never shown.
+                    "compaction_delta" => {
+                        let summary = delta["content"]
+                            .as_str()
+                            .or_else(|| delta["text"].as_str())
+                            .context("INVALID_CONTENT_DELTA")?;
+                        match &mut block["content"] {
+                            Value::String(text) => text.push_str(summary),
+                            other => *other = Value::String(summary.to_owned()),
+                        }
+                        return Ok(None);
+                    }
                     "citations_delta" => {
                         if block.get("citations").is_none() {
                             block["citations"] = json!([]);
@@ -194,6 +206,33 @@ impl ResponsesUsage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_compaction_block_streams_whole_and_shows_nothing() {
+        let mut message = NativeMessage::default();
+        let events = [
+            json!({"type":"message_start","message":{"id":"m","role":"assistant","content":[]}}),
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"compaction","content":""}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"compaction_delta","content":"summary of before"}}),
+            json!({"type":"content_block_stop","index":0}),
+            json!({"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}),
+            json!({"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"reply"}}),
+            json!({"type":"content_block_stop","index":1}),
+            json!({"type":"message_delta","delta":{"stop_reason":"end_turn"}}),
+            json!({"type":"message_stop"}),
+        ];
+        let shown: Vec<String> = events
+            .iter()
+            .filter_map(|e| message.apply(e).unwrap())
+            .collect();
+        assert_eq!(shown, ["reply"]);
+        let response = message.finish().unwrap();
+        assert_eq!(
+            response["content"][0],
+            json!({"type":"compaction","content":"summary of before"})
+        );
+    }
+
     #[test]
     fn fragmented_unicode_sse_preserves_native_thinking_tools_and_cumulative_usage() {
         let events = vec![

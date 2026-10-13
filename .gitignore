@@ -12,6 +12,7 @@ __pycache__/
 
 
 /client/web/pkg/
+/client/web/syntaxes.bin
 /crates/bridge/web/
 /client/android/app/src/main/jniLibs/
 

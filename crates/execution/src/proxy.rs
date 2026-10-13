@@ -4,9 +4,9 @@ use axum::{
     Router,
     body::{Body, Bytes},
     extract::{OriginalUri, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, Method, StatusCode},
     response::{IntoResponse, Response},
-    routing::post,
+    routing::{get, post},
 };
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::sync::Mutex;
@@ -41,8 +41,12 @@ pub fn router(guest: Arc<Guest>) -> anyhow::Result<Router> {
     });
     Ok(Router::new()
         .route("/v1/messages", post(forward))
+        .route("/v1/messages/count_tokens", post(forward))
         .route("/v1/responses", post(forward))
         .route("/v1/responses/compact", post(forward))
+        .route("/v1/chat/completions", post(forward))
+        .route("/v1beta/models/{target}", post(forward))
+        .route("/v1/models", get(forward))
         .route("/mcp", post(forward))
         .layer(axum::extract::DefaultBodyLimit::max(16 * 1024 * 1024))
         .with_state(proxy))
@@ -71,6 +75,7 @@ impl Proxy {
 
 async fn forward(
     State(proxy): State<Arc<Proxy>>,
+    method: Method,
     OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
     body: Bytes,
@@ -81,10 +86,13 @@ async fn forward(
     let result = async {
         let client = proxy.client(&socket_name, uri.path() == "/mcp").await?;
         let mut request = client
-            .post(format!("http://gateway{}", uri.path()))
-            .bearer_auth(key)
-            .header("content-type", "application/json")
-            .body(body);
+            .request(method.clone(), format!("http://gateway{}", uri.path()))
+            .bearer_auth(key);
+        if method == Method::POST {
+            request = request
+                .header("content-type", "application/json")
+                .body(body);
+        }
         for name in FORWARDED {
             if let Some(value) = headers.get(name) {
                 request = request.header(name, value);

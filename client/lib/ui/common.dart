@@ -2,6 +2,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 
+import '../l10n.dart';
 import '../prefs.dart';
 import '../theme.dart';
 
@@ -67,7 +68,12 @@ class SectionLabel extends StatelessWidget {
   Widget build(BuildContext context) {
     final c = HubColors.of(context);
     return Padding(
-      padding: const EdgeInsets.fromLTRB(16, 18, 8, 4),
+      padding: const EdgeInsets.fromLTRB(
+        Space.s16,
+        Space.s18,
+        Space.s8,
+        Space.s4,
+      ),
       child: SizedBox(
         height: 26,
         child: Row(
@@ -134,7 +140,10 @@ class NavRow extends StatelessWidget {
   Widget build(BuildContext context) {
     final c = HubColors.of(context);
     return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+      padding: const EdgeInsets.symmetric(
+        horizontal: Space.s8,
+        vertical: Space.s2,
+      ),
       child: Semantics(
         container: true,
         button: true,
@@ -221,7 +230,9 @@ class PillMenu<T> extends StatelessWidget {
       ],
       child: Container(
         height: 34,
-        padding: EdgeInsets.symmetric(horizontal: compact ? 8 : 10),
+        padding: EdgeInsets.symmetric(
+          horizontal: compact ? Space.s8 : Space.s10,
+        ),
         decoration: BoxDecoration(
           borderRadius: BorderRadius.circular(17),
           border: Border.all(color: c.border),
@@ -254,12 +265,44 @@ class PillMenu<T> extends StatelessWidget {
   }
 }
 
+/// An info mark beside a control the platform emulates: tap or hover for
+/// what it does instead.
+class EmulatedNote extends StatelessWidget {
+  final String capability;
+  const EmulatedNote(this.capability, {super.key});
+  @override
+  Widget build(BuildContext context) {
+    final text = emulatedNote(capability);
+    if (text == null) return const SizedBox.shrink();
+    return Tooltip(
+      message: text,
+      triggerMode: TooltipTriggerMode.tap,
+      child: Semantics(
+        label: text,
+        child: Padding(
+          padding: const EdgeInsets.all(Space.s4),
+          child: Icon(
+            Icons.info_outline,
+            size: 15,
+            color: HubColors.of(context).subtle,
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 class EmptyHint extends StatelessWidget {
   final String text;
   const EmptyHint(this.text, {super.key});
   @override
   Widget build(BuildContext context) => Padding(
-    padding: const EdgeInsets.fromLTRB(16, 4, 16, 6),
+    padding: const EdgeInsets.fromLTRB(
+      Space.s16,
+      Space.s4,
+      Space.s16,
+      Space.s6,
+    ),
     child: Text(
       text,
       style: TextStyle(fontSize: 13, color: HubColors.of(context).subtle),
@@ -407,7 +450,12 @@ class MenuGroup extends StatelessWidget {
                 }
               }),
               child: Padding(
-                padding: const EdgeInsets.fromLTRB(14, 8, 14, 4),
+                padding: const EdgeInsets.fromLTRB(
+                  Space.s14,
+                  Space.s8,
+                  Space.s14,
+                  Space.s4,
+                ),
                 child: Row(
                   children: [
                     Text(
@@ -455,7 +503,7 @@ class MenuDivider extends StatelessWidget {
   const MenuDivider({super.key});
   @override
   Widget build(BuildContext context) => const Padding(
-    padding: EdgeInsets.symmetric(vertical: 4),
+    padding: EdgeInsets.symmetric(vertical: Space.s4),
     child: Divider(),
   );
 }

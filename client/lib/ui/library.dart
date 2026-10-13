@@ -212,7 +212,9 @@ class LibraryViewState extends State<LibraryView> {
         : tr('上传', 'Upload');
     return FilledButton.icon(
       style: FilledButton.styleFrom(
-        padding: EdgeInsets.symmetric(horizontal: compact ? 14 : 18),
+        padding: EdgeInsets.symmetric(
+          horizontal: compact ? Space.s14 : Space.s18,
+        ),
         // As tall as the search box beside it, at any density.
         visualDensity: VisualDensity.standard,
         minimumSize: const Size(0, 40),
@@ -265,7 +267,7 @@ class LibraryViewState extends State<LibraryView> {
           for (final MapEntry(key: id, value: (label, _, _))
               in _filters.entries)
             Padding(
-              padding: const EdgeInsets.only(right: 4),
+              padding: const EdgeInsets.only(right: Space.s4),
               child: _FilterTab(
                 label: label(),
                 selected: filter == id,
@@ -322,7 +324,7 @@ class LibraryViewState extends State<LibraryView> {
     final narrowed = query.trim().isNotEmpty || filter != 'all';
     return Center(
       child: Padding(
-        padding: const EdgeInsets.all(24),
+        padding: const EdgeInsets.all(Space.s24),
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
@@ -381,7 +383,12 @@ class LibraryViewState extends State<LibraryView> {
       controller: scroll,
       slivers: [
         SliverPadding(
-          padding: EdgeInsets.fromLTRB(side, list ? 8 : 16, side, 16),
+          padding: EdgeInsets.fromLTRB(
+            side,
+            list ? Space.s8 : Space.s16,
+            side,
+            Space.s16,
+          ),
           sliver: list
               ? SliverList.builder(
                   itemCount: files.length,
@@ -411,7 +418,7 @@ class LibraryViewState extends State<LibraryView> {
         ),
         SliverToBoxAdapter(
           child: Padding(
-            padding: const EdgeInsets.only(bottom: 24),
+            padding: const EdgeInsets.only(bottom: Space.s24),
             child: Center(
               child: busy && paging
                   ? SizedBox(
@@ -445,7 +452,7 @@ class LibraryViewState extends State<LibraryView> {
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
             Padding(
-              padding: EdgeInsets.fromLTRB(side, 4, side, 4),
+              padding: EdgeInsets.fromLTRB(side, Space.s4, side, Space.s4),
               child: header(narrow),
             ),
             // A refresh keeps the files on screen under a thin bar.
@@ -521,7 +528,10 @@ class _FilterTab extends StatelessWidget {
           hoverColor: c.hover,
           onTap: onTap,
           child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+            padding: const EdgeInsets.symmetric(
+              horizontal: Space.s16,
+              vertical: Space.s8,
+            ),
             child: Text(
               label,
               style: TextStyle(
@@ -646,13 +656,20 @@ class _FileCard extends StatelessWidget {
                           ),
                         )
                       : Padding(
-                          padding: const EdgeInsets.fromLTRB(18, 16, 18, 16),
+                          padding: const EdgeInsets.fromLTRB(
+                            Space.s18,
+                            Space.s16,
+                            Space.s18,
+                            Space.s16,
+                          ),
                           child: Column(
                             crossAxisAlignment: CrossAxisAlignment.start,
                             children: [
                               Padding(
                                 // Clear of the menu in the corner.
-                                padding: const EdgeInsets.only(right: 20),
+                                padding: const EdgeInsets.only(
+                                  right: Space.s20,
+                                ),
                                 child: Text(
                                   name,
                                   maxLines: 2,
@@ -704,7 +721,12 @@ class _FileCard extends StatelessWidget {
                     opacity: hovered || touchPlatform ? 1 : 0,
                     duration: const Duration(milliseconds: 120),
                     child: Container(
-                      padding: const EdgeInsets.fromLTRB(12, 24, 12, 10),
+                      padding: const EdgeInsets.fromLTRB(
+                        Space.s12,
+                        Space.s24,
+                        Space.s12,
+                        Space.s10,
+                      ),
                       decoration: BoxDecoration(
                         gradient: LinearGradient(
                           begin: Alignment.topCenter,
@@ -781,8 +803,8 @@ class _FileRow extends StatelessWidget {
                   onTap: onOpen,
                   child: Padding(
                     padding: const EdgeInsets.symmetric(
-                      horizontal: 10,
-                      vertical: 9,
+                      horizontal: Space.s10,
+                      vertical: Space.s9,
                     ),
                     child: Row(
                       children: [

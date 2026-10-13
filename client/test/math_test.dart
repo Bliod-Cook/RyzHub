@@ -3,6 +3,8 @@ import 'package:flutter_math_fork/flutter_math.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:ryzhub/ui/messages.dart';
 
+import 'kernel.dart';
+
 void main() {
   Future<void> show(
     WidgetTester tester,
@@ -24,10 +26,7 @@ void main() {
   );
 
   /// The text the reply shows, a formula as U+FFFC.
-  String shown(WidgetTester tester) => tester
-      .widgetList<SelectableText>(find.byType(SelectableText))
-      .map((w) => w.data ?? w.textSpan!.toPlainText())
-      .join('\n');
+  String shown(WidgetTester tester) => shownText(tester);
 
   testWidgets('every delimiter renders TeX', (tester) async {
     for (final text in [

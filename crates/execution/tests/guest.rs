@@ -76,18 +76,20 @@ async fn durable_exec_deduplication_fencing_replay_and_restart() -> anyhow::Resu
     drop(guest);
     let restarted = Guest::open(id, directory.path().into())?;
     assert_eq!(restarted.handle(request(2, command)).await?, final_result);
+    let after_restart = restarted
+        .handle(request(
+            2,
+            GuestCommand::Replay {
+                after: 0,
+                wait_ms: 0,
+                folds_seen: 0,
+            },
+        ))
+        .await?;
+    // The journal survives; folds (and their version) belong to the process.
     assert_eq!(
-        restarted
-            .handle(request(
-                2,
-                GuestCommand::Replay {
-                    after: 0,
-                    wait_ms: 0,
-                    folds_seen: 0
-                }
-            ))
-            .await?,
-        replay
+        (&after_restart["events"], &after_restart["head"]),
+        (&replay["events"], &replay["head"])
     );
     restarted
         .handle(request(2, GuestCommand::Ack { through: 1 }))

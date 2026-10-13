@@ -1,19 +1,19 @@
-# 平台线协议 v1.1
+# 平台线协议 v1
 
-唯一 schema 为 `proto/agentplatform/v1/wire.proto`；`prost + protox` 构建不依赖系统 protoc。WebSocket 子协议为 `ryzhub.v1.protobuf`，每个 binary message 对应一个 Frame。M0 支持 `text/part_index=0`，未宣告多流、压缩或真实 harness 能力。
+当前小版本为 6（`PROTOCOL_MINOR`）。唯一 schema 为 `proto/agentplatform/v1/wire.proto`；`prost + protox` 构建不依赖系统 protoc。WebSocket 子协议为 `ryzhub.v1.protobuf`，每个 binary message 对应一个 Frame；另有压缩子协议 `ryzhub.v1.protobuf+zstd`、开发用的 JSON 子协议和 SSE 降级，见“传输”。M0 支持 `text/part_index=0`。
 
 ## 连接与身份
 
 原生连接使用 Authorization Bearer；浏览器先 POST `/auth/ticket`，再连接 `/ws?ticket=...`。ticket 哈希落库、30 秒有效，兑换使用 DELETE RETURNING，只能用一次。跨域 Origin 必须在配置白名单内。M0 HTTP/WS 由本地服务提供，部署时由反向代理终止 HTTPS/WSS。
 
-10 秒内发送 Hello，必须包含 major=1 和稳定 device_id。Welcome 返回连接 ID、协议版本、22 秒心跳和 1 MiB 帧限制。服务端不保存订阅集合：`resume_token` 恒为空、`resumed` 恒为 false（字段保留以兼容旧客户端）。重连后客户端按本地连续游标重新订阅；只有客户端知道自己真正应用到了哪里。
+10 秒内发送 Hello，必须包含 major=1 和稳定 device_id。Welcome 返回连接 ID、协议版本、22 秒心跳和 1 MiB 帧限制。服务端不保存订阅集合：`resume_token` 恒为空、`resumed` 恒为 false，三个字段在 proto 中标为 deprecated，只为兼容旧客户端保留，客户端不再发送。重连后客户端按本地连续游标重新订阅；只有客户端知道自己真正应用到了哪里。
 
 服务端 Ping 需回 Pong；超过 55 秒未收到任何客户端帧会关闭连接。AuthRefresh 仅允许同一用户的新有效会话，并触发订阅重新鉴权。注销和会话到期撤销该连接的全部订阅；移除成员撤销其在该组织的订阅，会话本身对其他组织仍然有效。撤销由数据库触发器通知、各进程单一监听连接即时推送，另有每 15 秒一次的兜底复核。
 
 ## 频道与订阅
 
 - `conv:<uuid>`：私有对话，只有创建者可订阅；组织管理员不自动获得内容权限。
-- `user:<org_uuid>:<user_uuid>`：组织内该用户的会话摘要和已读。
+- `user:<org_uuid>:<user_uuid>`：组织内该用户的会话摘要、已读位置和草稿；该用户的 CreateRun 与 UndoMemoryUpdate 也发在这里。
 - `org:<org_uuid>`：仅当前成员可订阅；M0 保留组织变更扩展点。
 
 Subscribe 的 `since_seq` 是 optional：缺失表示首次快照，0 是有效的重放起点。Gateway 先建立并 flush NATS 订阅，再在 REPEATABLE READ 事务内读取投影和 head_seq；缓冲中的旧事件会去重。已过期的游标或超前游标转快照。快照提供最近 100 个 Item，历史由 REST `items?before_seq=` 分页，每页 100 个，响应为 `{items, has_more}`，`has_more` 表示是否还有更早的 Item。Flutter 在时间线顶端进入视野时自动加载下一页，`has_more` 为 false 后停止；Rust core 按 Item revision 合并历史，不覆盖同 revision 的流式文本，不推进 live cursor，并将结果持久化到同一缓存。
@@ -41,9 +41,13 @@ Owner 在频道行锁内完成事件发布、Delta 发布及 NATS flush，随后
 
 M0 实现 SendMessage、DecideApproval、Cancel、MarkRead。M1 增加 Steer、SideQuery、AnswerQuestion；`GET /capabilities` 返回 Chat 模式及模型，Work 仍为 mock。
 
+harness 专属命令（如 Claude 的 `/review`）以 `/name` 文本经 SendMessage 原样透传，由 harness 自己识别。`InvokeMenuCommand` 只用于带参数表单、prompt 模板在服务端的插件命令（M5）。
+
 M1 活跃主线期间新输入使用 Steer，持久 Item 状态先为 `accepted`，在下一次模型请求前变为 `injected`；任务结束仍未注入的补充标为 `cancelled`。SideQuery 创建 `read_only` run，不带工具，不写回主线。AnswerQuestion 携带 action_id、run_epoch 和 answer，与审批使用相同的待决状态/代次 CAS。客户端问题卡片通过 `PendingAction.options=["__answer__"]` 识别；该标记是 v1 的暂行约定。
 
 RunState 支持 `running/requires_action/completed/cancelled/failed`，`read_only` 区分旁问与主线（缺省 false，兼容旧缓存）。前端运行状态以 RunState 为准；工具卡片与助手消息可先完成，不能据此推断整个 run 已结束。
+
+用户频道上的命令由 Gateway 自己受理，见“v1.6 新增”。
 
 cid 必须是 UUID；同一用户内全局唯一。重复请求必须有相同的目标对话和 protobuf payload，返回第一次保存的完整结果；复用 cid 携带不同内容返回 CID_REUSED。两个设备重发同一个 cid 不改变原始执行设备归因。
 
@@ -59,15 +63,80 @@ cid 必须是 UUID；同一用户内全局唯一。重复请求必须有相同�
 - `Item.detail`：工具与文件变更的结构化内容。`ToolDetail` 含工具名、参数 JSON、结果 JSON（完成后出现）和命令输出；`FileChangeDetail` 列出每个文件的路径、变更类型（add/update/delete）和 diff。每个字段各自限制在 64 KiB。`Item.text` 保留 v1.0 的渲染，供不认识 detail 的客户端使用。
 - `PendingAction.kind`：`approval` 或 `question`。v1.0 的 `options=["__answer__"]` 约定继续保留。
 
+## v1.6 新增
+
+小版本 6。新增字段与命令都是可选的，旧客户端忽略即可；`GET /capabilities` 用 `create_run`、`unread`、`drafts`、`memory_undo_command`、`event_stream` 宣告对应能力。
+
+- **CreateRun**：创建对话并排队它的第一条消息，是一条命令，所以可以离线排队。发在创建者的用户频道上，`conversation_id` 由客户端生成（UUIDv7）；`mode`、`run_config_json`、`project_id`、`temporary` 与 REST 创建相同，`title` 为空时取自消息的第一行。
+  - Gateway 在一个事务里创建对话、频道和 `commands` 行，提交后唤醒该对话的 Owner；Owner 按 SendMessage 执行它，结果帧照常推回。
+  - 同一 cid 重发返回第一次的结果（还没有结果时继续等待）。这个 ID 已被别的对话（任何组织）占用时返回不可重试的 `CONVERSATION_ID_TAKEN`。
+  - 对话与排队的首条消息原子创建，run 不是：Owner 万一拒绝首条消息，对话仍在、为空。
+  - 客户端内核在 CreateRun 得到结果之前暂扣发往 `conv:<id>` 的 Subscribe 和命令（服务端此时还不认识这个频道），得到结果后一并发出。
+- **UndoMemoryUpdate(event_id)**：撤销一条记忆变更，发在用户频道上，由 Gateway 直接执行并保存结果；同一 cid 只撤销一次。已撤销或记忆已再次变化时返回不可重试的 `MEMORY_UNDO_UNAVAILABLE`。
+- **未读**：主线 run 结束时，对话的 `ConversationDetail.activity_seq` 记为对话频道当时的 seq，并重新发布到用户频道。`activity_seq` 大于用户频道里该对话的已读位置（`ReadState.read_seq`）即为未读。客户端打开对话且停在最新处时发送 MarkRead。
+- **草稿**：`PUT /orgs/{org}/conversations/{conv}/draft {text, attachment_ids, device_id}` 保存对话的未发送消息，后写入者胜；被接受的写入以 `DraftChanged(Draft)` 发到用户频道，用户频道快照的 `drafts` 带着所有未清空的草稿。空草稿即清除。其他设备只在输入框没有焦点时采用别处的草稿。
+
+## v1.7 新增
+
+小版本 7。新增字段均为可选，旧客户端忽略即可。
+
+- **`Item.parent_item_id`**：条目所属的父条目，目前是子 agent 的调用：Claude Code 的 Agent/Task 工具启动的子 agent 所做的事（回复、命令、工具）都挂在这次调用下面。客户端把有父条目的条目缩进显示在父条目里，不单独成行；父条目不在时照常显示。
+- **`terminal_output` 流**：命令运行期间，它的输出以 `Delta.stream = "terminal_output"` 推送，挂在命令（工具）条目上，偏移与 `text` 流各自计算。`ItemFold` 同样按流区分。条目完成后，完整输出在 `ToolDetail.output` 里，流上的内容随之作废。Chat 的 `exec`、Codex 的命令都会这样推送；输出可能含 ANSI 转义，客户端按终端样式显示。
+- **新的 Work harness**：`GET /orgs/{org}/models` 的 `work` 分组多了 `label`（显示名）。除 `codex`、`claude` 外，实例可以配置经 ACP 接入的 agent（如 `opencode`），harness 名由实例决定，客户端不应写死列表。它们的能力在 `commandCatalog.capabilities` 里照常给出：补充指令在下一轮生效（`steer: emulated`），不能分叉。
+
+## v1.8 新增
+
+小版本 8：插件。新增字段与命令都是可选的，旧客户端忽略即可。`GET /capabilities` 的 `plugins` 宣告插件可用，`plugin_content_origin` 是 MCP Apps 页面所在的源。
+
+- **InvokeMenuCommand(installation_id, command, params_json, attachment_ids)**：运行插件命令，发在对话频道上。
+  - 服务端按命令声明的参数校验 `params_json`（JSON 对象），把参数填进 prompt 模板。
+  - 结果以 `/<插件>:<命令>` 开头，作为成员的消息发出，之后与 SendMessage 相同。
+  - 插件在本对话未启用、命令不存在时返回 `PLUGIN_NOT_FOUND`，参数不符时返回 `INVALID_ARGUMENTS`。
+  - 可用的命令在 `GET …/commands` 的 `plugin_commands` 里：`[{installation, plugin, name, title, description, params}]`。
+- **PendingAction.form_json**：插件服务的提问（MCP elicitation），`kind` 为 `question`。
+  - `{"mode":"form","message","requestedSchema"}`：按 JSON schema 生成表单，回答是字段组成的 JSON 对象的文本。
+  - `{"mode":"url","message","url"}`：成员打开页面，回答 `accept` 或 `decline`。
+  - 两种都可以回答 `decline`。回答仍用 AnswerQuestion。
+- **ToolDetail.plugin / ToolDetail.app**：插件工具的插件名，以及它的 MCP App 页面（`ui://…`）。
+  - 有 `app` 时，客户端可以用 `POST /orgs/{org}/conversations/{conv}/apps {item_id}` 取得页面地址和这次调用的输入、结果，在沙箱化的 frame 里显示。
+  - 页面与声明式组件里的工具调用走 `POST …/tool-calls {item_id, tool, arguments}`，规则与模型调用相同。必须审批的工具不能从界面调用。
+
+## 阶段 7 的 REST 补充
+
+WebSocket 帧没有变化，小版本仍是 8。`GET /capabilities` 多了：
+
+- `auth_providers`：`[{id, label, kind}]`（`kind` 为 `oidc` 或 `github`），可用的外部登录（OIDC 提供方与 GitHub）。登录走 `/auth/oauth/{id}/start?return_to=`，回来时地址带 `login_code`（用 `POST /auth/oauth/exchange` 换会话）、`login_linked` 或 `login_error`。
+- `push`：服务端会向 Android 设备发通知；客户端登录后 `POST /devices` 登记 FCM 令牌，WebSocket 的 Hello 里的 `device_id` 与登记时的 `device` 相同，连接期间这台设备不收通知。
+- `attachments.part_bytes`：比它大的文件经 `/orgs/{org}/uploads` 分片上传，见 README 的“附件与文件库”。
+
+`GET …/workspace` 多了 `storage_state`；新的错误码：`WORKSPACE_PURGED`、`UNSUPPORTED_PROJECT_FILE`、`DOCUMENT_UNREADABLE`、`DOCUMENT_NOT_FOUND`、`UPLOAD_NOT_FOUND`、`UPLOAD_INCOMPLETE`、`UPLOAD_CLOSED`、`INVALID_UPLOAD_PART`、`MEMORY_CATEGORY_FORBIDDEN`，以及外部登录的 `PROVIDER_UNKNOWN`、`LOGIN_FAILED`、`IDENTITY_TAKEN`、`IDENTITY_EMAIL_REQUIRED`、`ACCOUNT_EXISTS`、`LAST_SIGN_IN_METHOD`、`IDENTITY_NOT_FOUND`。
+
 ## 背压与存储
 
 每连接最多 16 个订阅、32 个并行待处理命令、256 个待发送帧。队列满时发送 ChannelLagged 并结束该频道的发送；客户端用自己的持久游标重新订阅。ChannelLagged 不删除投影或离线命令，SubscriptionRevoked 才清除对应私有数据。
 
-Rust 原生驱动使用 SQLite WAL；Flutter 外壳原生使用 SQLite，Web 使用 IndexedDB。状态按服务器 × 用户 × 组织分区，待发队列和投影游标在同一次写入保存；先保存再发出。访问令牌仅保留在当前客户端进程内存。
+WebSocket 与本地缓存由 Flutter 外壳实现并注入 Rust 内核（原生使用 SQLite，Web 使用 IndexedDB），协议、游标与命令队列逻辑全部在内核。状态按服务器 × 用户 × 组织分区，待发队列和投影游标在同一次写入保存；先保存再发出。访问令牌仅保留在当前客户端进程内存。
+
+## 传输
+
+一个连接无论走哪种传输，Hello/Welcome、订阅、命令和背压规则都相同。
+
+- **压缩**：服务端 WebSocket 栈（axum 0.8 / tungstenite 0.29）不支持 permessage-deflate，压缩以子协议 `ryzhub.v1.protobuf+zstd` 提供，客户端在 `ryzhub.v1.protobuf` 之前提供它。
+  - 只压缩服务端到客户端方向：不小于 256 字节的帧作为一个完整的 zstd frame 发送（压缩后不更小时照原样发），更小的帧照原样发。
+  - protobuf Frame 不会以 zstd 的魔数开头（那是 Frame 没有的 5 号字段的键），所以客户端按开头 4 字节区分，不需要标记。客户端内核用纯 Rust 的 ruzstd 解压，解压上限 4 MiB。
+  - 不在消息之间共享压缩上下文：ruzstd 在一个 zstd frame 结束前保留最后一个窗口的数据不交出，整条连接一个流就无法逐条解码。真正占流量的大帧（快照、历史、长回复）各自压缩；流式 Delta 帧很小，压缩本来无益。
+- **JSON**：开发配置 `json_protocol = true` 时提供 `ryzhub.v1.json`，帧以 serde 形式的 JSON 文本双向传输，便于用文本工具调试。默认关闭。
+- **SSE 降级**：WebSocket 连续 3 次握手失败、且服务端宣告 `event_stream` 时，客户端改用事件流，事件流失败后再试 WebSocket。
+  - `GET /stream?ticket=&device_id=` 打开连接（鉴权同 `/ws`）。第一个事件 `connection` 给出连接 ID（随机，也是 Welcome 的 `connection_id`），之后每个事件的 data 是一个 base64 编码的 protobuf Frame。
+  - 客户端帧逐个 `POST /stream/{connection}`（protobuf 正文，带访问令牌，只能投递到自己的连接），按顺序串行发送。
+  - 连接只存在于打开它的进程：多个 Gateway 时需要会话粘滞。
+- **RFC 8441**：服务端开启了 HTTP/2 extended CONNECT，`/ws` 可以经 HTTP/2 承载 WebSocket（已用 hyper 的 h2 客户端测试）。只在 TLS 由本服务终止（或反向代理以 HTTP/2 转发 extended CONNECT）时有意义。
+
+这些传输优化不改变上述一致性规则。
 
 ## 边界
 
-M0 不协商 permessage-deflate/zstd、JSON 子协议、SSE 降级或 RFC 8441。这些传输优化不改变上述一致性规则。客户端主动断开/重连覆盖连接迁移机制；真实 Windows/Android 系统回调和 IME 表现仍需要实机 PoC。
+客户端主动断开/重连覆盖连接迁移机制；真实 Windows/Android 系统回调和 IME 表现仍需要实机 PoC。
 
 ## M3 命令与状态
 

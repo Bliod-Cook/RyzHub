@@ -12,6 +12,7 @@ import '../controller.dart';
 import '../l10n.dart';
 import '../link.dart';
 import '../prefs.dart';
+import '../push.dart';
 import '../theme.dart';
 import 'attachments.dart';
 import 'common.dart';
@@ -21,10 +22,14 @@ import 'icons.dart';
 import 'library.dart';
 import 'login.dart';
 import 'messages.dart';
+import 'plugins.dart';
+import 'plugin_ui.dart';
 import 'preview.dart';
 import 'settings.dart';
 import 'sidebar.dart';
+import 'terminal.dart';
 import 'unfold.dart';
+import 'workspace_status.dart';
 
 class HubPage extends StatefulWidget {
   /// The address that names the open conversation.
@@ -43,6 +48,9 @@ class _HubPageState extends State<HubPage>
 
   /// The message field's text, so a refused message can be put back.
   final composerText = TextEditingController();
+
+  /// The Work conversation whose terminal panel is open.
+  String? terminalFor;
   final scaffoldKey = GlobalKey<ScaffoldState>();
   final libraryKey = GlobalKey<LibraryViewState>();
 
@@ -57,14 +65,81 @@ class _HubPageState extends State<HubPage>
   /// Signing back in with the device's refresh cookie; the login page waits.
   bool restoring = keepsSession;
 
+  /// The conversation whose draft the composer holds; empty for a new chat.
+  String _draftFor = '';
+
+  /// What was typed for a new chat, kept while a conversation is open.
+  String _newChatDraft = '';
+
+  /// The composer's text is being replaced, not typed.
+  bool _loadingDraft = false;
+  Timer? _draftSave;
+
   /// Files are being dragged over the window.
   bool dragging = false;
   late final void Function() _stopPaste;
 
+  /// Each conversation keeps its own draft, synced to the user's other
+  /// devices; another device's edit shows while this field is not in use.
+  void _syncDraft() {
+    if (hub.selected != _draftFor) {
+      _draftSave?.cancel();
+      final previous = _draftFor, text = composerText.text;
+      if (previous.isEmpty) {
+        _newChatDraft = text;
+      } else {
+        unawaited(hub.saveDraft(previous, text));
+      }
+      _draftFor = hub.selected;
+      _setComposer(
+        _draftFor.isEmpty
+            ? _newChatDraft
+            : '${hub.drafts[_draftFor]?['text'] ?? ''}',
+      );
+      return;
+    }
+    final remote = hub.drafts[_draftFor];
+    if (remote != null &&
+        remote['device_id'] != hub.device &&
+        !composerFocus.hasFocus &&
+        remote['text'] != composerText.text) {
+      _setComposer('${remote['text'] ?? ''}');
+    }
+  }
+
+  void _setComposer(String text) {
+    if (composerText.text == text) return;
+    _loadingDraft = true;
+    composerText.text = text;
+    _loadingDraft = false;
+  }
+
+  /// Typing saves the conversation's draft once it pauses.
+  void _typed() {
+    if (_loadingDraft || _draftFor.isEmpty) return;
+    _draftSave?.cancel();
+    final conv = _draftFor, text = composerText.text;
+    _draftSave = Timer(
+      const Duration(milliseconds: 1500),
+      () => hub.saveDraft(conv, text),
+    );
+  }
+
   @override
   void initState() {
     super.initState();
+    composerText.addListener(_typed);
+    timelineScroll.addListener(() {
+      if (timelineScroll.offset < 48) hub.sawLatest();
+    });
     WidgetsBinding.instance.addObserver(this);
+    // Windows tells of waking from sleep; the socket the sleep cut may look
+    // alive, so reconnect straight away.
+    if (!kIsWeb && defaultTargetPlatform == TargetPlatform.windows) {
+      const MethodChannel('ryzhub/power').setMethodCallHandler((call) async {
+        if (call.method == 'resumed' && hub.signedIn) await hub.reconnect();
+      });
+    }
     hub.addListener(_changed);
     prefs.addListener(_changed);
     widget.link?.requested.addListener(_follow);
@@ -88,6 +163,10 @@ class _HubPageState extends State<HubPage>
     // Not while the old controller is still notifying: it is disposed.
     if (hub.sessionEnded) return scheduleMicrotask(_sessionEnded);
     setState(() {});
+    _syncDraft();
+    if (!timelineScroll.hasClients || timelineScroll.offset < 48) {
+      hub.sawLatest();
+    }
     final shows = (hub.selected, hub.searchFocusSeq, hub.sends);
     if (shows != _timelineShows) {
       _timelineShows = shows;
@@ -155,15 +234,65 @@ class _HubPageState extends State<HubPage>
       ..mode = prefs.defaultMode
       ..harness = prefs.defaultHarness;
     final server = prefs.server.isEmpty ? defaultServerUrl : prefs.server;
+    // Back from signing in with another account: the address carries the result.
+    final returned = takeSignInResult();
+    if (returned.containsKey('login_code') ||
+        returned.containsKey('login_error')) {
+      try {
+        await _finishSignIn(server, returned);
+        if (!mounted) return;
+        setState(() => restoring = false);
+        _opened();
+        return;
+      } catch (e) {
+        signInError = errorText(e);
+      }
+    }
     final restored = await hub.restore(server);
     if (!mounted) return;
     setState(() => restoring = false);
     if (restored) _opened();
+    if (restored && returned.containsKey('login_linked')) {
+      openSettings('account');
+    }
+  }
+
+  /// Why signing in with another account did not finish, for the login page.
+  String signInError = '';
+
+  /// Sign in with another account at [server]; native builds wait here for the browser.
+  Future<void> providerLogin(String server, String provider) async {
+    server = server.replaceAll(RegExp(r'/+$'), '');
+    prefs.update((p) => p.server = server);
+    final returned = await signInElsewhere(
+      (returnTo) =>
+          '$server/auth/oauth/$provider/start?return_to=${Uri.encodeQueryComponent(returnTo)}',
+    );
+    await _finishSignIn(server, returned);
+  }
+
+  Future<void> _finishSignIn(
+    String server,
+    Map<String, String> returned,
+  ) async {
+    final error = returned['login_error'];
+    if (error != null) throw Exception(error);
+    final code = returned['login_code'];
+    if (code == null) return;
+    hub
+      ..mode = prefs.defaultMode
+      ..harness = prefs.defaultHarness;
+    await hub.loginWithCode(server, code);
+    prefs.update((p) => p.server = server);
+    if (mounted) _opened();
   }
 
   /// After signing in, open the conversation the address names; a native
   /// start reopens the last one.
   void _opened() {
+    Push.start(hub, (conversation) {
+      if (mounted && hub.has(conversation)) openConversation(conversation);
+    });
     final asked = widget.link?.requested.value ?? '';
     widget.link?.requested.value = null;
     final id = asked.isNotEmpty || kIsWeb
@@ -172,6 +301,9 @@ class _HubPageState extends State<HubPage>
     if (id.isEmpty) return;
     if (id == libraryLink) {
       openLibrary();
+    } else if (id == pluginsLink) {
+      _report();
+      openSettings('plugins');
     } else if (hub.has(id)) {
       openConversation(id);
     } else {
@@ -186,6 +318,9 @@ class _HubPageState extends State<HubPage>
     widget.link!.requested.value = null;
     if (id == libraryLink) {
       if (!hub.libraryOpen) openLibrary();
+    } else if (id == pluginsLink) {
+      _report();
+      openSettings('plugins');
     } else if (id == hub.selected && !hub.libraryOpen) {
       return;
     } else if (id.isEmpty) {
@@ -487,7 +622,7 @@ class _HubPageState extends State<HubPage>
                 if (title != null)
                   Expanded(
                     child: Padding(
-                      padding: const EdgeInsets.symmetric(horizontal: 8),
+                      padding: const EdgeInsets.symmetric(horizontal: Space.s8),
                       // The mode trails the title the way a reasoning level
                       // trails its model; it is set when the chat starts.
                       child: Row(
@@ -569,8 +704,13 @@ class _HubPageState extends State<HubPage>
     return Center(
       child: Container(
         constraints: const BoxConstraints(maxWidth: contentWidth),
-        margin: const EdgeInsets.fromLTRB(16, 0, 16, 8),
-        padding: const EdgeInsets.fromLTRB(14, 6, 6, 6),
+        margin: const EdgeInsets.fromLTRB(Space.s16, 0, Space.s16, Space.s8),
+        padding: const EdgeInsets.fromLTRB(
+          Space.s14,
+          Space.s6,
+          Space.s6,
+          Space.s6,
+        ),
         decoration: BoxDecoration(
           color: c.danger.withValues(alpha: .08),
           borderRadius: BorderRadius.circular(12),
@@ -607,8 +747,13 @@ class _HubPageState extends State<HubPage>
     return Center(
       child: Container(
         constraints: const BoxConstraints(maxWidth: contentWidth),
-        margin: const EdgeInsets.fromLTRB(16, 0, 16, 8),
-        padding: const EdgeInsets.fromLTRB(14, 6, 6, 6),
+        margin: const EdgeInsets.fromLTRB(Space.s16, 0, Space.s16, Space.s8),
+        padding: const EdgeInsets.fromLTRB(
+          Space.s14,
+          Space.s6,
+          Space.s6,
+          Space.s6,
+        ),
         decoration: BoxDecoration(
           color: c.danger.withValues(alpha: .08),
           borderRadius: BorderRadius.circular(12),
@@ -648,8 +793,8 @@ class _HubPageState extends State<HubPage>
       onSend: (text) => action(() => hub.send(text), rethrowError: true),
       running: running,
       onCancel: () => action(hub.cancel),
-      // Side questions and the approval mode are off the composer for now;
-      // they are meant to come back as commands.
+      // Side questions are off the composer for now; they are meant to come
+      // back as a command. Work's approval mode is among the run tools.
       steer: steerable,
       enterToSend: prefs.enterToSend,
       focusNode: composerFocus,
@@ -662,6 +807,15 @@ class _HubPageState extends State<HubPage>
       // Work keeps its controls on their own row below the field.
       stacked: (draft ? hub.mode : hub.selectedConversation['mode']) == 'work',
       footer: composerFooter(hub),
+      commands: slashCommands(
+        context,
+        hub,
+        action,
+        onNewChat: () {
+          hub.startDraft(project: hub.contextProject);
+          focusComposer();
+        },
+      ),
     );
   }
 
@@ -673,7 +827,7 @@ class _HubPageState extends State<HubPage>
     if (project == null) {
       return LayoutBuilder(
         builder: (context, box) => SingleChildScrollView(
-          padding: const EdgeInsets.symmetric(horizontal: 16),
+          padding: const EdgeInsets.symmetric(horizontal: Space.s16),
           child: ConstrainedBox(
             constraints: BoxConstraints(minHeight: box.maxHeight),
             child: Center(
@@ -722,7 +876,12 @@ class _HubPageState extends State<HubPage>
     }
     final chats = hub.projectConversations(project['id']);
     return SingleChildScrollView(
-      padding: const EdgeInsets.fromLTRB(16, 40, 16, 32),
+      padding: const EdgeInsets.fromLTRB(
+        Space.s16,
+        Space.s40,
+        Space.s16,
+        Space.s32,
+      ),
       child: Center(
         child: ConstrainedBox(
           constraints: const BoxConstraints(maxWidth: contentWidth),
@@ -757,7 +916,10 @@ class _HubPageState extends State<HubPage>
               ),
               if ((project['instructions'] ?? '').toString().isNotEmpty)
                 Padding(
-                  padding: const EdgeInsets.only(top: 10, left: 38),
+                  padding: const EdgeInsets.only(
+                    top: Space.s10,
+                    left: Space.s38,
+                  ),
                   child: Text(
                     project['instructions'],
                     maxLines: 2,
@@ -775,7 +937,7 @@ class _HubPageState extends State<HubPage>
               const SizedBox(height: 8),
               if (chats.isEmpty)
                 Container(
-                  padding: const EdgeInsets.all(20),
+                  padding: const EdgeInsets.all(Space.s20),
                   decoration: BoxDecoration(
                     borderRadius: BorderRadius.circular(16),
                     border: Border.all(color: c.border),
@@ -833,7 +995,12 @@ class _HubPageState extends State<HubPage>
       child: ConstrainedBox(
         constraints: const BoxConstraints(maxWidth: contentWidth),
         child: Padding(
-          padding: const EdgeInsets.fromLTRB(16, 4, 16, 6),
+          padding: const EdgeInsets.fromLTRB(
+            Space.s16,
+            Space.s4,
+            Space.s16,
+            Space.s6,
+          ),
           child: Wrap(
             spacing: 8,
             runSpacing: 6,
@@ -849,13 +1016,25 @@ class _HubPageState extends State<HubPage>
                   style: small.copyWith(color: c.danger),
                 ),
               if (hub.workspace['checkpoint'] != null)
+                Tooltip(
+                  message: fileTime(hub.workspace['checkpoint']['created_at']),
+                  child: Text(
+                    checkpointSaved(hub.workspace['checkpoint']['created_at']),
+                    style: small,
+                  ),
+                ),
+              // In use, yet its last checkpoint is older than the recovery
+              // point objective.
+              if (hub.workspace['stale'] == true)
                 Text(
                   tr(
-                    '已保存检查点 · 水位 ${hub.workspace['checkpoint']['channel_seq']}',
-                    'Checkpoint saved · seq ${hub.workspace['checkpoint']['channel_seq']}',
+                    '超过 20 分钟没有新的检查点：执行节点故障时，之后的改动可能丢失。',
+                    'No checkpoint for over 20 minutes: a node failure could lose the changes since.',
                   ),
-                  style: small,
+                  style: small.copyWith(color: c.warning),
                 ),
+              if (storageNote(hub.workspace['storage_state']) case final note?)
+                Text(note, style: small),
               if (hub.workspaceBusy.isNotEmpty)
                 Text(tr('工作区任务进行中…', 'Workspace job running…'), style: small),
               for (final (kind, label) in [
@@ -876,6 +1055,24 @@ class _HubPageState extends State<HubPage>
                       : () => action(() => hub.workspaceOperation(kind)),
                   child: Text(label),
                 ),
+              if (hub.supports('terminal') &&
+                  hub.workspace['sandbox']?['state'] == 'running')
+                OutlinedButton.icon(
+                  style: OutlinedButton.styleFrom(
+                    textStyle: const TextStyle(
+                      fontSize: 13,
+                      fontFamily: fontFamily,
+                      fontFamilyFallback: fontFallback,
+                    ),
+                  ),
+                  onPressed: () => setState(
+                    () => terminalFor = terminalFor == hub.selected
+                        ? null
+                        : hub.selected,
+                  ),
+                  icon: const Icon(Icons.terminal, size: 16),
+                  label: Text(tr('终端', 'Terminal')),
+                ),
               IconButton(
                 tooltip: tr('刷新工作区', 'Refresh workspace'),
                 onPressed: () => action(hub.refreshWorkspace),
@@ -890,13 +1087,11 @@ class _HubPageState extends State<HubPage>
 
   Widget conversationView() {
     final c = HubColors.of(context);
-    final rows = timeline(
-      hub.items.where(
-        (i) =>
-            hub.searchFocusSeq == null ||
-            (i['first_seq'] as int) <= hub.searchFocusSeq!,
-      ),
-    );
+    final rows = hub.rows;
+    Rendered? rendered(String id) {
+      final entry = hub.entry(id);
+      return entry == null ? null : Rendered(entry.blocks, entry.chips);
+    }
 
     // Found by key, a row keeps its state (an opened steps group) as rows
     // arrive below it.
@@ -966,23 +1161,32 @@ class _HubPageState extends State<HubPage>
       if (index == rows.length) {
         return OlderLoader(key: ValueKey('older:${hub.selected}'), hub: hub);
       }
-      final item = rows[rows.length - 1 - index];
-      if (item['kind'] == 'steps') {
+      final row = rows[rows.length - 1 - index];
+      final id = row['item'] as String?;
+      if (id == null) {
+        final steps = [
+          for (final step in row['steps'] as List)
+            ?hub.entry(step as String)?.item,
+        ];
         return centered(
-          key: ValueKey(item['id']),
+          key: ValueKey(row['id']),
           StepsGroup(
-            steps: item['steps'],
-            running: hub.runActive(item['run_id']),
-            latest: item['latest'] == true,
-            worked: hub.workedFor(item['run_id']),
-            onSource: (href) => openLink(href, item['steps'] as List),
+            steps: steps,
+            running: hub.runActive('${row['run_id'] ?? ''}'),
+            latest: row['latest'] == true,
+            worked: hub.workedFor('${row['run_id'] ?? ''}'),
+            onSource: (href) => openLink(href, steps),
+            rendered: rendered,
+            children: hub.childrenOf,
           ),
         );
       }
+      final item = hub.entry(id)?.item ?? {'id': id, 'kind': '', 'text': ''};
       return centered(
-        key: ValueKey(item['id']),
+        key: ValueKey(row['id']),
         MessageCard(
           item: item,
+          rendered: rendered(id),
           agentLabel: hub.agentLabel,
           onSource: (href) => openLink(href, [item]),
           files: (files) => MessageFiles(
@@ -995,15 +1199,20 @@ class _HubPageState extends State<HubPage>
           onMemoryUndo: item['kind'] == 'memory_notice'
               ? () => action(() async {
                   final notice = jsonDecode(item['text']);
-                  await hub.request(
-                    '/orgs/${hub.org}/memory-events/${notice['event_id']}/undo',
-                    body: {},
-                  );
+                  await hub.undoMemory('${notice['event_id']}');
+                  if (mounted) {
+                    ScaffoldMessenger.of(this.context).showSnackBar(
+                      SnackBar(
+                        content: Text(tr('已撤销记忆变更', 'Memory change undone')),
+                      ),
+                    );
+                  }
                 })
               : null,
           onFork: hub.canFork(item)
               ? () => action(() => hub.fork(item['id']))
               : null,
+          forkNote: hub.emulated('fork') ? emulatedNote('fork') : null,
         ),
       );
     }
@@ -1032,7 +1241,12 @@ class _HubPageState extends State<HubPage>
                       semanticChildCount: rows.length + 1,
                       slivers: [
                         SliverPadding(
-                          padding: const EdgeInsets.fromLTRB(24, 16, 24, 8),
+                          padding: const EdgeInsets.fromLTRB(
+                            Space.s24,
+                            Space.s16,
+                            Space.s24,
+                            Space.s8,
+                          ),
                           sliver: TimelineRows(
                             loader: true,
                             delegate: SliverChildBuilderDelegate(
@@ -1060,9 +1274,24 @@ class _HubPageState extends State<HubPage>
           ),
         for (final approval in hub.actions)
           Padding(
-            padding: const EdgeInsets.fromLTRB(16, 4, 16, 4),
+            padding: const EdgeInsets.fromLTRB(
+              Space.s16,
+              Space.s4,
+              Space.s16,
+              Space.s4,
+            ),
             child: centered(
-              (approval['options'] as List).contains('__answer__')
+              '${approval['form_json'] ?? ''}'.isNotEmpty
+                  ? ElicitationCard(
+                      key: ValueKey(approval['id']),
+                      summary: approval['summary'],
+                      form: Map<String, dynamic>.from(
+                        jsonDecode(approval['form_json']) as Map,
+                      ),
+                      onAnswer: (answer) =>
+                          action(() => hub.answer(approval, answer)),
+                    )
+                  : (approval['options'] as List).contains('__answer__')
                   ? QuestionCard(
                       key: ValueKey(approval['id']),
                       summary: approval['summary'],
@@ -1079,10 +1308,22 @@ class _HubPageState extends State<HubPage>
             ),
           ),
         if (hub.realWork) workspaceBar(),
+        if (hub.realWork && terminalFor == hub.selected)
+          TerminalPanel(
+            key: ValueKey(hub.selected),
+            hub: hub,
+            conversation: hub.selected,
+            onClose: () => setState(() => terminalFor = null),
+          ),
         SafeArea(
           top: false,
           child: Padding(
-            padding: const EdgeInsets.fromLTRB(16, 4, 16, 14),
+            padding: const EdgeInsets.fromLTRB(
+              Space.s16,
+              Space.s4,
+              Space.s16,
+              Space.s14,
+            ),
             child: centered(composer()),
           ),
         ),
@@ -1093,153 +1334,165 @@ class _HubPageState extends State<HubPage>
   @override
   Widget build(BuildContext context) {
     if (restoring) return const Scaffold();
-    if (!hub.signedIn) return LoginPage(onLogin: login);
+    if (!hub.signedIn) {
+      return LoginPage(
+        onLogin: login,
+        onProvider: providerLogin,
+        error: signInError,
+      );
+    }
     final c = HubColors.of(context);
     final collapsed = wide && prefs.sidebarCollapsed;
     final previewing = hub.previewFiles != null;
     final floating = previewing && hub.previewInConversation;
-    return Scaffold(
-      key: scaffoldKey,
-      drawer: wide
-          ? null
-          : Drawer(
-              child: Sidebar(hub: hub, app: this, drawer: true),
-            ),
-      body: Stack(
-        fit: StackFit.expand,
-        children: [
-          // Under a preview over the conversation, the whole page, sidebar
-          // too, is out of reach.
-          ExcludeFocus(
-            excluding: floating,
-            child: ExcludeSemantics(
+    return PluginHost(
+      hub: hub,
+      child: Scaffold(
+        key: scaffoldKey,
+        drawer: wide
+            ? null
+            : Drawer(
+                child: Sidebar(hub: hub, app: this, drawer: true),
+              ),
+        body: Stack(
+          fit: StackFit.expand,
+          children: [
+            // Under a preview over the conversation, the whole page, sidebar
+            // too, is out of reach.
+            ExcludeFocus(
               excluding: floating,
-              child: IgnorePointer(
-                ignoring: floating,
-                child: Row(
-                  children: [
-                    if (wide)
-                      Container(
-                        width: collapsed ? 56 : 260,
-                        decoration: BoxDecoration(
-                          border: Border(right: BorderSide(color: c.border)),
+              child: ExcludeSemantics(
+                excluding: floating,
+                child: IgnorePointer(
+                  ignoring: floating,
+                  child: Row(
+                    children: [
+                      if (wide)
+                        Container(
+                          width: collapsed ? 56 : 260,
+                          decoration: BoxDecoration(
+                            border: Border(right: BorderSide(color: c.border)),
+                          ),
+                          child: collapsed
+                              ? SidebarRail(hub: hub, app: this)
+                              : Sidebar(hub: hub, app: this),
                         ),
-                        child: collapsed
-                            ? SidebarRail(hub: hub, app: this)
-                            : Sidebar(hub: hub, app: this),
-                      ),
-                    Expanded(
-                      // Files dropped anywhere on the conversation go with the next message.
-                      child: DropTarget(
-                        enable: hub.canAttach && !previewing,
-                        onDragEntered: (_) => setState(() => dragging = true),
-                        onDragExited: (_) => setState(() => dragging = false),
-                        onDragDone: (details) async {
-                          setState(() => dragging = false);
-                          if (hub.libraryOpen) {
-                            final files = await droppedFiles(details.files);
-                            await libraryKey.currentState?.upload(files);
-                          } else {
-                            await attachDropped(context, hub, details.files);
-                          }
-                        },
-                        child: Stack(
-                          children: [
-                            // Under a preview the page keeps its state but is out of
-                            // reach: no taps, no keyboard focus, nothing for assistive
-                            // tech.
-                            ExcludeFocus(
-                              excluding: previewing,
-                              child: ExcludeSemantics(
+                      Expanded(
+                        // Files dropped anywhere on the conversation go with the next message.
+                        child: DropTarget(
+                          enable: hub.canAttach && !previewing,
+                          onDragEntered: (_) => setState(() => dragging = true),
+                          onDragExited: (_) => setState(() => dragging = false),
+                          onDragDone: (details) async {
+                            setState(() => dragging = false);
+                            if (hub.libraryOpen) {
+                              final files = await droppedFiles(details.files);
+                              await libraryKey.currentState?.upload(files);
+                            } else {
+                              await attachDropped(context, hub, details.files);
+                            }
+                          },
+                          child: Stack(
+                            children: [
+                              // Under a preview the page keeps its state but is out of
+                              // reach: no taps, no keyboard focus, nothing for assistive
+                              // tech.
+                              ExcludeFocus(
                                 excluding: previewing,
-                                child: IgnorePointer(
-                                  ignoring: previewing,
-                                  child: SafeArea(
-                                    left: !wide,
-                                    child: Column(
-                                      children: [
-                                        hub.libraryOpen
-                                            ? libraryHeader()
-                                            : header(),
-                                        if (hub.failedSend case final failed?)
-                                          failedBar(failed),
-                                        if (hub.error.isNotEmpty) errorBar(),
-                                        Expanded(
-                                          child: hub.libraryOpen
-                                              ? LibraryView(
-                                                  key: libraryKey,
-                                                  hub: hub,
-                                                  onUse: useFile,
-                                                )
-                                              : hub.isDraft
-                                              ? draftHome()
-                                              : conversationView(),
+                                child: ExcludeSemantics(
+                                  excluding: previewing,
+                                  child: IgnorePointer(
+                                    ignoring: previewing,
+                                    child: SafeArea(
+                                      left: !wide,
+                                      child: Column(
+                                        children: [
+                                          hub.libraryOpen
+                                              ? libraryHeader()
+                                              : header(),
+                                          if (hub.failedSend case final failed?)
+                                            failedBar(failed),
+                                          if (hub.error.isNotEmpty) errorBar(),
+                                          Expanded(
+                                            child: hub.libraryOpen
+                                                ? LibraryView(
+                                                    key: libraryKey,
+                                                    hub: hub,
+                                                    onUse: useFile,
+                                                  )
+                                                : hub.isDraft
+                                                ? draftHome()
+                                                : conversationView(),
+                                          ),
+                                        ],
+                                      ),
+                                    ),
+                                  ),
+                                ),
+                              ),
+                              // The library's, over everything right of the sidebar,
+                              // even its header.
+                              if (previewing && !floating)
+                                Positioned.fill(
+                                  child: FilePreviewView(
+                                    hub: hub,
+                                    onAsk: askAbout,
+                                  ),
+                                ),
+                              if (dragging)
+                                Positioned.fill(
+                                  child: IgnorePointer(
+                                    child: Container(
+                                      margin: const EdgeInsets.all(Space.s12),
+                                      decoration: BoxDecoration(
+                                        color: c.background.withValues(
+                                          alpha: .85,
                                         ),
-                                      ],
-                                    ),
-                                  ),
-                                ),
-                              ),
-                            ),
-                            // The library's, over everything right of the sidebar,
-                            // even its header.
-                            if (previewing && !floating)
-                              Positioned.fill(
-                                child: FilePreviewView(
-                                  hub: hub,
-                                  onAsk: askAbout,
-                                ),
-                              ),
-                            if (dragging)
-                              Positioned.fill(
-                                child: IgnorePointer(
-                                  child: Container(
-                                    margin: const EdgeInsets.all(12),
-                                    decoration: BoxDecoration(
-                                      color: c.background.withValues(
-                                        alpha: .85,
+                                        borderRadius: BorderRadius.circular(16),
+                                        border: Border.all(
+                                          color: c.accent,
+                                          width: 2,
+                                        ),
                                       ),
-                                      borderRadius: BorderRadius.circular(16),
-                                      border: Border.all(
-                                        color: c.accent,
-                                        width: 2,
-                                      ),
-                                    ),
-                                    alignment: Alignment.center,
-                                    child: Text(
-                                      hub.libraryOpen
-                                          ? tr(
-                                              '松开以上传到文件库',
-                                              'Drop to upload to your library',
-                                            )
-                                          : tr('松开以添加文件', 'Drop to add files'),
-                                      style: TextStyle(
-                                        fontSize: 16,
-                                        color: c.text,
+                                      alignment: Alignment.center,
+                                      child: Text(
+                                        hub.libraryOpen
+                                            ? tr(
+                                                '松开以上传到文件库',
+                                                'Drop to upload to your library',
+                                              )
+                                            : tr(
+                                                '松开以添加文件',
+                                                'Drop to add files',
+                                              ),
+                                        style: TextStyle(
+                                          fontSize: 16,
+                                          color: c.text,
+                                        ),
                                       ),
                                     ),
                                   ),
                                 ),
-                              ),
-                          ],
+                            ],
+                          ),
                         ),
                       ),
-                    ),
-                  ],
+                    ],
+                  ),
                 ),
               ),
             ),
-          ),
-          if (floating)
-            FilePreviewView(
-              hub: hub,
-              onAsk: followUp,
-              floating: true,
-              running: running,
-              steer: steerable,
-              onCancel: () => action(hub.cancel),
-            ),
-        ],
+            if (floating)
+              FilePreviewView(
+                hub: hub,
+                onAsk: followUp,
+                floating: true,
+                running: running,
+                steer: steerable,
+                onCancel: () => action(hub.cancel),
+              ),
+          ],
+        ),
       ),
     );
   }
@@ -1269,7 +1522,10 @@ class ModePill extends StatelessWidget {
             // Stays tappable when selected so tests never see it disabled.
             onTap: () => onChanged(value),
             child: Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 6),
+              padding: const EdgeInsets.symmetric(
+                horizontal: Space.s18,
+                vertical: Space.s6,
+              ),
               child: Row(
                 mainAxisSize: MainAxisSize.min,
                 children: [
@@ -1293,7 +1549,7 @@ class ModePill extends StatelessWidget {
     }
 
     return Container(
-      padding: const EdgeInsets.all(3),
+      padding: const EdgeInsets.all(Space.s3),
       decoration: BoxDecoration(
         color: c.bubble,
         borderRadius: BorderRadius.circular(999),
@@ -1359,7 +1615,7 @@ class _OlderLoaderState extends State<OlderLoader> {
     }
     return Center(
       child: Padding(
-        padding: const EdgeInsets.symmetric(vertical: 12),
+        padding: const EdgeInsets.symmetric(vertical: Space.s12),
         child: hub.historyFailed
             ? TextButton.icon(
                 onPressed: () => hub.loadOlder().catchError((_) {}),

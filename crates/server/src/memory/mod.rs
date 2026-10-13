@@ -158,7 +158,52 @@ async fn row(tx: &mut Tx<'_>, org: Uuid, user: Uuid, id: Uuid) -> anyhow::Result
     sqlx::query_scalar("SELECT to_jsonb(m) FROM memory_items m WHERE org_id=$1 AND user_id=$2 AND id=$3 FOR UPDATE")
         .bind(org).bind(user).bind(id).fetch_optional(&mut **tx).await?.context(Code::Forbidden)
 }
-pub async fn save(tx: &mut Tx<'_>, org: Uuid, user: Uuid, input: Save) -> anyhow::Result<Value> {
+/// Categories the platform keeps out of memory, with the words that mark them.
+pub const CATEGORIES: [(&str, &[&str]); 6] = [
+    ("race", &["种族", "民族", "race", "ethnic"]),
+    ("religion", &["宗教", "信仰", "religion", "religious"]),
+    ("sexuality", &["性取向", "sexuality", "sexual orientation"]),
+    ("politics", &["政治", "political", "politics"]),
+    (
+        "health",
+        &["健康", "病史", "疾病", "health", "diagnos", "medical"],
+    ),
+    ("criminal", &["犯罪", "前科", "criminal", "conviction"]),
+];
+
+/// The words that keep text out of memory under `policy`: those of the platform's categories,
+/// and of the categories the policy adds (a name the platform does not know is a word itself).
+pub fn forbidden_words(policy: &ryzhub_domain::Policy) -> Vec<String> {
+    let mut words: Vec<String> = CATEGORIES
+        .iter()
+        .flat_map(|(_, words)| words.iter().map(|w| w.to_string()))
+        .collect();
+    for category in policy.memory_forbidden_categories.iter().flatten() {
+        match CATEGORIES.iter().find(|(name, _)| name == category) {
+            Some(_) => {}
+            None => words.push(category.to_lowercase()),
+        }
+    }
+    words
+}
+
+/// Whether `text` touches a forbidden category.
+pub fn forbidden(text: &str, words: &[String]) -> bool {
+    let lower = text.to_lowercase();
+    words.iter().any(|word| lower.contains(word.as_str()))
+}
+
+pub async fn save(
+    tx: &mut Tx<'_>,
+    org: Uuid,
+    user: Uuid,
+    input: Save,
+    words: &[String],
+) -> anyhow::Result<Value> {
+    ensure!(
+        !forbidden(&input.content, words),
+        Code::MemoryCategoryForbidden
+    );
     ensure!(
         !input.content.trim().is_empty()
             && input.content.len() <= 8192
@@ -438,6 +483,11 @@ pub async fn digest(app: &App, org: Uuid, conversation: Uuid, user: Uuid) -> any
     if !a.enabled || !a.history {
         return Ok(false);
     }
+    let policy = crate::store::effective_policy(&mut tx, &app.config.policy, org).await?;
+    if policy.allow_memory_auto_extract == Some(false) {
+        return Ok(false);
+    }
+    let words = forbidden_words(&policy);
     let idle:bool=sqlx::query_scalar("SELECT NOT EXISTS(SELECT 1 FROM runs WHERE org_id=$1 AND conversation_id=$2 AND state IN ('running','requires_action'))")
         .bind(org).bind(conversation).fetch_one(&mut *tx).await?;
     if !idle {
@@ -452,26 +502,7 @@ pub async fn digest(app: &App, org: Uuid, conversation: Uuid, user: Uuid) -> any
         &points
             .into_iter()
             .rev()
-            .filter(|s| {
-                let lower = s.to_lowercase();
-                ![
-                    "宗教",
-                    "种族",
-                    "性取向",
-                    "政治",
-                    "健康",
-                    "病史",
-                    "犯罪",
-                    "religion",
-                    "race",
-                    "sexuality",
-                    "political",
-                    "health",
-                    "criminal",
-                ]
-                .iter()
-                .any(|w| lower.contains(w))
-            })
+            .filter(|s| !forbidden(s, &words))
             .map(|s| s.chars().take(320).collect::<String>())
             .collect::<Vec<_>>()
             .join("\n"),
@@ -667,6 +698,8 @@ pub async fn collect_conversation(app: &App, org: Uuid, conv: Uuid) -> anyhow::R
     for (sandbox, old_epoch) in &sandboxes {
         crate::sandbox::host(
             app,
+            org,
+            *sandbox,
             ryzhub_execution::HostCommand::Destroy {
                 sandbox_id: *sandbox,
                 exec_epoch: epoch.max(old_epoch + 1) as u64,
@@ -677,8 +710,10 @@ pub async fn collect_conversation(app: &App, org: Uuid, conv: Uuid) -> anyhow::R
     if !sandboxes.is_empty() {
         let artifacts:Vec<Uuid>=sqlx::query_scalar("SELECT id FROM checkpoints WHERE org_id=$1 AND conversation_id=$2 UNION SELECT id FROM workspace_jobs WHERE org_id=$1 AND conversation_id=$2")
             .bind(org).bind(conv).fetch_all(&mut *tx).await?;
-        crate::sandbox::host(
+        crate::sandbox::host_workspace(
             app,
+            org,
+            conv,
             ryzhub_execution::HostCommand::PurgeWorkspace {
                 org_id: org,
                 workspace_id: conv,
@@ -774,4 +809,41 @@ pub async fn announce(
         .await?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod category_tests {
+    use super::*;
+
+    #[test]
+    fn policies_add_categories_kept_out_of_memory() {
+        let platform = forbidden_words(&ryzhub_domain::Policy::default());
+        assert!(forbidden("我有糖尿病病史", &platform));
+        assert!(forbidden("Diagnosed with asthma", &platform));
+        assert!(!forbidden("我喜欢用 Rust 写服务端", &platform));
+        let stricter = ryzhub_domain::Policy {
+            memory_forbidden_categories: Some(["salary".to_owned(), "health".to_owned()].into()),
+            ..Default::default()
+        };
+        let words = forbidden_words(&stricter);
+        assert!(forbidden("My salary is 10k", &words));
+        assert!(!forbidden("My salary is 10k", &platform));
+        // An organization adds to the instance's list; it cannot take categories away.
+        let instance = ryzhub_domain::Policy {
+            memory_forbidden_categories: Some(["salary".to_owned()].into()),
+            allow_memory_auto_extract: Some(true),
+            ..Default::default()
+        };
+        let org = ryzhub_domain::Policy {
+            memory_forbidden_categories: Some(["address".to_owned()].into()),
+            allow_memory_auto_extract: Some(false),
+            ..Default::default()
+        };
+        let effective = instance.restrict(&org);
+        assert_eq!(
+            effective.memory_forbidden_categories,
+            Some(["address".to_owned(), "salary".to_owned()].into())
+        );
+        assert_eq!(effective.allow_memory_auto_extract, Some(false));
+    }
 }

@@ -1,0 +1,60 @@
+{
+ "$description": "What the kernel holds after a fixed event stream: one finished Chat-style run and one Work run still at work. golden_test.dart renders it.",
+ "items": [
+  {
+   "id": "ask",
+   "kind": "user",
+   "state": "completed",
+   "run_id": "r1",
+   "text": "帮我修复登录后的跳转问题，并解释**原因**。\n\n- 复现：点击 `登录`\n- 期望：进入首页"
+  },
+  {
+   "id": "answer",
+   "kind": "assistant",
+   "state": "completed",
+   "run_id": "r1",
+   "text": "## 原因\n\n跳转发生在会话写入之前，首页读不到登录状态。\n\n```rust\nasync fn login(session: &Session) -> Result<Redirect> {\n    session.save().await?; // 先写入会话\n    Ok(Redirect::to(\"/\"))\n}\n```\n\n| 文件 | 改动 |\n|---|---|\n| `src/login.rs` | 1 行 |\n\n修复后 **3 项**测试通过。"
+  },
+  {
+   "id": "ask2",
+   "kind": "user",
+   "state": "completed",
+   "run_id": "r2",
+   "text": "Run the tests again"
+  },
+  {
+   "id": "edit",
+   "kind": "file_change",
+   "state": "completed",
+   "run_id": "r2",
+   "detail": {
+    "kind": {
+     "FileChange": {
+      "changes": [
+       {
+        "change": "update",
+        "path": "src/login.rs",
+        "diff": "@@ -10,4 +10,4 @@ async fn login(session: &Session)\n-    let redirect = Redirect::to(\"/\");\n-    session.save().await?;\n+    session.save().await?;\n+    let redirect = Redirect::to(\"/\");\n     Ok(redirect)\n"
+       }
+      ]
+     }
+    }
+   }
+  },
+  {
+   "id": "tests",
+   "kind": "tool",
+   "state": "streaming",
+   "run_id": "r2",
+   "live_output": "\u001b[1m running 3 tests\u001b[0m\ntest login::saves_session ... \u001b[32mok\u001b[0m\ntest login::redirects_home ... \u001b[32mok\u001b[0m\ntest login::rejects_bad_password ... \u001b[33mrunning\u001b[0m",
+   "detail": {
+    "kind": {
+     "Tool": {
+      "name": "exec",
+      "arguments_json": "{\"cmd\":\"cargo test login\"}"
+     }
+    }
+   }
+  }
+ ]
+}

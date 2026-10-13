@@ -6,11 +6,15 @@ final _uuid = RegExp(r'^[0-9a-fA-F-]{36}$');
 /// What an address shows in place of a conversation: the file library.
 const libraryLink = 'library';
 
+/// Where the browser returns after connecting a plugin's account: plugin settings.
+const pluginsLink = 'plugins';
+
 /// The conversation an address names: `/c/<id>`, [libraryLink] for
 /// `/library`, or '' for a new chat. The web build shows it after the `#`.
 String conversationIn(Uri uri) {
   final parts = uri.pathSegments;
   if (parts.length == 1 && parts[0] == libraryLink) return libraryLink;
+  if (parts.length == 1 && parts[0] == pluginsLink) return pluginsLink;
   return parts.length == 2 && parts[0] == 'c' && _uuid.hasMatch(parts[1])
       ? parts[1]
       : '';

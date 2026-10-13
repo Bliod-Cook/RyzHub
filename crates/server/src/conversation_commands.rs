@@ -17,7 +17,7 @@ use crate::{
     error::{ApiResult, Code},
     owner::OwnerLink,
     run_config::{self, RunConfig},
-    store::{Lease, Tx, append, conversation_in, conversation_item, effective_policy},
+    store::{Lease, Tx, append, conversation_in, effective_policy},
 };
 
 /// `UpdateRunConfig`: merge a settings patch into the conversation's run configuration.
@@ -154,6 +154,10 @@ pub async fn enqueue_fork(
     .fetch_optional(&mut **tx)
     .await?
     .flatten();
+    ensure!(
+        run_config::capabilities(&harness, "")["fork"] != "unsupported",
+        Code::ForkPointUnavailable
+    );
     match harness.as_str() {
         "claude" => ensure!(message.is_some(), Code::ForkPointUnavailable),
         "codex" => {
@@ -258,6 +262,8 @@ pub async fn catalog(
     } else {
         None
     };
+    // The commands of the plugins on here, for the `/` menu (InvokeMenuCommand).
+    let plugin_commands = crate::plugins::commands(&mut tx, org, conv).await?;
     tx.commit().await?;
     let approval_modes = if policy.allow_full_auto == Some(false) {
         vec!["ask", "allow_edits"]
@@ -275,6 +281,7 @@ pub async fn catalog(
         "harness_commands": native.map_or(json!([]), |(_, commands)| commands),
         "operations": operations,
         "fork_points": fork_points,
+        "plugin_commands": plugin_commands,
     })))
 }
 
@@ -320,12 +327,11 @@ pub async fn platform(
     if let Some(archive) = input.archive {
         crate::projects::idle(&mut tx, org, conv).await?;
         require!(c.mode != "work", Code::UseWorkspaceArchive);
-        sqlx::query("UPDATE conversations SET state=$3 WHERE org_id=$1 AND id=$2")
-            .bind(org)
-            .bind(conv)
-            .bind(if archive { "archived" } else { "active" })
-            .execute(&mut *tx)
-            .await?;
+        if archive {
+            crate::lifecycle::archive(&mut tx, org, conv).await?;
+        } else {
+            crate::lifecycle::unarchive(&mut tx, org, conv, "hot").await?;
+        }
     }
     if let Some(pinned) = input.pinned {
         require!(!(pinned && c.temporary), Code::InvalidConversation);
@@ -340,39 +346,7 @@ pub async fn platform(
         .await?;
     }
     if changed {
-        let (title, state, pinned_at_ms): (String, String, Option<i64>) = sqlx::query_as(
-            "SELECT title,state,(extract(epoch FROM pinned_at)*1000)::bigint
-             FROM conversations WHERE org_id=$1 AND id=$2",
-        )
-        .bind(org)
-        .bind(conv)
-        .fetch_one(&mut *tx)
-        .await?;
-        let channel = format!("user:{org}:{}", c.creator_id);
-        // A user-channel sequence is also a monotonic metadata revision. Lock
-        // before allocating it so concurrent conversations cannot reuse it.
-        let revision: i64 = sqlx::query_scalar(
-            "SELECT last_seq+1 FROM channels WHERE org_id=$1 AND id=$2 FOR UPDATE",
-        )
-        .bind(org)
-        .bind(&channel)
-        .fetch_one(&mut *tx)
-        .await?;
-        append(
-            &mut tx,
-            org,
-            &channel,
-            None,
-            "",
-            Event::ItemUpserted(conversation_item(
-                conv,
-                revision as u64,
-                state,
-                title,
-                pinned_at_ms,
-            )),
-        )
-        .await?;
+        crate::store::publish_conversation(&mut tx, org, conv).await?;
     }
     tx.commit().await?;
     Ok(Json(json!({"updated":true})))
@@ -655,15 +629,7 @@ async fn fork(
         .bind(child.channel())
         .execute(&mut *tx)
         .await?;
-    append(
-        &mut tx,
-        lease.org_id,
-        &format!("user:{}:{}", lease.org_id, source.creator_id),
-        None,
-        "",
-        Event::ItemUpserted(conversation_item(id, 1, "active".into(), title, None)),
-    )
-    .await?;
+    crate::store::publish_conversation(&mut tx, lease.org_id, id).await?;
     tx.commit().await?;
     Ok(id)
 }

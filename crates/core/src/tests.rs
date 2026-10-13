@@ -298,3 +298,166 @@ fn cache_from_an_older_schema_is_refetched_but_keeps_pending_commands() {
         Some(1)
     );
 }
+
+#[test]
+fn a_conversation_being_created_holds_its_frames_until_answered() {
+    let mut e = Engine::default();
+    let create = e.enqueue(
+        "user:o:u".into(),
+        CommandEnvelope {
+            cid: "1".into(),
+            command: Some(command_envelope::Command::CreateRun(CreateRun {
+                conversation_id: "c".into(),
+                ..Default::default()
+            })),
+        },
+    );
+    assert!(!e.held(&create), "the CreateRun itself goes out");
+    let subscribe = e.subscribe("conv:c".into());
+    let send = e.enqueue(
+        "conv:c".into(),
+        CommandEnvelope {
+            cid: "2".into(),
+            command: Some(command_envelope::Command::Cancel(Cancel {})),
+        },
+    );
+    assert!(e.held(&subscribe) && e.held(&send));
+    let other = e.subscribe("conv:other".into());
+    assert!(!e.held(&other));
+    // A retryable refusal keeps holding; an answer releases the subscription and commands.
+    let retry = e.apply(frame(
+        "user:o:u",
+        Body::CommandRejected(CommandRejected {
+            cid: "1".into(),
+            code: "OWNER_UNAVAILABLE".into(),
+            retryable: true,
+        }),
+    ));
+    assert!(retry.outbound.is_empty() && e.held(&send));
+    let acked = e.apply(frame(
+        "conv:c",
+        Body::CommandAck(CommandAck {
+            cid: "1".into(),
+            ..Default::default()
+        }),
+    ));
+    assert_eq!(acked.results[0].channel, "user:o:u");
+    let released: Vec<_> = acked.outbound.iter().map(|f| f.channel.as_str()).collect();
+    assert_eq!(released, ["conv:c", "conv:c"]);
+    assert!(matches!(acked.outbound[0].body, Some(Body::Subscribe(_))));
+    assert!(matches!(acked.outbound[1].body, Some(Body::Command(_))));
+    assert!(!e.held(&send));
+}
+
+#[test]
+fn drafts_follow_their_events_and_snapshots() {
+    let mut e = Engine::default();
+    e.subscribe("user:o:u".into());
+    let draft = |text: &str| Draft {
+        conversation_id: "c".into(),
+        text: text.into(),
+        ..Default::default()
+    };
+    e.apply(frame(
+        "user:o:u",
+        Body::Event(EventEnvelope {
+            seq: 1,
+            cause_cid: "".into(),
+            event: Some(Event::DraftChanged(draft("hello"))),
+        }),
+    ));
+    assert_eq!(e.channels["user:o:u"].drafts["c"].text, "hello");
+    e.apply(frame(
+        "user:o:u",
+        Body::Snapshot(Snapshot {
+            head_seq: 2,
+            drafts: vec![draft("from snapshot")],
+            ..Default::default()
+        }),
+    ));
+    assert_eq!(e.channels["user:o:u"].drafts["c"].text, "from snapshot");
+}
+
+#[test]
+fn compressed_frames_unwrap_and_plain_ones_pass() {
+    use prost::Message as _;
+    let f = frame("conv:x", Body::Ping(Ping { nonce: 7 }));
+    let plain = f.encode_to_vec();
+    assert_eq!(&*frame_bytes(&plain).unwrap(), plain.as_slice());
+    let big = frame(
+        "conv:x",
+        Body::Delta(Delta {
+            text: "流式文本 ".repeat(400),
+            ..Default::default()
+        }),
+    )
+    .encode_to_vec();
+    let compressed = ruzstd::encoding::compress_to_vec(
+        big.as_slice(),
+        ruzstd::encoding::CompressionLevel::Fastest,
+    );
+    assert!(compressed.len() < big.len());
+    assert_eq!(&*frame_bytes(&compressed).unwrap(), big.as_slice());
+    assert!(frame_bytes(&[0x28, 0xB5, 0x2F, 0xFD, 0]).is_err());
+}
+
+#[test]
+fn command_output_streams_apart_from_the_item_text() {
+    let mut e = Engine::default();
+    e.subscribe("conv:x".into());
+    e.apply(frame(
+        "conv:x",
+        Body::Event(EventEnvelope {
+            seq: 1,
+            cause_cid: "".into(),
+            event: Some(Event::ItemUpserted(Item {
+                id: "t".into(),
+                revision: 2,
+                kind: "tool".into(),
+                state: "running".into(),
+                text: "exec".into(),
+                first_seq: 1,
+                last_seq: 1,
+                ..Default::default()
+            })),
+        }),
+    ));
+    let delta = |offset: u64, text: &str| {
+        frame(
+            "conv:x",
+            Body::Delta(Delta {
+                item_id: "t".into(),
+                stream: "terminal_output".into(),
+                offset,
+                text: text.into(),
+                base_seq: 1,
+                revision: 2,
+                ..Default::default()
+            }),
+        )
+    };
+    let applied = e.apply(delta(0, "line 1\n"));
+    assert!(applied.touched["conv:x"].items.contains("t"));
+    e.apply(delta(7, "line 2\n"));
+    // A repeated delta adds nothing.
+    e.apply(delta(0, "line 1\n"));
+    let channel = &e.channels["conv:x"];
+    assert_eq!(channel.outputs["t"], (2, "line 1\nline 2\n".into()));
+    assert_eq!(
+        channel.items["t"].text, "exec",
+        "the item's text is its own"
+    );
+    // A reply's text does not stream into an item that is not streaming.
+    let text = frame(
+        "conv:x",
+        Body::Delta(Delta {
+            item_id: "t".into(),
+            stream: "text".into(),
+            text: "x".into(),
+            base_seq: 1,
+            revision: 2,
+            ..Default::default()
+        }),
+    );
+    assert!(e.apply(text).touched.is_empty());
+}

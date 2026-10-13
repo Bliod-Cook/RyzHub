@@ -7,8 +7,65 @@ import 'frb_generated.dart';
 
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `channel_key`, `command`, `committed`, `dirty`, `sendable`, `update`, `writes`
-// These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `State`
+// These functions are ignored because they are not marked as `pub`: `channel_change`, `channel_key`, `command`, `committed`, `dirty`, `flush`, `is_empty`, `sendable`, `update`, `writes`
+// These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `Pending`, `State`
+// These functions are ignored (category: IgnoreBecauseOwnerTyShouldIgnore): `default`
+
+/// `text` rendered as messages show it: `{blocks, chips}`. `cited` are the pages a reply cites;
+/// `streaming` closes what its end leaves open.
+String renderMarkdown({
+  required String text,
+  required List<String> cited,
+  required bool streaming,
+}) => RustLib.instance.api.crateApiRenderMarkdown(
+  text: text,
+  cited: cited,
+  streaming: streaming,
+);
+
+/// Rows and items for `items_json`, a stretch of a conversation shown apart from its live
+/// timeline: `{rows, items}` as a timeline hands them over.
+String timelineSnapshot({required String itemsJson}) =>
+    RustLib.instance.api.crateApiTimelineSnapshot(itemsJson: itemsJson);
+
+/// `code` coloured as `language`: `[[text, class], …]` with highlight.js class names. `key`
+/// names the code block across calls, so a growing block is parsed only from its last complete
+/// line. None when the language is unknown, the grammars are not loaded or the code is long.
+String? highlight({
+  required String key,
+  required String language,
+  required String code,
+}) => RustLib.instance.api.crateApiHighlight(
+  key: key,
+  language: language,
+  code: code,
+);
+
+/// Whether code can be coloured; on the web, not until [`load_syntaxes`].
+bool syntaxesReady() => RustLib.instance.api.crateApiSyntaxesReady();
+
+/// Whether `language` names a language code can be coloured in.
+bool knownLanguage({required String language}) =>
+    RustLib.instance.api.crateApiKnownLanguage(language: language);
+
+/// Loads the grammars the web fetches on first use.
+void loadSyntaxes({required List<int> dump}) =>
+    RustLib.instance.api.crateApiLoadSyntaxes(dump: dump);
+
+/// Terminal output as spans: `[{text, fg?, bg?, style?}]`.
+String ansiSpans({required String text}) =>
+    RustLib.instance.api.crateApiAnsiSpans(text: text);
+
+/// A unified diff as lines: `[{kind, text, old?, new?}]`.
+String diffLines({required String text}) =>
+    RustLib.instance.api.crateApiDiffLines(text: text);
+
+/// What changed from `old` to `new`, as [`diff_lines`] gives it.
+String compareTexts({required String old, required String new_}) =>
+    RustLib.instance.api.crateApiCompareTexts(old: old, new_: new_);
+
+/// An id for a conversation this client creates.
+String newConversationId() => RustLib.instance.api.crateApiNewConversationId();
 
 int reconnectDelay({required int attempt, required int random}) => RustLib
     .instance
@@ -36,6 +93,21 @@ abstract class ClientCore implements RustOpaqueInterface {
 
   Update configure({required String channel, required String configJson});
 
+  /// Creates conversation `conversation_id` (see [`new_conversation_id`]) with its first
+  /// message, on the user's channel `channel`. Queued like any command, it may be created
+  /// offline; frames for the conversation wait until the server has answered it.
+  Update createRun({
+    required String channel,
+    required String conversationId,
+    required String mode,
+    required String runConfigJson,
+    String? projectId,
+    required bool temporary,
+    required String title,
+    required String text,
+    required List<String> attachmentIds,
+  });
+
   Update decide({
     required String channel,
     required String actionId,
@@ -43,13 +115,29 @@ abstract class ClientCore implements RustOpaqueInterface {
     required String decision,
   });
 
+  /// The changes waiting in the kernel; none when nothing waits.
+  Update flush({required double nowMs});
+
   Update fork({required String channel, required String itemId});
 
   Uint8List hello({required String deviceId});
 
-  /// Flutter batches incoming frames for one display tick, then receives what changed: only
-  /// the channels and items these frames touched.
-  Update ingest({required List<Uint8List> frames});
+  /// Applies frames as they arrive (`now_ms` is the client's clock). What they change waits
+  /// in the kernel to cross with what follows it within [`BATCH_MS`]: the update says when to
+  /// [`ClientCore::flush`]. Frames to send go out at once.
+  Update ingest({required List<Uint8List> frames, required double nowMs});
+
+  /// Runs a plugin's command in conversation `channel`, with its parameters as JSON.
+  Update invokeMenuCommand({
+    required String channel,
+    required String installationId,
+    required String command,
+    required String paramsJson,
+    required List<String> attachmentIds,
+  });
+
+  /// The user has read conversation `channel` up to `read_seq`.
+  Update markRead({required String channel, required int readSeq});
 
   Update mergeHistory({required String channel, required String itemsJson});
 
@@ -78,6 +166,9 @@ abstract class ClientCore implements RustOpaqueInterface {
   });
 
   Update subscribe({required String channel});
+
+  /// Undoes the memory change of `event_id`, on the user's channel `channel`.
+  Update undoMemoryUpdate({required String channel, required String eventId});
 
   String viewJson();
 }
@@ -139,6 +230,9 @@ class Update {
   /// The command this update queued.
   final String? cid;
 
+  /// Changes wait in the kernel: call [`ClientCore::flush`] after this many milliseconds.
+  final int? flushInMs;
+
   const Update({
     required this.changesJson,
     required this.cacheWrites,
@@ -147,6 +241,7 @@ class Update {
     required this.resultsJson,
     required this.authExpiring,
     this.cid,
+    this.flushInMs,
   });
 
   @override
@@ -157,7 +252,8 @@ class Update {
       error.hashCode ^
       resultsJson.hashCode ^
       authExpiring.hashCode ^
-      cid.hashCode;
+      cid.hashCode ^
+      flushInMs.hashCode;
 
   @override
   bool operator ==(Object other) =>
@@ -170,5 +266,6 @@ class Update {
           error == other.error &&
           resultsJson == other.resultsJson &&
           authExpiring == other.authExpiring &&
-          cid == other.cid;
+          cid == other.cid &&
+          flushInMs == other.flushInMs;
 }

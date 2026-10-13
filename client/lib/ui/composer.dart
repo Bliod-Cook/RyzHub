@@ -8,8 +8,23 @@ import '../controller.dart';
 import '../l10n.dart';
 import '../theme.dart';
 import 'attachments.dart';
+import 'plugins.dart';
 import 'common.dart';
+import 'dialogs.dart';
 import 'model_picker.dart';
+
+/// A command the composer offers as `/` is typed.
+class SlashCommand {
+  final String name, description;
+
+  /// The group it is listed under, in the order groups first appear.
+  final String group;
+
+  /// Runs it; without one, choosing it puts `/name ` in the field for its
+  /// arguments, and it is sent as text.
+  final VoidCallback? run;
+  const SlashCommand(this.name, this.description, this.group, {this.run});
+}
 
 class Composer extends StatefulWidget {
   final Future<void> Function(String) onSend;
@@ -47,6 +62,9 @@ class Composer extends StatefulWidget {
 
   /// The field's text, when the page needs to put a message back into it.
   final TextEditingController? controller;
+
+  /// Offered as the field starts with `/`.
+  final List<SlashCommand> commands;
   const Composer({
     super.key,
     required this.onSend,
@@ -66,6 +84,7 @@ class Composer extends StatefulWidget {
     this.blocked = false,
     this.hint,
     this.controller,
+    this.commands = const [],
   });
   @override
   State<Composer> createState() => _ComposerState();
@@ -103,11 +122,59 @@ class _ComposerState extends State<Composer> {
   bool sideQuery = false;
   bool empty = true;
 
+  /// The suggested command the keyboard is on.
+  int highlighted = 0;
+
+  /// The suggestions were dismissed for the text as it is.
+  String? dismissedFor;
+
+  /// The commands whose name starts with what follows the `/`, while only a
+  /// command's name is typed.
+  List<SlashCommand> get suggestions {
+    final text = input.text;
+    if (!text.startsWith('/') ||
+        text.contains(RegExp(r'\s')) ||
+        text == dismissedFor ||
+        !input.value.composing.isCollapsed) {
+      return const [];
+    }
+    final query = text.substring(1).toLowerCase();
+    return [
+      for (final command in widget.commands)
+        if (command.name.toLowerCase().startsWith(query)) command,
+    ];
+  }
+
+  void choose(SlashCommand command) {
+    final run = command.run;
+    if (run == null) {
+      input.text = '/${command.name} ';
+      input.selection = TextSelection.collapsed(offset: input.text.length);
+      return;
+    }
+    input.clear();
+    run();
+  }
+
+  void move(int by) {
+    final count = suggestions.length;
+    if (count == 0) return;
+    setState(() => highlighted = (highlighted + by) % count);
+  }
+
   @override
   void initState() {
     super.initState();
     // Every edit can change whether the text still fits on the single row.
-    input.addListener(() => setState(() => empty = input.text.trim().isEmpty));
+    var typed = input.text;
+    input.addListener(
+      () => setState(() {
+        empty = input.text.trim().isEmpty;
+        // Moving the cursor keeps the highlighted suggestion.
+        if (input.text != typed) highlighted = 0;
+        typed = input.text;
+      }),
+    );
   }
 
   @override
@@ -202,6 +269,22 @@ class _ComposerState extends State<Composer> {
     )..layout();
     final textWidth = painter.width;
     painter.dispose();
+    final suggested = suggestions;
+    if (highlighted >= suggested.length) highlighted = 0;
+    void pick() => choose(suggested[highlighted]);
+    // Bound at the field itself: the menu anchor between it and the
+    // composer's shortcuts takes arrow keys for its own traversal.
+    final picking = <ShortcutActivator, VoidCallback>{
+      if (suggested.isNotEmpty) ...{
+        // Picking a command comes before sending.
+        const SingleActivator(LogicalKeyboardKey.enter): pick,
+        const SingleActivator(LogicalKeyboardKey.tab): pick,
+        const SingleActivator(LogicalKeyboardKey.arrowDown): () => move(1),
+        const SingleActivator(LogicalKeyboardKey.arrowUp): () => move(-1),
+        const SingleActivator(LogicalKeyboardKey.escape): () =>
+            setState(() => dismissedFor = input.text),
+      },
+    };
     return CallbackShortcuts(
       bindings: {
         const SingleActivator(LogicalKeyboardKey.enter, control: true): send,
@@ -216,11 +299,22 @@ class _ComposerState extends State<Composer> {
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
+            if (suggested.isNotEmpty)
+              _Suggestions(
+                commands: suggested,
+                highlighted: highlighted,
+                onPick: choose,
+              ),
             // Separate semantics nodes: otherwise the hint and footer lines merge
             // into the text field's accessible name.
             if (widget.steer && !sideQuery)
               Padding(
-                padding: const EdgeInsets.fromLTRB(18, 0, 18, 6),
+                padding: const EdgeInsets.fromLTRB(
+                  Space.s18,
+                  0,
+                  Space.s18,
+                  Space.s6,
+                ),
                 child: Semantics(
                   container: true,
                   child: Text(
@@ -254,7 +348,12 @@ class _ComposerState extends State<Composer> {
                   ),
                   menuChildren: menuItems?.call(context) ?? const [],
                   child: Container(
-                    padding: const EdgeInsets.fromLTRB(8, 6, 8, 6),
+                    padding: const EdgeInsets.fromLTRB(
+                      Space.s8,
+                      Space.s6,
+                      Space.s8,
+                      Space.s6,
+                    ),
                     decoration: BoxDecoration(
                       color: c.composer,
                       borderRadius: BorderRadius.circular(28),
@@ -279,7 +378,12 @@ class _ComposerState extends State<Composer> {
                         children: [
                           if (widget.attachments != null)
                             Padding(
-                              padding: const EdgeInsets.fromLTRB(6, 4, 6, 4),
+                              padding: const EdgeInsets.fromLTRB(
+                                Space.s6,
+                                Space.s4,
+                                Space.s6,
+                                Space.s4,
+                              ),
                               child: widget.attachments,
                             ),
                           _ComposerRow(
@@ -301,7 +405,7 @@ class _ComposerState extends State<Composer> {
                                             if (widget.onSideQuery != null)
                                               Padding(
                                                 padding: const EdgeInsets.only(
-                                                  left: 4,
+                                                  left: Space.s4,
                                                 ),
                                                 child: FilterChip(
                                                   label: Text(
@@ -327,7 +431,7 @@ class _ComposerState extends State<Composer> {
                                             for (final tool in widget.tools)
                                               Padding(
                                                 padding: const EdgeInsets.only(
-                                                  left: 6,
+                                                  left: Space.s6,
                                                 ),
                                                 child: tool,
                                               ),
@@ -339,27 +443,31 @@ class _ComposerState extends State<Composer> {
                                 ),
                                 Semantics(
                                   container: true,
-                                  child: TextField(
-                                    controller: input,
-                                    focusNode: widget.focusNode,
-                                    minLines: 1,
-                                    maxLines: 8,
-                                    textInputAction: TextInputAction.newline,
-                                    style: fieldStyle,
-                                    decoration: InputDecoration(
-                                      hintText:
-                                          widget.hint ??
-                                          tr('写下你的想法…', 'Ask anything…'),
-                                      border: InputBorder.none,
-                                      enabledBorder: InputBorder.none,
-                                      focusedBorder: InputBorder.none,
-                                      filled: false,
-                                      isDense: true,
-                                      contentPadding: const EdgeInsets.fromLTRB(
-                                        _ComposerRow.fieldStart,
-                                        10,
-                                        _ComposerRow.fieldEnd,
-                                        10,
+                                  child: CallbackShortcuts(
+                                    bindings: picking,
+                                    child: TextField(
+                                      controller: input,
+                                      focusNode: widget.focusNode,
+                                      minLines: 1,
+                                      maxLines: 8,
+                                      textInputAction: TextInputAction.newline,
+                                      style: fieldStyle,
+                                      decoration: InputDecoration(
+                                        hintText:
+                                            widget.hint ??
+                                            tr('写下你的想法…', 'Ask anything…'),
+                                        border: InputBorder.none,
+                                        enabledBorder: InputBorder.none,
+                                        focusedBorder: InputBorder.none,
+                                        filled: false,
+                                        isDense: true,
+                                        contentPadding:
+                                            const EdgeInsets.fromLTRB(
+                                              _ComposerRow.fieldStart,
+                                              Space.s10,
+                                              _ComposerRow.fieldEnd,
+                                              Space.s10,
+                                            ),
                                       ),
                                     ),
                                   ),
@@ -407,7 +515,7 @@ class _ComposerState extends State<Composer> {
             ),
             if (widget.footer.isNotEmpty)
               Padding(
-                padding: const EdgeInsets.only(top: 8),
+                padding: const EdgeInsets.only(top: Space.s8),
                 child: DefaultTextStyle.merge(
                   style: TextStyle(fontSize: 11.5, color: c.subtle),
                   child: Wrap(
@@ -549,15 +657,110 @@ List<Widget> runTools(HubController hub, RunAction action) {
     return const [];
   }
   final settings = hub.settings;
+  final modes = (hub.commandCatalog['approval_modes'] as List? ?? const [])
+      .cast<String>();
+  final approval = settings['approval'] as String? ?? 'ask';
   return [
+    // Work only: Chat has no approvals.
+    if (hub.realWork && modes.isNotEmpty)
+      ApprovalMenu(
+        value: approval,
+        modes: modes,
+        onSelected: (mode) {
+          if (mode != approval) action(() => hub.configure({'approval': mode}));
+        },
+      ),
     if (hub.supports('plan_mode'))
-      FilterChip(
-        label: Text(tr('计划模式', 'Plan mode')),
-        selected: settings['plan'] == true,
-        visualDensity: VisualDensity.compact,
-        onSelected: (v) => action(() => hub.configure({'plan': v})),
+      Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          FilterChip(
+            label: Text(tr('计划模式', 'Plan mode')),
+            selected: settings['plan'] == true,
+            visualDensity: VisualDensity.compact,
+            onSelected: (v) => action(() => hub.configure({'plan': v})),
+          ),
+          if (hub.emulated('plan_mode')) const EmulatedNote('plan_mode'),
+        ],
       ),
   ];
+}
+
+/// The Work conversation's approval mode, as a pill; it applies from the next
+/// turn.
+class ApprovalMenu extends StatelessWidget {
+  final String value;
+  final List<String> modes;
+  final ValueChanged<String> onSelected;
+  const ApprovalMenu({
+    super.key,
+    required this.value,
+    required this.modes,
+    required this.onSelected,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final c = HubColors.of(context);
+    return PopupMenuButton<String>(
+      tooltip: tr('审批模式', 'Approval mode'),
+      position: PopupMenuPosition.under,
+      offset: const Offset(0, 6),
+      onSelected: onSelected,
+      itemBuilder: (_) => [
+        for (final mode in modes)
+          HubMenuItem(
+            value: mode,
+            height: 52,
+            child: Row(
+              children: [
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text(approvalLabel(mode)),
+                      Text(
+                        approvalDescription(mode),
+                        style: TextStyle(fontSize: 12, color: c.muted),
+                      ),
+                    ],
+                  ),
+                ),
+                if (mode == value) ...[
+                  const SizedBox(width: 12),
+                  Icon(Icons.check, size: 16, color: c.text),
+                ],
+              ],
+            ),
+          ),
+      ],
+      child: Container(
+        height: 32,
+        padding: const EdgeInsets.symmetric(horizontal: Space.s10),
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(16),
+          border: Border.all(color: c.border),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(
+              value == 'full_auto'
+                  ? Icons.bolt_outlined
+                  : Icons.verified_user_outlined,
+              size: 15,
+              color: value == 'full_auto' ? c.warning : c.muted,
+            ),
+            const SizedBox(width: 6),
+            Text(approvalLabel(value), style: const TextStyle(fontSize: 13)),
+            const SizedBox(width: 2),
+            Icon(Icons.expand_more, size: 16, color: c.subtle),
+          ],
+        ),
+      ),
+    );
+  }
 }
 
 /// The model and its reasoning level, placed beside the send button.
@@ -714,6 +917,15 @@ Widget? plusMenu(
       // The + stays in a conversation too, so the composer keeps one layout.
       return [
         ...files,
+        if (hub.capabilities['plugins'] == true) ...[
+          row(
+            Icons.extension_outlined,
+            tr('插件', 'Plugins'),
+            tr('本对话使用哪些插件', 'Which plugins this chat uses'),
+            () => showConversationPlugins(page, hub),
+          ),
+          const MenuDivider(),
+        ],
         if (commands.isEmpty)
           row(
             Icons.terminal,
@@ -735,7 +947,12 @@ Widget? plusMenu(
     return [
       ...files,
       Padding(
-        padding: const EdgeInsets.fromLTRB(14, 8, 14, 4),
+        padding: const EdgeInsets.fromLTRB(
+          Space.s14,
+          Space.s8,
+          Space.s14,
+          Space.s4,
+        ),
         child: Text(
           tr('新对话放入项目', 'Start in a project'),
           style: TextStyle(fontSize: 12, color: c.subtle),
@@ -778,7 +995,182 @@ Widget? plusMenu(
   );
 }
 
+/// Commands matching what follows the typed `/`, grouped, the highlighted one
+/// shaded; a click picks one.
+class _Suggestions extends StatelessWidget {
+  final List<SlashCommand> commands;
+  final int highlighted;
+  final ValueChanged<SlashCommand> onPick;
+  const _Suggestions({
+    required this.commands,
+    required this.highlighted,
+    required this.onPick,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final c = HubColors.of(context);
+    final rows = <Widget>[];
+    String? group;
+    for (final (i, command) in commands.indexed) {
+      if (command.group != group) {
+        group = command.group;
+        rows.add(
+          Padding(
+            padding: const EdgeInsets.fromLTRB(
+              Space.s14,
+              Space.s8,
+              Space.s14,
+              Space.s2,
+            ),
+            child: Text(
+              command.group,
+              style: TextStyle(fontSize: 11.5, color: c.subtle),
+            ),
+          ),
+        );
+      }
+      rows.add(
+        Semantics(
+          selected: i == highlighted,
+          button: true,
+          child: InkWell(
+            onTap: () => onPick(command),
+            child: Container(
+              color: i == highlighted ? c.hover : null,
+              padding: const EdgeInsets.symmetric(
+                horizontal: Space.s14,
+                vertical: Space.s7,
+              ),
+              child: Row(
+                children: [
+                  Text(
+                    '/${command.name}',
+                    style: TextStyle(fontSize: 14, color: c.text),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Text(
+                      command.description,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(fontSize: 13, color: c.subtle),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      );
+    }
+    return Container(
+      margin: const EdgeInsets.only(bottom: Space.s6),
+      constraints: const BoxConstraints(maxHeight: 260),
+      decoration: BoxDecoration(
+        color: c.menu,
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: c.border),
+      ),
+      clipBehavior: Clip.antiAlias,
+      child: SingleChildScrollView(
+        padding: const EdgeInsets.only(bottom: Space.s4),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: rows,
+        ),
+      ),
+    );
+  }
+}
+
+/// The commands `/` offers in a conversation: the ones every harness has,
+/// then the platform's, then the project's and plugins', then the harness's
+/// own, which are sent as text.
+List<SlashCommand> slashCommands(
+  BuildContext context,
+  HubController hub,
+  RunAction action, {
+  required VoidCallback onNewChat,
+}) {
+  if (hub.isDraft) return const [];
+  final conversation = hub.selectedConversation;
+  final unified = tr('通用命令', 'Commands');
+  final platform = tr('对话', 'Conversation');
+  final agent = tr('Agent 命令', 'Agent commands');
+  return [
+    if (hub.supports('compact') && !hub.running)
+      SlashCommand(
+        'compact',
+        hub.emulated('compact')
+            ? emulatedNote('compact')!
+            : tr('压缩上下文，释放空间', 'Compact the context to free room'),
+        unified,
+        run: () => action(hub.compact),
+      ),
+    if (hub.running)
+      SlashCommand(
+        'stop',
+        tr('停止当前任务', 'Stop the current run'),
+        unified,
+        run: () => action(hub.cancel),
+      ),
+    SlashCommand(
+      'new',
+      tr('新建对话', 'Start a new chat'),
+      platform,
+      run: onNewChat,
+    ),
+    for (final (name, label, value) in [
+      ('rename', tr('重命名对话', 'Rename the chat'), 'rename'),
+      ('archive', tr('归档对话', 'Archive the chat'), 'archive'),
+      ('export', tr('导出对话', 'Export the chat'), 'export'),
+    ])
+      SlashCommand(
+        name,
+        label,
+        platform,
+        run: () =>
+            action(() => conversationAction(context, hub, conversation, value)),
+      ),
+    // Plugin commands run as InvokeMenuCommand, after their parameters.
+    for (final command
+        in (hub.commandCatalog['plugin_commands'] as List? ?? []))
+      if (command is Map && command['name'] is String)
+        SlashCommand(
+          '${command['plugin']}:${command['name']}',
+          '${command['title'] ?? ''} ${command['description'] ?? ''}'.trim(),
+          tr('插件命令', 'Plugin commands'),
+          run: () => action(() async {
+            final params = await askCommandParams(context, command);
+            if (params == null) return;
+            await hub.invokeMenuCommand(
+              '${command['installation']}',
+              '${command['name']}',
+              params,
+            );
+          }),
+        ),
+    for (final command
+        in (hub.commandCatalog['harness_commands'] as List? ?? []))
+      if (command is Map && command['name'] is String)
+        SlashCommand(
+          command['name'] as String,
+          '${command['description'] ?? ''}',
+          agent,
+        ),
+  ];
+}
+
 List<Widget> composerFooter(HubController hub) => [
-  if (!hub.isDraft && hub.realWork && hub.settings['harness'] == 'claude')
-    Text(tr('补充指令排入下一轮', 'Instructions queue for the next turn')),
+  // A Work harness that cannot steer the turn in progress gets the
+  // instructions as its next turn.
+  if (!hub.isDraft && hub.realWork && hub.emulated('steer'))
+    Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Text(tr('补充指令排入下一轮', 'Instructions queue for the next turn')),
+        const EmulatedNote('steer'),
+      ],
+    ),
 ];

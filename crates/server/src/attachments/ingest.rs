@@ -80,6 +80,15 @@ impl Writer {
 }
 
 impl Spool {
+    /// The first bytes: enough to recognize a format.
+    pub fn head(&self) -> &[u8] {
+        &self.head
+    }
+
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
     /// An HTTP request body of at most `limit` bytes.
     pub async fn receive(body: Body, limit: u64) -> anyhow::Result<Self> {
         let mut writer = Writer::new(limit).await?;

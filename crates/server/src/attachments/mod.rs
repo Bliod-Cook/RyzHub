@@ -7,6 +7,7 @@ pub mod http;
 pub(crate) mod ingest;
 pub mod outputs;
 pub mod sandbox;
+pub mod uploads;
 
 use std::{
     path::{Path, PathBuf},
@@ -345,7 +346,7 @@ pub(crate) async fn render(app: &App, file: &Path) -> Option<Rendition> {
 /// The program that renders images: the configured one, or else this very binary. The kernel's
 /// link to the running binary still works once a rebuild or an upgrade has replaced the file
 /// it was started from, which the path `current_exe` names no longer does.
-fn renderer(configured: &str) -> std::io::Result<PathBuf> {
+pub(crate) fn renderer(configured: &str) -> std::io::Result<PathBuf> {
     if !configured.is_empty() {
         return Ok(configured.into());
     }

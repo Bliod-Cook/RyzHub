@@ -1,4 +1,5 @@
 //! Real PostgreSQL, NATS and containerd; only the paid model upstream is a protocol fixture.
+mod common;
 use anyhow::{Context, ensure};
 use axum::{
     Json, Router,
@@ -40,9 +41,14 @@ async fn upstream(
             })
             .unwrap_or_default()
     });
-    let claude = body["tools"]
-        .as_array()
-        .is_some_and(|a| a.iter().any(|t| t["name"] == "Bash"));
+    let tool = |name: &str| {
+        body["tools"]
+            .as_array()
+            .is_some_and(|a| a.iter().any(|t| t["name"] == name))
+    };
+    let claude = tool("Bash");
+    // OpenCode, over ACP: its tools have lower-case names.
+    let opencode = tool("bash");
     let result = last
         .as_array()
         .is_some_and(|blocks| blocks.iter().any(|b| b["type"] == "tool_result"));
@@ -52,19 +58,27 @@ async fn upstream(
     ];
     if !result
         && body.get("tools").is_some()
-        && (if claude {
+        && (if claude || opencode {
             prompt.contains("M3_EXEC")
         } else {
             prompt.contains("exec")
         })
     {
         let command = if prompt.contains("proxyexec") {
-            r#"sleep 2; wget -qO- --header 'Content-Type: application/json' --post-data '{"model":body["model"],"max_tokens":32,"stream":true,"messages":[{"role":"user","content":"guest local proxy"}]}' http://127.0.0.1:8090/v1/messages"#
+            r#"sleep 2; wget -Y off -qO- --header 'Content-Type: application/json' --post-data '{"model":body["model"],"max_tokens":32,"stream":true,"messages":[{"role":"user","content":"guest local proxy"}]}' http://127.0.0.1:8090/v1/messages"#
         } else {
             "printf once >> marker; sleep 1; printf '真实沙箱结果'"
         };
         content.push(json!({"type":"text","text":"准备执行工具"}));
-        content.push(json!({"type":"tool_use","id":"call_exec","name":if claude {"Bash"} else {"exec"},"input":if claude{json!({"command":command,"description":"Local execution"})}else{json!({"cmd":command,"timeout_ms":10000})}}));
+        let (name, input) = if claude || opencode {
+            (
+                if claude { "Bash" } else { "bash" },
+                json!({"command":command,"description":"Local execution"}),
+            )
+        } else {
+            ("exec", json!({"cmd":command,"timeout_ms":10000}))
+        };
+        content.push(json!({"type":"tool_use","id":format!("call_exec_{}",Uuid::now_v7().simple()),"name":name,"input":input}));
     } else if !result
         && body.get("tools").is_some()
         && (if claude {
@@ -76,6 +90,19 @@ async fn upstream(
         content.push(json!({"type":"tool_use","id":"call_question","name":if claude {"AskUserQuestion"}else{"ask_user"},"input":if claude{json!({"questions":[{"question":"选择一种颜色","header":"颜色","options":[{"label":"Blue","description":"Blue"},{"label":"Green","description":"Green"}],"multiSelect":false}]})}else{json!({"question":"选择一种颜色"})}}));
     } else if !result && prompt.contains("M3_SHARE") {
         content.push(json!({"type":"text","text":SHARED_REPLY}));
+    } else if claude && !result && prompt.contains("M3_AGENT") {
+        // The SDK names its subagent tool Agent (Task in older releases).
+        let agent = if body["tools"]
+            .as_array()
+            .is_some_and(|a| a.iter().any(|t| t["name"] == "Agent"))
+        {
+            "Agent"
+        } else {
+            "Task"
+        };
+        content.push(json!({"type":"tool_use","id":"call_agent","name":agent,"input":{"description":"Look around","prompt":"M3_SUBAGENT list the workspace","subagent_type":"general-purpose"}}));
+    } else if !result && prompt.contains("M3_SUBAGENT") {
+        content.push(json!({"type":"text","text":"子任务完成"}));
     } else {
         content.push(json!({"type":"text","text":if result{"工具结果已用于回答"}else if body.get("tools").is_none(){"只读旁问完成"}else{"本地协议联调：你好 Rust"}}));
     }
@@ -113,7 +140,11 @@ async fn upstream(
         events.push(json!({"type":"content_block_stop","index":index}));
     }
     events.push(json!({"type":"message_delta","delta":{"stop_reason":if tool{"tool_use"}else{"end_turn"}},"usage":{"output_tokens":4}}));
-    events.push(json!({"type":"message_delta","delta":{},"usage":{"output_tokens":8}}));
+    // A later usage-only delta; the AI SDK behind OpenCode reads it as an unknown finish
+    // and continues the turn, so it gets the one delta the API sends.
+    if !opencode {
+        events.push(json!({"type":"message_delta","delta":{},"usage":{"output_tokens":8}}));
+    }
     events.push(json!({"type":"message_stop"}));
     let delay = if prompt.contains("slow") { 100 } else { 5 };
     if prompt.contains("interrupt") {
@@ -138,6 +169,45 @@ async fn upstream(
         .body(Body::from_stream(stream))
         .unwrap()
 }
+/// OpenCode over ACP, through its Anthropic provider and the guest's model proxy.
+fn opencode_profile() -> ryzhub_execution::AcpProfile {
+    let config = json!({
+        "$schema": "https://opencode.ai/config.json",
+        "autoupdate": false,
+        "share": "disabled",
+        "enabled_providers": ["anthropic"],
+        "model": "anthropic/{model}",
+        "small_model": "anthropic/{model}",
+        "instructions": ["{instructions}"],
+        "provider": {"anthropic": {"options": {"baseURL": "{proxy}/v1", "apiKey": "guest-proxy"}, "models": "{models}"}},
+        "permission": {"bash": "ask", "edit": "ask", "webfetch": "ask"},
+    })
+    .to_string()
+    .replace("\"{models}\"", "{models}");
+    let mut env: std::collections::BTreeMap<String, String> = [
+        "OPENCODE_DISABLE_AUTOUPDATE",
+        "OPENCODE_DISABLE_MODELS_FETCH",
+        "OPENCODE_DISABLE_LSP_DOWNLOAD",
+        "OPENCODE_DISABLE_DEFAULT_PLUGINS",
+        "OPENCODE_DISABLE_SHARE",
+        "OPENCODE_DISABLE_CLAUDE_CODE",
+    ]
+    .into_iter()
+    .map(|name| (name.to_owned(), "1".to_owned()))
+    .collect();
+    env.insert("OPENCODE_CONFIG_CONTENT".into(), config);
+    ryzhub_execution::AcpProfile {
+        name: "opencode".into(),
+        label: "OpenCode".into(),
+        command: "/usr/local/bin/opencode".into(),
+        args: vec!["acp".into()],
+        env,
+        model_option: "anthropic/{model}".into(),
+        protocol: "anthropic".into(),
+        model: "claude-sonnet-4-6".into(),
+        version: "1.19.0".into(),
+    }
+}
 struct Harness {
     name: String,
     admin: PgPool,
@@ -156,6 +226,12 @@ impl Harness {
             "postgres://postgres:local-development-only@127.0.0.1:55432/postgres".into()
         });
         let admin = PgPool::connect(&admin_url).await?;
+        common::sweep(
+            &admin,
+            admin_url.rsplit_once('/').unwrap().0,
+            &common::host_socket(),
+        )
+        .await;
         let name = format!("ryzhub_test_{}", Uuid::now_v7().simple());
         sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {name}")))
             .execute(&admin)
@@ -180,9 +256,10 @@ impl Harness {
         config.llm.models = vec![ryzhub_server::config::ModelRoute {
             id: "claude-opus-4-6".into(),
             protocol: "anthropic".into(),
-            harnesses: vec!["claude".into(), "chat".into()],
+            harnesses: vec!["claude".into(), "chat".into(), "opencode".into()],
             ..Default::default()
         }];
+        config.harness.acp = vec![opencode_profile()];
         config.llm.models.push(ryzhub_server::config::ModelRoute {
             id: "gpt-5.2".into(),
             protocol: "responses".into(),
@@ -335,7 +412,9 @@ impl Harness {
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        anyhow::bail!("run did not reach {state}")
+        let events:Vec<String>=sqlx::query_scalar("SELECT left(payload::text,400) FROM guest_events WHERE sandbox_id IN (SELECT id FROM sandboxes WHERE conversation_id=$1) ORDER BY gseq DESC LIMIT 12").bind(conv).fetch_all(&self.db).await?;
+        let items:Vec<(String,String,String)>=sqlx::query_as("SELECT kind,state,left(text,80) FROM items WHERE conversation_id=$1 ORDER BY first_seq").bind(conv).fetch_all(&self.db).await?;
+        anyhow::bail!("run did not reach {state}; guest events: {events:#?}; items: {items:?}")
     }
     async fn action(&self, run: Uuid) -> anyhow::Result<(Uuid, i64)> {
         Ok(sqlx::query_as(
@@ -346,19 +425,11 @@ impl Harness {
         .await?)
     }
     async fn close(self) -> anyhow::Result<()> {
-        let sandboxes: Vec<(Uuid, i64)> = sqlx::query_as("SELECT id,exec_epoch FROM sandboxes")
-            .fetch_all(&self.db)
-            .await?;
-        for (id, epoch) in sandboxes {
-            let _ = ryzhub_execution::call(
-                std::path::Path::new(&self.app.config.sandbox.host_socket),
-                &ryzhub_execution::HostCommand::Destroy {
-                    sandbox_id: id,
-                    exec_epoch: (epoch + 100) as u64,
-                },
-            )
-            .await;
-        }
+        common::release(
+            &self.db,
+            std::path::Path::new(&self.app.config.sandbox.host_socket),
+        )
+        .await;
         if let Some(path) = &self.app.config.llm.unix_socket {
             let _ = std::fs::remove_file(path);
         }
@@ -820,18 +891,18 @@ async fn two_harnesses_steer_commands_fork_and_restore() -> anyhow::Result<()> {
     let org = id(&user, "org_id");
     let mut owner = h.owner()?;
     let outcome=async {
- for harness in ["codex","claude"] {
+ for harness in ["codex","claude","opencode"] {
   println!("M3 harness: {harness}");
   let conv=h.configured(&user,"work",json!({"harness":harness}),None).await?;
   h.submit(&user,conv,message("slow hello")).await?;let run=h.wait_state(conv,"running").await?;
   // Steer immediately, including while the native session is still being provisioned.
   h.submit(&user,conv,Command::Steer(Steer{text:"second queued instruction".into(),..Default::default()})).await?;
-  let model=if harness=="claude" {"claude-opus-4-6"}else{"gpt-5.2"};
+  let model=if harness=="codex" {"gpt-5.2"}else{"claude-opus-4-6"};
   h.submit(&user,conv,Command::UpdateRunConfig(UpdateRunConfig{config_json:json!({"model":model,"reasoning":"high","plan":true}).to_string()})).await?;
   let snapshot:Value=sqlx::query_scalar("SELECT run_config FROM runs WHERE id=$1").bind(run).fetch_one(&h.db).await?;ensure!(snapshot["model"]!=model && snapshot["plan"]==false,"settings must not alter the active run");
   h.wait_state(conv,"completed").await?;
   let steer:String=sqlx::query_scalar("SELECT state FROM items WHERE run_id=$1 AND kind='steer'").bind(run).fetch_one(&h.db).await?;ensure!(steer=="handed","{harness} steer: {steer}");
-  if harness=="claude" {let turns:i64=sqlx::query_scalar("SELECT count(*) FROM native_turns WHERE run_id=$1").bind(run).fetch_one(&h.db).await?;ensure!(turns==2,"Claude must queue into a second native turn: {turns}");}
+  if harness!="codex" {let turns:i64=sqlx::query_scalar("SELECT count(*) FROM native_turns WHERE run_id=$1").bind(run).fetch_one(&h.db).await?;ensure!(turns==2,"{harness} must queue into a second native turn: {turns}");}
   h.idle(conv).await?;
   h.submit(&user,conv,message("plan a change")).await?;let configured=h.wait_state(conv,"completed").await?;
   let settings:Value=sqlx::query_scalar("SELECT run_config FROM runs WHERE id=$1").bind(configured).fetch_one(&h.db).await?;ensure!(settings["plan"]==true && settings["reasoning"]=="high" && settings["model"]==model);
@@ -848,15 +919,35 @@ async fn two_harnesses_steer_commands_fork_and_restore() -> anyhow::Result<()> {
   let file=&detail["kind"]["Answer"]["files"][0];
   ensure!(file["link"]=="/workspace/share/report.txt" && file["file"]["name"]=="report.txt" && file["file"]["size"]==11,"{harness} hand-over: {detail}");
   if harness=="claude" {
+   // What a subagent does nests under the call that started it.
+   h.submit(&user,conv,message("M3_AGENT")).await?;
+   let mut agent=None;
+   for _ in 0..600 {
+    let latest:Option<(Uuid,String)>=sqlx::query_as("SELECT id,state FROM runs WHERE conversation_id=$1 ORDER BY started_at DESC LIMIT 1").bind(conv).fetch_optional(&h.db).await?;
+    match latest {
+     Some((run,state)) if state=="requires_action" => {let (action,epoch)=h.action(run).await?;h.submit(&user,conv,Command::DecideApproval(DecideApproval{action_id:action.to_string(),run_epoch:epoch as u64,decision:"allow".into()})).await?;}
+     Some((run,state)) if state=="completed" && sqlx::query_scalar::<_,bool>("SELECT EXISTS(SELECT 1 FROM items WHERE run_id=$1 AND text LIKE '%M3_SUBAGENT%')").bind(run).fetch_one(&h.db).await? => {agent=Some(run);break;}
+     _ => {}
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+   }
+   let agent=agent.context("the subagent run did not complete")?;
+   let nested:Vec<(String,String)>=sqlx::query_as("SELECT c.kind,c.text FROM items c JOIN items p ON p.id=c.parent_item_id WHERE c.run_id=$1 AND p.text LIKE '%M3_SUBAGENT%'").bind(agent).fetch_all(&h.db).await?;
+   let all:Vec<(String,String,Option<Uuid>)>=sqlx::query_as("SELECT kind,left(text,80),parent_item_id FROM items WHERE run_id=$1 ORDER BY first_seq").bind(agent).fetch_all(&h.db).await?;
+   ensure!(nested.iter().any(|(kind,text)|kind=="assistant" && text.contains("子任务完成")),"subagent items must nest under their call: {nested:?} in {all:?}");
+   h.idle(conv).await?;
    h.submit(&user,conv,message("M3_QUESTION")).await?;let run=h.wait_state(conv,"requires_action").await?;let (action,epoch)=h.action(run).await?;
    h.submit(&user,conv,Command::AnswerQuestion(AnswerQuestion{action_id:action.to_string(),run_epoch:epoch as u64,answer:"Blue".into()})).await?;h.wait_state(conv,"completed").await?;h.idle(conv).await?;
   }
+  // ACP has no forks.
+  if harness!="opencode" {
   let latest:Uuid=sqlx::query_scalar("SELECT id FROM items WHERE conversation_id=$1 AND kind='assistant' AND state='completed' ORDER BY last_seq DESC LIMIT 1").bind(conv).fetch_one(&h.db).await?;
   let fork=h.submit(&user,conv,Command::Fork(Fork{item_id:latest.to_string()})).await?;let fork=h.fork_result(fork).await?;
   h.submit(&user,fork,message("hello fork")).await?;h.wait_state(fork,"completed").await?;h.idle(fork).await?;
+  }
   h.submit(&user,conv,Command::Compact(Compact{})).await?;h.wait_state(conv,"completed").await?;h.idle(conv).await?;
   let job=h.json(&user,&format!("/orgs/{org}/conversations/{conv}/workspace"),reqwest::Method::POST,json!({"kind":"restore"})).await?;let job=id(&job,"id");
-  for _ in 0..1000 {let state:String=sqlx::query_scalar("SELECT state FROM workspace_jobs WHERE id=$1").bind(job).fetch_one(&h.db).await?;if state=="completed"{break;}ensure!(state!="failed","restore failed");tokio::time::sleep(Duration::from_millis(100)).await;}
+  for _ in 0..1000 {let state:String=sqlx::query_scalar("SELECT state FROM workspace_jobs WHERE id=$1").bind(job).fetch_one(&h.db).await?;if state=="completed"{break;}else if state=="failed"{let result:Option<Value>=sqlx::query_scalar("SELECT result FROM workspace_jobs WHERE id=$1").bind(job).fetch_one(&h.db).await?;anyhow::bail!("{harness} restore failed: {result:?}");}tokio::time::sleep(Duration::from_millis(100)).await;}
   h.submit(&user,conv,message("hello restored")).await?;h.wait_state(conv,"completed").await?;h.idle(conv).await?;
   let (sandbox,epoch):(Uuid,i64)=sqlx::query_as("SELECT id,exec_epoch FROM sandboxes WHERE conversation_id=$1 AND state='running'").bind(conv).fetch_one(&h.db).await?;
   let check=guest_exec(std::path::Path::new(&h.app.config.sandbox.host_socket),sandbox,epoch,"project-read-only","printf bad > /project/nope").await?;ensure!(check["exit_code"]!=0,"/project must be read-only");

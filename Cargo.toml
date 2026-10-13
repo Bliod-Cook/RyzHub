@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/proto", "crates/domain", "crates/core", "crates/server", "crates/driver-native", "crates/bridge", "crates/execution"]
+members = ["crates/proto", "crates/domain", "crates/core", "crates/server", "crates/bridge", "crates/execution"]
 
 [workspace.package]
 version = "0.1.0"
@@ -11,13 +11,13 @@ rust-version = "1.94"
 [workspace.dependencies]
 anyhow = "1"
 async-nats = "0.49"
-axum = { version = "0.8", features = ["ws"] }
+axum = { version = "0.8", features = ["ws", "http2"] }
 chrono = { version = "0.4", features = ["serde"] }
 futures-util = "0.3"
 prost = "0.14"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls-ring", "postgres", "sqlite", "uuid", "chrono", "json", "migrate", "macros"] }
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls-ring", "postgres", "uuid", "chrono", "json", "migrate", "macros"] }
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }

@@ -5,6 +5,32 @@ use serde_json::{Value, json};
 
 use crate::error::Code;
 
+/// A summary the model wrote of its context, standing in for that context when the provider
+/// cannot compact it (see `runner`).
+pub const SUMMARY: &str = "ryzhub.summary";
+/// Tool results shorter than this stay in the context: a placeholder would save little.
+const OFFLOAD_MIN: usize = 1024;
+/// How much of a moved result its placeholder shows.
+const PREVIEW_CHARS: usize = 300;
+
+/// Whether `response` replaces the context before it: a compaction (Responses, or Anthropic's
+/// own, on demand or past its threshold) or a summary.
+pub fn resets_context(response: &Value) -> bool {
+    response["object"] == "response.compaction"
+        || response["object"] == SUMMARY
+        || response["content"]
+            .as_array()
+            .is_some_and(|content| content.iter().any(|b| b["type"] == "compaction"))
+}
+
+/// The context a summary leaves: the summary, and the model taking it up.
+pub fn summary_context(summary: &str) -> Value {
+    json!([
+        {"role": "user", "content": format!("[Summary of the conversation so far, written when its context was compacted]\n\n{summary}")},
+        {"role": "assistant", "content": "I have the summary of our conversation and will continue from it."},
+    ])
+}
+
 pub fn continue_with(
     protocol: &str,
     messages: &mut Value,
@@ -14,6 +40,22 @@ pub fn continue_with(
     if protocol == "responses" && response["object"] == "response.compaction" {
         ensure!(response["output"].is_array(), "INVALID_CHECKPOINT");
         *messages = response["output"].clone();
+        return Ok(());
+    }
+    if response["object"] == SUMMARY {
+        *messages = summary_context(response["summary"].as_str().unwrap_or_default());
+        return Ok(());
+    }
+    // An on-demand compaction leads the context; what it summarized must go.
+    if protocol != "responses" && response["stop_reason"] == "compaction" {
+        let content = response["content"]
+            .as_array()
+            .context("INVALID_CHECKPOINT")?;
+        ensure!(
+            content.iter().any(|b| b["type"] == "compaction"),
+            "INVALID_CHECKPOINT"
+        );
+        *messages = json!([{"role": "assistant", "content": content}]);
         return Ok(());
     }
     let target = messages.as_array_mut().context("INVALID_CHECKPOINT")?;
@@ -90,6 +132,84 @@ pub fn continue_with(
         }
     }
     Ok(())
+}
+
+/// Move the oldest tool results out of `messages` while it is estimated above `budget` tokens
+/// (about four bytes each), until it is under 60% of it. Each leaves a placeholder naming its
+/// call, which `read_tool_output` reads back. The oldest go first and placeholders are
+/// deterministic, so the context's prefix (and the provider's cache of it) changes only as
+/// results move. Results of the current turn, after the last user input, stay. Returns how
+/// many moved.
+pub fn offload(protocol: &str, messages: &mut Value, budget: usize) -> usize {
+    let total = messages.to_string().len();
+    if budget == 0 || total / 4 <= budget {
+        return 0;
+    }
+    let mut excess = total.saturating_sub(budget * 4 * 6 / 10);
+    let Some(list) = messages.as_array_mut() else {
+        return 0;
+    };
+    let current = list
+        .iter()
+        .rposition(|m| user_input(protocol, m))
+        .unwrap_or(0);
+    let mut moved = 0;
+    for message in &mut list[..current] {
+        let slots: Vec<(String, &mut Value)> = if protocol == "responses" {
+            match message["call_id"].as_str().map(str::to_owned) {
+                Some(id) if message["type"] == "function_call_output" => {
+                    vec![(id, &mut message["output"])]
+                }
+                _ => vec![],
+            }
+        } else if message["role"] == "user" {
+            match message["content"].as_array_mut() {
+                Some(blocks) => blocks
+                    .iter_mut()
+                    .filter(|b| b["type"] == "tool_result")
+                    .filter_map(|b| {
+                        let id = b["tool_use_id"].as_str()?.to_owned();
+                        Some((id, &mut b["content"]))
+                    })
+                    .collect(),
+                None => vec![],
+            }
+        } else {
+            vec![]
+        };
+        for (id, slot) in slots {
+            if excess == 0 {
+                return moved;
+            }
+            let Some(text) = slot.as_str() else {
+                continue;
+            };
+            if text.len() < OFFLOAD_MIN {
+                continue;
+            }
+            let preview: String = text.chars().take(PREVIEW_CHARS).collect();
+            let placeholder = format!(
+                "[Moved out of the context to save space: this tool result ({} bytes) begins {preview:?}. Call read_tool_output with id {id:?} to read it.]",
+                text.len()
+            );
+            excess = excess.saturating_sub(text.len().saturating_sub(placeholder.len()));
+            *slot = Value::String(placeholder);
+            moved += 1;
+        }
+    }
+    moved
+}
+
+/// Whether a context entry is input from the user, rather than tool results.
+fn user_input(protocol: &str, message: &Value) -> bool {
+    if message["role"] != "user" {
+        return false;
+    }
+    protocol == "responses"
+        || message["content"].is_string()
+        || message["content"]
+            .as_array()
+            .is_some_and(|blocks| blocks.iter().any(|b| b["type"] != "tool_result"))
 }
 
 /// A tool result as model context: its JSON text, or an image reference with that text.
@@ -460,6 +580,90 @@ impl NativeResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn old_tool_results_move_out_of_a_long_context_oldest_first() {
+        let result = |id: &str, size: usize| json!({"role":"user","content":[{"type":"tool_result","tool_use_id":id,"content":"x".repeat(size)}]});
+        let call = |id: &str| json!({"role":"assistant","content":[{"type":"tool_use","id":id,"name":"exec","input":{}}]});
+        let mut messages = json!([
+            {"role":"user","content":"first"},
+            call("a"), result("a", 6000),
+            call("b"), result("b", 6000),
+            call("small"), result("small", 100),
+            {"role":"user","content":"now"},
+            call("c"), result("c", 6000),
+        ]);
+        let before = messages.clone();
+        // Within budget: nothing moves.
+        assert_eq!(offload("anthropic", &mut messages, 10_000), 0);
+        assert_eq!(messages, before);
+        // Over 3000 tokens: the oldest go until under 1800; the current turn's stays.
+        assert_eq!(offload("anthropic", &mut messages, 3000), 2);
+        let content = |i: usize| {
+            messages[i]["content"][0]["content"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        assert!(
+            content(2).starts_with("[Moved out of the context") && content(2).contains("\"a\"")
+        );
+        assert!(content(4).contains("read_tool_output"));
+        assert_eq!(content(6).len(), 100);
+        assert_eq!(content(9).len(), 6000);
+        // The same context moves the same results the same way.
+        let mut again = before.clone();
+        offload("anthropic", &mut again, 3000);
+        assert_eq!(again, messages);
+
+        let mut items = json!([
+            {"role":"user","content":"first"},
+            {"type":"function_call","call_id":"a","name":"exec","arguments":"{}"},
+            {"type":"function_call_output","call_id":"a","output":"y".repeat(8000)},
+            {"role":"user","content":"now"},
+        ]);
+        assert_eq!(offload("responses", &mut items, 1000), 1);
+        assert!(items[2]["output"].as_str().unwrap().contains("\"a\""));
+    }
+
+    #[test]
+    fn compactions_and_summaries_replace_the_context() {
+        let mut messages = json!([{"role":"user","content":"long ago"},{"role":"assistant","content":[{"type":"text","text":"old"}]}]);
+        // Anthropic on demand: its block leads what follows.
+        let compaction = json!({"content":[{"type":"compaction","content":"what happened"}],"stop_reason":"compaction"});
+        assert!(resets_context(&compaction));
+        continue_with("anthropic", &mut messages, &compaction, &[]).unwrap();
+        assert_eq!(
+            messages,
+            json!([{"role":"assistant","content":[{"type":"compaction","content":"what happened"}]}])
+        );
+        // Past the threshold mid-reply: the block stays where it came, ahead of the reply.
+        let mut messages = json!([{"role":"user","content":"hi"}]);
+        let threshold = json!({"content":[{"type":"compaction","content":"s"},{"type":"text","text":"answer"}],"stop_reason":"end_turn"});
+        assert!(resets_context(&threshold));
+        continue_with("anthropic", &mut messages, &threshold, &[]).unwrap();
+        assert_eq!(messages[1]["content"][0]["type"], "compaction");
+        assert_eq!(messages.as_array().unwrap().len(), 2);
+        // A summary, in either protocol.
+        let summary = json!({"object":SUMMARY,"summary":"the gist","content":[],"output":[]});
+        assert!(resets_context(&summary));
+        for protocol in ["anthropic", "responses"] {
+            let mut messages = json!([{"role":"user","content":"long ago"}]);
+            continue_with(protocol, &mut messages, &summary, &[]).unwrap();
+            assert!(
+                messages[0]["content"]
+                    .as_str()
+                    .unwrap()
+                    .ends_with("the gist")
+            );
+            assert_eq!(messages[1]["role"], "assistant");
+            assert!(tool_calls(protocol, &summary).unwrap().is_empty());
+        }
+        assert!(!resets_context(
+            &json!({"content":[{"type":"text","text":"plain"}]})
+        ));
+    }
+
     #[test]
     fn responses_preserve_completed_reasoning_and_compaction() {
         let reasoning = json!({"type":"reasoning","id":"rs","encrypted_content":"complete-secret","summary":[]});

@@ -36,7 +36,8 @@ pub async fn reclaim(app: &App, org: Uuid, id: Uuid) -> anyhow::Result<()> {
     }
     let shared: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM attachments WHERE org_id=$1 AND sha256=$2
-         AND state IN ('uploading','ready'))",
+         AND state IN ('uploading','ready'))
+         OR EXISTS(SELECT 1 FROM project_files WHERE org_id=$1 AND source_sha256=$2)",
     )
     .bind(org)
     .bind(&sha256)
@@ -82,7 +83,7 @@ pub async fn collect_org(app: &App, org: Uuid) -> anyhow::Result<()> {
     for id in deleted {
         reclaim(app, org, id).await?;
     }
-    Ok(())
+    super::uploads::collect_org(app, org).await
 }
 
 /// Owner-role loop: organizations are discovered with the read-only worker role, then each is
@@ -91,7 +92,8 @@ pub async fn collector(app: App, worker: sqlx::PgPool) -> anyhow::Result<()> {
     loop {
         let orgs: Vec<Uuid> = sqlx::query_scalar(
             "SELECT DISTINCT org_id FROM attachments WHERE state='deleted'
-             OR (state='uploading' AND created_at<now()-($1::bigint*interval '1 hour'))",
+             OR (state='uploading' AND created_at<now()-($1::bigint*interval '1 hour'))
+             UNION SELECT org_id FROM uploads WHERE expires_at<now() OR state='aborted'",
         )
         .bind(ABANDONED_UPLOAD_HOURS)
         .fetch_all(&worker)

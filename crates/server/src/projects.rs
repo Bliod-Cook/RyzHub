@@ -20,6 +20,9 @@ use crate::{
     store::{Lease, Tx, conversation_in, effective_policy},
 };
 
+mod sources;
+pub use sources::{source as file_source, upload as upload_file};
+
 /// A deleted project can be restored this long.
 const RECOVERABLE_DAYS: i64 = 30;
 /// Total size of a project's knowledge files.
@@ -204,6 +207,14 @@ pub struct FileInput {
     content: String,
 }
 
+/// A knowledge file's name: a plain file name.
+fn valid_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && !name.starts_with('.')
+        && !name.contains(['/', '\\', '\0'])
+}
+
 /// `POST /orgs/{org}/projects/{project}/files`: create or replace a knowledge file, within the
 /// policy's size limit for the whole project.
 pub async fn put_file(
@@ -213,11 +224,7 @@ pub async fn put_file(
     Json(input): Json<FileInput>,
 ) -> ApiResult<Json<Value>> {
     require!(
-        !input.name.is_empty()
-            && input.name.len() <= 128
-            && !input.name.starts_with('.')
-            && !input.name.contains(['/', '\\', '\0'])
-            && input.content.len() <= 1024 * 1024,
+        valid_name(&input.name) && input.content.len() <= 1024 * 1024,
         Code::InvalidProjectFile
     );
     let (ctx, mut tx) = member_tx(&app, &headers, org).await?;
@@ -263,13 +270,19 @@ pub async fn remove_file(
 ) -> ApiResult<Json<Value>> {
     let (ctx, mut tx) = member_tx(&app, &headers, org).await?;
     owned(&mut tx, org, ctx.user_id, id, true).await?;
-    sqlx::query("DELETE FROM project_files WHERE org_id=$1 AND project_id=$2 AND id=$3")
-        .bind(org)
-        .bind(id)
-        .bind(file)
-        .execute(&mut *tx)
-        .await?;
+    let source: Option<String> = sqlx::query_scalar(
+        "DELETE FROM project_files WHERE org_id=$1 AND project_id=$2 AND id=$3 RETURNING source_sha256",
+    )
+    .bind(org)
+    .bind(id)
+    .bind(file)
+    .fetch_optional(&mut *tx)
+    .await?
+    .flatten();
     tx.commit().await?;
+    if let Some(source) = source {
+        sources::release(&app, org, &source).await;
+    }
     Ok(Json(json!({"deleted":true})))
 }
 
@@ -560,6 +573,8 @@ pub async fn mount(app: &App, lease: &Lease, run: Uuid, sandbox: Uuid) -> anyhow
     };
     crate::sandbox::host(
         app,
+        lease.org_id,
+        sandbox,
         HostCommand::Project {
             sandbox_id: sandbox,
             exec_epoch: lease.epoch as u64,
@@ -635,6 +650,8 @@ pub async fn collect(app: &App, org: Uuid, project: Uuid) -> anyhow::Result<bool
         for (sandbox_id, old_epoch) in &sandboxes {
             crate::sandbox::host(
                 app,
+                org,
+                *sandbox_id,
                 HostCommand::Destroy {
                     sandbox_id: *sandbox_id,
                     exec_epoch: epoch.max(*old_epoch + 1) as u64,
@@ -651,8 +668,10 @@ pub async fn collect(app: &App, org: Uuid, project: Uuid) -> anyhow::Result<bool
             .bind(conv)
             .fetch_all(&mut *tx)
             .await?;
-            crate::sandbox::host(
+            crate::sandbox::host_workspace(
                 app,
+                org,
+                conv,
                 HostCommand::PurgeWorkspace {
                     org_id: org,
                     workspace_id: conv,
@@ -670,6 +689,14 @@ pub async fn collect(app: &App, org: Uuid, project: Uuid) -> anyhow::Result<bool
             .fetch_all(&mut *tx)
             .await?;
     crate::memory::purge_memories(&mut tx, org, &memories).await?;
+    let documents: Vec<String> = sqlx::query_scalar(
+        "DELETE FROM project_files WHERE org_id=$1 AND project_id=$2 AND source_sha256 IS NOT NULL
+         RETURNING source_sha256",
+    )
+    .bind(org)
+    .bind(project)
+    .fetch_all(&mut *tx)
+    .await?;
     sqlx::query("DELETE FROM project_files WHERE org_id=$1 AND project_id=$2")
         .bind(org)
         .bind(project)
@@ -698,6 +725,9 @@ pub async fn collect(app: &App, org: Uuid, project: Uuid) -> anyhow::Result<bool
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
+    for document in documents {
+        sources::release(app, org, &document).await;
+    }
     crate::workspace::collect_org(app, org).await?;
     Ok(true)
 }

@@ -232,8 +232,22 @@ fn now_ms() -> u64 {
 
 #[derive(Default)]
 struct Folds {
+    /// Streaming text of native items.
     items: BTreeMap<String, String>,
+    /// Output so far of running commands: native command items, and `exec` operations.
+    outputs: BTreeMap<String, Vec<u8>>,
     version: u64,
+}
+
+impl Folds {
+    fn output(&mut self, key: &str, bytes: &[u8]) {
+        let output = self.outputs.entry(key.to_owned()).or_default();
+        // Past the limit, the rest arrives with the command's result.
+        if output.len() + bytes.len() <= FOLD_BYTES {
+            output.extend_from_slice(bytes);
+        }
+        self.version += 1;
+    }
 }
 
 struct Job {
@@ -253,7 +267,27 @@ pub struct Guest {
     /// Signalled whenever an event, a result or streaming text arrives.
     changed: Notify,
     pub(crate) key: tokio::sync::RwLock<Option<(String, String)>>,
+    terminals: Arc<crate::pty::Terminals>,
     _lock: std::fs::File,
+}
+
+/// Let the out-of-memory killer pick `command`'s process before the guest. The guest starts
+/// with a low `oom_score_adj` (set in the sandbox's OCI spec) so a sandbox under memory
+/// pressure loses the command, not the agent that runs everything; children inherit that
+/// value, and raising it back needs no privilege.
+pub(crate) fn killable_first(command: &mut tokio::process::Command) {
+    // SAFETY: between fork and exec this only calls the async-signal-safe open, write and
+    // close on a static path, allocating nothing.
+    unsafe {
+        command.pre_exec(|| {
+            let fd = libc::open(c"/proc/self/oom_score_adj".as_ptr(), libc::O_WRONLY);
+            if fd >= 0 {
+                libc::write(fd, b"0".as_ptr().cast(), 1);
+                libc::close(fd);
+            }
+            Ok(())
+        });
+    }
 }
 
 impl Guest {
@@ -295,6 +329,7 @@ impl Guest {
             folds: Mutex::new(Folds::default()),
             changed: Notify::new(),
             key: tokio::sync::RwLock::new(None),
+            terminals: crate::pty::Terminals::new("/workspace"),
             _lock: process_lock,
         }))
     }
@@ -320,17 +355,28 @@ impl Guest {
                 install_project_instructions(&text)?;
                 Ok(json!({"installed":true}))
             }
+            GuestCommand::InstallSkills { skills } => {
+                drop(journal);
+                let home = std::env::var("HOME").unwrap_or_else(|_| "/home/agent".into());
+                install_skills(std::path::Path::new(&home), &skills)?;
+                Ok(json!({"installed":skills.len()}))
+            }
             GuestCommand::NativeStart {
                 model,
                 mcp,
                 harness,
+                acp,
+                models,
             } => {
                 drop(journal);
+                let capabilities = crate::native::capabilities(&harness, acp.as_ref());
                 let mut native = self.native.lock().await;
                 if native.is_none() {
-                    *native = Some(Native::start(self.clone(), &model, mcp, &harness).await?);
+                    *native = Some(
+                        Native::start(self.clone(), &model, mcp, &harness, acp, models).await?,
+                    );
                 }
-                Ok(json!({"running":true,"capabilities":crate::native::capabilities(&harness)}))
+                Ok(json!({"running":true,"capabilities":capabilities}))
             }
             GuestCommand::Harness { op_id, request } => {
                 let reserved = journal.reserve(&op_id, &request, |fingerprint| Operation {
@@ -347,16 +393,12 @@ impl Guest {
                     .await
                     .clone()
                     .context("NATIVE_NOT_STARTED")?;
-                match native.request(&op_id, &request) {
-                    Some(message) => {
-                        native.send(message).await?;
-                        Ok(json!({"state":"running"}))
-                    }
-                    None => {
-                        let result = json!({"state":"completed","result":HarnessResult::default()});
-                        journal.complete(&op_id, result.clone(), false)?;
-                        Ok(result)
-                    }
+                if native.dispatch(&op_id, &request).await? {
+                    Ok(json!({"state":"running"}))
+                } else {
+                    let result = json!({"state":"completed","result":HarnessResult::default()});
+                    journal.complete(&op_id, result.clone(), false)?;
+                    Ok(result)
                 }
             }
             GuestCommand::Answer {
@@ -374,7 +416,7 @@ impl Guest {
                     .await
                     .clone()
                     .context("NATIVE_NOT_STARTED")?;
-                native.send(Native::answer(&request_id, &answer)?).await?;
+                native.answer(&request_id, &answer).await?;
                 let result = json!({"state":"completed"});
                 journal.complete(&op_id, result.clone(), true)?;
                 self.changed.notify_waiters();
@@ -424,13 +466,20 @@ impl Guest {
                 })
                 .await;
                 let journal = self.journal.lock().await;
-                Ok(journal
+                let mut result = journal
                     .state
                     .operations
                     .get(&op_id)
                     .context("UNKNOWN_OPERATION")?
                     .result
-                    .clone())
+                    .clone();
+                // A command still running shows its output so far.
+                if result["state"] == "running"
+                    && let Some(output) = self.folds.lock().await.outputs.get(&op_id)
+                {
+                    result["output"] = String::from_utf8_lossy(output).into();
+                }
+                Ok(result)
             }
             GuestCommand::Write {
                 op_id,
@@ -469,6 +518,7 @@ impl Guest {
                 self.changed.notify_waiters();
                 Ok(result)
             }
+            GuestCommand::PtyAttach { .. } => anyhow::bail!("STREAM_REQUIRED"),
             GuestCommand::ReadImage {
                 path,
                 max_edge,
@@ -559,8 +609,14 @@ impl Guest {
         }
         let folds = self.folds.lock().await;
         let texts: BTreeMap<&String, &String> = folds.items.iter().take(FOLD_ITEMS).collect();
+        let outputs: BTreeMap<&String, String> = folds
+            .outputs
+            .iter()
+            .take(FOLD_ITEMS)
+            .map(|(key, bytes)| (key, String::from_utf8_lossy(bytes).into_owned()))
+            .collect();
         Ok(
-            json!({"events":events,"head":journal.state.head,"folds":texts,"fold_version":folds.version}),
+            json!({"events":events,"head":journal.state.head,"folds":texts,"outputs":outputs,"fold_version":folds.version}),
         )
     }
 
@@ -568,13 +624,21 @@ impl Guest {
     pub(crate) async fn native_line(&self, incoming: Incoming) -> anyhow::Result<()> {
         match incoming {
             Incoming::Ignore | Incoming::AutoReply { .. } => return Ok(()),
-            Incoming::Delta { item_id, text } => {
+            Incoming::Delta {
+                item_id,
+                stream,
+                text,
+            } => {
                 let mut folds = self.folds.lock().await;
-                let fold = folds.items.entry(item_id).or_default();
-                if fold.len() + text.len() <= FOLD_BYTES {
-                    fold.push_str(&text);
+                if stream == "text" {
+                    let fold = folds.items.entry(item_id).or_default();
+                    if fold.len() + text.len() <= FOLD_BYTES {
+                        fold.push_str(&text);
+                    }
+                    folds.version += 1;
+                } else {
+                    folds.output(&item_id, text.as_bytes());
                 }
-                folds.version += 1;
             }
             Incoming::Response { id, response } => {
                 let mut journal = self.journal.lock().await;
@@ -615,7 +679,9 @@ impl Guest {
                     ..
                 } = &event
                 {
-                    self.folds.lock().await.items.remove(native_id);
+                    let mut folds = self.folds.lock().await;
+                    folds.items.remove(native_id);
+                    folds.outputs.remove(native_id);
                 }
                 journal.record(Entry::Event {
                     result: serde_json::to_value(&event)?,
@@ -636,12 +702,14 @@ impl Guest {
             .env_clear()
             .env("PATH", "/usr/local/bin:/usr/bin:/bin")
             .env("HOME", "/home/agent")
+            .envs(crate::egress::child_env())
             .envs(&spec.env)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
         command.as_std_mut().process_group(0);
+        killable_first(&mut command);
         let this = self.clone();
         let mut child = match command.spawn() {
             Ok(child) => child,
@@ -670,9 +738,11 @@ impl Guest {
         let filename = format!("{:x}", Sha256::digest(op.as_bytes()));
         let stdout_path = directory.join(format!("{filename}.stdout"));
         let stderr_path = directory.join(format!("{filename}.stderr"));
+        let live = (self.clone(), op.clone());
+        let live_err = live.clone();
         tokio::spawn(async move {
-            let out = tokio::spawn(capture(stdout, stdout_path.clone()));
-            let err = tokio::spawn(capture(stderr, stderr_path.clone()));
+            let out = tokio::spawn(capture(stdout, stdout_path.clone(), Some(live)));
+            let err = tokio::spawn(capture(stderr, stderr_path.clone(), Some(live_err)));
             let (mut timed_out, mut cancelled) = (false, false);
             let group = Pid::from_raw(pid as i32);
             let status = tokio::select! {
@@ -713,6 +783,7 @@ impl Guest {
 
     async fn complete(&self, op: &str, result: Value) -> anyhow::Result<()> {
         self.journal.lock().await.complete(op, result, true)?;
+        self.folds.lock().await.outputs.remove(op);
         self.jobs.lock().await.remove(op);
         self.changed.notify_waiters();
         Ok(())
@@ -728,6 +799,13 @@ impl Guest {
         tokio::spawn(async move {
             let _ = axum::serve(proxy, app).await;
         });
+        // The host serves the egress proxy beside this socket when the sandbox may reach the
+        // network; otherwise connections to the local port are refused there.
+        let egress = tokio::net::TcpListener::bind("127.0.0.1:8091").await?;
+        tokio::spawn(crate::egress::forward(
+            egress,
+            socket.with_file_name(crate::egress::GUEST_SOCKET),
+        ));
         std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
         loop {
             let (stream, _) = listener.accept().await?;
@@ -736,19 +814,65 @@ impl Guest {
                 let (read, mut write) = stream.into_split();
                 let mut read = BufReader::new(read).take(MAX_MESSAGE as u64 + 1);
                 let mut line = String::new();
-                let result = async {
+                let request = async {
                     tokio::time::timeout(Duration::from_secs(5), read.read_line(&mut line))
                         .await??;
                     ensure!(line.len() <= MAX_MESSAGE, "REQUEST_TOO_LARGE");
-                    this.handle(serde_json::from_str(&line)?).await
+                    Ok::<GuestRequest, anyhow::Error>(serde_json::from_str(&line)?)
                 }
                 .await;
+                if let Ok(GuestRequest {
+                    sandbox_id,
+                    exec_epoch,
+                    command:
+                        GuestCommand::PtyAttach {
+                            session,
+                            cols,
+                            rows,
+                            since,
+                        },
+                }) = &request
+                {
+                    let attached = this
+                        .terminal_epoch(*sandbox_id, *exec_epoch)
+                        .await
+                        .and_then(|()| this.terminals.open(session, *cols, *rows));
+                    let attached = match attached {
+                        Ok(attached) => attached,
+                        Err(error) => {
+                            let _ = write.write_all(&Reply::from(Err(error)).line()).await;
+                            return;
+                        }
+                    };
+                    let header =
+                        Reply::from(Ok(json!({"session": session, "start": attached.start})));
+                    if write.write_all(&header.line()).await.is_ok() {
+                        let read = read.into_inner();
+                        let _ = this.terminals.serve(attached, *since, read, write).await;
+                    }
+                    return;
+                }
+                let result = match request {
+                    Ok(request) => this.handle(request).await,
+                    Err(error) => Err(error),
+                };
                 let _ = write.write_all(&Reply::from(result).line()).await;
             });
         }
     }
 
+    /// A terminal may attach only under the current execution epoch.
+    async fn terminal_epoch(&self, sandbox: Uuid, epoch: u64) -> anyhow::Result<()> {
+        ensure!(sandbox == self.id, "SANDBOX_ID_MISMATCH");
+        ensure!(
+            epoch > 0 && epoch == self.journal.lock().await.state.epoch,
+            "FENCED"
+        );
+        Ok(())
+    }
+
     pub async fn stop_jobs(&self) {
+        self.terminals.end_all();
         for job in self.jobs.lock().await.values() {
             let _ = killpg(Pid::from_raw(job.pid as i32), Signal::SIGKILL);
         }
@@ -756,6 +880,69 @@ impl Guest {
 }
 
 /// Write the project instructions and make both harnesses' memory files import them.
+/// Where harnesses read skills from: Codex, Claude Code, OpenCode.
+const SKILL_DIRS: [&str; 3] = [".codex/skills", ".claude/skills", ".config/opencode/skills"];
+/// Marks a skill directory the platform wrote, which it may replace.
+const SKILL_MARK: &str = ".ryzhub-plugin";
+
+pub fn install_skills(home: &std::path::Path, skills: &[crate::SkillFiles]) -> anyhow::Result<()> {
+    let total: usize = skills
+        .iter()
+        .flat_map(|s| s.files.values())
+        .map(String::len)
+        .sum();
+    ensure!(
+        skills.len() <= 200 && total <= 8 * 1024 * 1024,
+        "SKILLS_TOO_LARGE"
+    );
+    for skill in skills {
+        ensure!(
+            !skill.name.is_empty()
+                && skill.name.len() <= 64
+                && skill
+                    .name
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'),
+            "INVALID_SKILL_NAME"
+        );
+        for path in skill.files.keys() {
+            ensure!(
+                !path.starts_with('/')
+                    && path
+                        .split('/')
+                        .all(|part| !part.is_empty() && part != "." && part != ".."),
+                "INVALID_SKILL_PATH"
+            );
+        }
+    }
+    for dir in SKILL_DIRS {
+        let root = home.join(dir);
+        std::fs::create_dir_all(&root)?;
+        // The platform's earlier skills go; the harness's own and the user's stay.
+        for entry in std::fs::read_dir(&root)? {
+            let path = entry?.path();
+            if path.join(SKILL_MARK).exists() {
+                std::fs::remove_dir_all(&path)?;
+            }
+        }
+        for skill in skills {
+            let target = root.join(&skill.name);
+            if target.exists() {
+                continue; // Someone else's skill of that name stays.
+            }
+            for (path, text) in &skill.files {
+                let file = target.join(path);
+                if let Some(parent) = file.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                journal::atomic_bytes(&file, text.as_bytes())?;
+            }
+            journal::atomic_bytes(&target.join(SKILL_MARK), b"")?;
+        }
+    }
+    Ok(())
+}
+
 fn install_project_instructions(text: &str) -> anyhow::Result<()> {
     ensure!(text.len() <= 600_000, "INVALID_PROJECT_INSTRUCTIONS");
     let dir = std::path::Path::new("/workspace/.platform");
@@ -798,7 +985,13 @@ struct Captured {
 }
 
 /// Keep the first and last 8 KiB for the model; the full output (up to 16 MiB) goes to disk.
-async fn capture(mut reader: impl AsyncRead + Unpin, path: PathBuf) -> anyhow::Result<Captured> {
+/// Keeps a command's output: in full in `path` (up to 16 MiB), its head and tail for the
+/// result, and as it comes in `live`'s output for a command still running.
+async fn capture(
+    mut reader: impl AsyncRead + Unpin,
+    path: PathBuf,
+    live: Option<(Arc<Guest>, String)>,
+) -> anyhow::Result<Captured> {
     const EDGE: usize = 8192;
     let mut file = tokio::fs::File::create(path).await?;
     let (mut head, mut tail, mut total) = (Vec::new(), Vec::new(), 0usize);
@@ -810,6 +1003,9 @@ async fn capture(mut reader: impl AsyncRead + Unpin, path: PathBuf) -> anyhow::R
         }
         if total < 16 * 1024 * 1024 {
             file.write_all(&buffer[..n]).await?;
+        }
+        if let Some((guest, op)) = &live {
+            guest.folds.lock().await.output(op, &buffer[..n]);
         }
         total += n;
         let take = (EDGE - head.len()).min(n);

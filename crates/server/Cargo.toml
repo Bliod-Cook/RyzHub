@@ -33,9 +33,26 @@ ryzhub-execution = { path = "../execution" }
 bytes = "1"
 object_store = { version = "0.14", default-features = false, features = ["aws"] }
 tokio-util = { version = "0.7", features = ["io"] }
+zstd = "0.13"
+url = "2"
+zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
+flate2 = "1"
+tar = "0.4"
+ed25519-dalek = "2"
+nix = { version = "0.30", features = ["resource"] }
+pdf-extract = "0.12"
+quick-xml = "0.41"
+# Local embeddings (`local-embedding`): Qwen3-Embedding on candle, no ONNX Runtime linked.
+fastembed = { version = "7.1", default-features = false, features = ["qwen3", "hf-hub-rustls-tls", "ort-load-dynamic"], optional = true }
+candle-core = { version = "0.11", optional = true }
+tempfile = "3"
+jsonwebtoken = { version = "11", default-features = false, features = ["use_pem", "rust_crypto"] }
 
 [dev-dependencies]
-zstd = "0.13"
-tempfile = "3"
 ryzhub-core.workspace = true
 tokio-tungstenite.workspace = true
+hyper = { version = "1", features = ["client", "http2"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+
+[features]
+local-embedding = ["dep:fastembed", "dep:candle-core"]

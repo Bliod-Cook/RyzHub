@@ -1,12 +1,19 @@
 use flutter_rust_bridge::frb;
 use prost::Message;
-use ryzhub_core::{Engine, Touched};
+use ryzhub_core::{
+    CommandResult, Engine, Touched, ansi, diff, highlight, markdown,
+    timeline::{self, View},
+};
 use ryzhub_proto::{command_envelope::Command, frame::Body, *};
-use serde_json::json;
+use serde_json::{Value, json};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     sync::Mutex,
 };
+
+/// How long changes wait to cross to the client together: a burst of streamed text arrives as
+/// one update per display tick or two, not one per token.
+const BATCH_MS: f64 = 32.0;
 
 /// The cache record holding the engine apart from its channels; each channel has its own, so
 /// a change rewrites only what changed.
@@ -46,6 +53,8 @@ pub struct Update {
     pub auth_expiring: bool,
     /// The command this update queued.
     pub cid: Option<String>,
+    /// Changes wait in the kernel: call [`ClientCore::flush`] after this many milliseconds.
+    pub flush_in_ms: Option<u32>,
 }
 
 fn update() -> Update {
@@ -57,6 +66,31 @@ fn update() -> Update {
         results_json: "[]".into(),
         auth_expiring: false,
         cid: None,
+        flush_in_ms: None,
+    }
+}
+
+/// Changes that wait to cross together.
+#[frb(ignore)]
+#[derive(Default)]
+struct Pending {
+    touched: BTreeMap<String, Touched>,
+    revoked: Vec<String>,
+    results: Vec<CommandResult>,
+    error: Option<String>,
+    expiring: bool,
+    /// The cache must be stored with them.
+    durable: bool,
+}
+
+impl Pending {
+    fn is_empty(&self) -> bool {
+        self.touched.is_empty()
+            && self.revoked.is_empty()
+            && self.results.is_empty()
+            && self.error.is_none()
+            && !self.expiring
+            && !self.durable
     }
 }
 
@@ -73,6 +107,11 @@ struct State {
     stored: BTreeSet<String>,
     /// The cache still holds a whole engine from before records.
     legacy: bool,
+    /// Timelines of the conversations the client shows, as it has them.
+    views: BTreeMap<String, View>,
+    pending: Pending,
+    /// When changes last crossed, in the client's milliseconds.
+    flushed_at: f64,
 }
 
 impl State {
@@ -120,12 +159,68 @@ impl State {
         self.legacy &= !legacy;
     }
 
-    /// Whether `frame` may go out: any but a command not stored yet.
-    fn sendable(&self, frame: &Frame) -> bool {
-        match &frame.body {
-            Some(Body::Command(command)) => self.stored.contains(&command.cid),
-            _ => true,
+    /// What changed in `channel`: its timeline when the client shows it, else its items (all of
+    /// them after a snapshot, else those in `change`).
+    fn channel_change(&mut self, channel: &str, change: &Touched) -> Option<Value> {
+        let state = self.engine.channels.get(channel)?;
+        let mut out = json!({"channel": channel,
+            "actions": state.actions.values().collect::<Vec<_>>(),
+            "runs": state.runs.values().collect::<Vec<_>>(),
+            "read_states": state.read_states,
+            "cursor": state.cursor,
+            "reset": change.reset});
+        if let Some(view) = self.views.get_mut(channel) {
+            let touched: HashSet<String> = change.items.iter().cloned().collect();
+            let diff = view.update(state, (!change.reset).then_some(&touched));
+            out["timeline"] = serde_json::to_value(diff).unwrap();
+        } else {
+            let items: Vec<&Item> = if change.reset {
+                state.items.values().collect()
+            } else {
+                change
+                    .items
+                    .iter()
+                    .filter_map(|id| state.items.get(id))
+                    .collect()
+            };
+            out["items"] = serde_json::to_value(items).unwrap();
+            out["drafts"] = serde_json::to_value(&state.drafts).unwrap();
         }
+        Some(out)
+    }
+
+    /// Hands over what waits: changes, results, and the cache writes that store them.
+    fn flush(&mut self, now: f64, result: &mut Update) {
+        let pending = std::mem::take(&mut self.pending);
+        self.flushed_at = now;
+        for channel in pending.touched.keys().chain(&pending.revoked) {
+            self.dirty(channel);
+        }
+        let mut changes = vec![];
+        for (channel, change) in &pending.touched {
+            changes.extend(self.channel_change(channel, change));
+        }
+        for channel in &pending.revoked {
+            self.views.remove(channel);
+            changes.push(json!({"channel":channel,"revoked":true}));
+        }
+        result.changes_json = serde_json::to_string(&changes).unwrap();
+        if pending.durable {
+            result.cache_writes = self.writes();
+        }
+        result.error = pending.error;
+        result.results_json = serde_json::to_string(&pending.results).unwrap();
+        result.auth_expiring = pending.expiring;
+    }
+
+    /// Whether `frame` may go out: any but a command not stored yet, or a frame for a
+    /// conversation still being created.
+    fn sendable(&self, frame: &Frame) -> bool {
+        !self.engine.held(frame)
+            && match &frame.body {
+                Some(Body::Command(command)) => self.stored.contains(&command.cid),
+                _ => true,
+            }
     }
 }
 
@@ -154,6 +249,9 @@ impl ClientCore {
             changes: 0,
             saving: Default::default(),
             engine,
+            views: BTreeMap::new(),
+            pending: Pending::default(),
+            flushed_at: f64::NEG_INFINITY,
         };
         // A cache from before records becomes records with the first save.
         if meta.is_none() && state.legacy {
@@ -175,7 +273,7 @@ impl ClientCore {
                 protocol_minor: PROTOCOL_MINOR,
                 device_id,
                 capabilities: vec!["text/0".into()],
-                resume_token: self.inner.lock().unwrap().engine.resume_token.clone(),
+                ..Default::default()
             }),
         )
         .encode_to_vec()
@@ -199,15 +297,16 @@ impl ClientCore {
         let items = serde_json::from_str(&items_json).map_err(|e| e.to_string())?;
         let mut state = self.inner.lock().unwrap();
         let changed = state.engine.merge_history(&channel, items);
-        let Some(channel_state) = state.engine.channels.get(&channel) else {
-            return Ok(update());
+        let change = Touched {
+            items: changed.into_iter().map(|i| i.id).collect(),
+            reset: false,
         };
-        let changes = json!([{"channel":channel,"items":changed,
-            "actions":channel_state.actions.values().collect::<Vec<_>>(),
-            "runs":channel_state.runs.values().collect::<Vec<_>>(),"cursor":channel_state.cursor}]);
         let mut result = update();
-        result.changes_json = changes.to_string();
-        if !changed.is_empty() {
+        let Some(changes) = state.channel_change(&channel, &change) else {
+            return Ok(result);
+        };
+        result.changes_json = json!([changes]).to_string();
+        if !change.items.is_empty() {
             state.dirty(&channel);
             result.cache_writes = state.writes();
         }
@@ -229,10 +328,26 @@ impl ClientCore {
                 outbound.push(state.engine.unsubscribe(c.clone()).encode_to_vec());
                 state.dirty(&c);
             }
+            // The client shows this conversation's timeline from what the cache holds.
+            state.views.clear();
+            state.views.insert(channel.clone(), View::default());
         }
-        outbound.push(state.engine.subscribe(channel.clone()).encode_to_vec());
+        let subscribe = state.engine.subscribe(channel.clone());
+        // A conversation still being created is subscribed once it exists.
+        if !state.engine.held(&subscribe) {
+            outbound.push(subscribe.encode_to_vec());
+        }
         state.dirty(&channel);
         let mut result = update();
+        if let Some(changes) = state.channel_change(
+            &channel,
+            &Touched {
+                items: BTreeSet::new(),
+                reset: true,
+            },
+        ) {
+            result.changes_json = json!([changes]).to_string();
+        }
         result.cache_writes = state.writes();
         result.outbound_frames = outbound;
         result
@@ -324,6 +439,73 @@ impl ClientCore {
     pub fn fork(&self, channel: String, item_id: String) -> Update {
         self.command(channel, Command::Fork(Fork { item_id }))
     }
+    /// Creates conversation `conversation_id` (see [`new_conversation_id`]) with its first
+    /// message, on the user's channel `channel`. Queued like any command, it may be created
+    /// offline; frames for the conversation wait until the server has answered it.
+    #[frb(sync)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_run(
+        &self,
+        channel: String,
+        conversation_id: String,
+        mode: String,
+        run_config_json: String,
+        project_id: Option<String>,
+        temporary: bool,
+        title: String,
+        text: String,
+        attachment_ids: Vec<String>,
+    ) -> Update {
+        self.command(
+            channel,
+            Command::CreateRun(CreateRun {
+                conversation_id,
+                mode,
+                run_config_json,
+                project_id: project_id.unwrap_or_default(),
+                temporary,
+                title,
+                first_message: Some(SendMessage {
+                    text,
+                    config_json: String::new(),
+                    attachment_ids,
+                }),
+            }),
+        )
+    }
+    /// Undoes the memory change of `event_id`, on the user's channel `channel`.
+    #[frb(sync)]
+    pub fn undo_memory_update(&self, channel: String, event_id: String) -> Update {
+        self.command(
+            channel,
+            Command::UndoMemoryUpdate(UndoMemoryUpdate { event_id }),
+        )
+    }
+    /// Runs a plugin's command in conversation `channel`, with its parameters as JSON.
+    #[frb(sync)]
+    pub fn invoke_menu_command(
+        &self,
+        channel: String,
+        installation_id: String,
+        command: String,
+        params_json: String,
+        attachment_ids: Vec<String>,
+    ) -> Update {
+        self.command(
+            channel,
+            Command::InvokeMenuCommand(InvokeMenuCommand {
+                installation_id,
+                command,
+                params_json,
+                attachment_ids,
+            }),
+        )
+    }
+    /// The user has read conversation `channel` up to `read_seq`.
+    #[frb(sync)]
+    pub fn mark_read(&self, channel: String, read_seq: u64) -> Update {
+        self.command(channel, Command::MarkRead(MarkRead { read_seq }))
+    }
     fn command(&self, channel: String, command: Command) -> Update {
         let mut state = self.inner.lock().unwrap();
         let cid = uuid::Uuid::now_v7().to_string();
@@ -336,7 +518,9 @@ impl ClientCore {
         );
         let mut result = update();
         result.cache_writes = state.writes();
-        result.outbound_frames = vec![f.encode_to_vec()];
+        if !state.engine.held(&f) {
+            result.outbound_frames = vec![f.encode_to_vec()];
+        }
         result.cid = Some(cid);
         result
     }
@@ -352,20 +536,17 @@ impl ClientCore {
             .map(|f| f.encode_to_vec())
             .collect()
     }
-    /// Flutter batches incoming frames for one display tick, then receives what changed: only
-    /// the channels and items these frames touched.
+    /// Applies frames as they arrive (`now_ms` is the client's clock). What they change waits
+    /// in the kernel to cross with what follows it within [`BATCH_MS`]: the update says when to
+    /// [`ClientCore::flush`]. Frames to send go out at once.
     #[frb(sync)]
-    pub fn ingest(&self, frames: Vec<Vec<u8>>) -> Result<Update, String> {
+    pub fn ingest(&self, frames: Vec<Vec<u8>>, now_ms: f64) -> Result<Update, String> {
         let mut state = self.inner.lock().unwrap();
-        let mut outbound_frames = vec![];
-        let mut durable = false;
-        let mut touched: BTreeMap<String, Touched> = BTreeMap::new();
-        let mut revoked = vec![];
-        let mut results = vec![];
-        let mut expiring = false;
+        let mut result = update();
         for bytes in frames {
-            let f = Frame::decode(bytes.as_slice()).map_err(|e| e.to_string())?;
-            durable |= matches!(
+            let bytes = ryzhub_core::frame_bytes(&bytes)?;
+            let f = Frame::decode(&*bytes).map_err(|e| e.to_string())?;
+            state.pending.durable |= matches!(
                 f.body,
                 Some(
                     Body::Welcome(_)
@@ -378,60 +559,129 @@ impl ClientCore {
             );
             if matches!(f.body, Some(Body::Welcome(_))) {
                 let frames = state.engine.reconnect();
-                outbound_frames.extend(
-                    frames
-                        .iter()
-                        .filter(|f| state.sendable(f))
-                        .map(|f| f.encode_to_vec()),
-                );
+                let sendable: Vec<Vec<u8>> = frames
+                    .iter()
+                    .filter(|f| state.sendable(f))
+                    .map(|f| f.encode_to_vec())
+                    .collect();
+                result.outbound_frames.extend(sendable);
             }
             let effects = state.engine.apply(f);
-            outbound_frames.extend(effects.outbound.into_iter().map(|f| f.encode_to_vec()));
+            let outbound: Vec<Vec<u8>> = effects
+                .outbound
+                .iter()
+                .filter(|f| state.sendable(f))
+                .map(|f| f.encode_to_vec())
+                .collect();
+            result.outbound_frames.extend(outbound);
+            let pending = &mut state.pending;
             for (channel, change) in effects.touched {
-                let entry = touched.entry(channel).or_default();
+                let entry = pending.touched.entry(channel).or_default();
                 entry.items.extend(change.items);
                 entry.reset |= change.reset;
             }
-            revoked.extend(effects.revoked);
-            results.extend(effects.results);
-            expiring |= effects.auth_expiring.is_some();
+            pending.revoked.extend(effects.revoked);
+            pending.results.extend(effects.results);
+            pending.expiring |= effects.auth_expiring.is_some();
+            if let Some(error) = state.engine.last_error.take() {
+                state.pending.error = Some(error);
+            }
         }
-        for channel in touched.keys().chain(&revoked) {
-            state.dirty(channel);
-        }
-        let mut changes = vec![];
-        for (channel, change) in &touched {
-            let Some(channel_state) = state.engine.channels.get(channel) else {
-                continue;
-            };
-            let items: Vec<&Item> = if change.reset {
-                channel_state.items.values().collect()
+        if !state.pending.is_empty() {
+            let waited = now_ms - state.flushed_at;
+            if waited >= BATCH_MS {
+                state.flush(now_ms, &mut result);
             } else {
-                change
-                    .items
-                    .iter()
-                    .filter_map(|id| channel_state.items.get(id))
-                    .collect()
-            };
-            changes.push(json!({"channel":channel,"reset":change.reset,"items":items,
-                "actions":channel_state.actions.values().collect::<Vec<_>>(),
-                "runs":channel_state.runs.values().collect::<Vec<_>>(),"cursor":channel_state.cursor}));
+                result.flush_in_ms = Some((BATCH_MS - waited).ceil().max(1.0) as u32);
+            }
         }
-        for channel in &revoked {
-            changes.push(json!({"channel":channel,"revoked":true}));
-        }
-        let mut result = update();
-        result.changes_json = serde_json::to_string(&changes).unwrap();
-        if durable {
-            result.cache_writes = state.writes();
-        }
-        result.outbound_frames = outbound_frames;
-        result.error = state.engine.last_error.take();
-        result.results_json = serde_json::to_string(&results).unwrap();
-        result.auth_expiring = expiring;
         Ok(result)
     }
+
+    /// The changes waiting in the kernel; none when nothing waits.
+    #[frb(sync)]
+    pub fn flush(&self, now_ms: f64) -> Update {
+        let mut state = self.inner.lock().unwrap();
+        let mut result = update();
+        if !state.pending.is_empty() {
+            state.flush(now_ms, &mut result);
+        }
+        result
+    }
 }
+
+/// `text` rendered as messages show it: `{blocks, chips}`. `cited` are the pages a reply cites;
+/// `streaming` closes what its end leaves open.
+#[frb(sync)]
+pub fn render_markdown(text: String, cited: Vec<String>, streaming: bool) -> String {
+    serde_json::to_string(&markdown::render(&text, &cited, streaming)).unwrap()
+}
+
+/// Rows and items for `items_json`, a stretch of a conversation shown apart from its live
+/// timeline: `{rows, items}` as a timeline hands them over.
+#[frb(sync)]
+pub fn timeline_snapshot(items_json: String) -> Result<String, String> {
+    let items: Vec<Item> = serde_json::from_str(&items_json).map_err(|e| e.to_string())?;
+    let (rows, items) = timeline::snapshot(items);
+    Ok(json!({"rows": rows, "items": items}).to_string())
+}
+
+static HIGHLIGHTER: Mutex<Option<highlight::Highlighter>> = Mutex::new(None);
+
+/// `code` coloured as `language`: `[[text, class], …]` with highlight.js class names. `key`
+/// names the code block across calls, so a growing block is parsed only from its last complete
+/// line. None when the language is unknown, the grammars are not loaded or the code is long.
+#[frb(sync)]
+pub fn highlight(key: String, language: String, code: String) -> Option<String> {
+    let mut highlighter = HIGHLIGHTER.lock().unwrap();
+    let spans = highlighter
+        .get_or_insert_with(Default::default)
+        .highlight(&key, &language, &code)?;
+    Some(serde_json::to_string(&spans).unwrap())
+}
+
+/// Whether code can be coloured; on the web, not until [`load_syntaxes`].
+#[frb(sync)]
+pub fn syntaxes_ready() -> bool {
+    highlight::ready()
+}
+
+/// Whether `language` names a language code can be coloured in.
+#[frb(sync)]
+pub fn known_language(language: String) -> bool {
+    highlight::known(&language)
+}
+
+/// Loads the grammars the web fetches on first use.
+#[frb(sync)]
+pub fn load_syntaxes(dump: Vec<u8>) -> Result<(), String> {
+    highlight::load_syntaxes(&dump)
+}
+
+/// Terminal output as spans: `[{text, fg?, bg?, style?}]`.
+#[frb(sync)]
+pub fn ansi_spans(text: String) -> String {
+    serde_json::to_string(&ansi::parse(&text)).unwrap()
+}
+
+/// A unified diff as lines: `[{kind, text, old?, new?}]`.
+#[frb(sync)]
+pub fn diff_lines(text: String) -> String {
+    serde_json::to_string(&diff::parse(&text)).unwrap()
+}
+
+/// What changed from `old` to `new`, as [`diff_lines`] gives it.
+#[frb(sync)]
+pub fn compare_texts(old: String, new: String) -> String {
+    serde_json::to_string(&diff::compare(&old, &new)).unwrap()
+}
+
+/// An id for a conversation this client creates.
+#[frb(sync)]
+pub fn new_conversation_id() -> String {
+    uuid::Uuid::now_v7().to_string()
+}
+
 #[frb(sync)]
 pub fn reconnect_delay(attempt: u32, random: u32) -> u32 {
     ryzhub_core::reconnect_delay_ms(attempt, random as u64) as u32

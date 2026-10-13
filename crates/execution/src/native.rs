@@ -3,16 +3,20 @@
 //! Codex app-server and the Claude Agent SDK adapter (`harness/claude`) both speak the Codex
 //! JSON-RPC dialect over stdio. This module is the only place that knows that dialect: it
 //! turns [`HarnessRequest`]s into native calls and native output into [`HarnessEvent`]s.
+//! Agents that speak ACP are put in front of it by the bridge in `acp`.
 use anyhow::{Context, ensure};
+use base64::Engine as _;
 use serde_json::{Value, json};
 use std::{process::Stdio, sync::Arc};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::ChildStdin,
-    sync::Mutex,
+    sync::{Mutex, mpsc},
 };
 
 use crate::{
+    AcpProfile,
+    acp::{Bridge, Out},
     guest::Guest,
     harness::{
         ApprovalCategory, FileChange, HarnessAnswer, HarnessEvent, HarnessRequest, HarnessResult,
@@ -26,6 +30,10 @@ pub const CODEX_VERSION: &str = "0.154.0";
 pub const CLAUDE_SDK_VERSION: &str = "0.3.283";
 /// Native lines above this are rejected; the harness is restarted.
 const MAX_LINE: usize = 4 * 1024 * 1024;
+/// The guest's model proxy, as ACP profiles name it (`{proxy}`).
+const PROXY: &str = "http://127.0.0.1:8090";
+/// Largest image handed to an ACP agent inline.
+const MAX_IMAGE: u64 = 20 * 1024 * 1024;
 /// MCP calls may wait for a user approval; the harness must not time them out first.
 const MCP_TOOL_TIMEOUT_SECS: u64 = 25 * 3600;
 
@@ -33,6 +41,8 @@ const MCP_TOOL_TIMEOUT_SECS: u64 = 25 * 3600;
 pub enum Harness {
     Codex,
     Claude,
+    /// An agent spoken to over ACP, as its profile says.
+    Acp,
 }
 
 impl Harness {
@@ -54,7 +64,22 @@ pub fn harness_version(harness: &str) -> &'static str {
 }
 
 /// What each harness supports natively, as reported to clients.
-pub fn capabilities(harness: &str) -> Value {
+pub fn capabilities(harness: &str, acp: Option<&AcpProfile>) -> Value {
+    if let Some(profile) = acp {
+        return json!({
+            "harness": harness,
+            "protocol": "acp",
+            "tested_version": profile.version,
+            "steer": "emulated",
+            "interrupt": "native",
+            "resume": "native",
+            "approval": "native",
+            "question": "unsupported",
+            "fork": "unsupported",
+            "compact": "native",
+            "pty": false,
+        });
+    }
     if harness == "claude" {
         return json!({
             "harness": "claude",
@@ -81,7 +106,7 @@ pub fn capabilities(harness: &str) -> Value {
         "approval": "native",
         "question": "native",
         "side_query": "unsupported",
-        "fork": "unsupported",
+        "fork": "native",
         "pty": false,
     })
 }
@@ -89,6 +114,14 @@ pub fn capabilities(harness: &str) -> Value {
 pub struct Native {
     input: Mutex<ChildStdin>,
     harness: Harness,
+    /// An ACP agent's bridge, and where the lines it makes for the guest go, in order.
+    bridge: Option<(std::sync::Mutex<Bridge>, mpsc::UnboundedSender<Incoming>)>,
+    home: String,
+}
+
+/// Where an ACP agent finds the platform's instructions for the session (`{instructions}`).
+fn instructions_path(home: &str) -> String {
+    format!("{home}/.ryzhub/instructions.md")
 }
 
 impl Native {
@@ -97,8 +130,20 @@ impl Native {
         model: &str,
         mcp: bool,
         harness: &str,
+        acp: Option<AcpProfile>,
+        models: Vec<String>,
     ) -> anyhow::Result<Arc<Self>> {
-        ensure!(!model.is_empty() && model.len() < 256, "invalid model");
+        ensure!(
+            !model.is_empty()
+                && model.len() < 256
+                && model
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "-._:/@+".contains(c)),
+            "invalid model"
+        );
+        if let Some(profile) = acp {
+            return Self::start_acp(guest, model, mcp, profile, models).await;
+        }
         let harness = Harness::parse(harness)?;
         let home = std::env::var("HOME").unwrap_or_else(|_| "/home/agent".into());
         let config_dir = std::path::Path::new(&home).join(".codex");
@@ -137,8 +182,9 @@ stream_max_retries = 0
                 command.arg("app-server");
                 command
             }
+            Harness::Acp => anyhow::bail!("ACP agents start from their profile"),
         };
-        let mut child = command
+        command
             .env_clear()
             .env("HOME", &home)
             .env("CODEX_HOME", &config_dir)
@@ -147,6 +193,9 @@ stream_max_retries = 0
             .env("ANTHROPIC_BASE_URL", "http://127.0.0.1:8090")
             .env("ANTHROPIC_API_KEY", "guest-proxy")
             .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
+            // Every model request belongs to a platform run: subagents and commands finish
+            // within the turn that started them instead of outliving it in the background.
+            .env("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS", "1")
             .env(
                 "MCP_TOOL_TIMEOUT",
                 (MCP_TOOL_TIMEOUT_SECS * 1000).to_string(),
@@ -154,15 +203,19 @@ stream_max_retries = 0
             .env("RYZHUB_CLAUDE_MODEL", model)
             .env("RYZHUB_MCP", if mcp { "1" } else { "0" })
             .env("TOKIO_WORKER_THREADS", "2")
+            .envs(crate::egress::child_env())
             .current_dir("/workspace")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
-            .kill_on_drop(true)
-            .spawn()?;
+            .kill_on_drop(true);
+        crate::guest::killable_first(&mut command);
+        let mut child = command.spawn()?;
         let native = Arc::new(Self {
             input: Mutex::new(child.stdin.take().context("harness stdin")?),
             harness,
+            bridge: None,
+            home,
         });
         let mut lines = BufReader::new(child.stdout.take().context("harness stdout")?).lines();
         let this = native.clone();
@@ -173,6 +226,22 @@ stream_max_retries = 0
                     let value: Value = serde_json::from_str(&line)?;
                     if value["id"] == "__initialize" && value.get("error").is_none() {
                         this.send(json!({"method":"initialized"})).await?;
+                        // Codex reports its commands (skills) when asked; the Claude adapter
+                        // announces them itself.
+                        if this.harness == Harness::Codex {
+                            this.send(json!({"id":"__skills","method":"skills/list","params":{}}))
+                                .await?;
+                        }
+                    }
+                    if value["id"] == "__skills" {
+                        if let Some(commands) = skills(&value["result"]) {
+                            let event = HarnessEvent::Capabilities {
+                                commands,
+                                models: vec![],
+                            };
+                            guest.native_line(Incoming::Event(event)).await?;
+                        }
+                        continue;
                     }
                     match classify(&value) {
                         Incoming::AutoReply { id, result } => {
@@ -210,6 +279,170 @@ stream_max_retries = 0
         Ok(native)
     }
 
+    /// An agent over ACP: started from its profile, its messages translated by a [`Bridge`].
+    async fn start_acp(
+        guest: Arc<Guest>,
+        model: &str,
+        mcp: bool,
+        profile: AcpProfile,
+        models: Vec<String>,
+    ) -> anyhow::Result<Arc<Self>> {
+        ensure!(
+            std::path::Path::new(&profile.command).is_absolute(),
+            "invalid ACP command"
+        );
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/home/agent".into());
+        let instructions = instructions_path(&home);
+        if let Some(dir) = std::path::Path::new(&instructions).parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let mut models = models;
+        if !models.iter().any(|m| m == model) {
+            models.push(model.to_owned());
+        }
+        let listed: serde_json::Map<String, Value> =
+            models.iter().map(|m| (m.clone(), json!({}))).collect();
+        let listed = serde_json::to_string(&listed)?;
+        let fill = |value: &str| {
+            value
+                .replace("{models}", &listed)
+                .replace("{model}", model)
+                .replace("{proxy}", PROXY)
+                .replace("{instructions}", &instructions)
+        };
+        let mut command = tokio::process::Command::new(&profile.command);
+        command
+            .args(&profile.args)
+            .env_clear()
+            .env("HOME", &home)
+            .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+            .env("TERM", "dumb")
+            .envs(crate::egress::child_env())
+            .envs(profile.env.iter().map(|(k, v)| (k.clone(), fill(v))))
+            .current_dir("/workspace")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        crate::guest::killable_first(&mut command);
+        let mut child = command.spawn()?;
+        let (deliver, mut delivered) = mpsc::unbounded_channel();
+        let mut bridge = Bridge::new(profile, models, mcp);
+        let initialize = bridge.initialize();
+        let native = Arc::new(Self {
+            input: Mutex::new(child.stdin.take().context("harness stdin")?),
+            harness: Harness::Acp,
+            bridge: Some((std::sync::Mutex::new(bridge), deliver)),
+            home,
+        });
+        // One task hands the guest what the bridge makes of both sides, in order.
+        tokio::spawn(async move {
+            while let Some(incoming) = delivered.recv().await {
+                if let Err(error) = guest.native_line(incoming).await {
+                    eprintln!("ACP line not recorded: {error:#}");
+                }
+            }
+        });
+        let mut lines = BufReader::new(child.stdout.take().context("harness stdout")?).lines();
+        let this = native.clone();
+        tokio::spawn(async move {
+            let result = async {
+                while let Some(line) = lines.next_line().await? {
+                    ensure!(line.len() <= MAX_LINE, "native line too large");
+                    let Ok(value) = serde_json::from_str::<Value>(&line) else {
+                        // Agents may log to stdout; only JSON-RPC lines count.
+                        continue;
+                    };
+                    let outs = this.bridge()?.lock().unwrap().incoming(&value);
+                    this.route(outs).await?;
+                }
+                Ok::<(), anyhow::Error>(())
+            }
+            .await;
+            let status = match child.try_wait() {
+                Ok(Some(status)) => Some(status),
+                _ => {
+                    let _ = child.kill().await;
+                    child.wait().await.ok()
+                }
+            };
+            let exited = HarnessEvent::Exited {
+                exit_code: status.and_then(|s| s.code()),
+                error: result.err().map(|e| e.to_string()),
+            };
+            if let Some((_, deliver)) = &this.bridge {
+                let _ = deliver.send(Incoming::Event(exited));
+            }
+        });
+        native.send(initialize).await?;
+        Ok(native)
+    }
+
+    fn bridge(&self) -> anyhow::Result<&std::sync::Mutex<Bridge>> {
+        Ok(&self.bridge.as_ref().context("not an ACP agent")?.0)
+    }
+
+    /// Send what the bridge made: messages to the agent, lines to the guest.
+    async fn route(&self, outs: Vec<Out>) -> anyhow::Result<()> {
+        for out in outs {
+            match out {
+                Out::Agent(message) => self.send(message).await?,
+                Out::Guest(incoming) => {
+                    if let Some((_, deliver)) = &self.bridge {
+                        deliver.send(*incoming).ok();
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Start platform operation `op_id`. False when the harness needs no call for it: the
+    /// operation is complete.
+    pub async fn dispatch(&self, op_id: &str, request: &HarnessRequest) -> anyhow::Result<bool> {
+        if self.bridge.is_none() {
+            return match self.request(op_id, request) {
+                Some(message) => {
+                    self.send(message).await?;
+                    Ok(true)
+                }
+                None => Ok(false),
+            };
+        }
+        if let HarnessRequest::StartThread { instructions, .. }
+        | HarnessRequest::ResumeThread { instructions, .. }
+        | HarnessRequest::ForkThread { instructions, .. }
+        | HarnessRequest::Configure { instructions, .. } = request
+        {
+            crate::journal::atomic_bytes(
+                std::path::Path::new(&instructions_path(&self.home)),
+                instructions.as_bytes(),
+            )?;
+        }
+        let images = match request {
+            HarnessRequest::StartTurn { images, .. } => {
+                images.iter().filter_map(|path| image_block(path)).collect()
+            }
+            _ => vec![],
+        };
+        let outs = self
+            .bridge()?
+            .lock()
+            .unwrap()
+            .request(op_id, request, images);
+        self.route(outs).await?;
+        Ok(true)
+    }
+
+    /// Deliver the user's decision on a harness approval or question.
+    pub async fn answer(&self, request_id: &str, answer: &HarnessAnswer) -> anyhow::Result<()> {
+        if self.bridge.is_some() {
+            let outs = self.bridge()?.lock().unwrap().answer(request_id, answer);
+            return self.route(outs).await;
+        }
+        self.send(Self::answer_message(request_id, answer)?).await
+    }
+
     pub async fn send(&self, value: Value) -> anyhow::Result<()> {
         let mut bytes = serde_json::to_vec(&value)?;
         ensure!(bytes.len() <= MAX_LINE, "native request too large");
@@ -229,7 +462,7 @@ stream_max_retries = 0
     }
 
     /// The native reply to a harness approval or question.
-    pub fn answer(request_id: &str, answer: &HarnessAnswer) -> anyhow::Result<Value> {
+    pub fn answer_message(request_id: &str, answer: &HarnessAnswer) -> anyhow::Result<Value> {
         let id: Value = serde_json::from_str(request_id).context("request id")?;
         let result = match answer {
             HarnessAnswer::Approval { allow } => {
@@ -244,6 +477,29 @@ stream_max_retries = 0
         };
         Ok(json!({"id":id,"result":result}))
     }
+}
+
+/// An image of a turn's input as an ACP content block; None when it cannot be read.
+fn image_block(path: &str) -> Option<Value> {
+    let mime = match std::path::Path::new(path)
+        .extension()?
+        .to_str()?
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        _ => return None,
+    };
+    let file = std::fs::File::open(path).ok()?;
+    if file.metadata().ok()?.len() > MAX_IMAGE {
+        return None;
+    }
+    let bytes = std::fs::read(path).ok()?;
+    let data = base64::engine::general_purpose::STANDARD.encode(bytes);
+    Some(json!({"type": "image", "mimeType": mime, "data": data, "uri": format!("file://{path}")}))
 }
 
 fn session_params(harness: Harness, settings: &TurnSettings, instructions: &str) -> Value {
@@ -390,6 +646,25 @@ pub fn result_of(request: &HarnessRequest, response: &Value) -> Result<HarnessRe
     })
 }
 
+/// Codex's skills as harness commands: `[{name, description}]`, enabled ones only.
+fn skills(result: &Value) -> Option<Value> {
+    let entries = result["data"].as_array()?;
+    let commands: Vec<Value> = entries
+        .iter()
+        .flat_map(|entry| entry["skills"].as_array().into_iter().flatten())
+        .filter(|skill| skill["enabled"] != false)
+        .filter_map(|skill| {
+            let name = skill["name"].as_str()?;
+            let description = skill["shortDescription"]
+                .as_str()
+                .or_else(|| skill["description"].as_str())
+                .unwrap_or_default();
+            Some(json!({"name": name, "description": description}))
+        })
+        .collect();
+    Some(Value::Array(commands))
+}
+
 fn models(list: &Value) -> Vec<ModelInfo> {
     list.as_array()
         .into_iter()
@@ -416,6 +691,7 @@ fn models(list: &Value) -> Vec<ModelInfo> {
 }
 
 /// What the guest does with one native line.
+#[derive(Debug)]
 pub enum Incoming {
     /// The reply to a request the guest sent, keyed by its id.
     Response {
@@ -424,9 +700,11 @@ pub enum Incoming {
     },
     /// A durable event to journal.
     Event(HarnessEvent),
-    /// Streaming text of an item; folded, never journaled.
+    /// Streaming text of an item, on `stream`: `text` for a reply, `terminal_output` for a
+    /// command's output. Folded, never journaled.
     Delta {
         item_id: String,
+        stream: &'static str,
         text: String,
     },
     /// A harness request the platform does not support: answered at once, never granted.
@@ -466,6 +744,8 @@ pub fn classify(value: &Value) -> Incoming {
                         params["command"].as_str().unwrap_or("文件变更"),
                         params["reason"].as_str().unwrap_or("")
                     ),
+                    tool: params["tool"].as_str().map(str::to_owned),
+                    arguments: params.get("input").cloned(),
                 })
             }
             "item/tool/requestUserInput" => Incoming::Event(HarnessEvent::QuestionRequested {
@@ -494,14 +774,17 @@ pub fn classify(value: &Value) -> Incoming {
         },
         (Some(method), None) => {
             if method.ends_with("/delta") || method.ends_with("Delta") {
-                // Only assistant text streams into the timeline; other deltas (command output,
-                // reasoning summaries) arrive complete with their item.
-                if method != "item/agentMessage/delta" {
-                    return Incoming::Ignore;
-                }
+                // Replies and command output stream into the timeline; other deltas (reasoning
+                // summaries) arrive complete with their item.
+                let stream = match method {
+                    "item/agentMessage/delta" => "text",
+                    "item/commandExecution/outputDelta" => "terminal_output",
+                    _ => return Incoming::Ignore,
+                };
                 return match (params["itemId"].as_str(), params["delta"].as_str()) {
                     (Some(item), Some(text)) => Incoming::Delta {
                         item_id: item.into(),
+                        stream,
                         text: text.into(),
                     },
                     _ => Incoming::Ignore,
@@ -521,6 +804,7 @@ pub fn classify(value: &Value) -> Incoming {
                     },
                 }),
                 "item/started" | "item/completed" => item_event(method, params, turn()),
+                "turn/diff/updated" => turn_diff(params, turn()),
                 "session/capabilities" => Incoming::Event(HarnessEvent::Capabilities {
                     commands: params["commands"].clone(),
                     models: models(&params["models"]),
@@ -605,6 +889,16 @@ fn item_event(method: &str, params: &Value, turn_id: Option<String>) -> Incoming
                 ..Default::default()
             },
         ),
+        // An agent Codex started for part of the work.
+        "collabAgentToolCall" => (
+            ItemKind::ToolCall,
+            ItemContent {
+                text: text("prompt"),
+                name: Some(format!("agent:{}", text("tool"))),
+                arguments_json: Some(json!({"prompt": item["prompt"]}).to_string()),
+                ..Default::default()
+            },
+        ),
         // The provider's own search, also emitted by the Claude adapter for its WebSearch tool.
         "webSearch" => {
             let action = &item["action"];
@@ -645,7 +939,61 @@ fn item_event(method: &str, params: &Value, turn_id: Option<String>) -> Incoming
         kind,
         content,
         message_id: item["nativeMessageId"].as_str().map(str::to_owned),
+        parent_native_id: item["parentItemId"]
+            .as_str()
+            .or_else(|| params["parentItemId"].as_str())
+            .filter(|parent| !parent.is_empty())
+            .map(str::to_owned),
     })
+}
+
+/// The turn's diff so far, as Codex aggregates it: one file-change item per turn, replaced as
+/// the diff grows.
+fn turn_diff(params: &Value, turn_id: Option<String>) -> Incoming {
+    let (Some(turn), Some(diff)) = (turn_id, params["diff"].as_str()) else {
+        return Incoming::Ignore;
+    };
+    Incoming::Event(HarnessEvent::Item {
+        phase: ItemPhase::Completed,
+        native_id: format!("turn-diff:{turn}"),
+        turn_id: Some(turn),
+        kind: ItemKind::FileChange,
+        content: ItemContent {
+            text: diff.to_owned(),
+            file_changes: diff_files(diff),
+            ..Default::default()
+        },
+        message_id: None,
+        parent_native_id: None,
+    })
+}
+
+/// The files a unified diff changes, each with its part of the diff.
+fn diff_files(diff: &str) -> Vec<FileChange> {
+    let mut files: Vec<FileChange> = Vec::new();
+    for line in diff.split_inclusive('\n') {
+        if let Some(rest) = line.strip_prefix("diff --git ") {
+            let path = rest
+                .split_whitespace()
+                .nth(1)
+                .map(|b| b.strip_prefix("b/").unwrap_or(b))
+                .unwrap_or_default();
+            files.push(FileChange {
+                path: path.trim().into(),
+                change: "update".into(),
+                diff: String::new(),
+            });
+        }
+        if let Some(file) = files.last_mut() {
+            if line.starts_with("new file mode") {
+                file.change = "add".into();
+            } else if line.starts_with("deleted file mode") {
+                file.change = "delete".into();
+            }
+            file.diff.push_str(line);
+        }
+    }
+    files
 }
 
 fn file_changes(changes: &Value) -> Vec<FileChange> {
@@ -697,7 +1045,8 @@ mod tests {
             ("7", ApprovalCategory::Command)
         );
         assert_eq!(summary, "rm -rf x\ncleanup");
-        let answer = Native::answer(&request_id, &HarnessAnswer::Approval { allow: true }).unwrap();
+        let answer =
+            Native::answer_message(&request_id, &HarnessAnswer::Approval { allow: true }).unwrap();
         assert_eq!(answer, json!({"id":7,"result":{"decision":"accept"}}));
         let unknown = json!({"id":"x","method":"item/network/request","params":{}});
         assert!(matches!(classify(&unknown), Incoming::AutoReply { .. }));
@@ -786,5 +1135,50 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn output_diffs_skills_and_subagents_map_to_platform_events() {
+        let output = json!({"method":"item/commandExecution/outputDelta","params":{"threadId":"th","turnId":"t","itemId":"c","delta":"line\n"}});
+        assert!(matches!(
+            classify(&output),
+            Incoming::Delta { stream: "terminal_output", ref text, .. } if text == "line\n"
+        ));
+        let diff = "diff --git a/a.txt b/a.txt\nindex 1..2\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-x\n+y\ndiff --git a/new.rs b/new.rs\nnew file mode 100644\n--- /dev/null\n+++ b/new.rs\n@@ -0,0 +1 @@\n+fn main() {}\n";
+        let updated = json!({"method":"turn/diff/updated","params":{"threadId":"th","turnId":"t","diff":diff}});
+        let Incoming::Event(HarnessEvent::Item {
+            native_id,
+            kind,
+            content,
+            ..
+        }) = classify(&updated)
+        else {
+            panic!("turn diff not classified")
+        };
+        assert_eq!(
+            (native_id.as_str(), kind),
+            ("turn-diff:t", ItemKind::FileChange)
+        );
+        let files: Vec<_> = content
+            .file_changes
+            .iter()
+            .map(|f| (f.path.as_str(), f.change.as_str()))
+            .collect();
+        assert_eq!(files, [("a.txt", "update"), ("new.rs", "add")]);
+        assert!(content.file_changes[1].diff.contains("+fn main() {}"));
+        let skills = super::skills(&json!({"data":[{"cwd":"/workspace","errors":[],"skills":[
+            {"name":"review","description":"Long","shortDescription":"Review changes","enabled":true,"path":"/p","scope":"user"},
+            {"name":"off","description":"x","enabled":false,"path":"/p","scope":"user"}
+        ]}]}))
+        .unwrap();
+        assert_eq!(
+            skills,
+            json!([{"name":"review","description":"Review changes"}])
+        );
+        let child = json!({"method":"item/started","params":{"turnId":"t","item":{"id":"m","type":"agentMessage","text":"","parentItemId":"task-1"}}});
+        assert!(matches!(
+            classify(&child),
+            Incoming::Event(HarnessEvent::Item { parent_native_id: Some(ref p), .. }) if p == "task-1"
+        ));
     }
 }

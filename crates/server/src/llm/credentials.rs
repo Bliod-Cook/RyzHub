@@ -3,10 +3,7 @@ use crate::{
     config::LlmConfig,
     error::{ApiResult, Code},
     store::{Tx, audit, effective_policy},
-};
-use aes_gcm::{
-    Aes256Gcm, KeyInit, Nonce,
-    aead::{Aead, Payload},
+    vault,
 };
 use anyhow::{Context, ensure};
 use axum::{
@@ -14,72 +11,74 @@ use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
 };
-use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use ryzhub_domain::{Action, Principal, Resource, authorize};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-fn aad(org: Uuid, id: Uuid, owner: Option<Uuid>) -> String {
+/// What a credential's secret is bound to: the credential and its owner, so the secret cannot
+/// be moved to another credential or change hands.
+fn purpose(id: Uuid, owner: Option<Uuid>) -> String {
+    format!(
+        "credential/{id}/{}",
+        owner.map(|u| u.to_string()).unwrap_or_default()
+    )
+}
+
+/// Associated data of a credential encrypted before secrets existed.
+fn legacy_aad(org: Uuid, id: Uuid, owner: Option<Uuid>) -> String {
     format!(
         "{org}/{id}/{}",
         owner.map(|u| u.to_string()).unwrap_or_default()
     )
 }
 
-/// A 32-byte key from an environment variable holding URL-safe base64.
-pub fn secret(name: &str) -> anyhow::Result<Vec<u8>> {
-    let encoded = std::env::var(name).with_context(|| format!("{name} is not set"))?;
-    let bytes = URL_SAFE_NO_PAD
-        .decode(encoded.trim())
-        .with_context(|| format!("{name} is not URL-safe base64"))?;
-    ensure!(bytes.len() == 32, "{name} must hold 32 bytes");
-    Ok(bytes)
+fn open_legacy(
+    config: &LlmConfig,
+    org: Uuid,
+    id: Uuid,
+    owner: Option<Uuid>,
+    cipher: &[u8],
+    key_id: i16,
+) -> anyhow::Result<String> {
+    let key = vault::kek(config, key_id)?;
+    Ok(String::from_utf8(vault::unseal(
+        &key,
+        &legacy_aad(org, id, owner),
+        cipher,
+    )?)?)
 }
 
-/// The vault key a ciphertext was written with. New ciphertexts use `vault_key_id`; retired
-/// keys stay readable until every credential has been re-encrypted.
-fn vault_key(config: &LlmConfig, id: i16) -> anyhow::Result<Vec<u8>> {
-    if id == config.vault_key_id {
-        return secret(&config.vault_key_env);
+/// Move the organization's credentials that are still encrypted the old way into secrets,
+/// and drop the ciphertext of revoked ones. Returns how many were moved.
+pub async fn convert_legacy(tx: &mut Tx<'_>, config: &LlmConfig, org: Uuid) -> anyhow::Result<u64> {
+    let legacy: Vec<(Uuid, Option<Uuid>, Vec<u8>, i16)> = sqlx::query_as(
+        "SELECT id,owner_user_id,encrypted_key,key_id FROM model_credentials
+         WHERE org_id=$1 AND encrypted_key IS NOT NULL AND revoked_at IS NULL FOR UPDATE",
+    )
+    .bind(org)
+    .fetch_all(&mut **tx)
+    .await?;
+    for (id, owner, cipher, key_id) in &legacy {
+        let plain = open_legacy(config, org, *id, *owner, cipher, *key_id)?;
+        let secret = vault::put(tx, config, org, &purpose(*id, *owner), plain.as_bytes()).await?;
+        sqlx::query(
+            "UPDATE model_credentials SET secret_id=$3,encrypted_key=NULL WHERE org_id=$1 AND id=$2",
+        )
+        .bind(org)
+        .bind(id)
+        .bind(secret)
+        .execute(&mut **tx)
+        .await?;
     }
-    let env = config
-        .vault_retired_keys
-        .get(&id.to_string())
-        .with_context(|| format!("vault key {id} is not configured"))?;
-    secret(env)
-}
-
-fn seal(key: &[u8], associated: &str, text: &str) -> anyhow::Result<Vec<u8>> {
-    let cipher =
-        Aes256Gcm::new_from_slice(key).map_err(|_| anyhow::anyhow!("INVALID_VAULT_KEY"))?;
-    let nonce: [u8; 12] = rand::random();
-    let encrypted = cipher
-        .encrypt(
-            Nonce::from_slice(&nonce),
-            Payload {
-                msg: text.as_bytes(),
-                aad: associated.as_bytes(),
-            },
-        )
-        .map_err(|_| anyhow::anyhow!("VAULT_ENCRYPT_FAILED"))?;
-    Ok([nonce.as_slice(), &encrypted].concat())
-}
-
-fn unseal(key: &[u8], associated: &str, bytes: &[u8]) -> anyhow::Result<String> {
-    ensure!(bytes.len() >= 28, "VAULT_CORRUPT");
-    let cipher =
-        Aes256Gcm::new_from_slice(key).map_err(|_| anyhow::anyhow!("INVALID_VAULT_KEY"))?;
-    let plain = cipher
-        .decrypt(
-            Nonce::from_slice(&bytes[..12]),
-            Payload {
-                msg: &bytes[12..],
-                aad: associated.as_bytes(),
-            },
-        )
-        .map_err(|_| anyhow::anyhow!("VAULT_DECRYPT_FAILED"))?;
-    Ok(String::from_utf8(plain)?)
+    sqlx::query(
+        "UPDATE model_credentials SET encrypted_key=NULL
+         WHERE org_id=$1 AND revoked_at IS NOT NULL AND encrypted_key IS NOT NULL",
+    )
+    .bind(org)
+    .execute(&mut **tx)
+    .await?;
+    Ok(legacy.len() as u64)
 }
 
 fn default_provider() -> String {
@@ -199,7 +198,7 @@ pub async fn put(
     )
     .map_err(|_| Code::Forbidden)?;
     require!(
-        matches!(input.provider.as_str(), "anthropic" | "openai")
+        matches!(input.provider.as_str(), "anthropic" | "openai" | "gemini")
             && !input.name.trim().is_empty()
             && input.name.len() <= 100
             && !input.api_key.is_empty()
@@ -214,23 +213,24 @@ pub async fn put(
     );
     let id = Uuid::now_v7();
     let owner = (!input.organization).then_some(ctx.user_id);
-    let key_id = app.config.llm.vault_key_id;
-    let encrypted = seal(
-        &vault_key(&app.config.llm, key_id)?,
-        &aad(org, id, owner),
-        &input.api_key,
-    )?;
+    let secret = vault::put(
+        &mut tx,
+        &app.config.llm,
+        org,
+        &purpose(id, owner),
+        input.api_key.as_bytes(),
+    )
+    .await?;
     sqlx::query(
-        "INSERT INTO model_credentials(id,org_id,owner_user_id,name,provider,encrypted_key,key_id)
-         VALUES($1,$2,$3,$4,$5,$6,$7)",
+        "INSERT INTO model_credentials(id,org_id,owner_user_id,name,provider,secret_id)
+         VALUES($1,$2,$3,$4,$5,$6)",
     )
     .bind(id)
     .bind(org)
     .bind(owner)
     .bind(input.name.trim())
     .bind(&input.provider)
-    .bind(encrypted)
-    .bind(key_id)
+    .bind(secret)
     .execute(&mut *tx)
     .await?;
     audit(
@@ -277,13 +277,14 @@ pub async fn revoke(
     Path((org, id)): Path<(Uuid, Uuid)>,
 ) -> ApiResult<StatusCode> {
     let (ctx, mut tx) = crate::http::member_tx(&app, &headers, org).await?;
-    let owner: Option<Uuid> =
-        sqlx::query_scalar("SELECT owner_user_id FROM model_credentials WHERE org_id=$1 AND id=$2")
-            .bind(org)
-            .bind(id)
-            .fetch_optional(&mut *tx)
-            .await?
-            .context(Code::Forbidden)?;
+    let (owner, secret): (Option<Uuid>, Option<Uuid>) = sqlx::query_as(
+        "SELECT owner_user_id,secret_id FROM model_credentials WHERE org_id=$1 AND id=$2 FOR UPDATE",
+    )
+    .bind(org)
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .context(Code::Forbidden)?;
     let action = if owner.is_some() {
         Action::SetPersonalCredential
     } else {
@@ -300,11 +301,18 @@ pub async fn revoke(
         },
     )
     .map_err(|_| Code::Forbidden)?;
-    sqlx::query("UPDATE model_credentials SET revoked_at=now() WHERE org_id=$1 AND id=$2")
-        .bind(org)
-        .bind(id)
-        .execute(&mut *tx)
-        .await?;
+    // The key is no longer needed by anything: drop it rather than keep it encrypted.
+    sqlx::query(
+        "UPDATE model_credentials SET revoked_at=coalesce(revoked_at,now()),secret_id=NULL,encrypted_key=NULL
+         WHERE org_id=$1 AND id=$2",
+    )
+    .bind(org)
+    .bind(id)
+    .execute(&mut *tx)
+    .await?;
+    if let Some(secret) = secret {
+        vault::delete(&mut tx, org, secret).await?;
+    }
     sqlx::query("UPDATE virtual_keys SET revoked_at=now() WHERE org_id=$1 AND credential_id=$2")
         .bind(org)
         .bind(id)
@@ -322,6 +330,16 @@ pub async fn revoke(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// A credential's key as stored: in a secret, or (before `migrate-secrets`) encrypted in place.
+#[derive(sqlx::FromRow)]
+struct StoredKey {
+    id: Uuid,
+    owner_user_id: Option<Uuid>,
+    secret_id: Option<Uuid>,
+    encrypted_key: Option<Vec<u8>>,
+    key_id: i16,
+}
+
 /// The upstream key for a request: the explicitly selected credential, else the user's
 /// personal key, else the organization's, else the platform key when policy allows it.
 /// An explicit selection never falls back.
@@ -334,22 +352,8 @@ pub async fn resolve(
     policy: &ryzhub_domain::Policy,
     provider: &str,
 ) -> anyhow::Result<(Option<Uuid>, String)> {
-    let row: Option<(Uuid, Option<Uuid>, Vec<u8>, i16)> = sqlx::query_as(
-        "SELECT id,owner_user_id,encrypted_key,key_id FROM model_credentials
-         WHERE org_id=$1 AND provider=$5 AND revoked_at IS NULL AND ($3::uuid IS NULL OR id=$3)
-           AND (owner_user_id IS NULL OR (owner_user_id=$2 AND $4))
-         ORDER BY owner_user_id NULLS LAST,created_at DESC LIMIT 1",
-    )
-    .bind(org)
-    .bind(user)
-    .bind(explicit)
-    .bind(policy.allow_personal_credentials != Some(false))
-    .bind(provider)
-    .fetch_optional(&mut **tx)
-    .await?;
-    if let Some((id, owner, cipher, key_id)) = row {
-        let key = vault_key(&app.config.llm, key_id)?;
-        return Ok((Some(id), unseal(&key, &aad(org, id, owner), &cipher)?));
+    if let Some((id, key)) = member_key(app, tx, org, user, explicit, policy, provider).await? {
+        return Ok((Some(id), key));
     }
     ensure!(explicit.is_none(), Code::CredentialUnavailable);
     ensure!(
@@ -367,17 +371,51 @@ pub async fn resolve(
     ))
 }
 
+/// The member's or organization's own key for `provider`: `explicit` when given, else the
+/// member's, else the organization's. None when there is none: the platform's keys apply.
+pub async fn member_key(
+    app: &App,
+    tx: &mut Tx<'_>,
+    org: Uuid,
+    user: Uuid,
+    explicit: Option<Uuid>,
+    policy: &ryzhub_domain::Policy,
+    provider: &str,
+) -> anyhow::Result<Option<(Uuid, String)>> {
+    let row: Option<StoredKey> = sqlx::query_as(
+        "SELECT id,owner_user_id,secret_id,encrypted_key,key_id FROM model_credentials
+         WHERE org_id=$1 AND provider=$5 AND revoked_at IS NULL AND ($3::uuid IS NULL OR id=$3)
+           AND (owner_user_id IS NULL OR (owner_user_id=$2 AND $4))
+         ORDER BY owner_user_id NULLS LAST,created_at DESC LIMIT 1",
+    )
+    .bind(org)
+    .bind(user)
+    .bind(explicit)
+    .bind(policy.allow_personal_credentials != Some(false))
+    .bind(provider)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let (config, id, owner) = (&app.config.llm, row.id, row.owner_user_id);
+    let key = match (row.secret_id, row.encrypted_key) {
+        (Some(secret), _) => {
+            String::from_utf8(vault::get(tx, config, org, secret, &purpose(id, owner)).await?)?
+        }
+        (None, Some(cipher)) => open_legacy(config, org, id, owner, &cipher, row.key_id)?,
+        (None, None) => anyhow::bail!(Code::CredentialUnavailable),
+    };
+    Ok(Some((id, key)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
-    fn vault_authenticates_tenant_owner_and_ciphertext() {
-        let key = [4; 32];
-        let encrypted = seal(&key, "org/a/member", "secret").unwrap();
-        assert_eq!(unseal(&key, "org/a/member", &encrypted).unwrap(), "secret");
-        assert!(unseal(&key, "org/b/member", &encrypted).is_err());
-        let mut tampered = encrypted;
-        tampered[14] ^= 1;
-        assert!(unseal(&key, "org/a/member", &tampered).is_err());
+    fn a_credential_secret_is_bound_to_its_owner() {
+        let (id, owner) = (Uuid::now_v7(), Uuid::now_v7());
+        assert_ne!(purpose(id, Some(owner)), purpose(id, None));
+        assert_ne!(purpose(id, None), purpose(Uuid::now_v7(), None));
     }
 }

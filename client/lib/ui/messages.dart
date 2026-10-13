@@ -3,15 +3,16 @@ import 'dart:math';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:flutter_markdown_plus/flutter_markdown_plus.dart';
-import 'package:markdown/markdown.dart' as md;
 
 import '../l10n.dart';
 import '../theme.dart';
 import 'code.dart';
+import 'plugin_ui.dart';
 import 'common.dart';
-import 'math.dart';
+import 'markdown.dart';
 import 'unfold.dart';
+
+export 'markdown.dart' show Rendered;
 
 /// Message actions keep a 16px glyph in a compact highlight.
 const _actionSize = 28.0;
@@ -19,229 +20,62 @@ const _actionSize = 28.0;
 /// Space between an action button's edge and its 16px glyph.
 const _actionInset = (_actionSize - 16) / 2;
 
-/// Item kinds a run produces on its way to an answer.
-const _stepKinds = {'tool', 'reasoning', 'plan', 'file_change'};
-
-/// The conversation as displayed. A run's answer is its last reply when
-/// nothing else of the run follows it; the work before it (tool calls,
-/// reasoning, interim replies) becomes one `steps` row. Memory context and
-/// what a retried model call discarded are not shown.
-List<Map<String, dynamic>> timeline(Iterable<Map<String, dynamic>> items) {
-  final visible = items
-      .where((i) => i['kind'] != 'memory_context' && i['state'] != 'discarded')
-      .toList();
-  bool ofRun(Map<String, dynamic> item) =>
-      (item['run_id'] ?? '') != '' &&
-      (item['kind'] == 'assistant' || _stepKinds.contains(item['kind']));
-  final last = <String, Map<String, dynamic>>{
-    for (final item in visible)
-      if (ofRun(item)) item['run_id'] as String: item,
-  };
-  final rows = <Map<String, dynamic>>[];
-  for (final item in visible) {
-    final run = item['run_id'];
-    if (!ofRun(item) ||
-        item['kind'] == 'assistant' && identical(last[run], item)) {
-      rows.add(item);
-      continue;
-    }
-    // A step that only called tools leaves an empty reply.
-    if (item['kind'] == 'assistant' && '${item['text'] ?? ''}'.trim().isEmpty) {
-      continue;
-    }
-    final group = rows.lastOrNull;
-    if (group?['kind'] == 'steps' && group!['run_id'] == run) {
-      (group['steps'] as List<Map<String, dynamic>>).add(item);
-    } else {
-      rows.add({
-        'id': 'steps:${item['id']}',
-        'kind': 'steps',
-        'run_id': run,
-        'steps': [item],
-      });
-    }
-  }
-  for (final row in rows.where((r) => r['kind'] == 'steps')) {
-    row['latest'] = identical((row['steps'] as List).last, last[row['run_id']]);
-  }
-  return rows;
-}
-
+/// [rendered] as a message shows it.
 List<Widget> _blocks(
-  BuildContext context,
-  String text,
+  Rendered rendered,
   double size, {
+  required String key,
   ValueChanged<String>? onSource,
   Color? color,
   _Citations? citations,
-}) {
-  final c = HubColors.of(context);
-  final theme = Theme.of(context);
-  final ink = color ?? c.text;
-  final sheet = MarkdownStyleSheet.fromTheme(theme).copyWith(
-    p: TextStyle(fontSize: size, height: 1.65, color: ink),
-    listBullet: TextStyle(fontSize: size, height: 1.65, color: ink),
-    code: TextStyle(
-      fontFamily: 'monospace',
-      fontFamilyFallback: const ['RyzHub Sans'],
-      fontSize: size - 1.5,
-      backgroundColor: c.code,
-      color: ink,
-    ),
-    blockquoteDecoration: BoxDecoration(
-      border: Border(left: BorderSide(color: c.border, width: 3)),
-    ),
-    horizontalRuleDecoration: BoxDecoration(
-      border: Border(top: BorderSide(color: c.border)),
-    ),
-  );
-  final chips = citations != null;
-  Widget markdown(String data, {bool tail = false}) => MarkdownBody(
-    data: chips ? citations.fold(data, tail: tail) : data,
-    onTapLink: (_, href, _) {
-      if (href != null) onSource?.call(href);
-    },
-    selectable: true,
-    styleSheet: sheet,
-    blockSyntaxes: const [MathBlockSyntax()],
-    inlineSyntaxes: [MathSyntax(), if (chips) _ChipSyntax(), _FileLinkSyntax()],
-    builders: {
-      'math': MathBuilder(style: sheet.p!, fallback: sheet.code!),
-      if (chips) 'cite': _ChipBuilder(citations, onSource),
-      'file': _FileLinkBuilder(onSource),
-    },
-  );
-  final out = <Widget>[];
-  var cursor = 0;
-  for (final code in RegExp(
-    r'```([^\n]*)\n([\s\S]*?)(?:```|$)',
-  ).allMatches(text)) {
-    if (code.start > cursor) {
-      out.add(markdown(text.substring(cursor, code.start)));
-    }
-    out.add(CodeBlock(code: code.group(2)!, info: code.group(1)!, color: ink));
-    cursor = code.end;
-  }
-  if (cursor < text.length) {
-    out.add(markdown(text.substring(cursor), tail: true));
-  }
-  return out;
-}
+}) => [
+  MarkdownBlocks(
+    blocks: rendered.blocks,
+    size: size,
+    color: color,
+    onLink: onSource,
+    chip: citations?.chip(onSource),
+    codeKey: key,
+  ),
+];
 
-/// Delimit a chip in the markdown handed to the renderer: private-use code
-/// points that no reply contains.
-const _chipOpen = '\uE000', _chipClose = '\uE001';
-
-/// The web pages a reply cites, and its source links folded into chips. Models
-/// write a passage's sources after it as `([site](url))`; a run of such links
-/// to cited pages becomes one chip, the rest of the text stays as is. The
-/// server sends each cited page as it streams.
+/// The web pages a reply cites, and the chips the kernel folded runs of their source links
+/// into. Models write a passage's sources after it as `([site](url))`; the server sends each
+/// cited page as it streams.
 class _Citations {
   /// Cited pages by URL, in order of first citation.
   final Map<String, Map> byUrl;
 
-  /// The reply is still streaming.
-  final bool partial;
-
   /// Each chip's sources as (link label, page).
-  final chips = <List<(String, Map)>>[];
+  final List<List<(String, Map)>> chips;
 
-  _Citations._(this.byUrl, this.partial);
+  _Citations._(this.byUrl, this.chips);
 
-  factory _Citations.of(Map<String, dynamic> item) {
+  factory _Citations.of(Map<String, dynamic> item, Rendered rendered) {
     final list = item['detail']?['kind']?['Answer']?['citations'];
-    return _Citations._({
+    final byUrl = <String, Map>{
       if (list is List)
         for (final citation in list.whereType<Map>())
           '${citation['url']}': citation,
-    }, item['state'] == 'streaming');
+    };
+    return _Citations._(byUrl, [
+      for (final chip in rendered.chips)
+        [
+          for (final source in chip as List)
+            (
+              '${source['label']}',
+              byUrl['${source['url']}'] ?? {'url': source['url']},
+            ),
+        ],
+    ]);
   }
 
-  /// [text] with each run of source links replaced by a chip placeholder. At
-  /// the [tail] of a streaming reply, a run not yet finished is hidden.
-  String fold(String text, {bool tail = false}) {
-    final out = StringBuffer();
-    var cursor = 0;
-    for (var at = text.indexOf('(['); at >= 0; at = text.indexOf('([', at)) {
-      final first = _group(text, at);
-      final cited =
-          first != null &&
-          first.$1 >= 0 &&
-          first.$2.every((link) => byUrl.containsKey(link.$2));
-      if (!cited) {
-        // At the tail of a streaming reply, links wait to be finished and cited.
-        final waiting =
-            first != null &&
-            (first.$1 < 0 || text.substring(first.$1).trim().isEmpty);
-        if (waiting && partial && tail) {
-          return (out..write(text.substring(cursor, at))).toString();
-        }
-        at++;
-        continue;
-      }
-      var (end, links) = first;
-      // Groups apart by spaces only read as one.
-      while (true) {
-        var next = end;
-        while (next < text.length && text[next] == ' ') {
-          next++;
-        }
-        final more = _group(text, next);
-        if (more == null ||
-            more.$1 < 0 ||
-            !more.$2.every((link) => byUrl.containsKey(link.$2))) {
-          break;
-        }
-        (end, links) = (more.$1, [...links, ...more.$2]);
-      }
-      final seen = <String>{};
-      chips.add([
-        for (final (label, url) in links)
-          if (seen.add(url)) (label, byUrl[url]!),
-      ]);
-      out
-        ..write(text.substring(cursor, at))
-        ..write('$_chipOpen${chips.length - 1}$_chipClose');
-      cursor = at = end;
-    }
-    return (out..write(text.substring(cursor))).toString();
-  }
-
-  /// The web links of a `([label](url), [label](url))` at [start], and its
-  /// end; the end is -1 when the text stops inside it.
-  (int, List<(String, String)>)? _group(String text, int start) {
-    if (!text.startsWith('([', start)) return null;
-    const unfinished = (-1, <(String, String)>[]);
-    final links = <(String, String)>[];
-    var i = start + 1;
-    while (true) {
-      if (i >= text.length) return unfinished;
-      if (text[i] != '[') return null;
-      final close = text.indexOf('](', i);
-      final line = text.indexOf('\n', i);
-      if (close < 0) return line < 0 ? unfinished : null;
-      if (line >= 0 && line < close) return null;
-      // The link ends at the parenthesis that closes it; ones in the URL pair up.
-      var depth = 0, j = close + 2;
-      for (; j < text.length; j++) {
-        final char = text[j];
-        if (char == ' ' || char == '\n') return null;
-        if (char == '(') depth++;
-        if (char == ')' && depth-- == 0) break;
-      }
-      if (j >= text.length) return unfinished;
-      final url = text.substring(close + 2, j);
-      if (!url.startsWith('https://') && !url.startsWith('http://')) {
-        return null;
-      }
-      links.add((text.substring(i + 1, close), url));
-      i = j + 1;
-      while (i < text.length && ', ;，；'.contains(text[i])) {
-        i++;
-      }
-      if (i < text.length && text[i] == ')') return (i + 1, links);
-    }
-  }
+  Widget? Function(int) chip(ValueChanged<String>? onSource) => (index) {
+    final sources = chips.elementAtOrNull(index);
+    return sources == null || sources.isEmpty
+        ? null
+        : _CitationChip(sources: sources, onSource: onSource);
+  };
 
   /// Cited pages no chip shows, in order of first citation.
   List<Map> get unshown {
@@ -305,111 +139,6 @@ bool isFileLink(String href) {
   return path.startsWith('/workspace/') || path.startsWith('/attachments/');
 }
 
-/// A link to a sandbox file, as `[label](sandbox:/workspace/...)`,
-/// `[label](/attachments/...)` or with the path in `<...>`.
-class _FileLinkSyntax extends md.InlineSyntax {
-  _FileLinkSyntax()
-    : super(
-        r'\[([^\]\n]+)\]\((?:<((?:sandbox:)?/(?:workspace|attachments)/[^>\n]+)>'
-        r'|((?:sandbox:)?/(?:workspace|attachments)/(?:[^()\s]|\([^()\s]*\))+))'
-        r'(?:\s+"[^"\n]*")?\)',
-      );
-
-  @override
-  bool onMatch(md.InlineParser parser, Match match) {
-    parser.addNode(
-      md.Element.text('file', match[1]!)
-        ..attributes['href'] = match[2] ?? match[3]!,
-    );
-    return true;
-  }
-}
-
-/// A file link inline: the file's glyph before the label, opened on tap.
-class _FileLinkBuilder extends MarkdownElementBuilder {
-  final ValueChanged<String>? onSource;
-  _FileLinkBuilder(this.onSource);
-
-  @override
-  Widget? visitElementAfterWithContext(
-    BuildContext context,
-    md.Element element,
-    TextStyle? preferredStyle,
-    TextStyle? parentStyle,
-  ) {
-    final c = HubColors.of(context);
-    final href = element.attributes['href'] ?? '';
-    final style = (parentStyle ?? const TextStyle()).copyWith(color: c.accent);
-    return Text.rich(
-      TextSpan(
-        children: [
-          WidgetSpan(
-            alignment: PlaceholderAlignment.middle,
-            child: Semantics(
-              link: true,
-              child: InkWell(
-                borderRadius: BorderRadius.circular(4),
-                onTap: () => onSource?.call(href),
-                child: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Icon(
-                      Icons.insert_drive_file_outlined,
-                      size: (style.fontSize ?? 15) * .95,
-                      color: c.accent,
-                    ),
-                    const SizedBox(width: 2),
-                    Text(element.textContent, style: style),
-                  ],
-                ),
-              ),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-class _ChipSyntax extends md.InlineSyntax {
-  _ChipSyntax() : super('$_chipOpen(\\d+)$_chipClose');
-
-  @override
-  bool onMatch(md.InlineParser parser, Match match) {
-    parser.addNode(md.Element.text('cite', match[1]!));
-    return true;
-  }
-}
-
-/// Renders a chip placeholder inline, so the paragraph wraps around it.
-class _ChipBuilder extends MarkdownElementBuilder {
-  final _Citations citations;
-  final ValueChanged<String>? onSource;
-  _ChipBuilder(this.citations, this.onSource);
-
-  @override
-  Widget? visitElementAfterWithContext(
-    BuildContext context,
-    md.Element element,
-    TextStyle? preferredStyle,
-    TextStyle? parentStyle,
-  ) {
-    final index = int.tryParse(element.textContent) ?? -1;
-    final sources = citations.chips.elementAtOrNull(index);
-    if (sources == null) return null;
-    return Text.rich(
-      TextSpan(
-        children: [
-          WidgetSpan(
-            alignment: PlaceholderAlignment.middle,
-            child: _CitationChip(sources: sources, onSource: onSource),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
 /// A cited page's title, or its site when it has none.
 String _sourceTitle(Map source) {
   final title = '${source['title'] ?? ''}'.trim();
@@ -460,7 +189,7 @@ class _CitationChip extends StatelessWidget {
     final site = label.trim().isEmpty ? _sourceTitle(first) : label.trim();
     final more = sources.length - 1;
     return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 3),
+      padding: const EdgeInsets.symmetric(horizontal: Space.s3),
       child: Tooltip(
         message: sources.map((s) => _sourceTitle(s.$2)).join('\n'),
         child: Material(
@@ -470,7 +199,7 @@ class _CitationChip extends StatelessWidget {
             customBorder: const StadiumBorder(),
             onTap: () => _open(context),
             child: Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 8),
+              padding: const EdgeInsets.symmetric(horizontal: Space.s8),
               child: Text(
                 more > 0 ? '$site +$more' : site,
                 style: TextStyle(fontSize: 12, height: 1.6, color: c.muted),
@@ -495,7 +224,7 @@ List<Widget> _sources(
   final c = HubColors.of(context);
   return [
     Padding(
-      padding: const EdgeInsets.only(top: 10, bottom: 2),
+      padding: const EdgeInsets.only(top: Space.s10, bottom: Space.s2),
       child: Text(
         tr('来源', 'Sources'),
         style: TextStyle(fontSize: 12, color: c.subtle),
@@ -524,7 +253,7 @@ class _Source extends StatelessWidget {
       borderRadius: BorderRadius.circular(6),
       onTap: onTap == null ? null : () => onTap!(url),
       child: Padding(
-        padding: const EdgeInsets.symmetric(vertical: 3),
+        padding: const EdgeInsets.symmetric(vertical: Space.s3),
         child: Text.rich(
           TextSpan(
             children: [
@@ -556,7 +285,7 @@ List<Widget> _states(BuildContext context, Map<String, dynamic> item) {
   return [
     if (item['state'] == 'streaming')
       Padding(
-        padding: const EdgeInsets.only(top: 6),
+        padding: const EdgeInsets.only(top: Space.s6),
         child: Row(
           children: [
             SizedBox(
@@ -631,9 +360,8 @@ class MarkdownText extends StatelessWidget {
   final double size;
   const MarkdownText(this.text, {super.key, this.size = 15});
   @override
-  Widget build(BuildContext context) => Column(
-    crossAxisAlignment: CrossAxisAlignment.stretch,
-    children: _blocks(context, text, size),
+  Widget build(BuildContext context) => SelectionArea(
+    child: MarkdownBlocks(blocks: Rendered.of(text).blocks, size: size),
   );
 }
 
@@ -641,19 +369,27 @@ class MessageCard extends StatelessWidget {
   final Map<String, dynamic> item;
   final String? agentLabel;
   final VoidCallback? onFork;
+
+  /// How the platform forks when the harness cannot, for the fork button.
+  final String? forkNote;
   final VoidCallback? onMemoryUndo;
   final ValueChanged<String>? onSource;
 
   /// Shows the files a message carried.
   final Widget Function(List<dynamic> files)? files;
+
+  /// Its text as the timeline rendered it; rendered here when absent.
+  final Rendered? rendered;
   const MessageCard({
     super.key,
     required this.item,
     this.agentLabel,
     this.onFork,
+    this.forkNote,
     this.onMemoryUndo,
     this.onSource,
     this.files,
+    this.rendered,
   });
 
   @override
@@ -661,6 +397,8 @@ class MessageCard extends StatelessWidget {
     final c = HubColors.of(context);
     final text = item['text'] as String;
     final kind = item['kind'];
+    final key = '${item['id']}';
+    Rendered render() => rendered ?? Rendered.item(item);
     if (kind == 'memory_notice') {
       Map<String, dynamic> notice;
       try {
@@ -669,7 +407,7 @@ class MessageCard extends StatelessWidget {
         notice = {};
       }
       return Padding(
-        padding: const EdgeInsets.symmetric(vertical: 6),
+        padding: const EdgeInsets.symmetric(vertical: Space.s6),
         child: Row(
           children: [
             const Icon(Icons.psychology_outlined, size: 16),
@@ -701,13 +439,13 @@ class MessageCard extends StatelessWidget {
         // parent would otherwise shrink the column to the bubble and centre it.
         builder: (context, hovered) => Container(
           width: double.infinity,
-          padding: const EdgeInsets.only(bottom: 8),
+          padding: const EdgeInsets.only(bottom: Space.s8),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.end,
             children: [
               if (carried != null)
                 Padding(
-                  padding: EdgeInsets.only(bottom: text.isEmpty ? 0 : 6),
+                  padding: EdgeInsets.only(bottom: text.isEmpty ? 0 : Space.s6),
                   child: LayoutBuilder(
                     builder: (context, box) => ConstrainedBox(
                       constraints: BoxConstraints(maxWidth: box.maxWidth * .78),
@@ -720,7 +458,12 @@ class MessageCard extends StatelessWidget {
                   builder: (context, box) => ConstrainedBox(
                     constraints: BoxConstraints(maxWidth: box.maxWidth * .78),
                     child: Container(
-                      padding: const EdgeInsets.fromLTRB(18, 10, 18, 10),
+                      padding: const EdgeInsets.fromLTRB(
+                        Space.s18,
+                        Space.s10,
+                        Space.s18,
+                        Space.s10,
+                      ),
                       decoration: BoxDecoration(
                         color: c.userBubble,
                         borderRadius: BorderRadius.circular(22),
@@ -729,7 +472,18 @@ class MessageCard extends StatelessWidget {
                         crossAxisAlignment: CrossAxisAlignment.start,
                         mainAxisSize: MainAxisSize.min,
                         children: [
-                          ..._blocks(context, text, 15, onSource: onSource),
+                          SelectionArea(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              mainAxisSize: MainAxisSize.min,
+                              children: _blocks(
+                                render(),
+                                15,
+                                key: key,
+                                onSource: onSource,
+                              ),
+                            ),
+                          ),
                           ..._states(context, item),
                         ],
                       ),
@@ -748,18 +502,25 @@ class MessageCard extends StatelessWidget {
       );
     }
     if (kind == 'assistant') {
-      final citations = _Citations.of(item);
+      final rendered = render();
+      final citations = _Citations.of(item, rendered);
       return Padding(
-        padding: const EdgeInsets.only(bottom: 18),
+        padding: const EdgeInsets.only(bottom: Space.s18),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            ..._blocks(
-              context,
-              text,
-              15,
-              onSource: onSource,
-              citations: citations,
+            SelectionArea(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                mainAxisSize: MainAxisSize.min,
+                children: _blocks(
+                  rendered,
+                  15,
+                  key: key,
+                  onSource: onSource,
+                  citations: citations,
+                ),
+              ),
             ),
             ..._sources(context, citations, onSource),
             ..._states(context, item),
@@ -775,7 +536,10 @@ class MessageCard extends StatelessWidget {
                     copy,
                     if (onFork != null)
                       _Action(
-                        tooltip: tr('从此处分叉', 'Fork from here'),
+                        tooltip: [
+                          tr('从此处分叉', 'Fork from here'),
+                          ?forkNote,
+                        ].join('\n'),
                         icon: Icons.fork_right,
                         size: 17,
                         onPressed: onFork,
@@ -810,9 +574,14 @@ class MessageCard extends StatelessWidget {
       ),
     };
     return Padding(
-      padding: const EdgeInsets.only(bottom: 14),
+      padding: const EdgeInsets.only(bottom: Space.s14),
       child: Container(
-        padding: const EdgeInsets.fromLTRB(14, 10, 8, 12),
+        padding: const EdgeInsets.fromLTRB(
+          Space.s14,
+          Space.s10,
+          Space.s8,
+          Space.s12,
+        ),
         decoration: BoxDecoration(
           borderRadius: BorderRadius.circular(14),
           border: Border.all(color: c.border),
@@ -830,20 +599,34 @@ class MessageCard extends StatelessWidget {
               ],
             ),
             Padding(
-              padding: const EdgeInsets.only(right: 6),
+              padding: const EdgeInsets.only(right: Space.s6),
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
                   if (carried != null)
                     Padding(
-                      padding: const EdgeInsets.only(top: 6, bottom: 4),
+                      padding: const EdgeInsets.only(
+                        top: Space.s6,
+                        bottom: Space.s4,
+                      ),
                       child: Align(
                         alignment: Alignment.centerLeft,
                         child: carried,
                       ),
                     ),
                   if (text.isNotEmpty)
-                    ..._blocks(context, text, 14, onSource: onSource),
+                    SelectionArea(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.stretch,
+                        mainAxisSize: MainAxisSize.min,
+                        children: _blocks(
+                          render(),
+                          14,
+                          key: key,
+                          onSource: onSource,
+                        ),
+                      ),
+                    ),
                   ..._states(context, item),
                 ],
               ),
@@ -892,7 +675,7 @@ class _DisclosureState extends State<_Disclosure> {
         overlayColor: const WidgetStatePropertyAll(Colors.transparent),
         splashFactory: NoSplash.splashFactory,
         child: Padding(
-          padding: const EdgeInsets.symmetric(vertical: 4),
+          padding: const EdgeInsets.symmetric(vertical: Space.s4),
           child: Row(
             mainAxisSize: MainAxisSize.min,
             children: [
@@ -948,6 +731,12 @@ class StepsGroup extends StatefulWidget {
   /// How long the finished run worked, when known.
   final Duration? worked;
   final ValueChanged<String>? onSource;
+
+  /// A step's text as the timeline rendered it; rendered here when absent.
+  final Rendered? Function(String id)? rendered;
+
+  /// What a subagent did for a call, shown under it.
+  final List<Map<String, dynamic>> Function(String id)? children;
   const StepsGroup({
     super.key,
     required this.steps,
@@ -955,6 +744,8 @@ class StepsGroup extends StatefulWidget {
     this.latest = false,
     this.worked,
     this.onSource,
+    this.rendered,
+    this.children,
   });
   @override
   State<StepsGroup> createState() => _StepsGroupState();
@@ -987,7 +778,7 @@ class _StepsGroupState extends State<StepsGroup> {
       }
     }
     return Padding(
-      padding: const EdgeInsets.only(bottom: 14),
+      padding: const EdgeInsets.only(bottom: Space.s14),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
@@ -1016,7 +807,7 @@ class _StepsGroupState extends State<StepsGroup> {
             // Following the run, it opens and folds in place of the newest.
             anchored: open != null,
             builder: (context) => Padding(
-              padding: const EdgeInsets.only(top: 6),
+              padding: const EdgeInsets.only(top: Space.s6),
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
@@ -1042,12 +833,12 @@ class _StepsGroupState extends State<StepsGroup> {
     final c = HubColors.of(context);
     final text = '${item['text'] ?? ''}';
     Widget note(IconData icon, List<Widget> body) => Padding(
-      padding: const EdgeInsets.symmetric(vertical: 4),
+      padding: const EdgeInsets.symmetric(vertical: Space.s4),
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Padding(
-            padding: const EdgeInsets.only(top: 4),
+            padding: const EdgeInsets.only(top: Space.s4),
             child: Icon(icon, size: 15, color: c.subtle),
           ),
           const SizedBox(width: 10),
@@ -1061,42 +852,71 @@ class _StepsGroupState extends State<StepsGroup> {
       ),
     );
     final muted = TextStyle(fontSize: 13.5, height: 1.65, color: c.muted);
-    final citations = _Citations.of(item);
+    final key = '${item['id']}';
+    final rendered =
+        widget.rendered?.call(key) ??
+        (_folds(item) ? const Rendered([], []) : Rendered.item(item));
+    final citations = _Citations.of(item, rendered);
+    List<Widget> selectable(List<Widget> blocks) => [
+      SelectionArea(
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          mainAxisSize: MainAxisSize.min,
+          children: blocks,
+        ),
+      ),
+    ];
     return switch (item['kind']) {
       'tool' => _ToolStep(
         key: ValueKey(item['id']),
         item: item,
         running: widget.running,
+        children: widget.children?.call(key) ?? const [],
+        step: (child) => step(context, child),
       ),
       'reasoning' => note(
         Icons.lightbulb_outline,
-        _blocks(context, text, 14, onSource: widget.onSource, color: c.muted),
+        selectable(
+          _blocks(
+            rendered,
+            14,
+            key: key,
+            onSource: widget.onSource,
+            color: c.muted,
+          ),
+        ),
       ),
       'plan' => note(
         Icons.checklist,
-        _blocks(context, text, 14, onSource: widget.onSource, color: c.muted),
+        selectable(
+          _blocks(
+            rendered,
+            14,
+            key: key,
+            onSource: widget.onSource,
+            color: c.muted,
+          ),
+        ),
       ),
       'file_change' => note(Icons.difference_outlined, [
-        for (final (change, path) in _changes(item))
-          Text(switch (change) {
-            'add' => tr('新增 $path', 'Added $path'),
-            'delete' => tr('删除 $path', 'Deleted $path'),
-            _ => tr('修改 $path', 'Edited $path'),
-          }, style: muted),
+        for (final change in _fileChanges(item))
+          _FileChangeLine(change: change, style: muted),
         if (_changes(item).isEmpty) Text(text, style: muted),
       ]),
       // An interim reply reads like the answer it leads to.
       _ => Padding(
-        padding: const EdgeInsets.symmetric(vertical: 4),
+        padding: const EdgeInsets.symmetric(vertical: Space.s4),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            ..._blocks(
-              context,
-              text,
-              15,
-              onSource: widget.onSource,
-              citations: citations,
+            ...selectable(
+              _blocks(
+                rendered,
+                15,
+                key: key,
+                onSource: widget.onSource,
+                citations: citations,
+              ),
             ),
             ..._sources(context, citations, widget.onSource),
             ..._states(context, item),
@@ -1251,10 +1071,99 @@ class _StepFoldState extends State<_StepFold> {
           anchored: open != null,
           // Indented so the calls' icons line up under the fold's text.
           builder: (context) => Padding(
-            padding: const EdgeInsets.only(left: 25),
+            padding: const EdgeInsets.only(left: Space.s25),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [for (final s in widget.steps) widget.step(s)],
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+/// A file-change item's changes: `{change, path, diff}`.
+List<Map> _fileChanges(Map<String, dynamic> item) {
+  final changes = item['detail']?['kind']?['FileChange']?['changes'];
+  return [
+    if (changes is List)
+      for (final change in changes)
+        if (change is Map) change,
+  ];
+}
+
+/// One changed file: what happened to it, and its diff to open below.
+class _FileChangeLine extends StatefulWidget {
+  final Map change;
+  final TextStyle style;
+  const _FileChangeLine({required this.change, required this.style});
+  @override
+  State<_FileChangeLine> createState() => _FileChangeLineState();
+}
+
+class _FileChangeLineState extends State<_FileChangeLine> {
+  bool open = false;
+  @override
+  Widget build(BuildContext context) {
+    final c = HubColors.of(context);
+    final path = '${widget.change['path']}';
+    final diff = '${widget.change['diff'] ?? ''}';
+    final label = switch ('${widget.change['change']}') {
+      'add' => tr('新增 $path', 'Added $path'),
+      'delete' => tr('删除 $path', 'Deleted $path'),
+      _ => tr('修改 $path', 'Edited $path'),
+    };
+    if (diff.isEmpty) return Text(label, style: widget.style);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        InkWell(
+          onTap: () => setState(() => open = !open),
+          child: Row(
+            children: [
+              Flexible(child: Text(label, style: widget.style)),
+              Icon(
+                open ? Icons.expand_less : Icons.expand_more,
+                size: 16,
+                color: c.subtle,
+              ),
+            ],
+          ),
+        ),
+        Unfold(
+          open: open,
+          // The fold loosens its constraints: full width, or a short diff
+          // would sit narrow and centred.
+          builder: (context) => Container(
+            width: double.infinity,
+            margin: const EdgeInsets.fromLTRB(0, Space.s4, 0, Space.s6),
+            constraints: const BoxConstraints(maxHeight: 320),
+            decoration: BoxDecoration(
+              color: c.code,
+              borderRadius: BorderRadius.circular(10),
+              border: Border.all(color: c.border),
+            ),
+            child: SingleChildScrollView(
+              padding: const EdgeInsets.fromLTRB(
+                Space.s12,
+                Space.s8,
+                Space.s12,
+                Space.s10,
+              ),
+              child: SingleChildScrollView(
+                scrollDirection: Axis.horizontal,
+                child: DiffText(
+                  diff,
+                  style: TextStyle(
+                    fontFamily: 'monospace',
+                    fontFamilyFallback: const ['RyzHub Sans'],
+                    fontSize: 12.5,
+                    height: 1.45,
+                    color: c.text,
+                  ),
+                ),
+              ),
             ),
           ),
         ),
@@ -1490,7 +1399,17 @@ class _ToolCall {
 class _ToolStep extends StatefulWidget {
   final Map<String, dynamic> item;
   final bool running;
-  const _ToolStep({super.key, required this.item, required this.running});
+
+  /// What the agent this call started did, shown under it.
+  final List<Map<String, dynamic>> children;
+  final Widget Function(Map<String, dynamic> item)? step;
+  const _ToolStep({
+    super.key,
+    required this.item,
+    required this.running,
+    this.children = const [],
+    this.step,
+  });
   @override
   State<_ToolStep> createState() => _ToolStepState();
 }
@@ -1514,6 +1433,14 @@ class _ToolStepState extends State<_ToolStep> {
         : _Phase.stopped;
     final subject = call.subject;
     final details = call.details;
+    final live = done ? '' : '${widget.item['live_output'] ?? ''}';
+    final mono = TextStyle(
+      fontFamily: 'monospace',
+      fontFamilyFallback: const ['RyzHub Sans'],
+      fontSize: 12.5,
+      height: 1.45,
+      color: c.text,
+    );
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
@@ -1548,10 +1475,54 @@ class _ToolStepState extends State<_ToolStep> {
             style: TextStyle(fontSize: 13.5, color: active ? c.text : c.muted),
           ),
         ),
+        // A subagent's work, under the call that started it.
+        if (widget.children.isNotEmpty && widget.step != null)
+          Container(
+            margin: const EdgeInsets.only(
+              left: Space.s7,
+              top: Space.s2,
+              bottom: Space.s4,
+            ),
+            padding: const EdgeInsets.only(left: Space.s14),
+            decoration: BoxDecoration(
+              border: Border(left: BorderSide(color: c.border, width: 2)),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                for (final child in widget.children) widget.step!(child),
+              ],
+            ),
+          ),
+        // What the command writes, as it writes it.
+        if (live.isNotEmpty)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(0, Space.s2, 0, Space.s6),
+            child: Container(
+              constraints: const BoxConstraints(maxHeight: 200),
+              decoration: BoxDecoration(
+                color: c.code,
+                borderRadius: BorderRadius.circular(10),
+                border: Border.all(color: c.border),
+              ),
+              child: SingleChildScrollView(
+                reverse: true,
+                padding: const EdgeInsets.fromLTRB(
+                  Space.s12,
+                  Space.s8,
+                  Space.s12,
+                  Space.s10,
+                ),
+                child: AnsiText(live, style: mono),
+              ),
+            ),
+          ),
+        // A plugin's cards and forms, and its page, beside the call's own result.
+        if (done) PluginResult(item: widget.item),
         Unfold(
           open: open,
           builder: (context) => Padding(
-            padding: const EdgeInsets.fromLTRB(0, 2, 0, 6),
+            padding: const EdgeInsets.fromLTRB(0, Space.s2, 0, Space.s6),
             child: Container(
               constraints: const BoxConstraints(maxHeight: 280),
               decoration: BoxDecoration(
@@ -1560,7 +1531,12 @@ class _ToolStepState extends State<_ToolStep> {
                 border: Border.all(color: c.border),
               ),
               child: SingleChildScrollView(
-                padding: const EdgeInsets.fromLTRB(12, 8, 12, 10),
+                padding: const EdgeInsets.fromLTRB(
+                  Space.s12,
+                  Space.s8,
+                  Space.s12,
+                  Space.s10,
+                ),
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.stretch,
                   children: [
@@ -1572,17 +1548,10 @@ class _ToolStepState extends State<_ToolStep> {
                         style: TextStyle(fontSize: 12, color: c.subtle),
                       ),
                       const SizedBox(height: 2),
-                      CodeText(
-                        body,
-                        language: language,
-                        style: TextStyle(
-                          fontFamily: 'monospace',
-                          fontFamilyFallback: const ['RyzHub Sans'],
-                          fontSize: 12.5,
-                          height: 1.45,
-                          color: c.text,
-                        ),
-                      ),
+                      if (language == null && AnsiText.styled(body))
+                        AnsiText(body, style: mono)
+                      else
+                        CodeText(body, language: language, style: mono),
                     ],
                   ],
                 ),
@@ -1608,7 +1577,12 @@ class ApprovalCard extends StatelessWidget {
   Widget build(BuildContext context) {
     final c = HubColors.of(context);
     return Container(
-      padding: const EdgeInsets.fromLTRB(16, 12, 12, 12),
+      padding: const EdgeInsets.fromLTRB(
+        Space.s16,
+        Space.s12,
+        Space.s12,
+        Space.s12,
+      ),
       decoration: BoxDecoration(
         color: c.composer,
         borderRadius: BorderRadius.circular(18),
@@ -1720,7 +1694,7 @@ class _QuestionCardState extends State<QuestionCard> {
   Widget build(BuildContext context) {
     final c = HubColors.of(context);
     return Container(
-      padding: const EdgeInsets.all(16),
+      padding: const EdgeInsets.all(Space.s16),
       decoration: BoxDecoration(
         color: c.composer,
         borderRadius: BorderRadius.circular(18),
@@ -1760,7 +1734,7 @@ class _QuestionCardState extends State<QuestionCard> {
                     ),
                     if (questions[i]['options'] is List)
                       Padding(
-                        padding: const EdgeInsets.only(top: 10),
+                        padding: const EdgeInsets.only(top: Space.s10),
                         child: Wrap(
                           spacing: 8,
                           runSpacing: 8,

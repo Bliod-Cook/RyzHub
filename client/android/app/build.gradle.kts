@@ -4,6 +4,12 @@ plugins {
     id("dev.flutter.flutter-gradle-plugin")
 }
 
+// Notifications need the Firebase project's google-services.json next to this file; without
+// it the app builds and runs without them.
+if (file("google-services.json").exists()) {
+    apply(plugin = "com.google.gms.google-services")
+}
+
 android {
     namespace = "dev.ryzhub.ryzhub"
     compileSdk = flutter.compileSdkVersion
@@ -46,4 +52,8 @@ kotlin {
 
 flutter {
     source = "../.."
+}
+
+dependencies {
+    implementation("com.google.firebase:firebase-messaging:26.0.0")
 }

@@ -66,8 +66,10 @@ const pending = new Map<string,(result:Json)=>void>();
 const tools = new Map<string,{name:string,input:Json}>();
 const permission = ():PermissionMode => config.plan ? 'plan' : config.approval==='allow_edits' ? 'acceptEdits' : 'default';
 const params = (extra:Json={}) => ({threadId:session,turnId:turn,...extra});
+/** An item event. What a subagent produces names the agent's call as its parent. */
 function item(method:string,id:string,type:string,data:Json,raw?:unknown) {
-  notify(method,params({item:{id,type,...data},raw}));
+  const parent=(raw as Json|undefined)?.parent_tool_use_id;
+  notify(method,params({item:{id,type,...data,...(parent?{parentItemId:parent}:{})},raw}));
 }
 async function authorize(tool:string, args:Json, signal:AbortSignal, toolId:string):Promise<PermissionResult> {
   if (signal.aborted) return {behavior:'deny',message:'Interrupted'};
@@ -100,6 +102,8 @@ async function start() {
     settingSources:[], // User-controlled CLI settings cannot replace platform routing or hooks.
     systemPrompt:{type:'preset',preset:'claude_code',append:project},
     includePartialMessages:true,
+    // What a subagent says arrives too, under the call that started it.
+    forwardSubagentText:true,
     env:{...process.env,ANTHROPIC_BASE_URL:process.env.ANTHROPIC_BASE_URL??'http://127.0.0.1:8090',ANTHROPIC_API_KEY:process.env.ANTHROPIC_API_KEY??'guest-proxy',CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC:'1'},
     ...(process.env.RYZHUB_MCP==='1'?{mcpServers:{ryzhub:{type:'http' as const,url:'http://127.0.0.1:8090/mcp'}}}:{}),
     canUseTool:(name,args,options)=>authorize(name,args,options.signal,options.toolUseID),

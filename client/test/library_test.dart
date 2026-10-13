@@ -73,8 +73,9 @@ class _Hub extends HubController {
   Future<Map<String, dynamic>> uploadFile(
     String name,
     int size,
-    Stream<List<int>> Function() open,
-  ) async {
+    Stream<List<int>> Function() open, {
+    String? to,
+  }) async {
     uploaded.add(name);
     return _file('f${files.length + 1}', name, 'image');
   }

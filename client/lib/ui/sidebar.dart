@@ -43,7 +43,12 @@ class Sidebar extends StatelessWidget {
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
             Padding(
-              padding: const EdgeInsets.fromLTRB(16, 8, 8, 6),
+              padding: const EdgeInsets.fromLTRB(
+                Space.s16,
+                Space.s8,
+                Space.s8,
+                Space.s6,
+              ),
               child: SizedBox(
                 height: 40,
                 child: Row(
@@ -108,7 +113,7 @@ class Sidebar extends StatelessWidget {
             ),
             Expanded(
               child: ListView(
-                padding: const EdgeInsets.only(bottom: 12),
+                padding: const EdgeInsets.only(bottom: Space.s12),
                 children: [
                   if (pinned.isNotEmpty) ...[
                     SectionHeader(id: 'pinned', title: tr('已置顶', 'Pinned')),
@@ -267,9 +272,15 @@ class _ConversationRowState extends State<ConversationRow> {
     final c = HubColors.of(context);
     final ConversationRow(:hub, :conversation, :indent, :onTap, :run) = widget;
     final selected = conversation['id'] == hub.selected;
+    final unread = hub.unread(conversation);
     return Hover(
       builder: (context, hovered) => Padding(
-        padding: EdgeInsets.fromLTRB(indent ? 22 : 6, 1, 6, 1),
+        padding: EdgeInsets.fromLTRB(
+          indent ? Space.s22 : Space.s6,
+          Space.s1,
+          Space.s6,
+          Space.s1,
+        ),
         child: Container(
           height: 36,
           decoration: BoxDecoration(
@@ -292,7 +303,9 @@ class _ConversationRowState extends State<ConversationRow> {
                     onTap: onTap,
                     onLongPress: () => menuKey.currentState?.showButtonMenu(),
                     child: Padding(
-                      padding: const EdgeInsets.symmetric(horizontal: 10),
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: Space.s10,
+                      ),
                       child: Row(
                         children: [
                           if (conversation['mode'] == 'work') ...[
@@ -304,9 +317,26 @@ class _ConversationRowState extends State<ConversationRow> {
                               conversation['title'] ?? '',
                               maxLines: 1,
                               overflow: TextOverflow.ellipsis,
-                              style: TextStyle(fontSize: 14, color: c.text),
+                              style: TextStyle(
+                                fontSize: 14,
+                                color: c.text,
+                                fontWeight: unread ? FontWeight.w600 : null,
+                              ),
                             ),
                           ),
+                          if (unread)
+                            Semantics(
+                              label: tr('有新消息', 'New messages'),
+                              child: Container(
+                                width: 7,
+                                height: 7,
+                                margin: const EdgeInsets.only(left: Space.s6),
+                                decoration: BoxDecoration(
+                                  color: c.accent,
+                                  shape: BoxShape.circle,
+                                ),
+                              ),
+                            ),
                         ],
                       ),
                     ),
@@ -378,7 +408,10 @@ class ProjectRow extends StatelessWidget {
     final c = HubColors.of(context);
     return Hover(
       builder: (context, hovered) => Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
+        padding: const EdgeInsets.symmetric(
+          horizontal: Space.s6,
+          vertical: Space.s1,
+        ),
         child: Container(
           height: 36,
           decoration: BoxDecoration(
@@ -400,7 +433,9 @@ class ProjectRow extends StatelessWidget {
                     borderRadius: BorderRadius.circular(10),
                     onTap: onTap,
                     child: Padding(
-                      padding: const EdgeInsets.symmetric(horizontal: 10),
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: Space.s10,
+                      ),
                       child: Row(
                         children: [
                           Icon(
@@ -527,7 +562,12 @@ class AccountButton extends StatelessWidget {
           ),
           menuChildren: [
             Padding(
-              padding: const EdgeInsets.fromLTRB(14, 8, 14, 8),
+              padding: const EdgeInsets.fromLTRB(
+                Space.s14,
+                Space.s8,
+                Space.s14,
+                Space.s8,
+              ),
               child: Row(
                 children: [
                   Icon(
@@ -571,8 +611,8 @@ class AccountButton extends StatelessWidget {
             // Inset so the highlight keeps clear of the sidebar edges.
             child: Padding(
               padding: compact
-                  ? const EdgeInsets.all(8)
-                  : const EdgeInsets.all(6),
+                  ? const EdgeInsets.all(Space.s8)
+                  : const EdgeInsets.all(Space.s6),
               child: InkWell(
                 borderRadius: BorderRadius.circular(10),
                 onTap: () =>
@@ -583,12 +623,17 @@ class AccountButton extends StatelessWidget {
                     ? SizedBox(
                         width: double.infinity,
                         child: Padding(
-                          padding: const EdgeInsets.all(6),
+                          padding: const EdgeInsets.all(Space.s6),
                           child: Center(child: Avatar(hub.email)),
                         ),
                       )
                     : Padding(
-                        padding: const EdgeInsets.fromLTRB(8, 8, 8, 8),
+                        padding: const EdgeInsets.fromLTRB(
+                          Space.s8,
+                          Space.s8,
+                          Space.s8,
+                          Space.s8,
+                        ),
                         child: Row(
                           children: [
                             Avatar(hub.email),
@@ -645,7 +690,7 @@ class ConnectionStatus extends StatelessWidget {
         excludeSemantics: true,
         child: Tooltip(
           message: label,
-          child: Padding(padding: const EdgeInsets.all(8), child: dot),
+          child: Padding(padding: const EdgeInsets.all(Space.s8), child: dot),
         ),
       );
     }
@@ -661,7 +706,7 @@ class ConnectionStatus extends StatelessWidget {
         child: InkWell(
           customBorder: const CircleBorder(),
           onTap: onReconnect,
-          child: Padding(padding: const EdgeInsets.all(8), child: dot),
+          child: Padding(padding: const EdgeInsets.all(Space.s8), child: dot),
         ),
       ),
     );
@@ -688,7 +733,12 @@ class SectionHeader extends StatelessWidget {
       if (!p.collapsedSections.remove(id)) p.collapsedSections.add(id);
     });
     return Padding(
-      padding: const EdgeInsets.fromLTRB(6, 14, 8, 2),
+      padding: const EdgeInsets.fromLTRB(
+        Space.s6,
+        Space.s14,
+        Space.s8,
+        Space.s2,
+      ),
       child: Hover(
         builder: (context, hovered) => Row(
           children: [

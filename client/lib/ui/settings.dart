@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
+import '../browser.dart';
 import '../controller.dart';
 import '../l10n.dart';
 import '../prefs.dart';
@@ -13,6 +14,7 @@ import 'icons.dart';
 import 'login.dart';
 import 'model_picker.dart';
 import 'memories.dart';
+import 'plugins.dart';
 
 class _Section {
   final String id, group;
@@ -90,6 +92,13 @@ final _sections = [
     Icons.inventory_2_outlined,
     () => tr('数据控制', 'Data controls'),
     ['归档', 'archive', '导出', 'export', '数据', 'data'],
+  ),
+  _Section(
+    'plugins',
+    'integrations',
+    Icons.extension_outlined,
+    () => tr('插件', 'Plugins'),
+    ['插件', 'plugin', 'mcp', '工具', 'tool', 'skill', '技能', '命令', 'command'],
   ),
   _Section(
     'credentials',
@@ -181,7 +190,12 @@ class _SettingsPageState extends State<SettingsPage> {
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
             Padding(
-              padding: const EdgeInsets.fromLTRB(8, 8, 8, 4),
+              padding: const EdgeInsets.fromLTRB(
+                Space.s8,
+                Space.s8,
+                Space.s8,
+                Space.s4,
+              ),
               child: Row(
                 children: [
                   if (!narrow)
@@ -199,7 +213,12 @@ class _SettingsPageState extends State<SettingsPage> {
               onTap: () => Navigator.pop(context),
             ),
             Padding(
-              padding: const EdgeInsets.fromLTRB(8, 8, 8, 4),
+              padding: const EdgeInsets.fromLTRB(
+                Space.s8,
+                Space.s8,
+                Space.s8,
+                Space.s4,
+              ),
               child: SizedBox(
                 height: 38,
                 child: TextField(
@@ -211,7 +230,9 @@ class _SettingsPageState extends State<SettingsPage> {
                     prefixIconConstraints: const BoxConstraints(minWidth: 36),
                     filled: true,
                     fillColor: c.hover,
-                    contentPadding: const EdgeInsets.symmetric(vertical: 8),
+                    contentPadding: const EdgeInsets.symmetric(
+                      vertical: Space.s8,
+                    ),
                     border: OutlineInputBorder(
                       borderRadius: BorderRadius.circular(10),
                       borderSide: BorderSide.none,
@@ -230,7 +251,7 @@ class _SettingsPageState extends State<SettingsPage> {
             ),
             Expanded(
               child: ListView(
-                padding: const EdgeInsets.only(bottom: 16),
+                padding: const EdgeInsets.only(bottom: Space.s16),
                 children: [
                   for (final group in ['personal', 'account', 'integrations'])
                     if (list.any((s) => s.group == group)) ...[
@@ -286,7 +307,12 @@ class _SettingsPageState extends State<SettingsPage> {
           ),
           Expanded(
             child: SingleChildScrollView(
-              padding: const EdgeInsets.fromLTRB(20, 0, 20, 40),
+              padding: const EdgeInsets.fromLTRB(
+                Space.s20,
+                0,
+                Space.s20,
+                Space.s40,
+              ),
               child: Center(
                 child: ConstrainedBox(
                   constraints: const BoxConstraints(maxWidth: 600),
@@ -323,6 +349,7 @@ class _SettingsPageState extends State<SettingsPage> {
                           'usage' => _Usage(hub: widget.hub),
                           'data' => _Data(hub: widget.hub, app: widget.app),
                           'credentials' => _Credentials(hub: widget.hub),
+                          'plugins' => PluginSettings(hub: widget.hub),
                           _ => _Server(hub: widget.hub),
                         },
                       ),
@@ -374,20 +401,25 @@ class SettingsCard extends StatelessWidget {
   Widget build(BuildContext context) {
     final c = HubColors.of(context);
     return Padding(
-      padding: const EdgeInsets.only(bottom: 20),
+      padding: const EdgeInsets.only(bottom: Space.s20),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           if (title != null)
             Padding(
-              padding: const EdgeInsets.fromLTRB(4, 0, 4, 8),
+              padding: const EdgeInsets.fromLTRB(
+                Space.s4,
+                0,
+                Space.s4,
+                Space.s8,
+              ),
               child: Text(
                 title!,
                 style: TextStyle(fontSize: 13, color: c.subtle),
               ),
             ),
           Container(
-            padding: const EdgeInsets.symmetric(horizontal: 16),
+            padding: const EdgeInsets.symmetric(horizontal: Space.s16),
             decoration: BoxDecoration(
               borderRadius: BorderRadius.circular(16),
               border: Border.all(color: c.border),
@@ -422,7 +454,7 @@ class SettingRow extends StatelessWidget {
   Widget build(BuildContext context) {
     final c = HubColors.of(context);
     return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 12),
+      padding: const EdgeInsets.symmetric(vertical: Space.s12),
       child: Row(
         children: [
           Expanded(
@@ -489,7 +521,7 @@ class ChoicePill<T> extends StatelessWidget {
       ],
       child: Container(
         height: 34,
-        padding: const EdgeInsets.only(left: 14, right: 8),
+        padding: const EdgeInsets.only(left: Space.s14, right: Space.s8),
         decoration: BoxDecoration(
           borderRadius: BorderRadius.circular(17),
           border: Border.all(color: c.border),
@@ -540,7 +572,7 @@ class _LoaderState<T> extends State<_Loader<T>> {
       }
       if (!snap.hasData) {
         return Padding(
-          padding: const EdgeInsets.all(24),
+          padding: const EdgeInsets.all(Space.s24),
           child: Center(
             child: SizedBox(
               width: 18,
@@ -637,7 +669,7 @@ class _Appearance extends StatelessWidget {
                       child: Container(
                         width: 26,
                         height: 26,
-                        padding: const EdgeInsets.all(3),
+                        padding: const EdgeInsets.all(Space.s3),
                         decoration: BoxDecoration(
                           shape: BoxShape.circle,
                           border: Border.all(
@@ -749,7 +781,10 @@ class _Keyboard extends StatelessWidget {
       children: [
         for (final k in list)
           Container(
-            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+            padding: const EdgeInsets.symmetric(
+              horizontal: Space.s8,
+              vertical: Space.s3,
+            ),
             decoration: BoxDecoration(
               color: c.bubble,
               borderRadius: BorderRadius.circular(6),
@@ -859,8 +894,107 @@ class _Account extends StatelessWidget {
               ),
             ],
           ),
+          _Identities(hub: hub),
         ],
       ),
+    );
+  }
+}
+
+/// The other accounts the member signs in with: connect more, remove those not needed.
+class _Identities extends StatefulWidget {
+  final HubController hub;
+  const _Identities({required this.hub});
+  @override
+  State<_Identities> createState() => _IdentitiesState();
+}
+
+class _IdentitiesState extends State<_Identities> {
+  Map<String, dynamic>? data;
+  String error = '';
+  HubController get hub => widget.hub;
+
+  @override
+  void initState() {
+    super.initState();
+    load();
+  }
+
+  Future<void> load() async {
+    try {
+      final loaded = await hub.request('/me/identities');
+      if (mounted) setState(() => data = Map<String, dynamic>.from(loaded));
+    } catch (e) {
+      if (mounted) setState(() => error = errorText(e));
+    }
+  }
+
+  Future<void> act(Future<void> Function() task) async {
+    setState(() => error = '');
+    try {
+      await task();
+    } catch (e) {
+      if (mounted) setState(() => error = errorText(e));
+    }
+    await load();
+  }
+
+  /// Adds an account: the provider signs the member in and returns here.
+  Future<void> connect(String provider) async {
+    final ticket = await hub.request('/auth/ticket', body: {});
+    final returned = await signInElsewhere(
+      (returnTo) =>
+          '${hub.base}/auth/oauth/$provider/start?return_to=${Uri.encodeQueryComponent(returnTo)}'
+          '&link=${Uri.encodeQueryComponent('${ticket['ticket']}')}',
+    );
+    final failed = returned['login_error'];
+    if (failed != null) throw Exception(failed);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final c = HubColors.of(context);
+    final shown = data;
+    final providers = (shown?['providers'] as List? ?? []).cast<Map>();
+    final identities = (shown?['identities'] as List? ?? []).cast<Map>();
+    if (shown == null || (providers.isEmpty && identities.isEmpty)) {
+      return const SizedBox.shrink();
+    }
+    String label(String id) =>
+        '${providers.where((p) => p['id'] == id).firstOrNull?['label'] ?? id}';
+    return SettingsCard(
+      title: tr('其他登录方式', 'Other ways to sign in'),
+      children: [
+        for (final identity in identities)
+          SettingRow(
+            title: label('${identity['provider']}'),
+            subtitle: '${identity['email'] ?? identity['subject']}',
+            trailing: TextButton(
+              style: TextButton.styleFrom(foregroundColor: c.danger),
+              onPressed: () => act(
+                () => hub.request(
+                  '/me/identities/${Uri.encodeComponent('${identity['provider']}')}/${Uri.encodeComponent('${identity['subject']}')}',
+                  method: 'DELETE',
+                ),
+              ),
+              child: Text(tr('移除', 'Remove')),
+            ),
+          ),
+        for (final provider in providers)
+          if (!identities.any((i) => i['provider'] == provider['id']))
+            SettingRow(
+              title: '${provider['label']}',
+              trailing: OutlinedButton(
+                onPressed: () => act(() => connect('${provider['id']}')),
+                child: Text(tr('连接', 'Connect')),
+              ),
+            ),
+        if (error.isNotEmpty)
+          Padding(
+            padding: const EdgeInsets.only(bottom: Space.s8),
+            child: Text(error, style: TextStyle(color: c.danger)),
+          ),
+      ],
     );
   }
 }
@@ -1103,7 +1237,7 @@ class _CredentialsState extends State<_Credentials> {
           title: tr('添加凭据', 'Add a credential'),
           children: [
             Padding(
-              padding: const EdgeInsets.symmetric(vertical: 14),
+              padding: const EdgeInsets.symmetric(vertical: Space.s14),
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
@@ -1129,6 +1263,7 @@ class _CredentialsState extends State<_Credentials> {
                       options: const [
                         ('anthropic', 'Anthropic'),
                         ('openai', 'OpenAI'),
+                        ('gemini', 'Gemini'),
                       ],
                       onChanged: (v) => setState(() => provider = v),
                     ),
@@ -1143,7 +1278,7 @@ class _CredentialsState extends State<_Credentials> {
                   ),
                   if (error.isNotEmpty)
                     Padding(
-                      padding: const EdgeInsets.only(bottom: 8),
+                      padding: const EdgeInsets.only(bottom: Space.s8),
                       child: Text(error, style: TextStyle(color: c.danger)),
                     ),
                   Align(

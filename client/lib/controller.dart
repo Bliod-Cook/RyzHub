@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:collection';
 import 'dart:convert';
 import 'dart:math';
+import 'dart:typed_data';
 
 import 'package:crypto/crypto.dart';
 import 'package:flutter/foundation.dart';
@@ -12,8 +13,10 @@ import 'package:web_socket_channel/web_socket_channel.dart';
 import 'browser.dart';
 import 'l10n.dart';
 import 'prefs.dart';
+import 'push.dart';
 import 'rust/api.dart';
 import 'storage/cache.dart';
+import 'transport/event_stream.dart';
 
 const defaultServerUrl = String.fromEnvironment(
   'RYZHUB_SERVER_URL',
@@ -110,6 +113,19 @@ class PendingFile {
   bool get uploading => id == null && error == null;
 }
 
+/// An item of a timeline as the kernel hands it over: the item, and its text rendered into
+/// blocks and citation chips.
+class TimelineItem {
+  Map<String, dynamic> item;
+  List<dynamic> blocks;
+  List<dynamic> chips;
+  TimelineItem(this.item, [this.blocks = const [], this.chips = const []]);
+}
+
+/// The client's clock for the kernel's batches.
+final _clock = Stopwatch()..start();
+double _now() => _clock.elapsedMicroseconds / 1000;
+
 /// Platform IO only. Protobuf, ordering, deduplication and projection live in Rust.
 class HubController extends ChangeNotifier {
   HubController() : _connect = _openSocket;
@@ -122,8 +138,41 @@ class HubController extends ChangeNotifier {
   });
 
   final WebSocketChannel Function(Uri) _connect;
-  static WebSocketChannel _openSocket(Uri uri) =>
-      WebSocketChannel.connect(uri, protocols: ['ryzhub.v1.protobuf']);
+
+  /// Large frames from the server come compressed where it can; the kernel
+  /// tells them apart.
+  static WebSocketChannel _openSocket(Uri uri) => WebSocketChannel.connect(
+    uri,
+    protocols: ['ryzhub.v1.protobuf+zstd', 'ryzhub.v1.protobuf'],
+  );
+
+  /// WebSocket attempts that failed in a row: from [_fallbackAfter] on, the
+  /// next connection is an event stream, until one fails in turn.
+  int _socketFailures = 0;
+  static const _fallbackAfter = 3;
+  bool get _useEventStream =>
+      _socketFailures >= _fallbackAfter && capabilities['event_stream'] == true;
+
+  /// How this client is connected: `websocket` or `event-stream`.
+  String transport = 'websocket';
+
+  Future<void> _postFrame(String connection, Uint8List frame) async {
+    Future<http.Response> once() => _http
+        .post(
+          Uri.parse('$base/stream/$connection'),
+          headers: {
+            'Authorization': 'Bearer $token',
+            'Content-Type': 'application/octet-stream',
+          },
+          body: frame,
+        )
+        .timeout(const Duration(seconds: 15));
+    var response = await once();
+    if (response.statusCode == 401 && await _renew()) response = await once();
+    if (response.statusCode >= 400) {
+      throw http.ClientException('frame not taken: ${response.statusCode}');
+    }
+  }
 
   String base = defaultServerUrl;
   String token = '', user = '', org = '', selected = '', email = '';
@@ -161,6 +210,10 @@ class HubController extends ChangeNotifier {
   bool supports(String name) =>
       commandCatalog['capabilities']?[name] != null &&
       commandCatalog['capabilities']?[name] != 'unsupported';
+
+  /// The harness lacks [name] and the platform stands in for it.
+  bool emulated(String name) =>
+      commandCatalog['capabilities']?[name] == 'emulated';
   bool canFork(Map<String, dynamic> item) =>
       supports('fork') &&
       !running &&
@@ -170,7 +223,10 @@ class HubController extends ChangeNotifier {
       (settings['harness'] != 'codex' ||
           (commandCatalog['fork_points'] as List? ?? []).contains(item['id']));
   final List<Map<String, dynamic>> conversations = [];
-  final Map<String, Map<String, Map<String, dynamic>>> _items = {};
+
+  /// Timelines of the conversations shown: their items by id, and their rows.
+  final Map<String, Map<String, TimelineItem>> _timeline = {};
+  final Map<String, List<Map<String, dynamic>>> _rows = {};
   final Map<String, List<Map<String, dynamic>>> _actions = {};
   final Map<String, List<Map<String, dynamic>>> _runs = {};
   final Set<String> _historyLoading = {}, _historyExhausted = {};
@@ -183,8 +239,7 @@ class HubController extends ChangeNotifier {
   StreamSubscription<dynamic>? _subscription;
   StreamSubscription<List<ConnectivityResult>>? _network;
   bool _suspended = false;
-  Timer? _retry, _batch, _resend, _heartbeat;
-  final List<Uint8List> _frames = [];
+  Timer? _retry, _flush, _resend, _heartbeat;
   Future<void> _serial = Future.value();
   int _generation = 0, _attempt = 0;
   bool _closed = false;
@@ -237,6 +292,111 @@ class HubController extends ChangeNotifier {
   bool get signedIn => token.isNotEmpty;
   bool get isDraft => selected.isEmpty;
   String get channel => 'conv:$selected';
+  String get userChannel => 'user:$org:$user';
+
+  /// The server creates conversations by command, so a new chat can start
+  /// offline; older servers create them over HTTP first.
+  bool get canCreateRun => capabilities['create_run'] == true;
+  bool get canMarkRead => capabilities['unread'] == true;
+  bool get syncsDrafts => capabilities['drafts'] == true;
+
+  /// Conversations being created by command, by the command's id.
+  final Map<String, String> _creating = {};
+
+  /// Commands someone waits on, by command id: completed with the result.
+  final Map<String, Completer<Map<String, dynamic>>> _waiting = {};
+
+  /// How far the user has read each conversation, from their user channel.
+  final Map<String, int> _readStates = {};
+
+  /// Each channel's sequence as last received.
+  final Map<String, int> _cursors = {};
+
+  /// Read positions this device has sent, so each is sent once.
+  final Map<String, int> _marked = {};
+  Timer? _markRead;
+
+  /// Unsent messages by conversation, as the user's devices last synced them.
+  final Map<String, Map<String, dynamic>> drafts = {};
+
+  /// This device's id, to tell its own draft writes from other devices'.
+  String get device => _device;
+
+  /// The conversation has news since the user last read it.
+  bool unread(Map<String, dynamic> conversation) {
+    final id = conversation['id'];
+    if (id == selected) return false;
+    final activity = (conversation['activity_seq'] as num?)?.toInt() ?? 0;
+    return activity > (_readStates[id] ?? 0);
+  }
+
+  /// The open conversation shows its newest messages: it is read up to them.
+  /// Sent once the view has settled there.
+  void sawLatest() {
+    if (isDraft || searchFocusSeq != null || !canMarkRead) return;
+    final ch = channel, conv = selected;
+    bool behind() {
+      final seq = _cursors[ch] ?? 0;
+      return seq > (_readStates[conv] ?? 0) && seq > (_marked[conv] ?? 0);
+    }
+
+    if (!behind()) return;
+    _markRead?.cancel();
+    _markRead = Timer(const Duration(milliseconds: 800), () {
+      if (_closed || selected != conv || !behind()) return;
+      final seq = _cursors[ch]!;
+      _marked[conv] = seq;
+      _schedule(() => _core!.markRead(channel: ch, readSeq: seq));
+    });
+  }
+
+  /// Saves [text] as [conv]'s draft for the user's other devices; empty
+  /// clears it. Unchanged drafts are not sent again.
+  Future<void> saveDraft(String conv, String text) async {
+    if (!syncsDrafts || conv.isEmpty) return;
+    if ((drafts[conv]?['text'] ?? '') == text) return;
+    drafts[conv] = {'text': text, 'device_id': _device};
+    try {
+      await request(
+        '/orgs/$org/conversations/$conv/draft',
+        method: 'PUT',
+        body: {'text': text, 'device_id': _device},
+      );
+    } catch (_) {
+      // Kept here; the next edit sends it again.
+      drafts.remove(conv);
+    }
+  }
+
+  /// Undoes a memory change, through the command queue: retried until the
+  /// server answers, and undone once whatever retries it.
+  Future<void> undoMemory(String eventId) async {
+    if (capabilities['memory_undo_command'] != true) {
+      await request('/orgs/$org/memory-events/$eventId/undo', body: {});
+      return;
+    }
+    final result = await _await(
+      () => _core!.undoMemoryUpdate(channel: userChannel, eventId: eventId),
+    );
+    if (result['accepted'] != true) throw Exception(result['code']);
+  }
+
+  /// Queues a command and waits for the server's answer to it.
+  Future<Map<String, dynamic>> _await(Update Function() command) async {
+    final waiting = Completer<Map<String, dynamic>>();
+    await _schedule(() {
+      final update = command();
+      final cid = update.cid;
+      if (cid != null) _waiting[cid] = waiting;
+      return update;
+    });
+    return waiting.future.timeout(
+      const Duration(seconds: 30),
+      onTimeout: () => throw Exception(
+        tr('服务器暂未响应，稍后会重试', 'No answer yet; it will be retried'),
+      ),
+    );
+  }
 
   // The instance capabilities must advertise each action before the UI offers it.
   bool get canPin => capabilities['conversation_pin'] == true;
@@ -353,10 +513,10 @@ class HubController extends ChangeNotifier {
       final more = body is Map ? body['has_more'] == true : page.length >= 100;
       if (focused != null) {
         if (!_closed && view == _view && searchFocusSeq == focused) {
-          _searchItems = [
+          _focus([
             ...?_searchItems,
             ...page.map((v) => Map<String, dynamic>.from(v)),
-          ];
+          ]);
           _searchHasMore = more;
         }
         return;
@@ -364,7 +524,7 @@ class HubController extends ChangeNotifier {
       final task = _serial.then((_) async {
         if (_closed ||
             core != _core ||
-            !_items.containsKey(name) ||
+            !_timeline.containsKey(name) ||
             (_historyVersion[name] ?? 0) != version) {
           return;
         }
@@ -389,10 +549,32 @@ class HubController extends ChangeNotifier {
   List<Map<String, dynamic>> get items =>
       (searchFocusSeq != null
             ? [...?_searchItems]
-            : (_items[channel]?.values.toList() ?? []))
+            : [
+                for (final e in _timeline[channel]?.values ?? <TimelineItem>[])
+                  e.item,
+              ])
         ..sort(
           (a, b) => (a['first_seq'] as num).compareTo(b['first_seq'] as num),
         );
+
+  /// The rows the conversation shows: messages, and the steps of a run folded together.
+  List<Map<String, dynamic>> get rows =>
+      searchFocusSeq != null ? _searchRows : (_rows[channel] ?? const []);
+
+  /// What a subagent did for the call [id], in order.
+  List<Map<String, dynamic>> childrenOf(String id) {
+    final entries = searchFocusSeq != null
+        ? _searchEntries.values
+        : _timeline[channel]?.values ?? const <TimelineItem>[];
+    return [
+      for (final e in entries)
+        if (e.item['parent_item_id'] == id) e.item,
+    ]..sort((a, b) => (a['first_seq'] as num).compareTo(b['first_seq'] as num));
+  }
+
+  /// An item the rows name, with its rendered text.
+  TimelineItem? entry(String id) =>
+      searchFocusSeq != null ? _searchEntries[id] : _timeline[channel]?[id];
   List<Map<String, dynamic>> get actions =>
       (_actions[channel] ?? []).where((a) => a['status'] == 'pending').toList();
   bool get running => (_runs[channel] ?? []).any(
@@ -431,13 +613,16 @@ class HubController extends ChangeNotifier {
       conversations.where((c) => c['id'] == selected).firstOrNull?['mode'] ==
           'work';
   String get agentLabel => realWork
-      ? (settings['harness'] == 'claude' ? 'Claude Code' : 'Codex')
+      ? pathLabel(settings['harness'] as String? ?? 'codex')
       : realChat
       ? 'Chat'
       : tr('模拟 Agent', 'Mock agent');
   Future<void> refreshModels() async {
     try {
       orgModels = Map<String, dynamic>.from(await request('/orgs/$org/models'));
+      for (final g in workGroups) {
+        if (g['label'] is String) harnessLabels[g['harness']] = g['label'];
+      }
     } catch (_) {
       // Servers without the catalog keep their defaults; no picker is shown.
       orgModels = {};
@@ -656,6 +841,7 @@ class HubController extends ChangeNotifier {
   static const _exchanges = {
     '/auth/login',
     '/auth/register',
+    '/auth/oauth/exchange',
     '/auth/refresh',
     '/auth/logout',
   };
@@ -664,17 +850,22 @@ class HubController extends ChangeNotifier {
     String path, {
     Map<String, dynamic>? body,
     String? method,
+    Duration timeout = const Duration(seconds: 15),
   }) async {
-    var response = await _send(path, body, method);
+    var response = await _send(path, body, method, timeout);
     if (response.statusCode == 401 &&
         token.isNotEmpty &&
         !_exchanges.contains(path) &&
         await _renew()) {
-      response = await _send(path, body, method);
+      response = await _send(path, body, method, timeout);
     }
     final data = response.body.isEmpty ? null : jsonDecode(response.body);
     if (response.statusCode >= 400) {
-      throw Exception(data?['error'] ?? response.statusCode);
+      final code = data is Map ? data['error'] : null;
+      final message = data is Map ? data['message'] : null;
+      throw Exception(
+        message is String ? '$code\n$message' : code ?? response.statusCode,
+      );
     }
     return data;
   }
@@ -682,8 +873,9 @@ class HubController extends ChangeNotifier {
   Future<http.Response> _send(
     String path,
     Map<String, dynamic>? body,
-    String? method,
-  ) {
+    String? method, [
+    Duration timeout = const Duration(seconds: 15),
+  ]) {
     final headers = {
       'Content-Type': 'application/json',
       if (token.isNotEmpty) 'Authorization': 'Bearer $token',
@@ -691,26 +883,43 @@ class HubController extends ChangeNotifier {
     final url = Uri.parse('$base$path');
     return (method == 'PATCH'
             ? _http.patch(url, headers: headers, body: jsonEncode(body))
+            : method == 'PUT'
+            ? _http.put(url, headers: headers, body: jsonEncode(body))
             : method == 'DELETE'
             ? _http.delete(url, headers: headers)
             : body == null
             ? _http.get(url, headers: headers)
             : _http.post(url, headers: headers, body: jsonEncode(body)))
-        .timeout(const Duration(seconds: 15));
+        .timeout(timeout);
   }
 
-  /// Upload [size] bytes from [open] as [name] to the member's library. [open]
-  /// is called again if the access token has to be renewed first.
+  /// Library files larger than this go up in parts of this size; null when the
+  /// server takes whole files only.
+  int? get uploadPartBytes =>
+      (capabilities['attachments']?['part_bytes'] as num?)?.toInt();
+
+  /// Uploads in parts that a failure interrupted, by name and size: trying the
+  /// same file again resumes them.
+  final _resumable = <String, String>{};
+
+  /// Upload [size] bytes from [open] as [name] to the member's library, or to
+  /// [to] (a path that takes the same request). [open] is called again if the
+  /// access token has to be renewed first, or to resume an upload in parts.
   Future<Map<String, dynamic>> uploadFile(
     String name,
     int size,
-    Stream<List<int>> Function() open,
-  ) async {
+    Stream<List<int>> Function() open, {
+    String? to,
+  }) async {
+    final part = uploadPartBytes;
+    if (to == null && part != null && size > part) {
+      return _uploadInParts(name, size, open);
+    }
     Future<http.StreamedResponse> once() {
       final query = Uri(queryParameters: {'name': name}).query;
       final request = http.StreamedRequest(
         'POST',
-        Uri.parse('$base/orgs/$org/attachments?$query'),
+        Uri.parse('$base${to ?? '/orgs/$org/attachments'}?$query'),
       );
       request.headers['Authorization'] = 'Bearer $token';
       request.headers['Content-Type'] = 'application/octet-stream';
@@ -732,6 +941,108 @@ class HubController extends ChangeNotifier {
       throw Exception(data?['error'] ?? response.statusCode);
     }
     return Map<String, dynamic>.from(data);
+  }
+
+  /// An upload through `/uploads`: each part is sent, retried and, after a
+  /// failure, resumed on its own; the server then puts the file together.
+  Future<Map<String, dynamic>> _uploadInParts(
+    String name,
+    int size,
+    Stream<List<int>> Function() open,
+  ) async {
+    final key = '$size/$name';
+    Map<String, dynamic>? upload;
+    final known = _resumable[key];
+    if (known != null) {
+      try {
+        upload = Map<String, dynamic>.from(
+          await request('/orgs/$org/uploads/$known'),
+        );
+        if (upload['state'] != 'open') upload = null;
+      } catch (_) {
+        upload = null;
+      }
+    }
+    upload ??= Map<String, dynamic>.from(
+      await request('/orgs/$org/uploads', body: {'name': name, 'size': size}),
+    );
+    final id = upload['id'] as String;
+    _resumable[key] = id;
+    final received = {
+      for (final n in upload['received'] as List) (n as num).toInt(),
+    };
+    final urls = {
+      for (final u in upload['urls'] as List)
+        (u['n'] as num).toInt(): u['url'] as String,
+    };
+    var n = 0;
+    await for (final chunk in byteChunks(
+      open(),
+      (upload['part_size'] as num).toInt(),
+    )) {
+      n++;
+      if (received.contains(n)) continue;
+      final url = urls[n];
+      await _retrying(
+        () => url != null
+            ? _sendDirect(id, n, url, chunk)
+            : _sendPart(id, n, chunk),
+      );
+    }
+    final file = await request(
+      '/orgs/$org/uploads/$id/complete',
+      body: {},
+      timeout: const Duration(minutes: 2),
+    );
+    _resumable.remove(key);
+    return Map<String, dynamic>.from(file);
+  }
+
+  Future<void> _retrying(Future<void> Function() send) async {
+    for (var attempt = 1; ; attempt++) {
+      try {
+        return await send();
+      } catch (_) {
+        if (attempt == 3) rethrow;
+        await Future.delayed(Duration(seconds: attempt));
+      }
+    }
+  }
+
+  Future<void> _sendPart(String id, int n, Uint8List bytes) async {
+    Future<http.Response> once() => _http.put(
+      Uri.parse('$base/orgs/$org/uploads/$id/parts/$n'),
+      headers: {
+        'Authorization': 'Bearer $token',
+        'Content-Type': 'application/octet-stream',
+      },
+      body: bytes,
+    );
+    var response = await once();
+    if (response.statusCode == 401 && await _renew()) response = await once();
+    if (response.statusCode >= 400) {
+      String? code;
+      try {
+        code = jsonDecode(response.body)['error'];
+      } catch (_) {}
+      throw Exception(code ?? response.statusCode);
+    }
+  }
+
+  /// A part straight to the bucket. Browsers read the entity tag only if the
+  /// bucket's CORS rules expose `ETag`.
+  Future<void> _sendDirect(
+    String id,
+    int n,
+    String url,
+    Uint8List bytes,
+  ) async {
+    final response = await _http.put(Uri.parse(url), body: bytes);
+    final etag = response.headers['etag'];
+    if (response.statusCode >= 400 || etag == null) {
+      throw Exception('UPLOAD_PART_FAILED');
+    }
+    await request('/orgs/$org/uploads/$id/parts/$n/sent', body: {'etag': etag});
   }
 
   /// A file's bytes from [path], e.g. its preview or content.
@@ -1028,6 +1339,13 @@ class HubController extends ChangeNotifier {
     );
   }
 
+  /// Signs in with the code a sign-in with another account (OIDC, GitHub) came back with.
+  Future<void> loginWithCode(String server, String code) async {
+    base = sameSiteServer(server.replaceAll(RegExp(r'/+$'), ''));
+    capabilities = Map<String, dynamic>.from(await request('/capabilities'));
+    await _start(await request('/auth/oauth/exchange', body: {'code': code}));
+  }
+
   /// Signs this device back in to [server] with its refresh cookie. False
   /// when it has none or it lapsed, and on platforms that keep no session.
   Future<bool> restore(String server) async {
@@ -1059,20 +1377,7 @@ class HubController extends ChangeNotifier {
           CacheRecord(key: key, value: value),
       ],
     );
-    final restored =
-        jsonDecode(_core!.viewJson())['channels'] as Map<String, dynamic>;
-    for (final entry in restored.entries) {
-      _items[entry.key] = (entry.value['items'] as Map<String, dynamic>).map(
-        (id, value) => MapEntry(id, Map<String, dynamic>.from(value)),
-      );
-      _actions[entry.key] = (entry.value['actions'] as Map<String, dynamic>)
-          .values
-          .map((v) => Map<String, dynamic>.from(v))
-          .toList();
-      _runs[entry.key] = (entry.value['runs'] as Map<String, dynamic>).values
-          .map((v) => Map<String, dynamic>.from(v))
-          .toList();
-    }
+    // A conversation's cached timeline shows when it opens.
     await refreshConversations();
     await refreshProjects();
     await refreshModels();
@@ -1117,6 +1422,7 @@ class HubController extends ChangeNotifier {
     draftReasoning = null;
     temporary = false;
     searchFocusSeq = null;
+    _focus(null);
     this.project = project;
     final defaults = _projectDefaults;
     this.mode = mode ?? defaults?['mode'] ?? this.mode;
@@ -1188,9 +1494,9 @@ class HubController extends ChangeNotifier {
     if (_closed || view != _view) return;
     if (view == _view) {
       searchFocusSeq = seq;
-      _searchItems = (body['items'] as List)
-          .map((v) => Map<String, dynamic>.from(v))
-          .toList();
+      _focus([
+        for (final v in body['items'] as List) Map<String, dynamic>.from(v),
+      ]);
       _searchHasMore = body['has_more'] == true;
       notifyListeners();
     }
@@ -1198,12 +1504,39 @@ class HubController extends ChangeNotifier {
 
   void clearSearchFocus() {
     searchFocusSeq = null;
-    _searchItems = null;
+    _focus(null);
     notifyListeners();
+  }
+
+  List<Map<String, dynamic>> _searchRows = const [];
+  Map<String, TimelineItem> _searchEntries = const {};
+
+  /// Shows [items], a stretch of the conversation apart from its live timeline.
+  void _focus(List<Map<String, dynamic>>? items) {
+    _searchItems = items;
+    if (items == null) {
+      _searchRows = const [];
+      _searchEntries = const {};
+      return;
+    }
+    final snapshot = jsonDecode(timelineSnapshot(itemsJson: jsonEncode(items)));
+    _searchRows = [
+      for (final row in snapshot['rows'] as List)
+        Map<String, dynamic>.from(row),
+    ];
+    _searchEntries = {
+      for (final change in snapshot['items'] as List)
+        change['id'] as String: TimelineItem(
+          Map<String, dynamic>.from(change['item']),
+          change['blocks']?['blocks'] ?? const [],
+          change['chips'] ?? const [],
+        ),
+    };
   }
 
   Future<void> select(String id) async {
     searchFocusSeq = null;
+    _focus(null);
     final view = ++_view;
     libraryOpen = false;
     previewFiles = null;
@@ -1281,6 +1614,17 @@ class HubController extends ChangeNotifier {
     for (final result in jsonDecode(json) as List) {
       final cid = result['cid'] as String;
       final sent = _outbox.remove(cid);
+      if (result['retryable'] != true) {
+        _waiting.remove(cid)?.complete(Map<String, dynamic>.from(result));
+        final created = _creating.remove(cid);
+        // Refused, the conversation shown while it was created is not there.
+        if (created != null && result['accepted'] != true) {
+          conversations.removeWhere(
+            (c) => c['id'] == created && c['creating'] == true,
+          );
+          if (selected == created) startDraft();
+        }
+      }
       if (result['accepted'] == true) continue;
       if (result['retryable'] == true) {
         // The same command goes again.
@@ -1344,6 +1688,7 @@ class HubController extends ChangeNotifier {
   }) async {
     final files = [for (final f in carried) f['id'] as String];
     if (creating) return;
+    if (canCreateRun) return _createByCommand(text, carried, picked: picked);
     creating = true;
     notifyListeners();
     try {
@@ -1400,6 +1745,102 @@ class HubController extends ChangeNotifier {
       notifyListeners();
     }
   }
+
+  /// Creates the conversation and sends its first message as one command,
+  /// which waits in the queue while offline. The conversation shows at once.
+  Future<void> _createByCommand(
+    String text,
+    List<Map<String, dynamic>> carried, {
+    required bool picked,
+  }) async {
+    final files = [for (final f in carried) f['id'] as String];
+    final reasoning = draftReasoningLevels.contains(draftReasoning)
+        ? draftReasoning
+        : null;
+    final id = newConversationId(), ch = 'conv:$id';
+    final title = conversationTitle(
+      text.trim().isEmpty && picked && pendingFiles.isNotEmpty
+          ? pendingFiles.first.name
+          : text,
+    );
+    final settings = {
+      if (mode == 'work') 'harness': harness,
+      'model': ?draftModel,
+      'reasoning': ?reasoning,
+    };
+    final temporary = this.temporary && canTemporary;
+    // Shown until the server's list replaces it.
+    conversations.insert(0, {
+      'id': id,
+      'title': title,
+      'mode': mode,
+      'state': 'active',
+      'project_id': project,
+      'temporary': temporary,
+      'run_config': settings,
+      'creating': true,
+    });
+    final projectId = project;
+    _view++;
+    selected = id;
+    workspace = {};
+    commandCatalog = {};
+    draftReasoning = null;
+    this.temporary = false;
+    notifyListeners();
+    await _schedule(() {
+      final update = _core!.createRun(
+        channel: userChannel,
+        conversationId: id,
+        mode: mode,
+        runConfigJson: jsonEncode(settings),
+        projectId: projectId,
+        temporary: temporary,
+        title: title,
+        text: text,
+        attachmentIds: files,
+      );
+      final cid = update.cid;
+      if (cid != null) _creating[cid] = id;
+      return _remember(
+        update,
+        SentInput(channel: ch, text: text, files: carried),
+      );
+    });
+    // Queued after the CreateRun, it is held until the conversation exists.
+    await _schedule(() => _core!.subscribe(channel: ch));
+    _sent(files);
+  }
+
+  /// Runs a plugin's command here: its prompt, filled in by the server, as a message.
+  Future<void> invokeMenuCommand(
+    String installation,
+    String command,
+    Map<String, dynamic> params,
+  ) async {
+    if (isDraft) return;
+    final ch = channel;
+    await _schedule(
+      () => _core!.invokeMenuCommand(
+        channel: ch,
+        installationId: installation,
+        command: command,
+        paramsJson: jsonEncode(params),
+        attachmentIds: const [],
+      ),
+    );
+  }
+
+  /// Calls a plugin tool for an MCP App or a declarative component of tool item `item`.
+  Future<dynamic> pluginToolCall(
+    String item,
+    String tool,
+    Map<String, dynamic> arguments,
+  ) => request(
+    '/orgs/$org/conversations/$selected/tool-calls',
+    body: {'item_id': item, 'tool': tool, 'arguments': arguments},
+    timeout: const Duration(minutes: 2),
+  );
 
   Future<void> sideQuery(String text) async {
     if (isDraft) return;
@@ -1471,20 +1912,39 @@ class HubController extends ChangeNotifier {
       if (diff['revoked'] == true) {
         if (name == channel) {
           searchFocusSeq = null;
-          _searchItems = null;
+          _focus(null);
         }
-        _items.remove(name);
+        _timeline.remove(name);
+        _rows.remove(name);
         _actions.remove(name);
         _runs.remove(name);
         continue;
       }
-      if (diff['reset'] == true) _items[name] = {};
-      final items = _items.putIfAbsent(name, () => {});
-      for (final item in diff['items'] as List) {
-        items[item['id']] = Map<String, dynamic>.from(item);
-        if (name == channel && item['kind'] == 'notice') {
-          needsCommandRefresh = true;
+      final cursor = diff['cursor'];
+      if (cursor is int) _cursors[name] = cursor;
+      if (name == userChannel) {
+        final reads = diff['read_states'];
+        if (reads is Map) {
+          for (final MapEntry(:key, :value) in reads.entries) {
+            _readStates[key as String] = (value as num).toInt();
+          }
         }
+        final synced = diff['drafts'];
+        if (synced is Map) {
+          for (final MapEntry(:key, :value) in synced.entries) {
+            drafts[key as String] = Map<String, dynamic>.from(value as Map);
+          }
+        }
+      }
+      final timeline = diff['timeline'];
+      if (timeline is Map) {
+        for (final item in _applyTimeline(name, timeline)) {
+          if (name == channel && item['kind'] == 'notice') {
+            needsCommandRefresh = true;
+          }
+        }
+      }
+      for (final item in diff['items'] as List? ?? const []) {
         if (name == 'user:$org:$user' && item['kind'] == 'conversation') {
           final index = conversations.indexWhere((c) => c['id'] == item['id']);
           if (index < 0) {
@@ -1496,7 +1956,11 @@ class HubController extends ChangeNotifier {
             conversation['state'] = item['state'];
             // Items cached before pins were carried leave the pin alone.
             final pin = item['detail']?['kind']?['Conversation'];
-            if (pin != null) conversation['pinned_at_ms'] = pin['pinned_at_ms'];
+            if (pin != null) {
+              conversation['pinned_at_ms'] = pin['pinned_at_ms'];
+              conversation['activity_seq'] = pin['activity_seq'] ?? 0;
+            }
+            conversation.remove('creating');
           }
         }
       }
@@ -1526,7 +1990,78 @@ class HubController extends ChangeNotifier {
     _results(update.resultsJson);
     if (update.authExpiring) unawaited(_carryOver());
     _sendFrames(update.outboundFrames);
+    // Changes wait in the kernel to cross with what follows them.
+    final wait = update.flushInMs;
+    if (wait != null && _flush == null) {
+      _flush = Timer(Duration(milliseconds: wait), _drain);
+    }
     notifyListeners();
+  }
+
+  /// Applies a timeline's diffs; returns the items that came whole.
+  List<Map<String, dynamic>> _applyTimeline(String name, Map timeline) {
+    final entries = _timeline.putIfAbsent(name, () => {});
+    final rows = _rows.putIfAbsent(name, () => []);
+    for (final op in timeline['rows'] as List) {
+      switch (op['op']) {
+        case 'reset':
+          rows
+            ..clear()
+            ..addAll([
+              for (final row in op['rows'] as List)
+                Map<String, dynamic>.from(row),
+            ]);
+        case 'insert':
+          rows.insert(op['index'], Map<String, dynamic>.from(op['row']));
+        case 'set':
+          rows[op['index']] = Map<String, dynamic>.from(op['row']);
+        case 'remove':
+          rows.removeAt(op['index']);
+      }
+    }
+    for (final id in timeline['removed'] as List? ?? const []) {
+      entries.remove(id);
+    }
+    final whole = <Map<String, dynamic>>[];
+    for (final change in timeline['items'] as List) {
+      final id = change['id'] as String;
+      var entry = entries[id];
+      final item = change['item'];
+      if (item != null) {
+        final map = Map<String, dynamic>.from(item);
+        whole.add(map);
+        if (entry == null) {
+          entry = entries[id] = TimelineItem(map);
+        } else {
+          entry.item = map;
+        }
+      }
+      if (entry == null) continue;
+      final append = change['append'];
+      if (append is String) {
+        entry.item = {...entry.item, 'text': '${entry.item['text']}$append'};
+      }
+      final blocks = change['blocks'];
+      if (blocks is Map) {
+        final from = (blocks['from'] as num).toInt();
+        // Blocks before `from` are unchanged: they keep their widgets.
+        entry.blocks = [
+          ...entry.blocks.take(from),
+          ...blocks['blocks'] as List,
+        ];
+      }
+      final chips = change['chips'];
+      if (chips is List) entry.chips = chips;
+      // A running command's output so far, shown with its call.
+      final output = change['output'], more = change['output_append'];
+      if (output is String || more is String) {
+        final live = output is String
+            ? output
+            : '${entry.item['live_output'] ?? ''}$more';
+        entry.item = {...entry.item, 'live_output': live};
+      }
+    }
+    return whole;
   }
 
   static const _configErrors = {
@@ -1540,15 +2075,14 @@ class HubController extends ChangeNotifier {
     'POLICY_DENIED',
   };
 
+  /// Hands over what waits in the kernel's batch now.
   void _drain() {
-    _batch?.cancel();
-    _batch = null;
-    if (_frames.isEmpty || _closed) return;
-    final batch = List<Uint8List>.of(_frames);
-    _frames.clear();
+    _flush?.cancel();
+    _flush = null;
+    if (_closed || _core == null) return;
     _serial = _serial
         .then((_) async {
-          if (!_closed) await _apply(_core!.ingest(frames: batch));
+          if (!_closed) await _apply(_core!.flush(nowMs: _now()));
         })
         .catchError((Object e) {
           if (_closed) return;
@@ -1602,13 +2136,33 @@ class HubController extends ChangeNotifier {
       if (!_current(generation)) return;
       final ticket = await request('/auth/ticket', body: {});
       if (!_current(generation)) return;
-      final uri = Uri.parse('$base/ws').replace(
-        scheme: base.startsWith('https:') ? 'wss' : 'ws',
-        queryParameters: {'ticket': ticket['ticket']},
-      );
-      final socket = _connect(uri);
+      final stream = _useEventStream;
+      final WebSocketChannel socket;
+      if (stream) {
+        socket = EventStreamChannel(
+          Uri.parse('$base/stream').replace(
+            queryParameters: {'ticket': ticket['ticket'], 'device_id': _device},
+          ),
+          post: _postFrame,
+        );
+      } else {
+        socket = _connect(
+          Uri.parse('$base/ws').replace(
+            scheme: base.startsWith('https:') ? 'wss' : 'ws',
+            queryParameters: {'ticket': ticket['ticket']},
+          ),
+        );
+      }
       _socket = socket;
-      await socket.ready;
+      try {
+        await socket.ready;
+      } catch (_) {
+        // A failed event stream gives WebSockets another try.
+        _socketFailures = stream ? 0 : _socketFailures + 1;
+        rethrow;
+      }
+      if (!stream) _socketFailures = 0;
+      transport = stream ? 'event-stream' : 'websocket';
       if (!_current(generation)) {
         await socket.sink.close();
         return;
@@ -1620,8 +2174,18 @@ class HubController extends ChangeNotifier {
         (dynamic message) {
           if (!_current(generation)) return;
           _lastFrame = DateTime.now();
-          _frames.add(Uint8List.fromList((message as List).cast<int>()));
-          _batch ??= Timer(const Duration(milliseconds: 32), _drain);
+          final frame = Uint8List.fromList((message as List).cast<int>());
+          _serial = _serial
+              .then((_) async {
+                if (!_closed) {
+                  await _apply(_core!.ingest(frames: [frame], nowMs: _now()));
+                }
+              })
+              .catchError((Object e) {
+                if (_closed) return;
+                error = '$e';
+                notifyListeners();
+              });
         },
         onError: (Object e) {
           if (!_current(generation)) return;
@@ -1701,14 +2265,14 @@ class HubController extends ChangeNotifier {
     _closed = true;
     _generation++;
     _retry?.cancel();
-    _batch?.cancel();
+    _flush?.cancel();
     _resend?.cancel();
     _heartbeat?.cancel();
     final closing = _closeSocket();
     await _network?.cancel();
     await closing;
-    _frames.clear();
     await _serial;
+    await Push.stop(this);
     try {
       await request('/auth/logout', body: {});
     } catch (_) {
@@ -1722,7 +2286,8 @@ class HubController extends ChangeNotifier {
     _closed = true;
     _generation++;
     _retry?.cancel();
-    _batch?.cancel();
+    _flush?.cancel();
+    _markRead?.cancel();
     _resend?.cancel();
     _heartbeat?.cancel();
     _network?.cancel();
@@ -1731,4 +2296,20 @@ class HubController extends ChangeNotifier {
     _core?.dispose();
     super.dispose();
   }
+}
+
+/// [source] in chunks of exactly [size] bytes, the last one shorter.
+Stream<Uint8List> byteChunks(Stream<List<int>> source, int size) async* {
+  final buffer = BytesBuilder(copy: false);
+  await for (final data in source) {
+    var offset = 0;
+    while (offset < data.length) {
+      final room = size - buffer.length, left = data.length - offset;
+      final take = room < left ? room : left;
+      buffer.add(data.sublist(offset, offset + take));
+      offset += take;
+      if (buffer.length == size) yield buffer.takeBytes();
+    }
+  }
+  if (buffer.length > 0) yield buffer.takeBytes();
 }

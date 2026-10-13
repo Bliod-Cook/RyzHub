@@ -128,6 +128,7 @@ async fn execute(
             || matches!(
                 command,
                 Command::SendMessage(_)
+                    | Command::CreateRun(_)
                     | Command::DecideApproval(_)
                     | Command::Cancel(_)
                     | Command::MarkRead(_)
@@ -144,6 +145,45 @@ async fn execute(
             let input = runs::Input {
                 text: &message.text,
                 files: &message.attachment_ids,
+                user,
+            };
+            runs::create(tx, lease, envelope, input, RunKind::Main, engine, config).await?;
+        }
+        // Created with its conversation: the run configuration was set then.
+        Command::CreateRun(create) => {
+            let message = create
+                .first_message
+                .as_ref()
+                .context(Code::InvalidMessage)?;
+            let input = runs::Input {
+                text: &message.text,
+                files: &message.attachment_ids,
+                user,
+            };
+            runs::create(tx, lease, envelope, input, RunKind::Main, engine, config).await?;
+        }
+        Command::UndoMemoryUpdate(_) => anyhow::bail!(Code::InvalidCommand),
+        Command::InvokeMenuCommand(invoke) => {
+            let installation =
+                Uuid::parse_str(&invoke.installation_id).map_err(|_| Code::InvalidArguments)?;
+            let params: serde_json::Map<String, serde_json::Value> =
+                if invoke.params_json.is_empty() {
+                    serde_json::Map::new()
+                } else {
+                    serde_json::from_str(&invoke.params_json).map_err(|_| Code::InvalidArguments)?
+                };
+            let text = crate::plugins::command_prompt(
+                tx,
+                lease.org_id,
+                lease.conversation_id,
+                installation,
+                &invoke.command,
+                &params,
+            )
+            .await?;
+            let input = runs::Input {
+                text: &text,
+                files: &invoke.attachment_ids,
                 user,
             };
             runs::create(tx, lease, envelope, input, RunKind::Main, engine, config).await?;

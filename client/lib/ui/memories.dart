@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import '../controller.dart';
 import '../l10n.dart';
 import 'dialogs.dart';
+import '../tokens.g.dart';
 
 class MemorySettings extends StatefulWidget {
   final HubController hub;
@@ -220,7 +221,7 @@ class _MemorySettingsState extends State<MemorySettings> {
         ),
       if (!busy && items.isEmpty)
         Padding(
-          padding: const EdgeInsets.all(16),
+          padding: const EdgeInsets.all(Space.s16),
           child: Text(tr('暂无记忆', 'No memories yet')),
         ),
       for (final item in items)
@@ -281,12 +282,9 @@ class _MemorySettingsState extends State<MemorySettings> {
                               content: Text(tr('记忆已删除', 'Memory deleted')),
                               action: SnackBarAction(
                                 label: tr('撤销', 'Undo'),
-                                onPressed: () => run(() async {
-                                  await hub.request(
-                                    '/orgs/${hub.org}/memory-events/${result['event_id']}/undo',
-                                    body: {},
-                                  );
-                                }),
+                                onPressed: () => run(
+                                  () => hub.undoMemory('${result['event_id']}'),
+                                ),
                               ),
                             ),
                           );

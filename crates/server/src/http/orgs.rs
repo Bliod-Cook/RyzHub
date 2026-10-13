@@ -116,10 +116,11 @@ pub async fn models(
     let config = &app.config;
     let catalog = run_config::catalog(config);
     let list = |harness: &str| -> Vec<Value> {
-        let default = match harness {
+        let default = match (harness, run_config::acp(config, harness)) {
             _ if !config.llm.enabled => "mock",
-            "codex" => config.work.model.as_str(),
-            "claude" => config.work.claude_model.as_str(),
+            (_, Some(profile)) => profile.model.as_str(),
+            ("codex", _) => config.work.model.as_str(),
+            ("claude", _) => config.work.claude_model.as_str(),
             _ => config.llm.model.as_str(),
         };
         let allowed = policy
@@ -148,16 +149,18 @@ pub async fn models(
             })
             .collect()
     };
-    let harnesses: &[&str] = match (config.llm.enabled, config.work.enabled) {
-        (false, _) => &["codex"],
-        (true, true) => &["codex", "claude"],
-        (true, false) => &[],
+    let harnesses = match (config.llm.enabled, config.work.enabled) {
+        (false, _) => vec!["codex"],
+        (true, true) => run_config::work_harnesses(config),
+        (true, false) => vec![],
     };
     let work: Vec<Value> = harnesses
-        .iter()
+        .into_iter()
         .map(|harness| (harness, list(harness)))
         .filter(|(_, models)| !models.is_empty())
-        .map(|(harness, models)| json!({"harness":harness,"models":models}))
+        .map(|(harness, models)| {
+            json!({"harness":harness,"label":run_config::harness_label(config, harness),"models":models})
+        })
         .collect();
     Ok(Json(json!({"chat":list("chat"),"work":work})))
 }

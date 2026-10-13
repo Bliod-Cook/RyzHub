@@ -32,92 +32,19 @@ impl Store {
         project: Option<Uuid>,
         config: Option<&Config>,
     ) -> anyhow::Result<Conversation> {
-        ensure!(
-            matches!(mode, "" | "chat" | "work") && !title.trim().is_empty() && title.len() <= 256,
-            Code::InvalidConversation
-        );
         let mut tx = self.tx(ctx.org_id).await?;
-        let ctx = context_in(&mut tx, ctx.user_id, ctx.org_id).await?;
-        authorize(
-            &Principal::User(ctx.clone()),
-            Action::UseConversation,
-            &Resource {
-                org_id: ctx.org_id,
-                id: ctx.org_id,
-                owner_user_id: Some(ctx.user_id),
-                target_role: None,
-            },
-        )
-        .map_err(|_| Code::Forbidden)?;
-        let (mode, mut settings) = match project {
-            Some(project) => {
-                if let Some(config) = config {
-                    let policy = effective_policy(&mut tx, &config.policy, ctx.org_id).await?;
-                    ensure!(policy.allow_projects != Some(false), Code::PolicyDenied);
-                }
-                apply_project_defaults(&mut tx, &ctx, project, mode, settings).await?
-            }
-            None => (mode.to_owned(), settings),
-        };
-        let mode = if mode.is_empty() { "chat".into() } else { mode };
-        ensure!(matches!(mode.as_str(), "chat" | "work"), Code::InvalidMode);
-        let temporary = settings
-            .as_object_mut()
-            .and_then(|s| s.remove("temporary"))
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        if let Some(config) = config {
-            let resolved = RunConfig::resolve(settings, &mode, config)?;
-            resolved.validate(&mut tx, ctx.org_id, config).await?;
-            settings = serde_json::to_value(resolved)?;
-        }
-        let id = Uuid::now_v7();
-        let conversation: Conversation = sqlx::query_as(concat!(
-            "INSERT INTO conversations(id,org_id,creator_id,title,mode,run_config,project_id,temporary,expires_at)
-             VALUES($1,$2,$3,$4,$5,$6,$7,$8,CASE WHEN $8 THEN now()+interval '30 days' END) RETURNING ",
-            conversation_columns!()
-        ))
-        .bind(id)
-        .bind(ctx.org_id)
-        .bind(ctx.user_id)
-        .bind(title)
-        .bind(&mode)
-        .bind(settings)
-        .bind(project)
-        .bind(temporary)
-        .fetch_one(&mut *tx)
-        .await?;
-        sqlx::query(
-            "INSERT INTO channels(id,org_id,kind,conversation_id,writer_epoch) VALUES($1,$2,'conv',$3,0)",
-        )
-        .bind(format!("conv:{id}"))
-        .bind(ctx.org_id)
-        .bind(id)
-        .execute(&mut *tx)
-        .await?;
-        append(
+        let conversation = create_in(
             &mut tx,
-            ctx.org_id,
-            &format!("user:{}:{}", ctx.org_id, ctx.user_id),
-            None,
-            "",
-            Event::ItemUpserted(conversation_item(
-                id,
-                1,
-                "active".into(),
-                title.into(),
-                None,
-            )),
+            ctx,
+            Uuid::now_v7(),
+            title,
+            mode,
+            settings,
+            project,
+            config,
         )
-        .await?;
-        audit(
-            &mut tx,
-            &ctx,
-            "conversation.create",
-            &id.to_string(),
-            "allowed",
-        )
-        .await?;
+        .await?
+        .context(Code::ConversationIdTaken)?;
         tx.commit().await?;
         Ok(conversation)
     }
@@ -142,6 +69,98 @@ impl Store {
         tx.commit().await?;
         Ok(list)
     }
+}
+
+/// Create conversation `id` in `tx`: None when a conversation already has that id. See
+/// [`Store::create_configured`].
+#[allow(clippy::too_many_arguments)]
+pub async fn create_in(
+    tx: &mut Tx<'_>,
+    ctx: &OrgContext,
+    id: Uuid,
+    title: &str,
+    mode: &str,
+    settings: Value,
+    project: Option<Uuid>,
+    config: Option<&Config>,
+) -> anyhow::Result<Option<Conversation>> {
+    ensure!(
+        matches!(mode, "" | "chat" | "work") && !title.trim().is_empty() && title.len() <= 256,
+        Code::InvalidConversation
+    );
+    let ctx = context_in(tx, ctx.user_id, ctx.org_id).await?;
+    authorize(
+        &Principal::User(ctx.clone()),
+        Action::UseConversation,
+        &Resource {
+            org_id: ctx.org_id,
+            id: ctx.org_id,
+            owner_user_id: Some(ctx.user_id),
+            target_role: None,
+        },
+    )
+    .map_err(|_| Code::Forbidden)?;
+    let (mode, mut settings) = match project {
+        Some(project) => {
+            if let Some(config) = config {
+                let policy = effective_policy(tx, &config.policy, ctx.org_id).await?;
+                ensure!(policy.allow_projects != Some(false), Code::PolicyDenied);
+            }
+            apply_project_defaults(tx, &ctx, project, mode, settings).await?
+        }
+        None => (mode.to_owned(), settings),
+    };
+    let mode = if mode.is_empty() { "chat".into() } else { mode };
+    ensure!(matches!(mode.as_str(), "chat" | "work"), Code::InvalidMode);
+    let temporary = settings
+        .as_object_mut()
+        .and_then(|s| s.remove("temporary"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if let Some(config) = config {
+        let resolved = RunConfig::resolve(settings, &mode, config)?;
+        resolved.validate(tx, ctx.org_id, config).await?;
+        settings = serde_json::to_value(resolved)?;
+    }
+    // An id taken in any organization is taken.
+    let conversation: Option<Conversation> = sqlx::query_as(concat!(
+        "INSERT INTO conversations(id,org_id,creator_id,title,mode,run_config,project_id,temporary,expires_at)
+         VALUES($1,$2,$3,$4,$5,$6,$7,$8,CASE WHEN $8 THEN now()+interval '30 days' END)
+         ON CONFLICT(id) DO NOTHING RETURNING ",
+        conversation_columns!()
+    ))
+    .bind(id)
+    .bind(ctx.org_id)
+    .bind(ctx.user_id)
+    .bind(title)
+    .bind(&mode)
+    .bind(settings)
+    .bind(project)
+    .bind(temporary)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some(conversation) = conversation else {
+        return Ok(None);
+    };
+    sqlx::query(
+        "INSERT INTO channels(id,org_id,kind,conversation_id,writer_epoch) VALUES($1,$2,'conv',$3,0)",
+    )
+    .bind(format!("conv:{id}"))
+    .bind(ctx.org_id)
+    .bind(id)
+    .execute(&mut **tx)
+    .await?;
+    append(
+        tx,
+        ctx.org_id,
+        &format!("user:{}:{}", ctx.org_id, ctx.user_id),
+        None,
+        "",
+        Event::ItemUpserted(conversation_item(&conversation, 1)),
+    )
+    .await?;
+    audit(tx, &ctx, "conversation.create", &id.to_string(), "allowed").await?;
+    Ok(Some(conversation))
 }
 
 /// Project defaults describe one path (mode, harness, model). A request for a different mode,

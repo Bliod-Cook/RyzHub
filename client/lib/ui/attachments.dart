@@ -491,7 +491,12 @@ class PendingFiles extends StatelessWidget {
           Container(
             key: ObjectKey(file),
             constraints: const BoxConstraints(maxWidth: 240),
-            padding: const EdgeInsets.fromLTRB(6, 6, 2, 6),
+            padding: const EdgeInsets.fromLTRB(
+              Space.s6,
+              Space.s6,
+              Space.s2,
+              Space.s6,
+            ),
             decoration: BoxDecoration(
               color: c.background,
               borderRadius: BorderRadius.circular(12),
@@ -553,7 +558,7 @@ class PendingFiles extends StatelessWidget {
                 ),
                 if (file.uploading)
                   const Padding(
-                    padding: EdgeInsets.symmetric(horizontal: 8),
+                    padding: EdgeInsets.symmetric(horizontal: Space.s8),
                     child: SizedBox(
                       width: 14,
                       height: 14,
@@ -628,7 +633,12 @@ class MessageFiles extends StatelessWidget {
                 onTap: open,
                 child: Container(
                   constraints: const BoxConstraints(maxWidth: 260),
-                  padding: const EdgeInsets.fromLTRB(8, 8, 12, 8),
+                  padding: const EdgeInsets.fromLTRB(
+                    Space.s8,
+                    Space.s8,
+                    Space.s12,
+                    Space.s8,
+                  ),
                   decoration: BoxDecoration(
                     borderRadius: BorderRadius.circular(12),
                     border: Border.all(color: c.border),
@@ -806,14 +816,19 @@ class _LibraryDialogState extends State<_LibraryDialog> {
     final c = HubColors.of(context);
     final full = chosen.length >= room;
     return Dialog(
-      insetPadding: const EdgeInsets.all(24),
+      insetPadding: const EdgeInsets.all(Space.s24),
       child: ConstrainedBox(
         constraints: const BoxConstraints(maxWidth: 600, maxHeight: 620),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
             Padding(
-              padding: const EdgeInsets.fromLTRB(24, 16, 12, 12),
+              padding: const EdgeInsets.fromLTRB(
+                Space.s24,
+                Space.s16,
+                Space.s12,
+                Space.s12,
+              ),
               child: Row(
                 children: [
                   Expanded(
@@ -835,7 +850,7 @@ class _LibraryDialogState extends State<_LibraryDialog> {
               ),
             ),
             Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 24),
+              padding: const EdgeInsets.symmetric(horizontal: Space.s24),
               child: FileSearchField(
                 autofocus: true,
                 onSearch: (query) {
@@ -860,7 +875,12 @@ class _LibraryDialogState extends State<_LibraryDialog> {
                       ),
                     )
                   : ListView(
-                      padding: const EdgeInsets.fromLTRB(14, 4, 14, 8),
+                      padding: const EdgeInsets.fromLTRB(
+                        Space.s14,
+                        Space.s4,
+                        Space.s14,
+                        Space.s8,
+                      ),
                       children: [
                         for (final file in files)
                           _LibraryRow(
@@ -890,7 +910,12 @@ class _LibraryDialogState extends State<_LibraryDialog> {
                       decoration: BoxDecoration(
                         border: Border(top: BorderSide(color: c.border)),
                       ),
-                      padding: const EdgeInsets.fromLTRB(24, 12, 20, 16),
+                      padding: const EdgeInsets.fromLTRB(
+                        Space.s24,
+                        Space.s12,
+                        Space.s20,
+                        Space.s16,
+                      ),
                       child: Row(
                         children: [
                           Expanded(
@@ -970,8 +995,8 @@ class _LibraryRow extends StatelessWidget {
               onTap: onTap,
               child: Padding(
                 padding: const EdgeInsets.symmetric(
-                  horizontal: 10,
-                  vertical: 9,
+                  horizontal: Space.s10,
+                  vertical: Space.s9,
                 ),
                 child: Row(
                   children: [

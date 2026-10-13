@@ -1,4 +1,5 @@
 //! Real PostgreSQL, NATS and containerd; only the paid model upstream is a protocol fixture.
+mod common;
 use anyhow::{Context, ensure};
 use axum::{
     Json, Router,
@@ -47,7 +48,7 @@ async fn upstream(
     ];
     if !result && body.get("tools").is_some() && prompt.contains("exec") {
         let command = if prompt.contains("proxyexec") {
-            r#"sleep 2; wget -qO- --header 'Content-Type: application/json' --post-data '{"model":"fixture-model","max_tokens":32,"stream":true,"messages":[{"role":"user","content":"guest local proxy"}]}' http://127.0.0.1:8090/v1/messages"#
+            r#"sleep 2; wget -Y off -qO- --header 'Content-Type: application/json' --post-data '{"model":"fixture-model","max_tokens":32,"stream":true,"messages":[{"role":"user","content":"guest local proxy"}]}' http://127.0.0.1:8090/v1/messages"#
         } else {
             "printf once >> marker; sleep 1; printf '真实沙箱结果'"
         };
@@ -119,6 +120,12 @@ impl Harness {
             "postgres://postgres:local-development-only@127.0.0.1:55432/postgres".into()
         });
         let admin = PgPool::connect(&admin_url).await?;
+        common::sweep(
+            &admin,
+            admin_url.rsplit_once('/').unwrap().0,
+            &common::host_socket(),
+        )
+        .await;
         let name = format!("ryzhub_test_{}", Uuid::now_v7().simple());
         sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {name}")))
             .execute(&admin)
@@ -312,19 +319,11 @@ impl Harness {
         .await?)
     }
     async fn close(self) -> anyhow::Result<()> {
-        let sandboxes: Vec<(Uuid, i64)> = sqlx::query_as("SELECT id,exec_epoch FROM sandboxes")
-            .fetch_all(&self.db)
-            .await?;
-        for (id, epoch) in sandboxes {
-            let _ = ryzhub_execution::call(
-                std::path::Path::new(&self.app.config.sandbox.host_socket),
-                &ryzhub_execution::HostCommand::Destroy {
-                    sandbox_id: id,
-                    exec_epoch: (epoch + 100) as u64,
-                },
-            )
-            .await;
-        }
+        common::release(
+            &self.db,
+            std::path::Path::new(&self.app.config.sandbox.host_socket),
+        )
+        .await;
         if let Some(path) = &self.app.config.llm.unix_socket {
             let _ = std::fs::remove_file(path);
         }
@@ -1125,6 +1124,42 @@ async fn s3_sigv4_storage_roundtrip_and_authentication() -> anyhow::Result<()> {
     store.put(&large_key, &large).await?;
     assert_eq!(store.get(&large_key).await?, large);
     store.delete(&large_key).await?;
+    // Clients send parts straight to the bucket over presigned URLs; a URL works only for the
+    // part it was signed for.
+    assert!(store.direct());
+    let target = format!("{:x}", Sha256::digest(b"direct target"));
+    let upload = store.start_direct(&target).await?;
+    let (first, second) = (vec![7u8; 5 * 1024 * 1024], b"tail".to_vec());
+    let mut etags = vec![];
+    for (n, part) in [(1, &first), (2, &second)] {
+        let url = store
+            .presign_part(&target, &upload, n, Duration::from_secs(600))
+            .await?;
+        let tampered = url.replace(&format!("partNumber={n}"), "partNumber=9");
+        let refused = reqwest::Client::new()
+            .put(&tampered)
+            .body(part.clone())
+            .send()
+            .await?;
+        assert_eq!(refused.status(), 403, "signed for another part");
+        let sent = reqwest::Client::new()
+            .put(&url)
+            .body(part.clone())
+            .send()
+            .await?
+            .error_for_status()?;
+        etags.push(sent.headers()["etag"].to_str()?.to_owned());
+    }
+    store.finish_direct(&target, &upload, etags).await?;
+    let (size, mut reader) = store.open(&target).await?;
+    let mut assembled = vec![];
+    tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut assembled).await?;
+    assert_eq!(size as usize, first.len() + second.len());
+    assert_eq!(&assembled[..first.len()], first.as_slice());
+    assert_eq!(&assembled[first.len()..], second.as_slice());
+    store.delete(&target).await?;
+    let abandoned = store.start_direct(&target).await?;
+    store.abort_direct(&target, &abandoned).await?;
     config.as_file_mut().set_len(0)?;
     use std::io::{Seek, SeekFrom};
     config.as_file_mut().seek(SeekFrom::Start(0))?;
@@ -1185,6 +1220,246 @@ async fn native_command_approval_is_durable_and_executes_once() -> anyhow::Resul
     assert_eq!(result["stdout_head"], "native-once");
     let tool:String=sqlx::query_scalar("SELECT text FROM items WHERE run_id=$1 AND kind='tool' AND state='completed' ORDER BY last_seq DESC LIMIT 1").bind(run).fetch_one(&h.db).await?;
     assert!(tool.contains("native-once"));
+    owner.kill().await?;
+    h.close().await
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL/NATS, containerd and Codex"]
+async fn a_work_terminal_runs_commands_resumes_detached_and_is_cut_by_fencing() -> anyhow::Result<()>
+{
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::{Message as Ws, client::IntoClientRequest};
+    let h = Harness::new().await?;
+    let user = h.user().await?;
+    let (org, conv) = (id(&user, "org_id"), h.conversation(&user).await?);
+    let mut owner = h.owner()?;
+    h.send(&user, conv, message("hello codex")).await?;
+    h.wait_state(conv, "completed").await?;
+    let token = user["token"].as_str().unwrap().to_owned();
+    let connect = |since: u64| {
+        let url = format!(
+            "{}/orgs/{org}/conversations/{conv}/terminal?cols=100&rows=30&since={since}",
+            h.base.replacen("http", "ws", 1)
+        );
+        let token = token.clone();
+        async move {
+            let mut request = url.into_client_request()?;
+            request
+                .headers_mut()
+                .insert("authorization", format!("Bearer {token}").parse()?);
+            let (socket, _) = tokio_tungstenite::connect_async(request).await?;
+            anyhow::Ok(socket)
+        }
+    };
+    // Output until `needle` appears, and how many bytes that was.
+    async fn until(
+        socket: &mut (
+                 impl futures_util::Stream<Item = Result<Ws, tokio_tungstenite::tungstenite::Error>>
+                 + Unpin
+             ),
+        needle: &str,
+    ) -> anyhow::Result<Vec<u8>> {
+        let mut seen = Vec::new();
+        while !String::from_utf8_lossy(&seen).contains(needle) {
+            match tokio::time::timeout(Duration::from_secs(15), socket.next()).await? {
+                Some(Ok(Ws::Binary(bytes))) => seen.extend_from_slice(&bytes),
+                Some(Ok(_)) => {}
+                other => anyhow::bail!("terminal ended early: {other:?}"),
+            }
+        }
+        Ok(seen)
+    }
+
+    let mut socket = connect(0).await?;
+    let attached = socket.next().await.context("attached")??;
+    assert_eq!(
+        serde_json::from_str::<Value>(attached.to_text()?)?["attached"]["start"],
+        0
+    );
+    socket
+        .send(Ws::Binary(
+            b"cd /workspace && echo term-$((6*7))\r".to_vec().into(),
+        ))
+        .await?;
+    let first = until(&mut socket, "term-42").await?;
+    socket
+        .send(Ws::Text(
+            json!({"resize": {"cols": 120, "rows": 40}})
+                .to_string()
+                .into(),
+        ))
+        .await?;
+    socket
+        .send(Ws::Binary(b"stty size\r".to_vec().into()))
+        .await?;
+    let sized = until(&mut socket, "40 120").await?;
+    let offset = (first.len() + sized.len()) as u64;
+    // Leaving detaches; reconnecting from the offset seen continues without replaying it.
+    drop(socket);
+    let mut socket = connect(offset).await?;
+    socket.next().await.context("attached")??;
+    socket
+        .send(Ws::Binary(b"echo again-$((1+1))\r".to_vec().into()))
+        .await?;
+    let resumed = until(&mut socket, "again-2").await?;
+    assert!(
+        !String::from_utf8_lossy(&resumed).contains("term-42"),
+        "replayed seen output"
+    );
+    // A newer execution epoch cuts the connection.
+    let (sandbox, epoch): (Uuid, i64) = sqlx::query_as(
+        "SELECT id,exec_epoch FROM sandboxes WHERE conversation_id=$1 AND state='running'",
+    )
+    .bind(conv)
+    .fetch_one(&h.db)
+    .await?;
+    let fence = ryzhub_execution::HostCommand::Guest {
+        request: ryzhub_execution::GuestRequest {
+            sandbox_id: sandbox,
+            exec_epoch: epoch as u64 + 1,
+            command: ryzhub_execution::GuestCommand::Fence,
+        },
+    };
+    ryzhub_server::sandbox::host(&h.app, org, sandbox, fence).await?;
+    let cut = loop {
+        match tokio::time::timeout(Duration::from_secs(10), socket.next()).await? {
+            Some(Ok(Ws::Binary(_))) => continue,
+            other => break other,
+        }
+    };
+    assert!(
+        matches!(cut, None | Some(Ok(Ws::Close(_))) | Some(Err(_))),
+        "{cut:?}"
+    );
+    sqlx::query("UPDATE sandboxes SET exec_epoch=$2 WHERE id=$1")
+        .bind(sandbox)
+        .bind(epoch + 1)
+        .execute(&h.db)
+        .await?;
+    // Under the new epoch the same session is still there; closing ends its shell.
+    let mut socket = connect(0).await?;
+    socket.next().await.context("attached")??;
+    until(&mut socket, "again-2").await?;
+    socket
+        .send(Ws::Text(json!({"close": true}).to_string().into()))
+        .await?;
+    owner.kill().await?;
+    owner.wait().await?;
+    h.close().await
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL/NATS/containerd and actual Codex binary"]
+async fn idle_work_archives_through_its_job_and_a_purged_workspace_cannot_restore()
+-> anyhow::Result<()> {
+    let h = Harness::new().await?;
+    let worker = PgPool::connect(&h.worker_url).await?;
+    let user = h.user().await?;
+    let conv = h.conversation(&user).await?;
+    let org = id(&user, "org_id");
+    let mut owner = h.owner()?;
+    h.send(&user, conv, message("hello codex")).await?;
+    h.wait_state(conv, "completed").await?;
+    let mut head: Option<Uuid> = None;
+    for _ in 0..600 {
+        head = sqlx::query_scalar(
+            "SELECT checkpoint_id FROM workspace_heads WHERE conversation_id=$1 AND checkpoint_id IS NOT NULL",
+        )
+        .bind(conv)
+        .fetch_optional(&h.db)
+        .await?;
+        if head.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    head.context("turn checkpoint")?;
+    wait_workspace_idle(&h, conv).await?;
+    sqlx::query(
+        "UPDATE org_policies SET policy=policy||'{\"auto_archive_after_secs\":3600,\"archive_retention_secs\":3600}'
+         WHERE org_id=$1",
+    )
+    .bind(org)
+    .execute(&h.db)
+    .await?;
+    sqlx::query("UPDATE conversations SET created_at=now()-interval '2 hours' WHERE id=$1")
+        .bind(conv)
+        .execute(&h.db)
+        .await?;
+    sqlx::query(
+        "UPDATE runs SET started_at=now()-interval '2 hours',ended_at=now()-interval '2 hours'
+         WHERE conversation_id=$1",
+    )
+    .bind(conv)
+    .execute(&h.db)
+    .await?;
+    ryzhub_server::lifecycle::sweep(&h.app, &worker).await?;
+    let queued: String = sqlx::query_scalar(
+        "SELECT kind FROM workspace_jobs WHERE conversation_id=$1 ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(conv)
+    .fetch_one(&h.db)
+    .await?;
+    assert_eq!(
+        queued, "archive",
+        "a running workspace archives through its job"
+    );
+    let mut archived = false;
+    for _ in 0..600 {
+        archived = sqlx::query_scalar(
+            "SELECT state='archived' AND archived_at IS NOT NULL FROM conversations WHERE id=$1",
+        )
+        .bind(conv)
+        .fetch_one(&h.db)
+        .await?;
+        if archived {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(archived, "archived after its checkpoint");
+    let (stored, sandbox): (String, String) = sqlx::query_as(
+        "SELECT h.storage_state,s.state FROM workspace_heads h JOIN sandboxes s
+         ON s.conversation_id=h.conversation_id AND s.persistent
+         WHERE h.conversation_id=$1 ORDER BY s.created_at DESC LIMIT 1",
+    )
+    .bind(conv)
+    .fetch_one(&h.db)
+    .await?;
+    assert_eq!((stored.as_str(), sandbox.as_str()), ("cold", "archived"));
+
+    sqlx::query("UPDATE conversations SET archived_at=now()-interval '2 hours' WHERE id=$1")
+        .bind(conv)
+        .execute(&h.db)
+        .await?;
+    ryzhub_server::lifecycle::sweep(&h.app, &worker).await?;
+    let (stored, head): (String, Option<Uuid>) = sqlx::query_as(
+        "SELECT storage_state,checkpoint_id FROM workspace_heads WHERE conversation_id=$1",
+    )
+    .bind(conv)
+    .fetch_one(&h.db)
+    .await?;
+    assert_eq!((stored.as_str(), head), ("deleted", None));
+    let left: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM checkpoints WHERE conversation_id=$1 AND state<>'deleted'",
+    )
+    .bind(conv)
+    .fetch_one(&h.db)
+    .await?;
+    assert_eq!(left, 0);
+    let refused = reqwest::Client::new()
+        .post(format!(
+            "{}/orgs/{org}/conversations/{conv}/workspace",
+            h.base
+        ))
+        .bearer_auth(user["token"].as_str().unwrap())
+        .json(&json!({"kind":"restore"}))
+        .send()
+        .await?;
+    assert_eq!(refused.status(), 409);
+    assert_eq!(refused.json::<Value>().await?["error"], "WORKSPACE_PURGED");
+    worker.close().await;
     owner.kill().await?;
     h.close().await
 }

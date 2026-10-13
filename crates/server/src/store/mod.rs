@@ -5,9 +5,10 @@ mod conversations;
 mod events;
 mod rows;
 
+pub use conversations::create_in;
 pub use events::{
     MAX_DETAIL_FIELD, MAX_ITEM_TEXT, append, conversation_item, events_between, head_seq,
-    lock_lease, truncate_utf8, upsert_item,
+    lock_lease, publish_conversation, truncate_utf8, upsert_item,
 };
 pub use rows::{ActionRow, Conversation, ItemRow, load_item};
 

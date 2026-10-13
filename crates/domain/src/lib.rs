@@ -120,7 +120,11 @@ pub struct Policy {
     pub models: Option<BTreeSet<String>>,
     pub harnesses: Option<BTreeSet<String>>,
     pub plugin_sources: Option<BTreeSet<String>>,
+    /// Egress rules sandboxes may use, within the instance's `sandbox.egress_allow`.
+    pub egress_hosts: Option<BTreeSet<String>>,
     pub max_sandboxes: Option<u32>,
+    /// Largest writable layer of a sandbox, in bytes.
+    pub sandbox_disk_bytes: Option<u64>,
     pub compute_idle_ttl_secs: Option<u64>,
     pub auto_archive_after_secs: Option<u64>,
     pub archive_retention_secs: Option<u64>,
@@ -136,6 +140,59 @@ pub struct Policy {
     pub attachment_bytes: Option<u64>,
     /// Total size of one member's file library.
     pub attachment_quota_bytes: Option<u64>,
+    /// The most reasoning a model request may ask for: `minimal`, `low`, `medium`, `high`,
+    /// `xhigh` or `max`.
+    pub max_reasoning: Option<String>,
+    /// Model requests and responses are kept this many days, for review; None keeps none.
+    pub retain_model_content_days: Option<u32>,
+    /// Plugins neither signed by a trusted publisher nor from the official catalog.
+    pub allow_unverified_plugins: Option<bool>,
+    /// Plugin tools (`<plugin>__<tool>`, `<plugin>__*` for all of a plugin's) whose every Work
+    /// call needs the member's approval, enforced by the gateway.
+    pub approval_required_tools: Option<BTreeSet<String>>,
+    /// Categories kept out of memory besides the platform's own (health, religion, …); a name
+    /// the platform does not know is matched as a word.
+    pub memory_forbidden_categories: Option<BTreeSet<String>>,
+    /// Memory written by the platform from conversations (idle summaries), not only by the
+    /// member or at their request.
+    pub allow_memory_auto_extract: Option<bool>,
+}
+
+/// Reasoning levels from least to most.
+pub const REASONING_LEVELS: [&str; 6] = ["minimal", "low", "medium", "high", "xhigh", "max"];
+
+/// A reasoning level's rank; unknown levels rank as the most.
+/// Whether `tool` (`<plugin>__<tool>`) matches one of `patterns` (`<plugin>__*` matches all of
+/// a plugin's tools).
+pub fn tool_matches(patterns: &BTreeSet<String>, tool: &str) -> bool {
+    patterns
+        .iter()
+        .any(|pattern| match pattern.strip_suffix('*') {
+            Some(prefix) => tool.starts_with(prefix),
+            None => pattern == tool,
+        })
+}
+
+pub fn reasoning_rank(level: &str) -> usize {
+    REASONING_LEVELS
+        .iter()
+        .position(|l| *l == level)
+        .unwrap_or(REASONING_LEVELS.len())
+}
+
+fn least_reasoning(a: &Option<String>, b: &Option<String>) -> Option<String> {
+    match (a, b) {
+        (Some(a), Some(b)) if reasoning_rank(b) < reasoning_rank(a) => Some(b.clone()),
+        (Some(a), _) => Some(a.clone()),
+        (None, b) => b.clone(),
+    }
+}
+
+fn union(a: &Option<BTreeSet<String>>, b: &Option<BTreeSet<String>>) -> Option<BTreeSet<String>> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.union(b).cloned().collect()),
+        (a, b) => a.clone().or_else(|| b.clone()),
+    }
 }
 
 fn intersection(
@@ -162,7 +219,9 @@ impl Policy {
             models: intersection(&self.models, &lower.models),
             harnesses: intersection(&self.harnesses, &lower.harnesses),
             plugin_sources: intersection(&self.plugin_sources, &lower.plugin_sources),
+            egress_hosts: intersection(&self.egress_hosts, &lower.egress_hosts),
             max_sandboxes: cap(self.max_sandboxes, lower.max_sandboxes),
+            sandbox_disk_bytes: cap(self.sandbox_disk_bytes, lower.sandbox_disk_bytes),
             compute_idle_ttl_secs: cap(self.compute_idle_ttl_secs, lower.compute_idle_ttl_secs),
             auto_archive_after_secs: cap(
                 self.auto_archive_after_secs,
@@ -185,6 +244,28 @@ impl Policy {
             project_file_bytes: cap(self.project_file_bytes, lower.project_file_bytes),
             attachment_bytes: cap(self.attachment_bytes, lower.attachment_bytes),
             attachment_quota_bytes: cap(self.attachment_quota_bytes, lower.attachment_quota_bytes),
+            max_reasoning: least_reasoning(&self.max_reasoning, &lower.max_reasoning),
+            retain_model_content_days: cap(
+                self.retain_model_content_days,
+                lower.retain_model_content_days,
+            ),
+            allow_unverified_plugins: cap(
+                self.allow_unverified_plugins,
+                lower.allow_unverified_plugins,
+            ),
+            // Narrowing adds tools that need approval, and categories kept out of memory.
+            approval_required_tools: union(
+                &self.approval_required_tools,
+                &lower.approval_required_tools,
+            ),
+            memory_forbidden_categories: union(
+                &self.memory_forbidden_categories,
+                &lower.memory_forbidden_categories,
+            ),
+            allow_memory_auto_extract: cap(
+                self.allow_memory_auto_extract,
+                lower.allow_memory_auto_extract,
+            ),
         }
     }
 

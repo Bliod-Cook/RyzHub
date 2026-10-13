@@ -25,14 +25,16 @@ class _Hub extends HubController {
   Future<Map<String, dynamic>> uploadFile(
     String name,
     int size,
-    Stream<List<int>> Function() open,
-  ) => (uploads[name] = Completer()).future;
+    Stream<List<int>> Function() open, {
+    String? to,
+  }) => (uploads[name] = Completer()).future;
 
   @override
   Future<dynamic> request(
     String path, {
     Map<String, dynamic>? body,
     String? method,
+    Duration timeout = const Duration(seconds: 15),
   }) async {
     requests.add('${method ?? 'GET'} $path');
     return {};

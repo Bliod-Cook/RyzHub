@@ -71,7 +71,12 @@ class _ModelPickerState extends State<ModelPicker> {
       Icon(Icons.check, size: 16, color: HubColors.of(context).text);
 
   Widget header(BuildContext context, String text) => Padding(
-    padding: const EdgeInsets.fromLTRB(14, 8, 14, 4),
+    padding: const EdgeInsets.fromLTRB(
+      Space.s14,
+      Space.s8,
+      Space.s14,
+      Space.s4,
+    ),
     child: Text(
       text,
       style: TextStyle(fontSize: 12, color: HubColors.of(context).subtle),
@@ -215,7 +220,7 @@ class _ModelPickerState extends State<ModelPicker> {
           onTap: onTap,
           child: Container(
             height: 36,
-            padding: const EdgeInsets.symmetric(horizontal: 12),
+            padding: const EdgeInsets.symmetric(horizontal: Space.s12),
             child: Row(
               mainAxisSize: MainAxisSize.min,
               children: [

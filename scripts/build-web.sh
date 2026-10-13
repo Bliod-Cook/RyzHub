@@ -7,6 +7,8 @@ flutter pub get
 popd >/dev/null
 flutter_rust_bridge_codegen generate
 cargo fmt -p ryzhub-bridge
+# The grammars code is coloured with: the page fetches them on first use.
+cargo run -q --release -p ryzhub-core --example syntax-dump -- client/web/syntaxes.bin
 cd client
 flutter_rust_bridge_codegen build-web --release --rust-root ../crates/bridge \
   --wasm-pack-rustup-toolchain nightly-2026-09-25 --output "$PWD/web"

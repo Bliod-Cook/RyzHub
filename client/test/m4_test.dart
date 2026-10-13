@@ -9,6 +9,8 @@ import 'package:ryzhub/ui/dialogs.dart';
 import 'package:ryzhub/ui/memories.dart';
 import 'package:ryzhub/ui/messages.dart';
 
+import 'kernel.dart';
+
 class _Hub extends HubController {
   final pending = <String, Completer<dynamic>>{};
   final requests = <Map<String, dynamic>>[];
@@ -22,6 +24,7 @@ class _Hub extends HubController {
     String path, {
     Map<String, dynamic>? body,
     String? method,
+    Duration timeout = const Duration(seconds: 15),
   }) async {
     requests.add({'path': path, 'body': body, 'method': method});
     if (path.contains('/items?before_seq=')) {

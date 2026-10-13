@@ -1,4 +1,5 @@
-//! `ryzhub-server <role>`: all | gateway | owner | llm-gateway | migrate | maintain [--loop].
+//! `ryzhub-server <role>`: all | gateway | owner | llm-gateway | migrate | maintain [--loop] |
+//! reindex | migrate-secrets.
 use anyhow::{Context, ensure};
 use ryzhub_server::{app::App, config::Config, store::Store};
 use sqlx::PgPool;
@@ -11,6 +12,14 @@ fn main() -> anyhow::Result<()> {
     if args.get(1).is_some_and(|role| role == "render-image") {
         return ryzhub_execution::picture::child_main(&args[2..]);
     }
+    // Reads one plugin package, likewise in a process of its own.
+    if args.get(1).is_some_and(|role| role == "parse-plugin") {
+        return ryzhub_server::plugins::package::child_main(&args[2..]);
+    }
+    // Reads one document's text, likewise.
+    if args.get(1).is_some_and(|role| role == "extract-text") {
+        return ryzhub_server::extract::child_main(&args[2..]);
+    }
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
@@ -22,12 +31,12 @@ async fn run(args: Vec<String>) -> anyhow::Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
     let role = args.get(1).map_or("all", String::as_str);
-    if matches!(role, "migrate" | "maintain" | "reindex") {
+    if matches!(role, "migrate" | "maintain" | "reindex" | "migrate-secrets") {
         return maintain(role, args.iter().any(|a| a == "--loop")).await;
     }
     ensure!(
         matches!(role, "all" | "gateway" | "owner" | "llm-gateway"),
-        "usage: ryzhub-server [all|gateway|owner|llm-gateway|migrate|maintain [--loop]|reindex]"
+        "usage: ryzhub-server [all|gateway|owner|llm-gateway|migrate|maintain [--loop]|reindex|migrate-secrets]"
     );
     let config = Config::load()?;
     let store = Store::connect(&env("DATABASE_URL")?).await?;
@@ -66,16 +75,38 @@ async fn run(args: Vec<String>) -> anyhow::Result<()> {
             let (app, worker) = (app.clone(), worker.clone());
             move || ryzhub_server::attachments::gc::collector(app.clone(), worker.clone())
         });
+        if !ryzhub_server::jobs::handlers().is_empty() {
+            supervise("jobs", {
+                let (app, worker) = (app.clone(), worker.clone());
+                move || {
+                    ryzhub_server::jobs::worker(
+                        app.clone(),
+                        worker.clone(),
+                        ryzhub_server::jobs::handlers(),
+                    )
+                }
+            });
+        }
+        supervise("conversation lifecycle", {
+            let (app, worker) = (app.clone(), worker.clone());
+            move || ryzhub_server::lifecycle::collector(app.clone(), worker.clone())
+        });
         supervise("retention", {
             let (app, worker) = (app.clone(), worker.clone());
             move || ryzhub_server::retention::collector(app.clone(), worker.clone())
         });
-        if app.config.work.enabled {
+        if app.config.work.enabled || ryzhub_server::sandbox::chat_checkpoints(&app) {
             supervise("checkpoint collector", {
                 let (app, worker) = (app.clone(), worker.clone());
                 move || ryzhub_server::workspace::collector(app.clone(), worker.clone())
             });
         }
+    }
+    if let (true, true, Some(worker)) = (owner, app.config.sandbox.enabled, &worker) {
+        supervise("node reclamation", {
+            let (app, worker) = (app.clone(), worker.clone());
+            move || ryzhub_server::sandbox::reclaim(app.clone(), worker.clone())
+        });
     }
     if app.config.work.enabled
         && let Some(worker) = &worker
@@ -94,6 +125,13 @@ async fn run(args: Vec<String>) -> anyhow::Result<()> {
         tracing::info!(address = %app.config.listen, "RyzHub gateway listening");
         let router = ryzhub_server::http::router(app.clone());
         servers.spawn(async move { axum::serve(listener, router).await.map_err(Into::into) });
+        if app.config.plugins.enabled {
+            let plugins = &app.config.plugins;
+            let listener = tokio::net::TcpListener::bind(&plugins.content_listen).await?;
+            tracing::info!(address = %plugins.content_listen, "plugin content origin listening");
+            let router = ryzhub_server::plugins::apps::content_router(app.clone());
+            servers.spawn(async move { axum::serve(listener, router).await.map_err(Into::into) });
+        }
     }
     tokio::select! {
         _ = tokio::signal::ctrl_c() => Ok(()),
@@ -139,7 +177,7 @@ async fn start_model_gateway(
 ) -> anyhow::Result<()> {
     let llm = &app.config.llm;
     ensure!(!llm.model.is_empty(), "llm.model required");
-    ryzhub_server::llm::credentials::secret(&llm.vault_key_env)?;
+    ryzhub_server::vault::secret(&llm.vault_key_env)?;
     let listener = tokio::net::TcpListener::bind(&llm.listen).await?;
     if let Some(path) = &llm.unix_socket {
         let socket = bind_unix_socket(path).await?;
@@ -176,12 +214,18 @@ async fn bind_unix_socket(path: &str) -> anyhow::Result<tokio::net::UnixListener
 }
 
 /// `migrate` applies migrations then maintains partitions; `maintain --loop` repeats daily.
+/// `migrate-secrets` needs the vault keys in its environment.
 async fn maintain(role: &str, repeat: bool) -> anyhow::Result<()> {
     let pool = PgPool::connect(&env("MIGRATION_DATABASE_URL")?).await?;
     if role == "migrate" {
         sqlx::migrate!("../../migrations").run(&pool).await?;
     }
     let config = Config::load()?;
+    if role == "migrate-secrets" {
+        let (converted, rewrapped) = ryzhub_server::vault::migrate(&pool, &config.llm).await?;
+        tracing::info!(converted, rewrapped, "secrets migrated");
+        return Ok(());
+    }
     if role == "reindex" {
         sqlx::query("INSERT INTO search_jobs(org_id,source_id,source_kind,source_version,op,available_at,priority)
             SELECT org_id,id,doc_kind,source_version,'upsert',now(),-10 FROM search_sources WHERE NOT deleted

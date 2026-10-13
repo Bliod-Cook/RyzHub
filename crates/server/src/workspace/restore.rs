@@ -1,10 +1,9 @@
 //! Restoring a checkpoint.
 use anyhow::{Context, ensure};
-use ryzhub_execution::{HostCommand, SandboxSpec, native::harness_version};
+use ryzhub_execution::{HostCommand, SandboxSpec};
 use ryzhub_proto::{Item, event_envelope::Event};
 use serde_json::Value;
 use sqlx::Row;
-use std::path::Path;
 use uuid::Uuid;
 
 use super::stores;
@@ -17,7 +16,7 @@ use crate::{
 };
 
 /// A checkpoint can be restored only by the harness version that wrote its native session.
-fn compatible(manifest: &Value) -> bool {
+fn compatible(config: &crate::config::Config, manifest: &Value) -> bool {
     let harness = manifest["harness"].as_str().unwrap_or("codex");
     let version = manifest["harness_version"]
         .as_str()
@@ -27,12 +26,12 @@ fn compatible(manifest: &Value) -> bool {
         .is_some_and(|image| image.contains("@sha256:"))
         && manifest["format"] == 1
         && manifest["encoding"] == "tar.zst"
-        && version == Some(harness_version(harness))
+        && version == Some(crate::run_config::harness_version(config, harness).as_str())
 }
 
 /// Make the primary store's copy valid (repairing it from the secondary if needed) and
-/// stream it to the execution node as `artifact`.
-async fn upload(app: &App, org: Uuid, key: &str, artifact: Uuid) -> anyhow::Result<()> {
+/// stream it to execution node `node` as `artifact`.
+async fn upload(app: &App, org: Uuid, key: &str, artifact: Uuid, node: &str) -> anyhow::Result<()> {
     let (primary, secondary) = stores(app, org)?;
     if !primary.verify(key).await? {
         let secondary = secondary.context("checkpoint missing and no secondary store")?;
@@ -40,7 +39,7 @@ async fn upload(app: &App, org: Uuid, key: &str, artifact: Uuid) -> anyhow::Resu
     }
     let (size, reader) = primary.open(key).await?;
     ryzhub_execution::upload(
-        Path::new(&app.config.sandbox.host_socket),
+        &sandbox::node_endpoint(app, node)?,
         &HostCommand::ArtifactUpload {
             artifact,
             size,
@@ -51,6 +50,69 @@ async fn upload(app: &App, org: Uuid, key: &str, artifact: Uuid) -> anyhow::Resu
     )
     .await?;
     Ok(())
+}
+
+/// Bring the Chat workspace's head checkpoint back on `sandbox`'s node if that node has no copy
+/// of the workspace (it ran elsewhere, or the node lost it). The node keeps a copy it has: it
+/// is at least as new. Returns whether the checkpoint was restored.
+pub async fn workspace_into(
+    app: &App,
+    lease: &Lease,
+    sandbox: Uuid,
+    disk_bytes: u64,
+) -> anyhow::Result<bool> {
+    let (org, conv) = (lease.org_id, lease.conversation_id);
+    let head: Option<Value> = {
+        let mut tx = app.store.tx(org).await?;
+        let head = sqlx::query_scalar(
+            "SELECT c.manifest FROM workspace_heads w
+             JOIN checkpoints c ON c.org_id=w.org_id AND c.id=w.checkpoint_id
+             WHERE w.org_id=$1 AND w.conversation_id=$2 AND c.state='committed'
+               AND c.manifest->>'scope'='workspace'",
+        )
+        .bind(org)
+        .bind(conv)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        head
+    };
+    let Some(manifest) = head else {
+        return Ok(false);
+    };
+    let node = sandbox::node_of(app, org, sandbox).await?;
+    let status = sandbox::host_on(
+        app,
+        &node,
+        HostCommand::WorkspaceStatus {
+            org_id: org,
+            workspace_id: conv,
+        },
+    )
+    .await?;
+    if status["exists"] == true {
+        return Ok(false);
+    }
+    let key = manifest["sha256"]
+        .as_str()
+        .context("manifest without checksum")?;
+    let artifact = Uuid::now_v7();
+    upload(app, org, key, artifact, &node).await?;
+    let reply = sandbox::host_job(
+        app,
+        org,
+        sandbox,
+        HostCommand::WorkspaceRestore {
+            org_id: org,
+            workspace_id: conv,
+            artifact,
+            sha256: key.into(),
+            disk_bytes,
+        },
+    )
+    .await;
+    let _ = sandbox::host_on(app, &node, HostCommand::DeleteArtifact { artifact }).await;
+    Ok(reply?["restored"] == true)
 }
 
 /// Restore `manifest` into the new sandbox `spec` (a fork or an idle resume). The timeline is
@@ -65,14 +127,21 @@ pub async fn restore_into(
         .as_str()
         .context("manifest without checksum")?;
     ensure!(
-        manifest["image"] == spec.image.as_str(),
+        manifest["image"] == spec.image.as_str()
+            && manifest["deps"].as_str() == spec.deps.as_deref(),
         Code::CheckpointIncompatible
     );
-    ensure!(compatible(manifest), Code::CheckpointIncompatible);
-    upload(app, lease.org_id, key, spec.id).await?;
-    let artifact = spec.id;
+    ensure!(
+        compatible(&app.config, manifest),
+        Code::CheckpointIncompatible
+    );
+    let (org, artifact) = (lease.org_id, spec.id);
+    let node = sandbox::node_of(app, org, artifact).await?;
+    upload(app, org, key, artifact, &node).await?;
     sandbox::host_job(
         app,
+        org,
+        artifact,
         HostCommand::Restore {
             spec,
             artifact,
@@ -80,7 +149,7 @@ pub async fn restore_into(
         },
     )
     .await?;
-    let _ = sandbox::host(app, HostCommand::DeleteArtifact { artifact }).await;
+    let _ = sandbox::host(app, org, artifact, HostCommand::DeleteArtifact { artifact }).await;
     Ok(())
 }
 
@@ -131,7 +200,10 @@ pub async fn restore(app: &App, lease: &Lease, job: Uuid, link: &OwnerLink) -> a
             .fetch_one(&mut *tx)
             .await?,
         };
-        ensure!(compatible(&manifest), Code::CheckpointIncompatible);
+        ensure!(
+            compatible(&app.config, &manifest),
+            Code::CheckpointIncompatible
+        );
         sqlx::query("INSERT INTO restore_pins(id,org_id,checkpoint_id) VALUES($1,$2,$3) ON CONFLICT DO NOTHING")
             .bind(job)
             .bind(lease.org_id)
@@ -159,7 +231,24 @@ pub async fn restore(app: &App, lease: &Lease, job: Uuid, link: &OwnerLink) -> a
     let key = manifest["sha256"]
         .as_str()
         .context("manifest without checksum")?;
-    upload(app, lease.org_id, key, job).await?;
+    // The destination row is written only after the upload succeeds, so a failed upload
+    // leaves no blank workspace; a retry keeps the node an earlier attempt recorded.
+    let node = {
+        let mut tx = app.store.fenced(lease).await?;
+        let recorded: Option<String> =
+            sqlx::query_scalar("SELECT node FROM sandboxes WHERE org_id=$1 AND id=$2")
+                .bind(lease.org_id)
+                .bind(job)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let node = match recorded {
+            Some(node) => node,
+            None => sandbox::place(&mut tx, app, lease.conversation_id).await?,
+        };
+        tx.commit().await?;
+        node
+    };
+    upload(app, lease.org_id, key, job, &node).await?;
     let spec = {
         let mut tx = app.store.fenced(lease).await?;
         let run: Uuid =
@@ -185,6 +274,7 @@ pub async fn restore(app: &App, lease: &Lease, job: Uuid, link: &OwnerLink) -> a
             .await?,
         };
         let cfg = &app.config.sandbox;
+        let limits = sandbox::limits(&mut tx, app, lease.org_id).await?;
         let spec = SandboxSpec {
             id: job,
             org_id: lease.org_id,
@@ -198,10 +288,14 @@ pub async fn restore(app: &App, lease: &Lease, job: Uuid, link: &OwnerLink) -> a
             memory_bytes: cfg.memory_bytes.max(512 * 1024 * 1024),
             pids_limit: cfg.pids_limit,
             persistent: true,
+            egress: limits.egress,
+            disk_bytes: limits.disk_bytes,
+            // A workspace comes back on the layers it was checkpointed on.
+            deps: manifest["deps"].as_str().map(Into::into),
         };
         sqlx::query(
-            "INSERT INTO sandboxes(id,org_id,conversation_id,run_id,lease_epoch,exec_epoch,state,handle,persistent,native_thread_id)
-             VALUES($1,$2,$3,$4,$5,$6,'provisioning',$7,true,$8) ON CONFLICT DO NOTHING",
+            "INSERT INTO sandboxes(id,org_id,conversation_id,run_id,lease_epoch,exec_epoch,state,handle,persistent,native_thread_id,node)
+             VALUES($1,$2,$3,$4,$5,$6,'provisioning',$7,true,$8,$9) ON CONFLICT DO NOTHING",
         )
         .bind(job)
         .bind(lease.org_id)
@@ -211,6 +305,7 @@ pub async fn restore(app: &App, lease: &Lease, job: Uuid, link: &OwnerLink) -> a
         .bind(lease.epoch)
         .bind(serde_json::to_value(&spec)?)
         .bind(manifest["thread_id"].as_str())
+        .bind(&node)
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -218,6 +313,8 @@ pub async fn restore(app: &App, lease: &Lease, job: Uuid, link: &OwnerLink) -> a
     };
     sandbox::host_job(
         app,
+        lease.org_id,
+        job,
         HostCommand::Restore {
             spec,
             artifact: job,
@@ -227,7 +324,13 @@ pub async fn restore(app: &App, lease: &Lease, job: Uuid, link: &OwnerLink) -> a
     .await?;
     apply(app, lease, job, checkpoint, seq, &manifest).await?;
     link.committed().await;
-    let _ = sandbox::host(app, HostCommand::DeleteArtifact { artifact: job }).await;
+    let _ = sandbox::host(
+        app,
+        lease.org_id,
+        job,
+        HostCommand::DeleteArtifact { artifact: job },
+    )
+    .await;
     Ok(())
 }
 
@@ -235,12 +338,15 @@ pub async fn restore(app: &App, lease: &Lease, job: Uuid, link: &OwnerLink) -> a
 async fn fence_old_writer(app: &App, lease: &Lease, old: Uuid) -> anyhow::Result<()> {
     let stopped = sandbox::host(
         app,
+        lease.org_id,
+        old,
         HostCommand::Stop {
             sandbox_id: old,
             exec_epoch: lease.epoch as u64,
         },
     )
     .await
+    .inspect_err(|error| tracing::warn!(sandbox = %old, error = format!("{error:#}"), "old writer not stopped"))
     .is_ok();
     let mut tx = app.store.fenced(lease).await?;
     let expired: bool = sqlx::query_scalar(
@@ -316,11 +422,16 @@ async fn apply(
     .bind(lease.epoch)
     .execute(&mut *tx)
     .await?;
-    sqlx::query("UPDATE conversations SET state='active' WHERE org_id=$1 AND id=$2")
-        .bind(lease.org_id)
-        .bind(lease.conversation_id)
-        .execute(&mut *tx)
-        .await?;
+    let archived: bool =
+        sqlx::query_scalar("SELECT state='archived' FROM conversations WHERE org_id=$1 AND id=$2")
+            .bind(lease.org_id)
+            .bind(lease.conversation_id)
+            .fetch_one(&mut *tx)
+            .await?;
+    crate::lifecycle::unarchive(&mut tx, lease.org_id, lease.conversation_id, "hot").await?;
+    if archived {
+        crate::store::publish_conversation(&mut tx, lease.org_id, lease.conversation_id).await?;
+    }
     let run: Uuid = sqlx::query_scalar("SELECT run_id FROM sandboxes WHERE org_id=$1 AND id=$2")
         .bind(lease.org_id)
         .bind(job)

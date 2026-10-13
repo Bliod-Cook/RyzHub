@@ -19,6 +19,8 @@ pub struct Conversation {
     pub project_id: Option<Uuid>,
     pub run_config: serde_json::Value,
     pub temporary: bool,
+    /// The conversation channel's sequence when its last run ended.
+    pub activity_seq: i64,
     /// When it was pinned, in Unix milliseconds.
     pub pinned_at_ms: Option<i64>,
 }
@@ -35,6 +37,7 @@ pub struct ItemRow {
     pub run_id: Option<Uuid>,
     pub truncated: bool,
     pub detail: Option<Json<ItemDetail>>,
+    pub parent_item_id: Option<Uuid>,
 }
 
 impl From<ItemRow> for Item {
@@ -50,6 +53,10 @@ impl From<ItemRow> for Item {
             run_id: row.run_id.map(|id| id.to_string()).unwrap_or_default(),
             truncated: row.truncated,
             detail: row.detail.map(|Json(detail)| detail),
+            parent_item_id: row
+                .parent_item_id
+                .map(|id| id.to_string())
+                .unwrap_or_default(),
         }
     }
 }
@@ -65,6 +72,8 @@ pub struct ActionRow {
     pub status: String,
     pub resolved_device: String,
     pub expires_at: DateTime<Utc>,
+    /// What a question asks for beyond text: an MCP elicitation's form or link.
+    pub form: Option<serde_json::Value>,
 }
 
 impl From<ActionRow> for PendingAction {
@@ -79,6 +88,7 @@ impl From<ActionRow> for PendingAction {
             resolved_device: row.resolved_device,
             expires_at_ms: row.expires_at.timestamp_millis(),
             kind: row.kind,
+            form_json: row.form.map(|form| form.to_string()).unwrap_or_default(),
         }
     }
 }

@@ -57,15 +57,26 @@ impl LiveRef {
     }
 }
 
+/// The live stream of a reply's text.
+pub const TEXT: &str = "text";
+/// The live stream of a command's output.
+pub const TERMINAL_OUTPUT: &str = "terminal_output";
+
 pub enum WorkerEvent {
-    /// Text appended at byte `offset` of a streaming item.
+    /// Text appended at byte `offset` of a streaming item's `stream`.
     Append {
         item: LiveRef,
+        stream: &'static str,
         offset: usize,
         text: String,
     },
-    /// The item's complete in-progress text (e.g. a harness fold after reconnecting).
-    Replace { item: LiveRef, text: String },
+    /// The complete in-progress text of an item's `stream` (e.g. a harness fold after
+    /// reconnecting).
+    Replace {
+        item: LiveRef,
+        stream: &'static str,
+        text: String,
+    },
     /// The worker committed durable events.
     Committed,
 }
@@ -108,6 +119,7 @@ impl OwnerLink {
 
 struct Live {
     item: LiveRef,
+    stream: &'static str,
     text: String,
     /// Bytes already sent as Delta frames.
     published: usize,
@@ -118,9 +130,10 @@ struct Live {
 }
 
 impl Live {
-    fn new(item: LiveRef) -> Self {
+    fn new(item: LiveRef, stream: &'static str) -> Self {
         Self {
             item,
+            stream,
             text: String::new(),
             published: 0,
             persisted: 0,
@@ -133,7 +146,7 @@ impl Live {
             channel,
             Body::ItemFold(ItemFold {
                 item_id: self.item.id.clone(),
-                stream: "text".into(),
+                stream: self.stream.into(),
                 part_index: 0,
                 text: self.text.clone(),
                 base_seq: self.item.base_seq,
@@ -151,7 +164,8 @@ struct Actor {
     workers: HashMap<Uuid, AbortHandle>,
     task_runs: HashMap<tokio::task::Id, Uuid>,
     exits: JoinSet<anyhow::Result<()>>,
-    live: HashMap<String, Live>,
+    /// Live streams by item and stream.
+    live: HashMap<(String, &'static str), Live>,
     /// Committed events may be waiting for publication.
     events_pending: bool,
     jobs: Option<JoinHandle<anyhow::Result<()>>>,
@@ -299,7 +313,7 @@ impl Actor {
                 crate::workspace::jobs(&app, &lease, &link).await?;
                 crate::work::interrupt_terminal(&app, &lease).await?;
             }
-            crate::sandbox::cleanup(&app, &lease).await?;
+            crate::sandbox::cleanup(&app, &lease, false).await?;
             link.committed().await;
             Ok(())
         }));
@@ -390,8 +404,13 @@ impl Actor {
     async fn on_event(&mut self, event: WorkerEvent) -> anyhow::Result<()> {
         match event {
             WorkerEvent::Committed => self.events_pending = true,
-            WorkerEvent::Append { item, offset, text } => {
-                let live = self.live_for(item);
+            WorkerEvent::Append {
+                item,
+                stream,
+                offset,
+                text,
+            } => {
+                let live = self.live_for(item, stream);
                 let first = live.published == 0 && live.text.is_empty();
                 // Ignore text the actor already has (a restarted worker re-sending a prefix).
                 if offset + text.len() > live.text.len() && offset <= live.text.len() {
@@ -405,8 +424,8 @@ impl Actor {
                     self.flush().await?;
                 }
             }
-            WorkerEvent::Replace { item, text } => {
-                let live = self.live_for(item);
+            WorkerEvent::Replace { item, stream, text } => {
+                let live = self.live_for(item, stream);
                 if !text.starts_with(&live.text[..live.published]) {
                     live.needs_fold = true;
                 }
@@ -417,13 +436,13 @@ impl Actor {
         Ok(())
     }
 
-    fn live_for(&mut self, item: LiveRef) -> &mut Live {
+    fn live_for(&mut self, item: LiveRef, stream: &'static str) -> &mut Live {
         let live = self
             .live
-            .entry(item.id.clone())
-            .or_insert_with(|| Live::new(item.clone()));
+            .entry((item.id.clone(), stream))
+            .or_insert_with(|| Live::new(item.clone(), stream));
         if live.item.revision != item.revision || live.item.base_seq != item.base_seq {
-            *live = Live::new(item);
+            *live = Live::new(item, stream);
         }
         live
     }
@@ -442,7 +461,7 @@ impl Actor {
                     &channel,
                     Body::Delta(Delta {
                         item_id: live.item.id.clone(),
-                        stream: "text".into(),
+                        stream: live.stream.into(),
                         part_index: 0,
                         offset: live.published as u64,
                         text: live.text[live.published..].into(),
@@ -474,10 +493,11 @@ impl Actor {
 
     /// Save partial replies so a cancellation or failure keeps what was already shown.
     async fn persist_live(&mut self) -> anyhow::Result<()> {
+        // Only a reply's text is saved; a command's output arrives with its result.
         let stale: Vec<_> = self
             .live
             .values()
-            .filter(|live| live.persisted < live.text.len())
+            .filter(|live| live.stream == TEXT && live.persisted < live.text.len())
             .map(|live| (live.item.id.clone(), live.text.clone()))
             .collect();
         if stale.is_empty() {
@@ -498,21 +518,22 @@ impl Actor {
         }
         tx.commit().await?;
         for (item, text) in stale {
-            if let Some(live) = self.live.get_mut(&item) {
+            if let Some(live) = self.live.get_mut(&(item, TEXT)) {
                 live.persisted = live.persisted.max(text.len());
             }
         }
         Ok(())
     }
 
-    /// Forget items that are no longer streaming.
+    /// Forget streams of items that are no longer streaming or running.
     async fn prune_live(&mut self) -> anyhow::Result<()> {
         if self.live.is_empty() {
             return Ok(());
         }
         let mut tx = self.app.store.tx(self.lease.org_id).await?;
         let streaming: HashSet<String> = sqlx::query_scalar(
-            "SELECT id::text FROM items WHERE org_id=$1 AND conversation_id=$2 AND state='streaming'",
+            "SELECT id::text FROM items WHERE org_id=$1 AND conversation_id=$2
+             AND state IN ('streaming','running','planned')",
         )
         .bind(self.lease.org_id)
         .bind(self.lease.conversation_id)
@@ -521,7 +542,7 @@ impl Actor {
         .into_iter()
         .collect();
         tx.commit().await?;
-        self.live.retain(|id, _| streaming.contains(id));
+        self.live.retain(|(id, _), _| streaming.contains(id));
         Ok(())
     }
 

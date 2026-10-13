@@ -1,5 +1,11 @@
 //! Deterministic client projection. No clocks, sockets, filesystem, or platform APIs.
-use ryzhub_proto::{event_envelope::Event, frame::Body, *};
+
+pub mod ansi;
+pub mod diff;
+pub mod highlight;
+pub mod markdown;
+pub mod timeline;
+use ryzhub_proto::{command_envelope::Command, event_envelope::Event, frame::Body, *};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -20,6 +26,12 @@ pub struct Channel {
     pub actions: BTreeMap<String, PendingAction>,
     pub runs: BTreeMap<String, RunState>,
     pub read_states: BTreeMap<String, u64>,
+    /// Unsent messages by conversation, in a user channel.
+    pub drafts: BTreeMap<String, Draft>,
+    /// Output so far of running commands, by item, with the item revision it streams on.
+    /// Not cached: the finished command's item carries its output.
+    #[serde(skip)]
+    pub outputs: BTreeMap<String, (u64, String)>,
     #[serde(skip)]
     waiting_events: BTreeMap<u64, EventEnvelope>,
     #[serde(skip)]
@@ -29,8 +41,6 @@ pub struct Channel {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Engine {
-    #[serde(default)]
-    pub resume_token: String,
     pub channels: BTreeMap<String, Channel>,
     /// Persist this alongside projections and cursors, atomically, before sending.
     pub pending_commands: BTreeMap<String, Frame>,
@@ -84,7 +94,6 @@ pub struct CommandResult {
 /// rewrites only it.
 #[derive(Serialize)]
 struct MetaRef<'a> {
-    resume_token: &'a str,
     pending_commands: &'a BTreeMap<String, Frame>,
     schema: u32,
 }
@@ -92,7 +101,6 @@ struct MetaRef<'a> {
 #[derive(Default, Deserialize)]
 #[serde(default)]
 struct Meta {
-    resume_token: String,
     pending_commands: BTreeMap<String, Frame>,
     schema: u32,
 }
@@ -121,7 +129,6 @@ impl Engine {
         };
         let meta: Meta = serde_json::from_str(meta)?;
         let mut engine = Engine {
-            resume_token: meta.resume_token,
             pending_commands: meta.pending_commands,
             schema: meta.schema,
             ..Default::default()
@@ -132,11 +139,9 @@ impl Engine {
         Ok(engine.upgraded())
     }
 
-    /// What persists beside the channels: the resume token and the commands not yet
-    /// acknowledged.
+    /// What persists beside the channels: the commands not yet acknowledged.
     pub fn meta_json(&self) -> String {
         serde_json::to_string(&MetaRef {
-            resume_token: &self.resume_token,
             pending_commands: &self.pending_commands,
             schema: self.schema,
         })
@@ -222,6 +227,31 @@ impl Engine {
         frames
     }
 
+    /// Whether `frame` waits for its conversation to be created: a pending CreateRun is
+    /// creating it, and the server knows no such channel until it is done.
+    pub fn held(&self, frame: &Frame) -> bool {
+        frame.channel.starts_with("conv:")
+            && self
+                .pending_commands
+                .values()
+                .filter_map(created_channel)
+                .any(|channel| channel == frame.channel)
+    }
+
+    /// Once its CreateRun is answered, a conversation's held frames go out: its subscription
+    /// and the commands queued for it.
+    fn release(&mut self, channel: &str, effects: &mut Effects) {
+        if self.channels.get(channel).is_some_and(|s| s.subscribed) {
+            effects.outbound.push(self.subscribe(channel.to_owned()));
+        }
+        effects.outbound.extend(
+            self.pending_commands
+                .values()
+                .filter(|f| f.channel == channel)
+                .cloned(),
+        );
+    }
+
     pub fn enqueue(&mut self, channel: String, command: CommandEnvelope) -> Frame {
         if let Some(existing) = self.pending_commands.get(&command.cid) {
             return existing.clone();
@@ -238,18 +268,16 @@ impl Engine {
             return effects;
         };
         match body {
-            Body::Welcome(w) => {
-                self.resume_token = w.resume_token;
-                effects.changed = true;
-            }
+            Body::Welcome(_) => {}
             Body::Ping(p) => effects
                 .outbound
                 .push(frame("", Body::Pong(Pong { nonce: p.nonce }))),
             Body::CommandAck(a) => {
-                let channel = self
-                    .pending_commands
-                    .remove(&a.cid)
-                    .map_or(input.channel, |f| f.channel);
+                let removed = self.pending_commands.remove(&a.cid);
+                if let Some(created) = removed.as_ref().and_then(created_channel) {
+                    self.release(&created, &mut effects);
+                }
+                let channel = removed.map_or(input.channel, |f| f.channel);
                 effects.results.push(CommandResult {
                     cid: a.cid,
                     channel,
@@ -264,8 +292,13 @@ impl Engine {
                     .pending_commands
                     .get(&r.cid)
                     .map_or(input.channel, |f| f.channel.clone());
-                if !r.retryable {
-                    self.pending_commands.remove(&r.cid);
+                if !r.retryable
+                    && let Some(removed) = self.pending_commands.remove(&r.cid)
+                    && let Some(created) = created_channel(&removed)
+                {
+                    // Refused, the conversation may not exist: its held commands are refused in
+                    // turn, and a subscription to it revoked.
+                    self.release(&created, &mut effects);
                 }
                 effects.results.push(CommandResult {
                     cid: r.cid,
@@ -322,6 +355,11 @@ impl Engine {
                                 .read_states
                                 .into_iter()
                                 .map(|r| (r.conversation_id, r.read_seq))
+                                .collect();
+                            state.drafts = s
+                                .drafts
+                                .into_iter()
+                                .map(|d| (d.conversation_id.clone(), d))
                                 .collect();
                             state.waiting_events.retain(|seq, _| *seq > s.head_seq);
                             state.waiting_streams.clear();
@@ -423,9 +461,23 @@ fn apply_event(state: &mut Channel, event: EventEnvelope) -> Option<String> {
             let seq = state.read_states.entry(read.conversation_id).or_default();
             *seq = (*seq).max(read.read_seq);
         }
+        Some(Event::DraftChanged(draft)) => {
+            state.drafts.insert(draft.conversation_id.clone(), draft);
+        }
         None => {}
     }
     None
+}
+
+/// The conversation channel a CreateRun command creates.
+fn created_channel(frame: &Frame) -> Option<String> {
+    match &frame.body {
+        Some(Body::Command(CommandEnvelope {
+            command: Some(Command::CreateRun(create)),
+            ..
+        })) => Some(format!("conv:{}", create.conversation_id)),
+        _ => None,
+    }
 }
 
 /// Apply the buffered events that now follow the cursor, noting the items they change.
@@ -476,8 +528,13 @@ fn apply_stream(state: &mut Channel, body: &Body) -> StreamResult {
         ),
         _ => return StreamResult::Ignored,
     };
-    // M0 negotiates text/part 0 only. Other streams do not corrupt the text projection.
-    if stream != "text" || part != 0 {
+    // A reply's text, or a command's output; other streams do not corrupt either.
+    let output = match stream.as_str() {
+        "text" => false,
+        "terminal_output" => true,
+        _ => return StreamResult::Ignored,
+    };
+    if part != 0 {
         return StreamResult::Ignored;
     }
     if base > state.cursor {
@@ -486,35 +543,58 @@ fn apply_stream(state: &mut Channel, body: &Body) -> StreamResult {
     let Some(item) = state.items.get_mut(id) else {
         return StreamResult::Gap;
     };
-    if item.state != "streaming" || revision < item.revision || base < item.last_seq {
+    let open = if output {
+        matches!(item.state.as_str(), "streaming" | "running" | "planned")
+    } else {
+        item.state == "streaming"
+    };
+    if !open || revision < item.revision || base < item.last_seq {
         return StreamResult::Ignored;
     }
     if revision > item.revision || base > item.last_seq {
         return StreamResult::Gap;
     }
+    let target = if output {
+        let entry = state
+            .outputs
+            .entry(id.clone())
+            .or_insert_with(|| (revision, String::new()));
+        if entry.0 != revision {
+            *entry = (revision, String::new());
+        }
+        &mut entry.1
+    } else {
+        &mut item.text
+    };
+    append(target, text, offset)
+}
+
+/// Applies streamed `text` to `target`: the whole text so far (a fold), or what follows byte
+/// `offset` (a delta), whose overlap with what is there must agree.
+fn append(target: &mut String, text: &str, offset: Option<u64>) -> StreamResult {
     let Some(offset) = offset else {
-        if text.len() <= item.text.len() {
+        if text.len() <= target.len() {
             return StreamResult::Ignored;
         }
-        if !text.starts_with(&item.text) {
+        if !text.starts_with(target.as_str()) {
             return StreamResult::Gap;
         }
-        item.text = text.clone();
+        *target = text.to_owned();
         return StreamResult::Applied;
     };
     let Ok(offset) = usize::try_from(offset) else {
         return StreamResult::Gap;
     };
-    if offset > item.text.len() || !item.text.is_char_boundary(offset) {
+    if offset > target.len() || !target.is_char_boundary(offset) {
         return StreamResult::Gap;
     }
-    let overlap = (item.text.len() - offset).min(text.len());
-    if item.text.as_bytes()[offset..offset + overlap] != text.as_bytes()[..overlap]
+    let overlap = (target.len() - offset).min(text.len());
+    if target.as_bytes()[offset..offset + overlap] != text.as_bytes()[..overlap]
         || !text.is_char_boundary(overlap)
     {
         return StreamResult::Gap;
     }
-    item.text.push_str(&text[overlap..]);
+    target.push_str(&text[overlap..]);
     StreamResult::Applied
 }
 
@@ -528,6 +608,31 @@ fn body_bytes(body: &Body) -> usize {
 
 fn buffered_bytes(state: &Channel) -> usize {
     state.waiting_streams.iter().map(body_bytes).sum()
+}
+
+/// zstd's frame magic number. A protobuf frame never starts with it: its first byte would be
+/// the key of field 5, which frames do not have.
+const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
+/// Largest frame a compressed message may expand to.
+const MAX_FRAME_BYTES: u64 = 4 * 1024 * 1024;
+
+/// The frame a server message carries: as it is, or decompressed when the server sent it as a
+/// zstd frame (`ryzhub.v1.protobuf+zstd`).
+pub fn frame_bytes(message: &[u8]) -> Result<std::borrow::Cow<'_, [u8]>, String> {
+    use std::io::Read;
+    if !message.starts_with(&ZSTD_MAGIC) {
+        return Ok(std::borrow::Cow::Borrowed(message));
+    }
+    let decoder = ruzstd::decoding::StreamingDecoder::new(message).map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    decoder
+        .take(MAX_FRAME_BYTES + 1)
+        .read_to_end(&mut out)
+        .map_err(|e| e.to_string())?;
+    if out.len() as u64 > MAX_FRAME_BYTES {
+        return Err("compressed frame too large".into());
+    }
+    Ok(std::borrow::Cow::Owned(out))
 }
 
 /// Full jitter bounded exponential backoff; randomness is supplied by the driver.

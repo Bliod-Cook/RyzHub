@@ -1,5 +1,5 @@
 //! Keeping a sandbox's `/attachments` equal to its conversation's files.
-use std::{collections::BTreeMap, path::Path};
+use std::collections::BTreeMap;
 
 use ryzhub_execution::{AttachmentFile, HostCommand};
 use uuid::Uuid;
@@ -33,7 +33,7 @@ pub async fn sync(app: &App, lease: &Lease, sandbox: Uuid) -> anyhow::Result<()>
         exec_epoch: lease.epoch as u64,
         files: files.clone(),
     };
-    let reply = sandbox::host(app, command).await?;
+    let reply = sandbox::host(app, lease.org_id, sandbox, command).await?;
     let missing: Vec<String> = reply["missing"]
         .as_array()
         .into_iter()
@@ -69,8 +69,8 @@ pub async fn sync(app: &App, lease: &Lease, sandbox: Uuid) -> anyhow::Result<()>
             size,
             sha256: file.sha256.clone(),
         };
-        let socket = Path::new(&app.config.sandbox.host_socket);
-        ryzhub_execution::upload(socket, &command, size, reader).await?;
+        let socket = sandbox::endpoint(app, lease.org_id, sandbox).await?;
+        ryzhub_execution::upload(&socket, &command, size, reader).await?;
     }
     Ok(())
 }

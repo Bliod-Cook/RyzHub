@@ -9,6 +9,25 @@ use anyhow::{Context, ensure};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
+/// Vectors for `texts` from the configured provider.
+pub async fn embed(
+    app: &App,
+    org: Uuid,
+    user: Uuid,
+    texts: Vec<String>,
+) -> anyhow::Result<Vec<Vec<f32>>> {
+    if app.config.search.embedding_provider == "local" {
+        #[cfg(feature = "local-embedding")]
+        return LocalEmbedding.embed(app, org, user, texts).await;
+        #[cfg(not(feature = "local-embedding"))]
+        anyhow::bail!(Code::TemporarilyUnavailable);
+    }
+    OpenAiEmbedding.embed(app, org, user, texts).await
+}
+
+/// Stored vectors have this many dimensions.
+pub const DIMENSIONS: usize = 1024;
+
 pub trait EmbeddingProvider: Send + Sync {
     fn embed(
         &self,
@@ -111,4 +130,108 @@ pub fn chunks(text: &str) -> Vec<String> {
         start = end - 225;
     }
     out
+}
+
+/// Qwen3-Embedding in this process, on candle (CPU). The model loads on first use; texts are
+/// embedded one batch at a time, off the async runtime. Vectors are cut to [`DIMENSIONS`]
+/// (Qwen3 embeddings are trained to keep their meaning when truncated) and renormalized.
+/// Nothing leaves the server, so no credential, policy model list or usage record applies.
+#[cfg(feature = "local-embedding")]
+pub struct LocalEmbedding;
+
+#[cfg(feature = "local-embedding")]
+static LOCAL_MODEL: tokio::sync::OnceCell<std::sync::Arc<fastembed::Qwen3TextEmbedding>> =
+    tokio::sync::OnceCell::const_new();
+#[cfg(feature = "local-embedding")]
+static LOCAL_TURN: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+
+#[cfg(feature = "local-embedding")]
+impl EmbeddingProvider for LocalEmbedding {
+    async fn embed(
+        &self,
+        app: &App,
+        _org: Uuid,
+        _user: Uuid,
+        texts: Vec<String>,
+    ) -> anyhow::Result<Vec<Vec<f32>>> {
+        if texts.is_empty() {
+            return Ok(vec![]);
+        }
+        let name = app.config.search.local_embedding_model.clone();
+        let model = LOCAL_MODEL
+            .get_or_try_init(|| async move {
+                tokio::task::spawn_blocking(move || {
+                    fastembed::Qwen3TextEmbedding::from_hf(
+                        &name,
+                        &candle_core::Device::Cpu,
+                        candle_core::DType::F32,
+                        1024,
+                    )
+                    .map(std::sync::Arc::new)
+                    .map_err(|error| anyhow::anyhow!("loading {name}: {error}"))
+                })
+                .await?
+            })
+            .await
+            .context(Code::TemporarilyUnavailable)?
+            .clone();
+        let _turn = LOCAL_TURN.acquire().await?;
+        let vectors = tokio::task::spawn_blocking(move || model.embed(&texts))
+            .await?
+            .map_err(|error| anyhow::anyhow!("embedding: {error}"))?;
+        vectors
+            .into_iter()
+            .map(|v| truncated(v, DIMENSIONS))
+            .collect()
+    }
+}
+
+/// `vector` cut to `dimensions` and scaled back to unit length.
+pub fn truncated(mut vector: Vec<f32>, dimensions: usize) -> anyhow::Result<Vec<f32>> {
+    ensure!(vector.len() >= dimensions, "embedding too short");
+    vector.truncate(dimensions);
+    let norm = vector.iter().map(|v| v * v).sum::<f32>().sqrt();
+    ensure!(norm.is_finite() && norm > 0.0, "invalid embedding");
+    Ok(vector.into_iter().map(|v| v / norm).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncated_vectors_keep_unit_length() {
+        let v = truncated(vec![3.0, 4.0, 12.0], 2).unwrap();
+        assert_eq!(v, vec![0.6, 0.8]);
+        assert!(truncated(vec![1.0], 2).is_err());
+        assert!(truncated(vec![0.0, 0.0], 2).is_err());
+    }
+
+    /// Downloads Qwen3-Embedding-0.6B (about 1.2 GB) into `HF_HOME` on first run.
+    #[cfg(feature = "local-embedding")]
+    #[test]
+    #[ignore = "downloads the embedding model"]
+    fn local_model_embeds_meaning() {
+        let model = fastembed::Qwen3TextEmbedding::from_hf(
+            "Qwen/Qwen3-Embedding-0.6B",
+            &candle_core::Device::Cpu,
+            candle_core::DType::F32,
+            1024,
+        )
+        .unwrap();
+        let vectors = model
+            .embed(&[
+                "How do I reset my password?",
+                "忘记密码怎么重置",
+                "Volcanoes erupt lava.",
+            ])
+            .unwrap();
+        let vectors: Vec<Vec<f32>> = vectors
+            .into_iter()
+            .map(|v| truncated(v, DIMENSIONS).unwrap())
+            .collect();
+        assert!(vectors.iter().all(|v| v.len() == DIMENSIONS));
+        let dot = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>();
+        assert!(dot(&vectors[0], &vectors[1]) > dot(&vectors[0], &vectors[2]));
+    }
 }

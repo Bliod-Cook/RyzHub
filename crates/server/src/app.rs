@@ -1,7 +1,12 @@
 //! Process-wide state shared by every role.
 use std::{sync::Arc, time::Duration};
 
-use crate::{config::Config, revocation::Revocations, store::Store, ws::Hub};
+use crate::{
+    config::Config,
+    revocation::Revocations,
+    store::Store,
+    ws::{Hub, sse::Streams},
+};
 
 #[derive(Clone)]
 pub struct App {
@@ -12,6 +17,8 @@ pub struct App {
     /// One NATS subscription per channel per process, shared by all local subscribers.
     pub hub: Hub,
     pub revocations: Revocations,
+    /// Event-stream connections opened here.
+    pub streams: Streams,
 }
 
 impl App {
@@ -25,6 +32,7 @@ impl App {
             config: Arc::new(config),
             hub,
             revocations,
+            streams: Streams::default(),
         })
     }
 }
@@ -39,6 +47,8 @@ pub struct Http {
     pub gateway: reqwest::Client,
     /// Remote MCP tool servers.
     pub tools: reqwest::Client,
+    /// Sign-in providers the instance configures.
+    pub identity: reqwest::Client,
 }
 
 impl Http {
@@ -49,6 +59,12 @@ impl Http {
                 .redirect(reqwest::redirect::Policy::none())
                 .connect_timeout(Duration::from_secs(10))
                 .read_timeout(read)
+                .build()?,
+            identity: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .connect_timeout(Duration::from_secs(10))
+                .timeout(Duration::from_secs(20))
+                .user_agent(concat!("RyzHub/", env!("CARGO_PKG_VERSION")))
                 .build()?,
             gateway: reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(10))

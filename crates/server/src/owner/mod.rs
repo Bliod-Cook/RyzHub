@@ -9,7 +9,7 @@ mod commands;
 mod mock;
 mod publish;
 
-pub use actor::{LiveRef, OwnerLink, WorkerEvent};
+pub use actor::{LiveRef, OwnerLink, TERMINAL_OUTPUT, TEXT, WorkerEvent};
 pub use commands::{Processed, process_command, process_next, process_with_config};
 pub use publish::{publish, publish_transient};
 
@@ -206,8 +206,9 @@ pub async fn active_conversations(
                             THEN (p.policy->>'compute_idle_ttl_secs')::numeric::bigint END
                 FROM org_policies p WHERE p.org_id=s.org_id ORDER BY p.version DESC LIMIT 1)) AS secs) idle
            WHERE s.state IN ('running','provisioning')
-           AND (NOT persistent
-                OR node_lease_until<clock_timestamp()
+           -- A Chat sandbox kept for reuse needs nothing until it expires.
+           AND ((NOT persistent AND coalesce(s.idle_until<=now(),true))
+                OR persistent AND (node_lease_until<clock_timestamp()
                 OR EXISTS(SELECT 1 FROM runs r WHERE r.org_id=s.org_id AND r.sandbox_id=s.id
                           AND r.state IN ('cancelled','failed') AND r.native_turn_id IS NOT NULL
                           AND NOT r.native_interrupted)
@@ -217,8 +218,9 @@ pub async fn active_conversations(
                               WHERE c.org_id=s.org_id AND c.conversation_id=s.conversation_id
                                 AND c.state IN ('uploading','committed')), '-infinity'))
                 OR (idle.secs>0 AND s.created_at<now()-(idle.secs * interval '1 second')
+                    AND coalesce(s.terminal_seen_at<now()-interval '1 minute',true)
                     AND NOT EXISTS(SELECT 1 FROM runs r WHERE r.org_id=s.org_id AND r.conversation_id=s.conversation_id
-                        AND coalesce(r.ended_at,'infinity')>now()-(idle.secs * interval '1 second'))))",
+                        AND coalesce(r.ended_at,'infinity')>now()-(idle.secs * interval '1 second')))))",
     )
     .bind(config.work.idle_suspend_secs as i64)
     .bind(config.policy.compute_idle_ttl_secs.map(|secs| secs as i64))

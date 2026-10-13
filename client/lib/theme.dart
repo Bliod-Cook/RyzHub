@@ -1,12 +1,11 @@
 import 'package:flutter/material.dart';
 
-const accents = <String, Color>{
-  'orange': Color(0xfff0692a),
-  'blue': Color(0xff2f6fed),
-  'green': Color(0xff10a37f),
-  'purple': Color(0xff8b5cf6),
-  'pink': Color(0xffe0457b),
-};
+import 'tokens.g.dart';
+
+export 'tokens.g.dart';
+
+/// Colors, spacing and radii come from `client/tokens/tokens.json`.
+const accents = accentTokens;
 
 Color accentColor(String name) => accents[name] ?? accents['orange']!;
 
@@ -40,50 +39,50 @@ class HubColors extends ThemeExtension<HubColors> {
   });
 
   factory HubColors.light(Color accent) => HubColors(
-    background: const Color(0xffffffff),
-    sidebar: const Color(0xfff9f9f9),
-    border: const Color(0xffe5e5e5),
-    hover: const Color(0xffefefef),
-    selected: const Color(0xffe8e8e8),
-    text: const Color(0xff0d0d0d),
-    muted: const Color(0xff5d5d5d),
-    subtle: const Color(0xff8f8f8f),
-    bubble: const Color(0xfff4f4f4),
-    composer: const Color(0xffffffff),
-    menu: const Color(0xffffffff),
-    code: const Color(0xfff7f7f7),
+    background: LightTokens.background,
+    sidebar: LightTokens.sidebar,
+    border: LightTokens.border,
+    hover: LightTokens.hover,
+    selected: LightTokens.selected,
+    text: LightTokens.text,
+    muted: LightTokens.muted,
+    subtle: LightTokens.subtle,
+    bubble: LightTokens.bubble,
+    composer: LightTokens.composer,
+    menu: LightTokens.menu,
+    code: LightTokens.code,
     accent: accent,
-    onAccent: const Color(0xffffffff),
-    danger: const Color(0xffd93025),
-    success: const Color(0xff10a37f),
-    warning: const Color(0xffe8a317),
+    onAccent: LightTokens.onAccent,
+    danger: LightTokens.danger,
+    success: LightTokens.success,
+    warning: LightTokens.warning,
     userBubble: Color.alphaBlend(
       accent.withValues(alpha: .12),
-      const Color(0xffffffff),
+      LightTokens.background,
     ),
   );
 
   factory HubColors.dark(Color accent) => HubColors(
-    background: const Color(0xff212121),
-    sidebar: const Color(0xff181818),
-    border: const Color(0x1affffff),
-    hover: const Color(0xff2a2a2a),
-    selected: const Color(0xff303030),
-    text: const Color(0xffececec),
-    muted: const Color(0xffb4b4b4),
-    subtle: const Color(0xff8f8f8f),
-    bubble: const Color(0xff303030),
-    composer: const Color(0xff303030),
-    menu: const Color(0xff353535),
-    code: const Color(0xff171717),
+    background: DarkTokens.background,
+    sidebar: DarkTokens.sidebar,
+    border: DarkTokens.border,
+    hover: DarkTokens.hover,
+    selected: DarkTokens.selected,
+    text: DarkTokens.text,
+    muted: DarkTokens.muted,
+    subtle: DarkTokens.subtle,
+    bubble: DarkTokens.bubble,
+    composer: DarkTokens.composer,
+    menu: DarkTokens.menu,
+    code: DarkTokens.code,
     accent: accent,
-    onAccent: const Color(0xffffffff),
-    danger: const Color(0xffff6b5e),
-    success: const Color(0xff3ecf9e),
-    warning: const Color(0xfff2c14e),
+    onAccent: DarkTokens.onAccent,
+    danger: DarkTokens.danger,
+    success: DarkTokens.success,
+    warning: DarkTokens.warning,
     userBubble: Color.alphaBlend(
       accent.withValues(alpha: .24),
-      const Color(0xff212121),
+      DarkTokens.background,
     ),
   );
 
@@ -200,7 +199,7 @@ ThemeData buildTheme(Brightness brightness, Color accent) {
         surfaceContainerHighest: c.bubble,
         error: c.danger,
       );
-  final radius = BorderRadius.circular(12);
+  final radius = BorderRadius.circular(Radii.field);
   final theme = ThemeData(
     useMaterial3: true,
     brightness: brightness,
@@ -220,7 +219,10 @@ ThemeData buildTheme(Brightness brightness, Color accent) {
     ),
     inputDecorationTheme: InputDecorationTheme(
       isDense: true,
-      contentPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 14),
+      contentPadding: const EdgeInsets.symmetric(
+        horizontal: Space.s14,
+        vertical: Space.s14,
+      ),
       border: OutlineInputBorder(
         borderRadius: radius,
         borderSide: BorderSide(color: c.border),
@@ -242,11 +244,11 @@ ThemeData buildTheme(Brightness brightness, Color accent) {
       elevation: 6,
       shadowColor: Colors.black.withValues(alpha: .18),
       shape: RoundedRectangleBorder(
-        borderRadius: BorderRadius.circular(16),
+        borderRadius: BorderRadius.circular(Radii.menu),
         side: BorderSide(color: c.border),
       ),
-      textStyle: _font(fontSize: 14, color: c.text),
-      menuPadding: const EdgeInsets.all(8),
+      textStyle: _font(fontSize: FontSizes.body, color: c.text),
+      menuPadding: const EdgeInsets.all(Space.s8),
     ),
     menuTheme: MenuThemeData(
       style: MenuStyle(
@@ -254,7 +256,7 @@ ThemeData buildTheme(Brightness brightness, Color accent) {
         surfaceTintColor: const WidgetStatePropertyAll(Colors.transparent),
         shape: WidgetStatePropertyAll(
           RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(16),
+            borderRadius: BorderRadius.circular(Radii.menu),
             side: BorderSide(color: c.border),
           ),
         ),
@@ -262,40 +264,44 @@ ThemeData buildTheme(Brightness brightness, Color accent) {
         shadowColor: WidgetStatePropertyAll(
           Colors.black.withValues(alpha: .18),
         ),
-        padding: const WidgetStatePropertyAll(EdgeInsets.all(8)),
+        padding: const WidgetStatePropertyAll(EdgeInsets.all(Space.s8)),
       ),
     ),
     // Items sit inset from the panel edge with a rounded highlight.
     menuButtonTheme: MenuButtonThemeData(
       style: ButtonStyle(
         padding: const WidgetStatePropertyAll(
-          EdgeInsets.symmetric(horizontal: 14),
+          EdgeInsets.symmetric(horizontal: Space.s14),
         ),
         minimumSize: const WidgetStatePropertyAll(Size(0, 38)),
         shape: WidgetStatePropertyAll(
-          RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+          RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(Radii.field),
+          ),
         ),
         foregroundColor: WidgetStatePropertyAll(c.text),
         iconColor: WidgetStatePropertyAll(c.muted),
         overlayColor: WidgetStatePropertyAll(c.hover),
-        textStyle: WidgetStatePropertyAll(_font(fontSize: 14)),
+        textStyle: WidgetStatePropertyAll(_font(fontSize: FontSizes.body)),
       ),
     ),
     tooltipTheme: TooltipThemeData(
       waitDuration: const Duration(milliseconds: 500),
       decoration: BoxDecoration(
         color: brightness == Brightness.dark ? c.menu : c.text,
-        borderRadius: BorderRadius.circular(8),
+        borderRadius: BorderRadius.circular(Radii.tooltip),
       ),
       textStyle: _font(
-        fontSize: 12,
+        fontSize: FontSizes.caption,
         color: brightness == Brightness.dark ? c.text : c.background,
       ),
     ),
     dialogTheme: DialogThemeData(
       backgroundColor: c.menu,
       surfaceTintColor: Colors.transparent,
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(Radii.dialog),
+      ),
     ),
     drawerTheme: DrawerThemeData(
       backgroundColor: c.sidebar,
@@ -325,7 +331,10 @@ ThemeData buildTheme(Brightness brightness, Color accent) {
         backgroundColor: c.text,
         foregroundColor: c.background,
         shape: const StadiumBorder(),
-        padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 12),
+        padding: const EdgeInsets.symmetric(
+          horizontal: Space.s18,
+          vertical: Space.s12,
+        ),
       ),
     ),
     outlinedButtonTheme: OutlinedButtonThemeData(
@@ -333,7 +342,10 @@ ThemeData buildTheme(Brightness brightness, Color accent) {
         foregroundColor: c.text,
         side: BorderSide(color: c.border),
         shape: const StadiumBorder(),
-        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+        padding: const EdgeInsets.symmetric(
+          horizontal: Space.s16,
+          vertical: Space.s10,
+        ),
       ),
     ),
     textButtonTheme: TextButtonThemeData(
@@ -348,7 +360,9 @@ ThemeData buildTheme(Brightness brightness, Color accent) {
         // Standard density keeps room between a glyph and its highlight; the
         // compact desktop default hugs it.
         visualDensity: VisualDensity.standard,
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(Radii.control),
+        ),
       ),
     ),
     chipTheme: ChipThemeData(
@@ -357,8 +371,8 @@ ThemeData buildTheme(Brightness brightness, Color accent) {
       checkmarkColor: accent,
       side: BorderSide(color: c.border),
       shape: const StadiumBorder(),
-      labelStyle: _font(fontSize: 13, color: c.text),
-      padding: const EdgeInsets.symmetric(horizontal: 4),
+      labelStyle: _font(fontSize: FontSizes.label, color: c.text),
+      padding: const EdgeInsets.symmetric(horizontal: Space.s4),
     ),
     segmentedButtonTheme: SegmentedButtonThemeData(
       style: SegmentedButton.styleFrom(
@@ -369,7 +383,7 @@ ThemeData buildTheme(Brightness brightness, Color accent) {
         side: BorderSide.none,
         shape: const StadiumBorder(),
         visualDensity: VisualDensity.compact,
-        textStyle: _font(fontSize: 13),
+        textStyle: _font(fontSize: FontSizes.label),
       ),
     ),
     progressIndicatorTheme: ProgressIndicatorThemeData(color: accent),

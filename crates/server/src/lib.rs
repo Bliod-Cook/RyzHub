@@ -21,17 +21,17 @@ macro_rules! require {
 /// string literals, so they compose with `concat!` into static SQL.
 macro_rules! item_columns {
     () => {
-        "id,revision,kind,state,text,first_seq,last_seq,run_id,truncated,detail"
+        "id,revision,kind,state,text,first_seq,last_seq,run_id,truncated,detail,parent_item_id"
     };
 }
 macro_rules! action_columns {
     () => {
-        "id,run_id,run_epoch,kind,summary,options,status,resolved_device,expires_at"
+        "id,run_id,run_epoch,kind,summary,options,status,resolved_device,expires_at,form"
     };
 }
 macro_rules! conversation_columns {
     () => {
-        "id,org_id,creator_id,title,mode,state,project_id,run_config,temporary,\
+        "id,org_id,creator_id,title,mode,state,project_id,run_config,temporary,activity_seq,\
          (extract(epoch FROM pinned_at)*1000)::bigint AS pinned_at_ms"
     };
 }
@@ -47,15 +47,21 @@ pub mod attachments;
 pub mod chat;
 pub mod config;
 pub mod conversation_commands;
+pub mod drafts;
 pub mod error;
+pub mod extract;
 pub mod http;
+pub mod jobs;
+pub mod lifecycle;
 pub mod llm;
 pub mod maintenance;
 pub mod mcp;
 pub mod memory;
 pub mod owner;
+pub mod plugins;
 pub mod projects;
 pub mod provider;
+pub mod push;
 pub mod retention;
 pub mod revocation;
 pub mod run_config;
@@ -63,6 +69,9 @@ pub mod runs;
 pub mod sandbox;
 pub mod search;
 pub mod store;
+pub mod terminal;
+pub mod user_commands;
+pub mod vault;
 pub mod work;
 pub mod workspace;
 pub mod ws;

@@ -12,7 +12,6 @@ use axum::{
     http::HeaderMap,
 };
 use chrono::{DateTime, Utc};
-use embedding::{EmbeddingProvider, OpenAiEmbedding};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::PgPool;
@@ -112,9 +111,7 @@ pub async fn retrieve(
         Code::InvalidArguments
     );
     let vector = if matches!(q.mode.as_str(), "vector" | "hybrid") {
-        let vectors = OpenAiEmbedding
-            .embed(app, org, user, vec![q.q.clone()])
-            .await;
+        let vectors = embedding::embed(app, org, user, vec![q.q.clone()]).await;
         match vectors {
             Ok(vectors) => Some(embedding::vector_literal(&vectors[0])),
             Err(error) if q.mode == "hybrid" => {
@@ -313,14 +310,11 @@ pub async fn process(app: &App, job: &Job) -> anyhow::Result<bool> {
         && s.source_version == job.source_version
         && s.doc_kind != "title"
         && memory_allowed
-        && !app.config.search.embedding_url.is_empty()
+        && app.config.search.embeddings()
     {
         let mut vectors = Vec::new();
         for batch in embedding::chunks(&s.text).chunks(64) {
-            match OpenAiEmbedding
-                .embed(app, job.org_id, s.owner_user_id, batch.to_vec())
-                .await
-            {
+            match embedding::embed(app, job.org_id, s.owner_user_id, batch.to_vec()).await {
                 Ok(batch) => vectors.extend(batch),
                 Err(error) => {
                     // Publish the current document without stale vectors; the worker retries

@@ -55,7 +55,14 @@ pub async fn put(
             Code::PolicyDenied
         );
     }
-    let result = save(&mut tx, org, ctx.user_id, input).await?;
+    let result = save(
+        &mut tx,
+        org,
+        ctx.user_id,
+        input,
+        &super::forbidden_words(&policy),
+    )
+    .await?;
     tx.commit().await?;
     Ok(Json(result))
 }
@@ -265,7 +272,8 @@ pub async fn execute(
             input.project_id = a.project;
             input.source_conversation_id = Some(a.conversation);
             input.request_key = Some(key);
-            let result = save(tx, org, a.user, input).await?;
+            let policy = crate::store::effective_policy(tx, &app.config.policy, org).await?;
+            let result = save(tx, org, a.user, input, &super::forbidden_words(&policy)).await?;
             sqlx::query(
                 "UPDATE memory_events SET origin_conversation_id=$3 WHERE org_id=$1 AND id=$2",
             )
@@ -305,10 +313,10 @@ pub async fn execute(
 fn search_mode<'a>(app: &'a App, args: &'a Value) -> anyhow::Result<&'a str> {
     let mode = args["mode"]
         .as_str()
-        .unwrap_or(if app.config.search.embedding_url.is_empty() {
-            "fulltext"
-        } else {
+        .unwrap_or(if app.config.search.embeddings() {
             "hybrid"
+        } else {
+            "fulltext"
         });
     ensure!(
         matches!(mode, "fulltext" | "hybrid" | "vector"),
@@ -343,10 +351,7 @@ pub async fn prepare_search(
         Code::PolicyDenied
     );
     tx.commit().await?;
-    use crate::search::embedding::EmbeddingProvider;
-    let vectors = crate::search::embedding::OpenAiEmbedding
-        .embed(app, org, a.user, vec![query.into()])
-        .await;
+    let vectors = crate::search::embedding::embed(app, org, a.user, vec![query.into()]).await;
     match vectors {
         Ok(vectors) => Ok(Some(crate::search::embedding::vector_literal(&vectors[0]))),
         Err(error) if mode == "hybrid" => {

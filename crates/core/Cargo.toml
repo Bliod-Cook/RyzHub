@@ -9,3 +9,14 @@ serde.workspace = true
 serde_json.workspace = true
 prost.workspace = true
 thiserror.workspace = true
+pulldown-cmark = { version = "0.13", default-features = false }
+syntect = { version = "5.3", default-features = false, features = ["parsing", "regex-fancy", "dump-load"] }
+similar = "3"
+vte = "0.15"
+ruzstd = "0.9"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+two-face = { version = "0.5.2", default-features = false, features = ["syntect-fancy"] }
+
+[dev-dependencies]
+syntect = { version = "5.3", default-features = false, features = ["dump-create"] }

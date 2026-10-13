@@ -15,6 +15,8 @@ pub struct RunConfig {
     pub reasoning: String,
     pub approval: String,
     pub plan: bool,
+    /// A `sandbox.profiles` name; empty is the default environment.
+    pub env_profile: String,
 }
 
 impl Default for RunConfig {
@@ -27,6 +29,7 @@ impl Default for RunConfig {
             reasoning: "medium".into(),
             approval: "ask".into(),
             plan: false,
+            env_profile: String::new(),
         }
     }
 }
@@ -44,21 +47,27 @@ impl RunConfig {
                     .iter()
                     .filter(|m| m.id == c.model)
                     .flat_map(|m| &m.harnesses)
-                    .find(|h| matches!(h.as_str(), "codex" | "claude"))
+                    .find(|h| matches!(h.as_str(), "codex" | "claude") || acp(config, h).is_some())
                     .cloned()
                     .unwrap_or_else(|| "codex".into())
             };
         }
+        let profile = acp(config, &c.harness);
         if c.model.is_empty() && !config.llm.enabled {
             c.model = "mock".into();
         }
         if c.model.is_empty() {
-            c.model = match c.harness.as_str() {
-                "codex" => config.work.model.clone(),
-                "claude" => config.work.claude_model.clone(),
+            c.model = match (c.harness.as_str(), profile) {
+                (_, Some(profile)) => profile.model.clone(),
+                ("codex", _) => config.work.model.clone(),
+                ("claude", _) => config.work.claude_model.clone(),
                 _ if c.protocol == "responses" => config.llm.responses_model.clone(),
                 _ => config.llm.model.clone(),
             };
+        }
+        // An ACP agent's provider speaks one protocol.
+        if let Some(profile) = profile {
+            c.protocol = profile.protocol.clone();
         }
         if c.protocol.is_empty() {
             // Resolve the default model first, then follow its catalog route.
@@ -71,11 +80,11 @@ impl RunConfig {
             matches!(
                 (mode, c.harness.as_str()),
                 ("chat", "chat") | ("work", "codex" | "claude")
-            ),
+            ) || (mode == "work" && profile.is_some()),
             Code::InvalidHarness
         );
         ensure!(
-            matches!(c.protocol.as_str(), "anthropic" | "responses"),
+            profile.is_some() || matches!(c.protocol.as_str(), "anthropic" | "responses"),
             Code::InvalidProtocol
         );
         if c.harness == "codex" {
@@ -129,6 +138,15 @@ impl RunConfig {
             self.approval != "full_auto" || p.allow_full_auto != Some(false),
             Code::PolicyDenied
         );
+        ensure!(
+            self.env_profile.is_empty()
+                || config
+                    .sandbox
+                    .profiles
+                    .iter()
+                    .any(|p| p.name == self.env_profile),
+            Code::InvalidArguments
+        );
         // Catalog entries are explicit routes. Legacy default models remain routable.
         let routes = models(config, &self.harness, &self.protocol);
         ensure!(routes.contains(&self.model), Code::ModelNotRoutable);
@@ -145,6 +163,39 @@ pub fn models(config: &Config, harness: &str, protocol: &str) -> Vec<String> {
         .filter(|m| m.protocol == protocol && m.harnesses.iter().any(|h| h == harness))
         .map(|m| m.id)
         .collect()
+}
+
+/// The ACP agent behind `harness`, when it is one.
+pub fn acp<'a>(config: &'a Config, harness: &str) -> Option<&'a ryzhub_execution::AcpProfile> {
+    config.harness.acp.iter().find(|p| p.name == harness)
+}
+
+/// The Work harnesses the instance offers.
+pub fn work_harnesses(config: &Config) -> Vec<&str> {
+    let mut harnesses = vec!["codex"];
+    if !config.work.claude_model.is_empty() {
+        harnesses.push("claude");
+    }
+    harnesses.extend(config.harness.acp.iter().map(|p| p.name.as_str()));
+    harnesses
+}
+
+/// The name clients show for a Work harness.
+pub fn harness_label<'a>(config: &'a Config, harness: &'a str) -> &'a str {
+    match (harness, acp(config, harness)) {
+        (_, Some(profile)) if !profile.label.is_empty() => &profile.label,
+        ("codex", _) => "Codex",
+        ("claude", _) => "Claude Code",
+        _ => harness,
+    }
+}
+
+/// The harness version a checkpoint records; a restore requires the same.
+pub fn harness_version(config: &Config, harness: &str) -> String {
+    acp(config, harness).map_or_else(
+        || ryzhub_execution::native::harness_version(harness).to_owned(),
+        |profile| profile.version.clone(),
+    )
 }
 
 /// An explicit route can make the default Chat model use Responses.
@@ -179,6 +230,11 @@ pub fn catalog(config: &Config) -> Vec<ModelEntry> {
         (&config.work.model, "responses", "codex"),
         (&config.work.claude_model, "anthropic", "claude"),
     ];
+    let agents = config
+        .harness
+        .acp
+        .iter()
+        .map(|p| (&p.model, p.protocol.as_str(), p.name.as_str()));
     let routes = config
         .llm
         .models
@@ -187,6 +243,7 @@ pub fn catalog(config: &Config) -> Vec<ModelEntry> {
         .chain(
             defaults
                 .into_iter()
+                .chain(agents)
                 .map(|(id, protocol, harness)| (id, protocol, vec![harness.to_owned()])),
         );
     let mut out: Vec<ModelEntry> = vec![];
@@ -240,8 +297,9 @@ pub fn provider(protocol: &str) -> &'static str {
 pub fn reasoning_levels(harness: &str, protocol: &str) -> Vec<&'static str> {
     match (harness, protocol) {
         ("claude", _) => vec!["low", "medium", "high", "xhigh", "max"],
-        ("chat", p) if p != "responses" => vec![],
-        _ => vec!["low", "medium", "high", "xhigh"],
+        ("codex", _) | ("chat", "responses") => vec!["low", "medium", "high", "xhigh"],
+        // Chat over Messages, and ACP agents, which choose their own.
+        _ => vec![],
     }
 }
 
@@ -266,23 +324,39 @@ pub fn capabilities(harness: &str, protocol: &str) -> Value {
         "subagent": "unsupported",
         "durable_pause": "emulated",
         "side_query": "emulated",
+        "terminal": "native",
     });
     if harness == "claude" {
         c["steer"] = json!("emulated");
         c["todo"] = json!("native");
+        // Its agents' work nests under the call that started them.
         c["subagent"] = json!("native");
     }
     if harness == "codex" {
         c["todo"] = json!("native");
         c["diff"] = json!("native");
+        c["terminal_stream"] = json!("native");
+    }
+    if !matches!(harness, "chat" | "codex" | "claude") {
+        // An agent over ACP: no steering (steers wait for the next turn), forks, questions or
+        // reasoning control; its plans and file diffs come as items.
+        c["steer"] = json!("emulated");
+        c["fork"] = json!("unsupported");
+        c["ask_user"] = json!("unsupported");
+        c["thought_level"] = json!("unsupported");
+        c["todo"] = json!("native");
+        c["diff"] = json!("native");
     }
     if harness == "chat" {
+        // A command's output streams while `exec` waits for it.
+        c["terminal_stream"] = json!("native");
+        c["terminal"] = json!("unsupported");
         c["steer"] = json!("emulated");
         c["plan_mode"] = json!("unsupported");
         c["commands_list"] = json!("unsupported");
         c["durable_pause"] = json!("native");
+        // Every Chat context compacts: by the provider where it can, else by a summary.
         if protocol != "responses" {
-            c["compact"] = json!("unsupported");
             c["thought_level"] = json!("unsupported");
         }
     }
@@ -393,6 +467,53 @@ mod tests {
         assert_eq!(work(json!({})).model, "gpt-5.4");
         let explicit = work(json!({"harness":"claude"}));
         assert_eq!(explicit.model, "claude-sonnet-4-6");
+    }
+
+    #[test]
+    fn acp_agents_are_work_harnesses_of_their_profiles() {
+        let mut c = config();
+        c.harness.acp = vec![ryzhub_execution::AcpProfile {
+            name: "opencode".into(),
+            label: "OpenCode".into(),
+            command: "/usr/local/bin/opencode".into(),
+            protocol: "chat_completions".into(),
+            model: "glm-5".into(),
+            version: "1.19.0".into(),
+            ..Default::default()
+        }];
+        c.llm.models[1].harnesses.push("opencode".into());
+        c.validate().unwrap();
+        let work = |v| RunConfig::resolve(v, "work", &c);
+        let agent = work(json!({"harness":"opencode"})).unwrap();
+        // Its provider's protocol, whatever the model's route says.
+        assert_eq!(
+            (agent.model.as_str(), agent.protocol.as_str()),
+            ("glm-5", "chat_completions")
+        );
+        assert_eq!(work(json!({"model":"glm-5"})).unwrap().harness, "opencode");
+        assert_eq!(
+            models(&c, "opencode", "chat_completions"),
+            vec!["glm-5".to_owned()]
+        );
+        assert!(RunConfig::resolve(json!({"harness":"opencode"}), "chat", &c).is_err());
+        assert_eq!(work_harnesses(&c), ["codex", "claude", "opencode"]);
+        assert_eq!(harness_label(&c, "opencode"), "OpenCode");
+        assert_eq!(harness_version(&c, "opencode"), "1.19.0");
+        let caps = capabilities("opencode", "chat_completions");
+        assert_eq!(
+            (
+                caps["steer"].as_str(),
+                caps["fork"].as_str(),
+                caps["compact"].as_str()
+            ),
+            (Some("emulated"), Some("unsupported"), Some("native"))
+        );
+        assert!(reasoning_levels("opencode", "chat_completions").is_empty());
+        for name in ["codex", "Open Code", ""] {
+            let mut bad = c.clone();
+            bad.harness.acp[0].name = name.into();
+            assert!(bad.validate().is_err(), "{name:?}");
+        }
     }
 
     #[test]

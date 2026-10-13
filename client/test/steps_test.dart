@@ -4,6 +4,8 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:ryzhub/prefs.dart';
 import 'package:ryzhub/ui/messages.dart';
 
+import 'kernel.dart';
+
 Map<String, dynamic> _item(
   String id,
   String kind, {
@@ -325,10 +327,7 @@ void main() {
           ),
         ),
       );
-      return tester
-          .widgetList<SelectableText>(find.byType(SelectableText))
-          .map((t) => t.textSpan?.toPlainText() ?? t.data ?? '')
-          .join('\n');
+      return shownText(tester);
     }
 
     const cited = '体育。([news.cn]($news))\n\n巴西。';
@@ -389,10 +388,7 @@ void main() {
         ),
       ),
     );
-    final shown = tester
-        .widgetList<SelectableText>(find.byType(SelectableText))
-        .map((t) => t.textSpan?.toPlainText() ?? t.data ?? '')
-        .join('\n');
+    final shown = shownText(tester);
     expect(shown, contains('体育消息。'));
     expect(shown, contains('普通链接'));
     expect(shown, isNot(contains('](')));
@@ -428,4 +424,60 @@ void main() {
     expect(find.text('处理中…'), findsOneWidget);
     await tester.pumpWidget(const SizedBox());
   });
+
+  testWidgets(
+    'a subagent works under its call; changed files open their diff',
+    (tester) async {
+      prefs.language = 'en';
+      final call = _item(
+        'call',
+        'tool',
+        tool: {'name': 'Agent', 'arguments_json': '{"prompt":"look"}'},
+      );
+      final child = {
+        ..._item('sub', 'assistant', text: 'subagent finding'),
+        'parent_item_id': 'call',
+      };
+      final edit = {
+        ..._item('edit', 'file_change'),
+        'detail': {
+          'kind': {
+            'FileChange': {
+              'changes': [
+                {
+                  'path': 'a.txt',
+                  'change': 'update',
+                  'diff': '@@ -1 +1 @@\n-old\n+new',
+                },
+              ],
+            },
+          },
+        },
+      };
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: SingleChildScrollView(
+              child: StepsGroup(
+                steps: [call, edit],
+                running: true,
+                latest: true,
+                children: (id) => id == 'call' ? [child] : const [],
+              ),
+            ),
+          ),
+        ),
+      );
+      await tester.pump(const Duration(milliseconds: 600));
+      expect(
+        find.textContaining('subagent finding', findRichText: true),
+        findsOneWidget,
+      );
+      expect(find.text('Edited a.txt'), findsOneWidget);
+      expect(find.textContaining('+new', findRichText: true), findsNothing);
+      await tester.tap(find.text('Edited a.txt'));
+      await tester.pump(const Duration(milliseconds: 600));
+      expect(find.textContaining('+new', findRichText: true), findsOneWidget);
+    },
+  );
 }

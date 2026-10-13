@@ -309,6 +309,7 @@ pub async fn create(
     .bind(if kind == RunKind::Compact { "compact" } else { "" })
     .execute(&mut **tx)
     .await?;
+    crate::plugins::fix_run(tx, lease.org_id, lease.conversation_id, run).await?;
     add_input(tx, lease, run, input, "message", &cmd.cid).await?;
     append(
         tx,
@@ -586,6 +587,17 @@ pub async fn request_action(
     run: Uuid,
     action: ActionRow,
 ) -> anyhow::Result<()> {
+    crate::push::notify(
+        tx,
+        lease.org_id,
+        lease.conversation_id,
+        crate::push::Notice::Action {
+            id: action.id,
+            kind: &action.kind,
+            summary: &action.summary,
+        },
+    )
+    .await?;
     append(
         tx,
         lease.org_id,
@@ -630,7 +642,7 @@ pub async fn resolve(tx: &mut Tx<'_>, lease: &Lease, r: Resolution<'_>) -> anyho
          WHERE a.org_id=$1 AND a.id=$2 AND a.run_epoch=$3 AND a.status='pending' AND a.kind=$8
            AND a.expires_at>now() AND r.org_id=a.org_id AND r.id=a.run_id AND r.conversation_id=$4
            AND r.exec_epoch=$3 AND r.state='requires_action'
-         RETURNING a.id,a.run_id,a.run_epoch,a.kind,a.summary,a.options,a.status,a.resolved_device,a.expires_at",
+         RETURNING a.id,a.run_id,a.run_epoch,a.kind,a.summary,a.options,a.status,a.resolved_device,a.expires_at,a.form",
     )
     .bind(lease.org_id)
     .bind(id)
@@ -652,6 +664,25 @@ pub async fn resolve(tx: &mut Tx<'_>, lease: &Lease, r: Resolution<'_>) -> anyho
             .await?;
     if let Some(request) = native {
         let answer = crate::work::answer(&request, r.kind, r.answer)?;
+        // The member allowed a call of a gateway tool: the gateway need not ask again.
+        if r.answer == "allow"
+            && let Some(tool) = request["tool"]
+                .as_str()
+                .and_then(|tool| tool.strip_prefix("mcp__ryzhub__"))
+        {
+            sqlx::query(
+                "INSERT INTO approval_grants(id,org_id,run_id,exec_epoch,tool,args_digest,expires_at)
+                 VALUES($1,$2,$3,$4,$5,$6,now()+interval '1 hour')",
+            )
+            .bind(Uuid::now_v7())
+            .bind(lease.org_id)
+            .bind(action.run_id)
+            .bind(action.run_epoch)
+            .bind(tool)
+            .bind(crate::mcp::args_digest(&request["arguments"]))
+            .execute(&mut **tx)
+            .await?;
+        }
         sqlx::query("UPDATE native_requests SET answer=$3 WHERE org_id=$1 AND action_id=$2")
             .bind(lease.org_id)
             .bind(id)
@@ -757,7 +788,24 @@ pub async fn finish(
     .bind(run)
     .execute(&mut **tx)
     .await?;
-    announce_run(tx, lease, "", run, state, row.get("read_only")).await
+    let read_only: bool = row.get("read_only");
+    announce_run(tx, lease, "", run, state, read_only).await?;
+    if !read_only && matches!(state, "completed" | "failed") {
+        let ended = crate::push::Notice::Ended { run, state };
+        crate::push::notify(tx, lease.org_id, lease.conversation_id, ended).await?;
+    }
+    // A main run's end is news to the user's other views until they read it.
+    if !read_only {
+        let head = crate::store::head_seq(tx, lease.org_id, &lease.channel()).await?;
+        sqlx::query("UPDATE conversations SET activity_seq=$3 WHERE org_id=$1 AND id=$2")
+            .bind(lease.org_id)
+            .bind(lease.conversation_id)
+            .bind(head as i64)
+            .execute(&mut **tx)
+            .await?;
+        crate::store::publish_conversation(tx, lease.org_id, lease.conversation_id).await?;
+    }
+    Ok(())
 }
 
 /// Stop every active run of the conversation.

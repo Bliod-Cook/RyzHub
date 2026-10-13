@@ -6,8 +6,11 @@
 use anyhow::{Context, ensure};
 use futures_util::{StreamExt, TryStreamExt};
 use object_store::{
-    ClientOptions, ObjectStore, ObjectStoreExt, PutPayload, RetryConfig, WriteMultipart,
-    aws::AmazonS3Builder, path::Path as ObjectPath,
+    ClientOptions, ObjectStoreExt, PutPayload, RetryConfig, WriteMultipart,
+    aws::{AmazonS3, AmazonS3Builder},
+    multipart::{MultipartStore, PartId},
+    path::Path as ObjectPath,
+    signer::{SignedUrlOptions, Signer},
 };
 use sha2::{Digest, Sha256};
 use std::{path::PathBuf, pin::Pin, sync::Arc, time::Duration};
@@ -23,7 +26,7 @@ pub type Reader = Pin<Box<dyn AsyncRead + Send>>;
 #[derive(Clone)]
 enum Backend {
     Local(PathBuf),
-    S3(Arc<dyn ObjectStore>),
+    S3(Arc<AmazonS3>),
 }
 
 #[derive(Clone)]
@@ -312,6 +315,81 @@ impl BlobStore {
                 Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
                 Err(error) => Err(error.into()),
             },
+        }
+    }
+
+    /// Whether clients can send objects straight to this store, over presigned URLs.
+    pub fn direct(&self) -> bool {
+        matches!(self.backend, Backend::S3(_))
+    }
+
+    fn bucket(&self) -> anyhow::Result<&Arc<AmazonS3>> {
+        match &self.backend {
+            Backend::S3(store) => Ok(store),
+            Backend::Local(_) => anyhow::bail!("not an S3 store"),
+        }
+    }
+
+    /// Start a multipart upload to `key` that clients send straight to the bucket. Its content
+    /// is not its address: it is read back, and checked, before use.
+    pub async fn start_direct(&self, key: &str) -> anyhow::Result<String> {
+        valid_key(key)?;
+        Ok(self.bucket()?.create_multipart(&self.object(key)).await?)
+    }
+
+    /// A URL that accepts part `part` (from 1) of direct upload `upload` with a PUT, for
+    /// `expires`.
+    pub async fn presign_part(
+        &self,
+        key: &str,
+        upload: &str,
+        part: usize,
+        expires: Duration,
+    ) -> anyhow::Result<String> {
+        valid_key(key)?;
+        let options = SignedUrlOptions::default().with_query([
+            ("partNumber", part.to_string()),
+            ("uploadId", upload.to_owned()),
+        ]);
+        let url = self
+            .bucket()?
+            .signed_url_opts(
+                axum::http::Method::PUT,
+                &self.object(key),
+                expires,
+                &options,
+            )
+            .await?;
+        Ok(url.into())
+    }
+
+    /// Put direct upload `upload` together from its parts' entity tags, in order.
+    pub async fn finish_direct(
+        &self,
+        key: &str,
+        upload: &str,
+        etags: Vec<String>,
+    ) -> anyhow::Result<()> {
+        valid_key(key)?;
+        let parts = etags
+            .into_iter()
+            .map(|content_id| PartId { content_id })
+            .collect();
+        self.bucket()?
+            .complete_multipart(&self.object(key), &upload.to_owned(), parts)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn abort_direct(&self, key: &str, upload: &str) -> anyhow::Result<()> {
+        valid_key(key)?;
+        match self
+            .bucket()?
+            .abort_multipart(&self.object(key), &upload.to_owned())
+            .await
+        {
+            Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
+            Err(error) => Err(error.into()),
         }
     }
 

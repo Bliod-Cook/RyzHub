@@ -105,7 +105,7 @@ pub async fn apply(
     let streaming = if done || through.is_some() {
         vec![]
     } else {
-        streaming_text(&mut tx, lease, sandbox_id, &reply["folds"]).await?
+        streaming_text(&mut tx, lease, sandbox_id, reply).await?
     };
     tx.commit().await?;
     link.committed().await;
@@ -118,8 +118,9 @@ pub async fn apply(
         },
     )
     .await?;
-    for (item, text) in streaming {
-        link.send(WorkerEvent::Replace { item, text }).await?;
+    for (item, stream, text) in streaming {
+        link.send(WorkerEvent::Replace { item, stream, text })
+            .await?;
     }
     Ok(done)
 }
@@ -176,15 +177,21 @@ async fn record(
     Ok(())
 }
 
-/// Current text of streaming assistant items, for the Owner's live stream.
+/// Current text of streaming replies and output of running commands, for the Owner's live
+/// streams.
 async fn streaming_text(
     tx: &mut Tx<'_>,
     lease: &Lease,
     sandbox: Uuid,
-    folds: &Value,
-) -> anyhow::Result<Vec<(LiveRef, String)>> {
+    reply: &Value,
+) -> anyhow::Result<Vec<(LiveRef, &'static str, String)>> {
     let mut streaming = vec![];
-    for (native, text) in folds.as_object().into_iter().flatten() {
+    let folds = reply["folds"].as_object().into_iter().flatten();
+    let outputs = reply["outputs"].as_object().into_iter().flatten();
+    for (stream, (native, text)) in folds
+        .map(|f| (crate::owner::TEXT, f))
+        .chain(outputs.map(|o| (crate::owner::TERMINAL_OUTPUT, o)))
+    {
         let item: Option<Uuid> = sqlx::query_scalar(
             "SELECT item_id FROM native_items WHERE org_id=$1 AND sandbox_id=$2 AND native_id=$3",
         )
@@ -195,9 +202,15 @@ async fn streaming_text(
         .await?;
         let Some(item) = item else { continue };
         let item = load_item(tx, lease.org_id, item).await?;
-        if item.state == "streaming" && item.kind == "assistant" {
+        let kind = if stream == crate::owner::TEXT {
+            "assistant"
+        } else {
+            "tool"
+        };
+        if item.state == "streaming" && item.kind == kind {
             streaming.push((
                 LiveRef::of(&item),
+                stream,
                 text.as_str().unwrap_or_default().to_owned(),
             ));
         }
@@ -238,15 +251,18 @@ async fn project(
         }
     }
     match event {
+        // A report without models (Codex's skills) keeps the models listed before.
         HarnessEvent::Capabilities { commands, models } => {
             sqlx::query(
-                "UPDATE sandboxes SET commands=$3,capabilities=jsonb_set(capabilities,'{models}',$4)
+                "UPDATE sandboxes SET commands=$3,capabilities=CASE WHEN $5 THEN capabilities
+                   ELSE jsonb_set(capabilities,'{models}',$4) END
                  WHERE org_id=$1 AND id=$2",
             )
             .bind(lease.org_id)
             .bind(sandbox)
             .bind(commands)
             .bind(serde_json::to_value(models)?)
+            .bind(models.is_empty())
             .execute(&mut **tx)
             .await?;
         }
@@ -288,6 +304,7 @@ async fn project(
             kind,
             content,
             message_id,
+            parent_native_id,
             ..
         } => {
             project_item(
@@ -295,19 +312,23 @@ async fn project(
                 lease,
                 run,
                 sandbox,
-                *phase,
-                native_id,
-                *kind,
-                content,
-                message_id.as_deref(),
+                Native {
+                    phase: *phase,
+                    id: native_id,
+                    kind: *kind,
+                    content,
+                    message_id: message_id.as_deref(),
+                    parent: parent_native_id.as_deref(),
+                },
             )
             .await?
         }
         HarnessEvent::TurnCompleted { status, .. } => {
-            // Claude queues steers into a following native turn of the same platform run.
+            // Harnesses without native steering (all but Codex) queue steers into a following
+            // native turn of the same platform run.
             let queued: bool = sqlx::query_scalar(
                 "SELECT EXISTS(SELECT 1 FROM runs r JOIN pending_inputs i ON i.org_id=r.org_id AND i.run_id=r.id
-                 WHERE r.org_id=$1 AND r.id=$2 AND r.harness='claude' AND r.state='running' AND i.consumed_step IS NULL)",
+                 WHERE r.org_id=$1 AND r.id=$2 AND r.harness<>'codex' AND r.state='running' AND i.consumed_step IS NULL)",
             )
             .bind(lease.org_id)
             .bind(run)
@@ -504,6 +525,7 @@ fn detail(kind: ItemKind, content: &ItemContent) -> Option<ItemDetail> {
             arguments_json: content.arguments_json.clone().unwrap_or_default(),
             result_json: content.result_json.clone().unwrap_or_default(),
             output: content.output.clone().unwrap_or_default(),
+            ..Default::default()
         }),
         ItemKind::FileChange => item_detail::Kind::FileChange(FileChangeDetail {
             changes: content
@@ -522,17 +544,32 @@ fn detail(kind: ItemKind, content: &ItemContent) -> Option<ItemDetail> {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// A harness item as the projection reads it.
+struct Native<'a> {
+    phase: ItemPhase,
+    id: &'a str,
+    kind: ItemKind,
+    content: &'a ItemContent,
+    message_id: Option<&'a str>,
+    /// The native item it belongs to.
+    parent: Option<&'a str>,
+}
+
 async fn project_item(
     tx: &mut Tx<'_>,
     lease: &Lease,
     run: Uuid,
     sandbox: Uuid,
-    phase: ItemPhase,
-    native_id: &str,
-    kind: ItemKind,
-    content: &ItemContent,
-    message_id: Option<&str>,
+    native: Native<'_>,
 ) -> anyhow::Result<()> {
+    let Native {
+        phase,
+        id: native_id,
+        kind,
+        content,
+        message_id,
+        parent,
+    } = native;
     let mapped: Option<Uuid> = sqlx::query_scalar(
         "SELECT item_id FROM native_items WHERE org_id=$1 AND sandbox_id=$2 AND native_id=$3",
     )
@@ -591,6 +628,20 @@ async fn project_item(
     .into();
     item.text = content.text.clone();
     item.detail = detail(kind, content);
+    // An item keeps the parent it started with; a completion may not know it.
+    if let Some(parent) = parent
+        && item.parent_item_id.is_empty()
+    {
+        let parent: Option<Uuid> = sqlx::query_scalar(
+            "SELECT item_id FROM native_items WHERE org_id=$1 AND sandbox_id=$2 AND native_id=$3",
+        )
+        .bind(lease.org_id)
+        .bind(sandbox)
+        .bind(parent)
+        .fetch_optional(&mut **tx)
+        .await?;
+        item.parent_item_id = parent.map(|p| p.to_string()).unwrap_or_default();
+    }
     if let Some(message) = message_id {
         sqlx::query(
             "UPDATE native_items SET native_message_id=$4 WHERE org_id=$1 AND sandbox_id=$2 AND native_id=$3",

@@ -1,4 +1,7 @@
+import 'dart:convert';
+
 import 'package:flutter/material.dart';
+import 'package:http/http.dart' as http;
 
 import '../controller.dart';
 import '../l10n.dart';
@@ -38,7 +41,18 @@ List<(String, String)> languageOptions() => [
 
 class LoginPage extends StatefulWidget {
   final Future<void> Function(String, String, String, bool) onLogin;
-  const LoginPage({super.key, required this.onLogin});
+
+  /// Signs in with another account (OIDC, GitHub) by its provider id.
+  final Future<void> Function(String server, String provider)? onProvider;
+
+  /// Why an earlier sign-in with another account did not finish.
+  final String error;
+  const LoginPage({
+    super.key,
+    required this.onLogin,
+    this.onProvider,
+    this.error = '',
+  });
   @override
   State<LoginPage> createState() => _LoginPageState();
 }
@@ -49,7 +63,53 @@ class _LoginPageState extends State<LoginPage> {
   );
   final email = TextEditingController(), password = TextEditingController();
   bool register = true, busy = false;
-  String error = '';
+  late String error = widget.error;
+
+  /// The server's other ways to sign in: `{id, label, kind}`.
+  List<Map<String, dynamic>> providers = [];
+  String providersOf = '';
+
+  @override
+  void initState() {
+    super.initState();
+    loadProviders();
+  }
+
+  Future<void> loadProviders() async {
+    final address = server.text.trim().replaceAll(RegExp(r'/+$'), '');
+    if (address.isEmpty || address == providersOf) return;
+    providersOf = address;
+    try {
+      final response = await http
+          .get(Uri.parse('$address/capabilities'))
+          .timeout(const Duration(seconds: 8));
+      final data = jsonDecode(response.body);
+      if (!mounted || providersOf != address) return;
+      setState(
+        () => providers = [
+          for (final p in (data['auth_providers'] as List? ?? []))
+            if (p is Map) Map<String, dynamic>.from(p),
+        ],
+      );
+    } catch (_) {
+      if (mounted && providersOf == address) setState(() => providers = []);
+    }
+  }
+
+  Future<void> elsewhere(String provider) async {
+    setState(() {
+      busy = true;
+      error = '';
+    });
+    try {
+      await widget.onProvider!(server.text.trim(), provider);
+    } catch (e) {
+      if (mounted) setState(() => error = errorText(e));
+    } finally {
+      if (mounted) setState(() => busy = false);
+    }
+  }
+
   @override
   void dispose() {
     server.dispose();
@@ -81,7 +141,7 @@ class _LoginPageState extends State<LoginPage> {
           children: [
             Center(
               child: SingleChildScrollView(
-                padding: const EdgeInsets.all(28),
+                padding: const EdgeInsets.all(Space.s28),
                 child: SizedBox(
                   width: 380,
                   child: Column(
@@ -108,10 +168,16 @@ class _LoginPageState extends State<LoginPage> {
                         style: TextStyle(color: c.muted),
                       ),
                       const SizedBox(height: 34),
-                      TextField(
-                        controller: server,
-                        decoration: InputDecoration(
-                          labelText: tr('服务器地址', 'Server URL'),
+                      Focus(
+                        onFocusChange: (focused) {
+                          if (!focused) loadProviders();
+                        },
+                        child: TextField(
+                          controller: server,
+                          onSubmitted: (_) => loadProviders(),
+                          decoration: InputDecoration(
+                            labelText: tr('服务器地址', 'Server URL'),
+                          ),
                         ),
                       ),
                       const SizedBox(height: 14),
@@ -138,13 +204,15 @@ class _LoginPageState extends State<LoginPage> {
                       const SizedBox(height: 20),
                       if (error.isNotEmpty)
                         Padding(
-                          padding: const EdgeInsets.only(bottom: 16),
+                          padding: const EdgeInsets.only(bottom: Space.s16),
                           child: Text(error, style: TextStyle(color: c.danger)),
                         ),
                       FilledButton(
                         onPressed: busy ? null : submit,
                         child: Padding(
-                          padding: const EdgeInsets.symmetric(vertical: 4),
+                          padding: const EdgeInsets.symmetric(
+                            vertical: Space.s4,
+                          ),
                           child: Text(
                             busy
                                 ? tr('连接中…', 'Connecting…')
@@ -154,6 +222,47 @@ class _LoginPageState extends State<LoginPage> {
                           ),
                         ),
                       ),
+                      if (providers.isNotEmpty &&
+                          widget.onProvider != null) ...[
+                        const SizedBox(height: 16),
+                        Row(
+                          children: [
+                            const Expanded(child: Divider()),
+                            Padding(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: Space.s10,
+                              ),
+                              child: Text(
+                                tr('或', 'or'),
+                                style: TextStyle(color: c.muted),
+                              ),
+                            ),
+                            const Expanded(child: Divider()),
+                          ],
+                        ),
+                        const SizedBox(height: 12),
+                        for (final provider in providers)
+                          Padding(
+                            padding: const EdgeInsets.only(bottom: Space.s8),
+                            child: OutlinedButton.icon(
+                              icon: Icon(
+                                provider['kind'] == 'github'
+                                    ? Icons.code
+                                    : Icons.verified_user_outlined,
+                                size: 18,
+                              ),
+                              onPressed: busy
+                                  ? null
+                                  : () => elsewhere('${provider['id']}'),
+                              label: Text(
+                                tr(
+                                  '使用 ${provider['label']} 登录',
+                                  'Continue with ${provider['label']}',
+                                ),
+                              ),
+                            ),
+                          ),
+                      ],
                       const SizedBox(height: 6),
                       TextButton(
                         onPressed: busy

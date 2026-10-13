@@ -88,16 +88,23 @@ pub async fn ensure_work(app: &App, lease: &Lease, run: Uuid) -> anyhow::Result<
             .bind(lease.conversation_id)
             .fetch_one(&mut *tx)
             .await?;
+    let limits = sandbox::limits(&mut tx, app, lease.org_id).await?;
+    let env = sandbox::environment(app, &settings.env_profile, true)?;
     let mut spec = SandboxSpec {
         id: Uuid::now_v7(),
         org_id: lease.org_id,
         workspace_id: lease.conversation_id,
         exec_epoch: lease.epoch as u64,
-        image: cfg.image.clone(),
+        image: env.image,
         runtime: cfg.runtime.clone(),
-        memory_bytes: cfg.memory_bytes.max(512 * 1024 * 1024),
-        pids_limit: cfg.pids_limit,
+        memory_bytes: env.memory_bytes,
+        pids_limit: env.pids_limit,
         persistent: true,
+        egress: limits.egress,
+        disk_bytes: env
+            .disk_cap
+            .map_or(limits.disk_bytes, |cap| cap.min(limits.disk_bytes)),
+        deps: env.deps,
     };
     let source = match (running, fork) {
         (Some((id, handle, node_lease)), _) => {
@@ -105,9 +112,10 @@ pub async fn ensure_work(app: &App, lease: &Lease, run: Uuid) -> anyhow::Result<
                 node_lease.is_none_or(|until| until > Utc::now()),
                 Code::WorkspaceRecoveryRequired
             );
-            // A workspace keeps the image and runtime it was created with.
+            // A workspace keeps the image, layer and runtime it was created with.
             if let Ok(pinned) = serde_json::from_value::<SandboxSpec>(handle) {
                 spec.image = pinned.image;
+                spec.deps = pinned.deps;
                 spec.runtime = pinned.runtime;
             }
             spec.id = id;
@@ -118,6 +126,7 @@ pub async fn ensure_work(app: &App, lease: &Lease, run: Uuid) -> anyhow::Result<
                 .as_str()
                 .context("fork manifest without image")?
                 .into();
+            spec.deps = fork["manifest"]["deps"].as_str().map(Into::into);
             Source::Fork {
                 manifest: fork["manifest"].clone(),
             }
@@ -128,6 +137,7 @@ pub async fn ensure_work(app: &App, lease: &Lease, run: Uuid) -> anyhow::Result<
                     .as_str()
                     .context("checkpoint manifest without image")?
                     .into();
+                spec.deps = manifest["deps"].as_str().map(Into::into);
                 Source::Suspended { thread, manifest }
             }
             None => {
@@ -140,6 +150,15 @@ pub async fn ensure_work(app: &App, lease: &Lease, run: Uuid) -> anyhow::Result<
                 .bind(lease.conversation_id)
                 .fetch_one(&mut *tx)
                 .await?;
+                let purged: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM workspace_heads WHERE org_id=$1 AND conversation_id=$2
+                     AND storage_state IN ('purging','deleted'))",
+                )
+                .bind(lease.org_id)
+                .bind(lease.conversation_id)
+                .fetch_one(&mut *tx)
+                .await?;
+                ensure!(!purged, Code::WorkspacePurged);
                 ensure!(!used, Code::WorkspaceRecoveryRequired);
                 Source::Fresh
             }
@@ -149,7 +168,8 @@ pub async fn ensure_work(app: &App, lease: &Lease, run: Uuid) -> anyhow::Result<
     if !matches!(source, Source::Running) {
         let generation: i64 = sqlx::query_scalar(
             "INSERT INTO workspace_heads(org_id,conversation_id) VALUES($1,$2)
-             ON CONFLICT(org_id,conversation_id) DO UPDATE SET generation=workspace_heads.generation+1
+             ON CONFLICT(org_id,conversation_id) DO UPDATE SET generation=workspace_heads.generation+1,
+               storage_state='hot'
              RETURNING generation",
         )
         .bind(lease.org_id)
@@ -160,9 +180,10 @@ pub async fn ensure_work(app: &App, lease: &Lease, run: Uuid) -> anyhow::Result<
             Source::Suspended { thread, .. } => thread.clone(),
             _ => None,
         };
+        let node = sandbox::place(&mut tx, app, lease.conversation_id).await?;
         sqlx::query(
-            "INSERT INTO sandboxes(id,org_id,conversation_id,run_id,lease_epoch,exec_epoch,state,handle,persistent,native_thread_id)
-             VALUES($1,$2,$3,$4,$5,$6,'provisioning',$7,true,$8)",
+            "INSERT INTO sandboxes(id,org_id,conversation_id,run_id,lease_epoch,exec_epoch,state,handle,persistent,native_thread_id,node)
+             VALUES($1,$2,$3,$4,$5,$6,'provisioning',$7,true,$8,$9)",
         )
         .bind(id)
         .bind(lease.org_id)
@@ -172,6 +193,7 @@ pub async fn ensure_work(app: &App, lease: &Lease, run: Uuid) -> anyhow::Result<
         .bind(lease.epoch)
         .bind(serde_json::to_value(&spec)?)
         .bind(thread)
+        .bind(node)
         .execute(&mut *tx)
         .await?;
     }
@@ -182,7 +204,7 @@ pub async fn ensure_work(app: &App, lease: &Lease, run: Uuid) -> anyhow::Result<
             crate::workspace::restore_into(app, lease, spec.clone(), manifest).await?
         }
         Source::Fresh => {
-            sandbox::host(app, HostCommand::Create { spec }).await?;
+            sandbox::host(app, lease.org_id, id, HostCommand::Create { spec }).await?;
         }
     }
     sandbox::guest(app, lease, id, GuestCommand::Fence).await?;
@@ -209,6 +231,25 @@ pub async fn ensure_work(app: &App, lease: &Lease, run: Uuid) -> anyhow::Result<
     refresh_key(app, lease, run, id).await?;
     crate::projects::mount(app, lease, run, id).await?;
     crate::attachments::sandbox::sync(app, lease, id).await?;
+    // The plugins' skills, for the harness to find when it starts.
+    let skills = {
+        let mut tx = app.store.tx(lease.org_id).await?;
+        let skills = crate::plugins::run_skills(&mut tx, lease.org_id, run).await?;
+        tx.commit().await?;
+        skills
+    };
+    sandbox::guest(
+        app,
+        lease,
+        id,
+        GuestCommand::InstallSkills {
+            skills: skills
+                .iter()
+                .map(|(plugin, skill)| skill_files(plugin, skill))
+                .collect(),
+        },
+    )
+    .await?;
     sandbox::guest(
         app,
         lease,
@@ -217,6 +258,8 @@ pub async fn ensure_work(app: &App, lease: &Lease, run: Uuid) -> anyhow::Result<
             harness: settings.harness.clone(),
             model: settings.model.clone(),
             mcp: app.config.search.enabled || !app.config.work.mcp_tools.is_empty(),
+            acp: crate::run_config::acp(&app.config, &settings.harness).cloned(),
+            models: crate::run_config::models(&app.config, &settings.harness, &settings.protocol),
         },
     )
     .await?;
@@ -342,4 +385,32 @@ pub async fn refresh_key(
     .await?;
     sandbox::rotate_key(app, lease, sandbox, key.token).await?;
     Ok(key.expires_at)
+}
+
+/// A plugin skill as the harnesses read it: in a directory `<plugin>-<skill>`, which its
+/// `SKILL.md` names too.
+fn skill_files(
+    plugin: &str,
+    skill: &crate::plugins::package::Skill,
+) -> ryzhub_execution::SkillFiles {
+    let name: String = format!("{plugin}-{}", skill.name)
+        .to_ascii_lowercase()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_lowercase() || c.is_ascii_digit() {
+                c
+            } else {
+                '-'
+            }
+        })
+        .take(64)
+        .collect();
+    let (_, body) = crate::plugins::package::front_matter(&skill.body);
+    let manifest = format!(
+        "---\nname: {name}\ndescription: {}\n---\n{body}",
+        skill.description.replace('\n', " ")
+    );
+    let mut files = skill.files.clone();
+    files.insert("SKILL.md".into(), manifest);
+    ryzhub_execution::SkillFiles { name, files }
 }

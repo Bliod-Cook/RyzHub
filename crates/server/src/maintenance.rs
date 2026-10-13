@@ -1,8 +1,8 @@
 //! Partition maintenance, run with the migration role (runtime roles cannot perform DDL).
 //!
-//! Weekly `events` and monthly `audit_logs` partitions are created ahead of time. Each table
-//! also has a DEFAULT partition, so writes never fail when maintenance lapses; rows that land
-//! there are moved into their proper partition before it is attached.
+//! Weekly `events` and monthly `audit_logs` and `usage_records` partitions are created ahead of
+//! time. Each table also has a DEFAULT partition, so writes never fail when maintenance lapses;
+//! rows that land there are moved into their proper partition before it is attached.
 use anyhow::ensure;
 use chrono::{Datelike, Duration, Months, NaiveDate, Utc, Weekday};
 use sqlx::{PgPool, Postgres, Transaction};
@@ -26,6 +26,10 @@ const AUDIT: Partitioned = Partitioned {
     table: "audit_logs",
     default: "audit_logs_default",
 };
+const USAGE: Partitioned = Partitioned {
+    table: "usage_records",
+    default: "usage_records_default",
+};
 
 fn week_name(start: NaiveDate) -> String {
     format!(
@@ -35,8 +39,8 @@ fn week_name(start: NaiveDate) -> String {
     )
 }
 
-fn month_name(start: NaiveDate) -> String {
-    format!("audit_logs_{}_{:02}", start.year(), start.month())
+fn month_name(parent: &Partitioned, start: NaiveDate) -> String {
+    format!("{}_{}_{:02}", parent.table, start.year(), start.month())
 }
 
 fn monday(day: NaiveDate) -> NaiveDate {
@@ -114,6 +118,66 @@ async fn partitions(
     .await?)
 }
 
+/// Monthly partitions of `parent` for the coming months and any month with rows stranded in
+/// its default partition.
+async fn ensure_months(
+    tx: &mut Transaction<'_, Postgres>,
+    parent: &Partitioned,
+    today: NaiveDate,
+) -> anyhow::Result<()> {
+    let mut months: Vec<NaiveDate> = (0..=MONTHS_AHEAD)
+        .filter_map(|n| first_of_month(today).checked_add_months(Months::new(n)))
+        .collect();
+    let stranded: Vec<NaiveDate> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT DISTINCT date_trunc('month',created_at)::date FROM {}",
+        parent.default
+    )))
+    .fetch_all(&mut **tx)
+    .await?;
+    months.extend(stranded);
+    months.sort();
+    months.dedup();
+    for start in months {
+        let end = start
+            .checked_add_months(Months::new(1))
+            .expect("valid month");
+        ensure_partition(tx, parent, &month_name(parent, start), start, end).await?;
+    }
+    Ok(())
+}
+
+/// Drop the monthly partitions of `parent` that end on or before `cutoff`.
+async fn drop_months(
+    tx: &mut Transaction<'_, Postgres>,
+    parent: &Partitioned,
+    cutoff: NaiveDate,
+) -> anyhow::Result<()> {
+    for name in partitions(tx, parent.table).await? {
+        let Some((year, month)) = name
+            .strip_prefix(parent.table)
+            .and_then(|rest| rest.strip_prefix('_'))
+            .and_then(|rest| rest.split_once('_'))
+        else {
+            continue;
+        };
+        if let (Ok(year), Ok(month)) = (year.parse::<i32>(), month.parse::<u32>())
+            && let Some(start) = NaiveDate::from_ymd_opt(year, month, 1)
+            && start
+                .checked_add_months(Months::new(1))
+                .is_some_and(|end| end <= cutoff)
+        {
+            ensure!(
+                month_name(parent, start) == name,
+                "noncanonical partition name"
+            );
+            sqlx::query(sqlx::AssertSqlSafe(format!("DROP TABLE {name}")))
+                .execute(&mut **tx)
+                .await?;
+        }
+    }
+    Ok(())
+}
+
 pub async fn maintain(pool: &PgPool, config: &Config) -> anyhow::Result<()> {
     ensure!(
         config.events_retention_days >= 7,
@@ -148,23 +212,9 @@ pub async fn maintain(pool: &PgPool, config: &Config) -> anyhow::Result<()> {
         .await?;
     }
 
-    // Monthly audit logs, likewise.
-    let mut months: Vec<NaiveDate> = (0..=MONTHS_AHEAD)
-        .filter_map(|n| first_of_month(today).checked_add_months(Months::new(n)))
-        .collect();
-    let stranded: Vec<NaiveDate> = sqlx::query_scalar(
-        "SELECT DISTINCT date_trunc('month',created_at)::date FROM audit_logs_default",
-    )
-    .fetch_all(&mut *tx)
-    .await?;
-    months.extend(stranded);
-    months.sort();
-    months.dedup();
-    for start in months {
-        let end = start
-            .checked_add_months(Months::new(1))
-            .expect("valid month");
-        ensure_partition(&mut tx, &AUDIT, &month_name(start), start, end).await?;
+    // Monthly audit logs and usage records, likewise.
+    for parent in [&AUDIT, &USAGE] {
+        ensure_months(&mut tx, parent, today).await?;
     }
 
     // Retention drops whole partitions: events keep up to a week beyond the setting.
@@ -182,22 +232,13 @@ pub async fn maintain(pool: &PgPool, config: &Config) -> anyhow::Result<()> {
                 .await?;
         }
     }
-    if config.retention.audit_days > 0 {
-        let cutoff = today - Duration::days(config.retention.audit_days as i64);
-        for name in partitions(&mut tx, "audit_logs").await? {
-            let parts: Vec<_> = name.split('_').collect();
-            if let ["audit", "logs", year, month] = parts.as_slice()
-                && let (Ok(year), Ok(month)) = (year.parse::<i32>(), month.parse::<u32>())
-                && let Some(start) = NaiveDate::from_ymd_opt(year, month, 1)
-                && start
-                    .checked_add_months(Months::new(1))
-                    .is_some_and(|end| end <= cutoff)
-            {
-                ensure!(month_name(start) == name, "noncanonical partition name");
-                sqlx::query(sqlx::AssertSqlSafe(format!("DROP TABLE {name}")))
-                    .execute(&mut *tx)
-                    .await?;
-            }
+    // Monthly tables keep up to a month beyond their setting.
+    for (parent, days) in [
+        (&AUDIT, config.retention.audit_days),
+        (&USAGE, config.retention.usage_days),
+    ] {
+        if days > 0 {
+            drop_months(&mut tx, parent, today - Duration::days(days as i64)).await?;
         }
     }
     sqlx::query("DELETE FROM ws_tickets WHERE expires_at<now()")
@@ -215,6 +256,13 @@ mod tests {
     fn partition_names_follow_iso_weeks_and_months() {
         let day = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
         assert_eq!(week_name(monday(day)), "events_2026_01");
-        assert_eq!(month_name(first_of_month(day)), "audit_logs_2026_01");
+        assert_eq!(
+            month_name(&AUDIT, first_of_month(day)),
+            "audit_logs_2026_01"
+        );
+        assert_eq!(
+            month_name(&USAGE, first_of_month(day)),
+            "usage_records_2026_01"
+        );
     }
 }

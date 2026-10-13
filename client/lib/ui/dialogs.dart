@@ -4,9 +4,11 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
+import '../browser.dart';
 import '../controller.dart';
 import '../l10n.dart';
 import '../theme.dart';
+import 'attachments.dart' show chooseLocalFiles;
 import 'common.dart';
 import 'icons.dart';
 
@@ -419,7 +421,7 @@ class _SearchDialogState extends State<SearchDialog> {
     );
     return Dialog(
       alignment: const Alignment(0, -.5),
-      insetPadding: const EdgeInsets.all(24),
+      insetPadding: const EdgeInsets.all(Space.s24),
       child: ConstrainedBox(
         constraints: const BoxConstraints(maxWidth: 620, maxHeight: 520),
         child: Column(
@@ -427,7 +429,12 @@ class _SearchDialogState extends State<SearchDialog> {
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
             Padding(
-              padding: const EdgeInsets.fromLTRB(18, 10, 8, 6),
+              padding: const EdgeInsets.fromLTRB(
+                Space.s18,
+                Space.s10,
+                Space.s8,
+                Space.s6,
+              ),
               child: Row(
                 children: [
                   Expanded(
@@ -454,7 +461,7 @@ class _SearchDialogState extends State<SearchDialog> {
             Flexible(
               child: ListView(
                 shrinkWrap: true,
-                padding: const EdgeInsets.symmetric(vertical: 8),
+                padding: const EdgeInsets.symmetric(vertical: Space.s8),
                 children: [
                   row(
                     null,
@@ -730,27 +737,79 @@ class _ProjectsDialogState extends State<ProjectsDialog> {
                 const SizedBox(height: 14),
                 const Divider(),
                 const SizedBox(height: 14),
-                Text(tr('知识文件 · UTF-8 文本', 'Knowledge files · UTF-8 text')),
+                Text(
+                  tr(
+                    '知识文件 · 文本、PDF 或 DOCX',
+                    'Knowledge files · text, PDF or DOCX',
+                  ),
+                ),
                 for (final f in files)
                   ListTile(
                     dense: true,
                     title: Text(f['name']),
+                    subtitle: f['source_type'] == null
+                        ? null
+                        : Text(
+                            documentNote(
+                              f['source_type'],
+                              f['truncated'] == true,
+                            ),
+                          ),
                     onTap: () => setState(() {
                       fileName.text = f['name'];
                       fileContent.text = f['content'];
                     }),
-                    trailing: IconButton(
-                      tooltip: tr('删除文件', 'Delete file'),
-                      icon: const Icon(Icons.delete_outline),
-                      onPressed: () => run(() async {
-                        await hub.request(
-                          '/orgs/${hub.org}/projects/${selected!['id']}/files/${f['id']}',
-                          method: 'DELETE',
-                        );
-                        await choose(selected);
-                      }),
+                    trailing: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        if (f['source_type'] != null)
+                          IconButton(
+                            tooltip: tr('下载原文件', 'Download original'),
+                            icon: const Icon(Icons.download_outlined),
+                            onPressed: () => run(() async {
+                              await saveFile(
+                                f['name'],
+                                await hub.fileBytes(
+                                  '/orgs/${hub.org}/projects/${selected!['id']}/files/${f['id']}/source',
+                                ),
+                              );
+                            }),
+                          ),
+                        IconButton(
+                          tooltip: tr('删除文件', 'Delete file'),
+                          icon: const Icon(Icons.delete_outline),
+                          onPressed: () => run(() async {
+                            await hub.request(
+                              '/orgs/${hub.org}/projects/${selected!['id']}/files/${f['id']}',
+                              method: 'DELETE',
+                            );
+                            await choose(selected);
+                          }),
+                        ),
+                      ],
                     ),
                   ),
+                const SizedBox(height: 8),
+                Align(
+                  alignment: Alignment.centerLeft,
+                  child: OutlinedButton.icon(
+                    icon: const Icon(Icons.upload_file_outlined, size: 18),
+                    label: Text(tr('上传文档', 'Upload document')),
+                    onPressed: busy
+                        ? null
+                        : () => run(() async {
+                            for (final file in await chooseLocalFiles()) {
+                              await hub.uploadFile(
+                                file.name,
+                                file.size,
+                                file.open,
+                                to: '/orgs/${hub.org}/projects/${selected!['id']}/files/upload',
+                              );
+                            }
+                            await choose(selected);
+                          }),
+                  ),
+                ),
                 const SizedBox(height: 8),
                 TextField(
                   controller: fileName,
@@ -789,7 +848,7 @@ class _ProjectsDialogState extends State<ProjectsDialog> {
               ],
               if (error.isNotEmpty)
                 Padding(
-                  padding: const EdgeInsets.only(top: 8),
+                  padding: const EdgeInsets.only(top: Space.s8),
                   child: Text(error, style: TextStyle(color: c.danger)),
                 ),
             ],
@@ -804,4 +863,17 @@ class _ProjectsDialogState extends State<ProjectsDialog> {
       ],
     );
   }
+}
+
+/// What a knowledge file read from a document says about it: the kind of
+/// document, and whether its text was cut short.
+String documentNote(String mediaType, bool truncated) {
+  final kind = switch (mediaType) {
+    'application/pdf' => 'PDF',
+    _ when mediaType.contains('wordprocessingml') => 'DOCX',
+    _ => mediaType,
+  };
+  return truncated
+      ? tr('$kind 中抽取的文本 · 过长已截断', 'Text from $kind · cut short')
+      : tr('$kind 中抽取的文本', 'Text from $kind');
 }

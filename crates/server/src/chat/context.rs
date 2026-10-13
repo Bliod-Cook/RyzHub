@@ -30,7 +30,7 @@ impl Link {
     fn resets_context(&self) -> bool {
         self.native_response
             .as_ref()
-            .is_some_and(|response| response["object"] == "response.compaction")
+            .is_some_and(protocol::resets_context)
     }
 }
 

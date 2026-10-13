@@ -169,12 +169,20 @@ pub enum HarnessEvent {
         content: ItemContent,
         /// Native message id, for forking after this message.
         message_id: Option<String>,
+        /// The native item this one belongs to: the subagent call whose agent produced it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_native_id: Option<String>,
     },
     ApprovalRequested {
         request_id: String,
         turn_id: Option<String>,
         category: ApprovalCategory,
         summary: String,
+        /// The tool the harness asks to call, and its arguments, when it says.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        arguments: Option<serde_json::Value>,
     },
     QuestionRequested {
         request_id: String,

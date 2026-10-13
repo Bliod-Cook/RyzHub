@@ -35,14 +35,17 @@ message Hello {
   uint32 protocol_minor = 2;
   string device_id = 3;
   repeated string capabilities = 4;
-  string resume_token = 5;
+  // The server keeps no subscriptions across connections; clients resubscribe by cursor.
+  string resume_token = 5 [deprecated = true];
 }
 message Welcome {
   string connection_id = 1;
-  string resume_token = 2;
+  // Always empty; see Hello.resume_token.
+  string resume_token = 2 [deprecated = true];
   uint32 heartbeat_ms = 3;
   uint32 max_frame_bytes = 4;
-  bool resumed = 5;
+  // Always false.
+  bool resumed = 5 [deprecated = true];
 }
 message Ping { uint64 nonce = 1; }
 message Pong { uint64 nonce = 1; }
@@ -56,6 +59,8 @@ message Snapshot {
   repeated PendingAction pending_actions = 3;
   repeated RunState runs = 4;
   repeated ReadState read_states = 5;
+  // The user's drafts, in their user channel (minor version 6).
+  repeated Draft drafts = 6;
 }
 message SubscriptionSynced { uint64 head_seq = 1; }
 message SubscriptionRevoked { string reason = 1; }
@@ -73,8 +78,40 @@ message CommandEnvelope {
     UpdateRunConfig update_run_config = 17;
     Compact compact = 18;
     Fork fork = 19;
+    CreateRun create_run = 20;
+    UndoMemoryUpdate undo_memory_update = 21;
+    InvokeMenuCommand invoke_menu_command = 22;
   }
 }
+// Runs a plugin's command (minor version 8): the server fills its prompt template with the
+// parameters and sends the result as the member's message, starting a run as SendMessage does.
+message InvokeMenuCommand {
+  string installation_id = 1;
+  string command = 2;
+  // The parameters, as a JSON object.
+  string params_json = 3;
+  repeated string attachment_ids = 4;
+}
+// Creates a conversation and queues its first message as one command, which a client may queue
+// offline (minor version 6). Sent on the creator's user channel; `conversation_id` is a UUID
+// the client chose. A retry with the same cid returns the first result; an id another
+// conversation has is refused with CONVERSATION_ID_TAKEN. The conversation and its queued
+// message are created together; the run starts as for SendMessage.
+message CreateRun {
+  string conversation_id = 1;
+  // chat or work; empty: the project's default mode, else chat.
+  string mode = 2;
+  // Run settings as for UpdateRunConfig.
+  string run_config_json = 3;
+  string project_id = 4;
+  bool temporary = 5;
+  // Empty: taken from the message.
+  string title = 6;
+  SendMessage first_message = 7;
+}
+// Undoes the memory change a memory notice reported (minor version 6). Sent on the user
+// channel; a retry with the same cid undoes it once.
+message UndoMemoryUpdate { string event_id = 1; }
 message UpdateRunConfig { string config_json = 1; }
 message Compact {}
 message Fork { string item_id = 1; }
@@ -125,6 +162,8 @@ message Item {
   // assistant reply cites (minor version 2), the files a message carries (minor version 3)
   // and whether a conversation is pinned (minor version 5).
   ItemDetail detail = 10;
+  // The item this one belongs to: a subagent call for what its agent did (minor version 7).
+  string parent_item_id = 11;
 }
 message ItemDetail {
   oneof kind {
@@ -139,6 +178,9 @@ message ItemDetail {
 message ConversationDetail {
   // When it was pinned, in Unix milliseconds; 0 while it is not pinned.
   uint64 pinned_at_ms = 1;
+  // The conversation channel's sequence when its last run ended: unread while greater than
+  // the user's read position (minor version 6).
+  uint64 activity_seq = 2;
 }
 // Files a user message or steer carries, in order.
 message AttachmentsDetail { repeated Attachment files = 1; }
@@ -184,6 +226,10 @@ message ToolDetail {
   string result_json = 3;
   // Human-readable command output, possibly truncated.
   string output = 4;
+  // A plugin tool's MCP App page (`ui://…`), which shows its result (minor version 8).
+  string app = 5;
+  // The plugin, for a plugin tool.
+  string plugin = 6;
 }
 message FileChangeDetail { repeated FileChange changes = 1; }
 message FileChange {
@@ -203,6 +249,11 @@ message PendingAction {
   int64 expires_at_ms = 8;
   // approval or question. Replaces the `options == ["__answer__"]` convention (minor version 1).
   string kind = 9;
+  // A question a plugin asks (MCP elicitation, minor version 8): `{"mode":"form","message",
+  // "requestedSchema"}` for a form whose answer is a JSON object of its fields, or
+  // `{"mode":"url","message","url"}` for a page the member opens, answered "accept" or
+  // "decline". AnswerQuestion carries the answer as JSON text.
+  string form_json = 10;
 }
 message EventEnvelope {
   uint64 seq = 1;
@@ -212,7 +263,17 @@ message EventEnvelope {
     PendingAction pending_action_changed = 11;
     RunState run_state_changed = 12;
     ReadState read_state_changed = 13;
+    Draft draft_changed = 14;
   }
+}
+// A conversation's unsent message, synced across the user's devices (minor version 6). The
+// latest write wins; an empty draft is a cleared one.
+message Draft {
+  string conversation_id = 1;
+  string text = 2;
+  repeated string attachment_ids = 3;
+  int64 updated_at_ms = 4;
+  string device_id = 5;
 }
 message RunState {
   string run_id = 1;

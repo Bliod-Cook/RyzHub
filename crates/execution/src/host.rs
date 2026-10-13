@@ -1711,23 +1711,29 @@ pub fn validate_spec(spec: &SandboxSpec, multi_tenant: bool) -> anyhow::Result<(
     Ok(())
 }
 
+/// Whether a mount's options leave redirect creation and metacopy off. The kernel lists an
+/// option only where it differs from the module default, and stores `redirect_dir=off` as
+/// `follow` or `nofollow` (by `redirect_always_follow`); neither creates redirects.
 pub fn validate_overlay(
     options: &str,
     redirect_default: &str,
     metacopy_default: &str,
 ) -> anyhow::Result<()> {
-    for (key, default) in [
-        ("redirect_dir", redirect_default),
-        ("metacopy", metacopy_default),
+    for (key, default, safe) in [
+        (
+            "redirect_dir",
+            redirect_default,
+            &["off", "follow", "nofollow"][..],
+        ),
+        ("metacopy", metacopy_default, &["off"][..]),
     ] {
         let value = options
             .split(',')
             .find_map(|option| option.strip_prefix(&format!("{key}=")));
         ensure!(
             match value {
-                Some("off") => true,
+                Some(value) => safe.contains(&value),
                 None => default.trim() == "N",
-                _ => false,
             },
             "OVERLAY_OPTIONS_UNSAFE"
         );
@@ -2461,6 +2467,10 @@ mod tests {
             )
             .is_ok()
         );
+        // A kernel defaulting to redirect_dir=on lists the explicit off as follow or nofollow.
+        assert!(validate_overlay("lowerdir=/a,redirect_dir=follow,metacopy=off", "Y", "Y").is_ok());
+        assert!(validate_overlay("redirect_dir=nofollow", "Y", "N").is_ok());
+        assert!(validate_overlay("lowerdir=/a,upperdir=/b,uuid=on", "N", "N").is_ok());
         assert!(validate_overlay("redirect_dir=on,metacopy=off", "N", "N").is_err());
         assert!(validate_overlay("redirect_dir=off,metacopy=on", "N", "N").is_err());
         assert!(validate_overlay("rw", "Y", "N").is_err());

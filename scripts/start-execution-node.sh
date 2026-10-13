@@ -5,6 +5,12 @@ node_name=ryzhub-m1-execution
 node_root="$PWD/var/execution"
 mkdir -p "$node_root/gateway"
 chmod 700 "$node_root"
+# Writable layers and workspaces go on a quota volume, as the tests expect. Sparse: a fresh
+# node (CI) need not reserve the disk up front.
+if [[ ! -f "$node_root/host.env" ]]; then
+  printf '%s\n' '# Read by ryzhub-host at start; the process environment takes precedence.' \
+    "RYZHUB_QUOTA_VOLUME_SIZE=$((8 << 30))" RYZHUB_QUOTA_VOLUME_SPARSE=1 > "$node_root/host.env"
+fi
 rustup target add x86_64-unknown-linux-musl
 export CC_x86_64_unknown_linux_musl="${CC_x86_64_unknown_linux_musl:-musl-gcc}"
 RUSTFLAGS='-C linker=rust-lld' cargo build -p ryzhub-execution --target x86_64-unknown-linux-musl

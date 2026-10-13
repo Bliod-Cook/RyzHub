@@ -58,13 +58,17 @@ jobs:
         working-directory: client
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: .
       - uses: subosito/flutter-action@v2
         with:
           flutter-version: '3.47.5'
           cache: true
       - run: flutter pub get
-      - run: flutter analyze
-      - run: flutter test
+      # Widget tests render with the kernel built for this machine.
+      - run: ../scripts/test-client.sh
   web:
     runs-on: ubuntu-latest
     defaults:

@@ -295,7 +295,6 @@ void main() {
         ),
       ),
     );
-    expect(find.text('补充指令将在下一次模型请求前采用'), findsOneWidget);
     await tester.tap(find.text('只读旁问'));
     await tester.enterText(find.byType(TextField), '旁问');
     await tester.tap(find.byTooltip('发送'));

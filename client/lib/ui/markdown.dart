@@ -70,6 +70,10 @@ class MarkdownBlocks extends StatefulWidget {
   /// left off.
   final String codeKey;
 
+  /// Blocks take the full width (a reply); otherwise the column is as wide as its widest
+  /// block, so a bubble around it fits its text.
+  final bool fill;
+
   const MarkdownBlocks({
     super.key,
     required this.blocks,
@@ -78,6 +82,7 @@ class MarkdownBlocks extends StatefulWidget {
     this.onLink,
     this.chip,
     this.codeKey = '',
+    this.fill = true,
   });
 
   @override
@@ -102,6 +107,7 @@ class _MarkdownBlocksState extends State<MarkdownBlocks> {
       widget.color,
       widget.codeKey,
       widget.chip == null,
+      widget.fill,
     );
     if (look != _builtFor) {
       _built.clear();
@@ -110,7 +116,7 @@ class _MarkdownBlocksState extends State<MarkdownBlocks> {
     final blocks = widget.blocks;
     _built.removeWhere((i, _) => i >= blocks.length);
     final children = <Widget>[];
-    final style = _Style.of(context, widget.size, widget.color);
+    final style = _Style.of(context, widget.size, widget.color, widget.fill);
     for (final (i, block) in blocks.indexed) {
       final built = _built[i];
       if (built != null && identical(built.$1, block)) {
@@ -119,6 +125,7 @@ class _MarkdownBlocksState extends State<MarkdownBlocks> {
       }
       final child = _Block(
         key: ValueKey(i),
+        first: i == 0,
         block: block as Map,
         style: style,
         link: _link,
@@ -129,7 +136,9 @@ class _MarkdownBlocksState extends State<MarkdownBlocks> {
       children.add(child);
     }
     return Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
+      crossAxisAlignment: widget.fill
+          ? CrossAxisAlignment.stretch
+          : CrossAxisAlignment.start,
       mainAxisSize: MainAxisSize.min,
       children: children,
     );
@@ -141,9 +150,26 @@ class _Style {
   final TextStyle text, code;
   final HubColors colors;
   final double size;
-  const _Style(this.text, this.code, this.colors, this.size);
 
-  factory _Style.of(BuildContext context, double size, Color? color) {
+  /// Blocks take the full width; otherwise lists and notes fit their text.
+  final bool fill;
+  const _Style(this.text, this.code, this.colors, this.size, this.fill);
+
+  /// A column's children at full width, or at their own.
+  CrossAxisAlignment get across =>
+      fill ? CrossAxisAlignment.stretch : CrossAxisAlignment.start;
+
+  /// What follows a list marker or note label: the rest of the row, or as much of
+  /// it as it needs.
+  Widget rest(Widget child) =>
+      fill ? Expanded(child: child) : Flexible(child: child);
+
+  factory _Style.of(
+    BuildContext context,
+    double size,
+    Color? color,
+    bool fill,
+  ) {
     final c = HubColors.of(context);
     final ink = color ?? c.text;
     return _Style(
@@ -157,11 +183,14 @@ class _Style {
       ),
       c,
       size,
+      fill,
     );
   }
 }
 
 class _Block extends StatelessWidget {
+  /// Space goes between blocks, none around them, so a bubble's padding is even.
+  final bool first;
   final Map block;
   final _Style style;
   final ValueChanged<String> link;
@@ -169,6 +198,7 @@ class _Block extends StatelessWidget {
   final String codeKey;
   const _Block({
     super.key,
+    required this.first,
     required this.block,
     required this.style,
     required this.link,
@@ -178,12 +208,12 @@ class _Block extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) => Padding(
-    padding: const EdgeInsets.only(bottom: _gap),
+    padding: EdgeInsets.only(top: first ? 0 : _gap),
     child: _content(context, block),
   );
 
   Widget _children(BuildContext context, List blocks, String key) => Column(
-    crossAxisAlignment: CrossAxisAlignment.stretch,
+    crossAxisAlignment: style.across,
     mainAxisSize: MainAxisSize.min,
     children: [
       for (final (i, b) in blocks.indexed)
@@ -262,17 +292,14 @@ class _Block extends StatelessWidget {
           style: TextStyle(fontSize: style.size - 2, color: c.muted),
           child: Row(
             crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: style.fill ? MainAxisSize.max : MainAxisSize.min,
             children: [
               Text(
                 '${block['label']}. ',
                 style: text.copyWith(color: c.subtle),
               ),
-              Expanded(
-                child: _children(
-                  context,
-                  block['blocks'] as List,
-                  key ?? codeKey,
-                ),
+              style.rest(
+                _children(context, block['blocks'] as List, key ?? codeKey),
               ),
             ],
           ),
@@ -290,7 +317,7 @@ class _Block extends StatelessWidget {
     final items = block['items'] as List;
     final text = style.text;
     return Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
+      crossAxisAlignment: style.across,
       mainAxisSize: MainAxisSize.min,
       children: [
         for (final (i, item) in items.indexed)
@@ -300,6 +327,7 @@ class _Block extends StatelessWidget {
             ),
             child: Row(
               crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: style.fill ? MainAxisSize.max : MainAxisSize.min,
               children: [
                 SizedBox(
                   width: start == null ? 18 : 26,
@@ -318,9 +346,9 @@ class _Block extends StatelessWidget {
                     ),
                   },
                 ),
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                style.rest(
+                  Column(
+                    crossAxisAlignment: style.across,
                     mainAxisSize: MainAxisSize.min,
                     children: [
                       for (final (j, b) in (item['blocks'] as List).indexed)

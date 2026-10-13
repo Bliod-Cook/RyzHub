@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:ryzhub/ui/common.dart';
 import 'package:ryzhub/ui/composer.dart';
+import 'package:ryzhub/ui/messages.dart';
 import 'package:ryzhub/ui/workspace_status.dart';
 
 Widget _page(Widget child) => MaterialApp(
@@ -47,6 +48,52 @@ void main() {
     );
     await tester.pumpWidget(_page(const EmulatedNote('todo')));
     expect(find.byIcon(Icons.info_outline), findsNothing);
+  });
+
+  testWidgets('a user bubble fits its text, up to most of the row', (
+    tester,
+  ) async {
+    final box = find.byWidgetPredicate(
+      (w) =>
+          w is Container &&
+          w.decoration is BoxDecoration &&
+          (w.decoration as BoxDecoration).borderRadius ==
+              BorderRadius.circular(22),
+    );
+    Future<double> bubble(String text) async {
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: SizedBox(
+              width: 800,
+              child: MessageCard(
+                item: {
+                  'id': 'u',
+                  'kind': 'user',
+                  'state': 'completed',
+                  'text': text,
+                },
+              ),
+            ),
+          ),
+        ),
+      );
+      await tester.pump();
+      return tester.getSize(box).width;
+    }
+
+    expect(await bubble('整理成一份文件给我'), lessThan(300));
+    expect(await bubble('很长的一段话' * 40), 800 * .78);
+
+    // As much space above the text as below it.
+    await bubble('做这题\n\n第二段');
+    final outer = tester.getRect(box);
+    final lines = find.descendant(of: box, matching: find.byType(RichText));
+    expect(lines, findsNWidgets(2));
+    expect(
+      tester.getRect(lines.first).top - outer.top,
+      outer.bottom - tester.getRect(lines.last).bottom,
+    );
   });
 
   test('checkpoints show how long ago they were saved', () {

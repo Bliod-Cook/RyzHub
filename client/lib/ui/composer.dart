@@ -305,27 +305,6 @@ class _ComposerState extends State<Composer> {
                 highlighted: highlighted,
                 onPick: choose,
               ),
-            // Separate semantics nodes: otherwise the hint and footer lines merge
-            // into the text field's accessible name.
-            if (widget.steer && !sideQuery)
-              Padding(
-                padding: const EdgeInsets.fromLTRB(
-                  Space.s18,
-                  0,
-                  Space.s18,
-                  Space.s6,
-                ),
-                child: Semantics(
-                  container: true,
-                  child: Text(
-                    tr(
-                      '补充指令将在下一次模型请求前采用',
-                      'Instructions apply before the next model request',
-                    ),
-                    style: TextStyle(fontSize: 11.5, color: c.subtle),
-                  ),
-                ),
-              ),
             LayoutBuilder(
               builder: (context, box) {
                 final width = menuFull

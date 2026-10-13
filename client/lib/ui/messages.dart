@@ -28,6 +28,7 @@ List<Widget> _blocks(
   ValueChanged<String>? onSource,
   Color? color,
   _Citations? citations,
+  bool fill = true,
 }) => [
   MarkdownBlocks(
     blocks: rendered.blocks,
@@ -36,6 +37,7 @@ List<Widget> _blocks(
     onLink: onSource,
     chip: citations?.chip(onSource),
     codeKey: key,
+    fill: fill,
   ),
 ];
 
@@ -476,11 +478,13 @@ class MessageCard extends StatelessWidget {
                             child: Column(
                               crossAxisAlignment: CrossAxisAlignment.start,
                               mainAxisSize: MainAxisSize.min,
+                              // The bubble fits its text.
                               children: _blocks(
                                 render(),
                                 15,
                                 key: key,
                                 onSource: onSource,
+                                fill: false,
                               ),
                             ),
                           ),

@@ -4,15 +4,13 @@
 #   scripts/build-deps.sh DIR                          the layer is DIR's tree
 #   scripts/build-deps.sh --dockerfile FILE [CONTEXT]  the layer is the built image's tree
 #
-# Prints the digest-pinned reference for `[sandbox] deps` or a profile's `deps`. The layer is
-# mounted read-only over the base image, so it may hold only what it adds (package caches,
-# tools under /usr/local, ...). Build it from trusted sources only: every organization's
-# sandboxes read it.
+# Prints the digest-pinned reference for `[sandbox] deps`. The layer is mounted read-only over
+# the base image, so it may hold only what it adds (package caches, tools under /usr/local, ...).
+# Build it from trusted sources only: every organization's sandboxes read it.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-node="${RYZHUB_EXECUTION_NODE:-ryzhub-execution}"
 name="ryzhub.local/deps:build"
-ctr=(docker exec -i "$node" ctr --address /run/ryzhub-containerd.sock --namespace ryzhub)
+ctr=(docker exec -i ryzhub-execution ctr --address /run/ryzhub-containerd.sock --namespace ryzhub)
 
 if [[ "${1:-}" == "--dockerfile" ]]; then
   docker build --quiet -t "$name" -f "$2" "${3:-.}" >/dev/null

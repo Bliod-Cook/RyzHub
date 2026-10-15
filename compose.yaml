@@ -10,7 +10,7 @@ services:
     ports: ["127.0.0.1:55432:5432"]
     volumes:
       - postgres:/var/lib/postgresql
-      - ./scripts/init-db.sql:/docker-entrypoint-initdb.d/roles.sql:ro
+      - ./infra/postgres/init-db.sql:/docker-entrypoint-initdb.d/roles.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d ryzhub"]
       interval: 2s

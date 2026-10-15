@@ -2,7 +2,7 @@
 set -euo pipefail
 export SQLX_OFFLINE=true
 cd "$(dirname "$0")/.."
-[[ -f var/vault.env ]] || (umask 077; mkdir -p var; python3 -c 'import base64,secrets; print("RYZHUB_VAULT_KEY="+base64.urlsafe_b64encode(secrets.token_bytes(32)).decode().rstrip("="))' > var/vault.env)
+[[ -f var/vault.env ]] || (umask 077; mkdir -p var; printf 'RYZHUB_VAULT_KEY=%s\n' "$(head -c 32 /dev/urandom | base64 | tr '+/' '-_' | tr -d '=')" > var/vault.env)
 set -a
 source "${RYZHUB_ENV_FILE:-.env.example}"
 source var/vault.env

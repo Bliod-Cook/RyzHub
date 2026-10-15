@@ -1,6 +1,7 @@
 #!/bin/sh
 set -eu
-export RYZHUB_RUNSC_CONFIG=/state/runsc.toml
+# Install the gVisor runtime prepare-runtimes.sh placed in /state/bin. With the argument
+# `install-gvisor` the script stops here, so a running node can be updated in place.
 if [ -f /state/bin/runsc ]; then
  for binary in runsc containerd-shim-runsc-v1; do
   if ! cmp -s "/state/bin/$binary" "/usr/local/bin/$binary"; then
@@ -8,8 +9,10 @@ if [ -f /state/bin/runsc ]; then
    mv "/usr/local/bin/$binary.new" "/usr/local/bin/$binary"
   fi
  done
- if [ ! -d /usr/local/bin/gvisor-bin ]; then cp -a /state/bin/gvisor-bin /usr/local/bin/; fi
+ [ -d /usr/local/bin/gvisor-bin ] || cp -a /state/bin/gvisor-bin /usr/local/bin/
 fi
+[ "${1:-}" = install-gvisor ] && exit 0
+export RYZHUB_RUNSC_CONFIG=/state/runsc.toml
 # Delegate only this Docker container's private cgroup subtree to nested tasks.
 if [ -f /sys/fs/cgroup/cgroup.controllers ]; then
   mkdir -p /sys/fs/cgroup/init

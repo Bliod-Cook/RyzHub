@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-"""Release Flutter/WASM + real Chromium + actual SDK sandbox, local protocol upstreams."""
-import os,importlib.util,json,time
+"""Work harnesses, projects and commands in the release Web client against scripts/dev-fixture.sh
+(set up as for browser-regression.py).
+
+Run from the RyzHub root: uv run --with playwright python scripts/browser-harnesses.py
+"""
+import importlib.util,json,time
 from pathlib import Path
 from playwright.sync_api import sync_playwright,expect
-os.environ.setdefault('RYZHUB_API_URL','http://127.0.0.1:8280')
 spec=importlib.util.spec_from_file_location('r',Path(__file__).with_name('browser-regression.py'));r=importlib.util.module_from_spec(spec);spec.loader.exec_module(r)
 with sync_playwright() as p:
  browser=p.chromium.launch(headless=True);context=browser.new_context(viewport={'width':1360,'height':1000},permissions=['clipboard-read','clipboard-write'],locale='zh-CN');errors=[];external=[];passed=[]
@@ -21,7 +24,7 @@ with sync_playwright() as p:
   page.get_by_role('button',name='模型',exact=False).click()
   if harness:menu_item(harness).hover()
   menu_item(model).click()
- def create(text):return r.create(page,text)['id']
+ def create(text):return r.create(page,text)
  def done(conv,previous=None):
   def check(s):
    c=s.get('channels',{}).get('conv:'+conv,{})
@@ -73,7 +76,7 @@ with sync_playwright() as p:
   r.send(page,'这是排入下一轮的补充。');r.wait_state(page,lambda s:any(i['kind']=='steer' and i['state']=='waiting' for i in r.items(s)))
   done(work);r.wait_state(page,lambda s:any(i['kind']=='steer' and i['state']=='handed' for i in r.items(s)));passed.append('queued Claude steer waits then starts the next turn')
   prev=previous(work);r.send(page,'fixture-exec');r.wait_state(page,lambda s:any(a['status']=='pending' for a in r.actions(s)));page.get_by_role('button',name='允许',exact=True).click();done(work,prev);passed.append('actual SDK Bash approval and execution')
-  prev=previous(work);r.send(page,'fixture-question');r.wait_state(page,lambda s:any(a['status']=='pending' and '__answer__' in a['options'] for a in r.actions(s)))
+  prev=previous(work);r.send(page,'fixture-question');r.wait_state(page,lambda s:any(a['status']=='pending' and a['kind']=='question' for a in r.actions(s)))
   # QuestionCard renders a text answer; no approval buttons should be present.
   assert page.get_by_role('button',name='允许',exact=True).count()==0
   expect(page.get_by_text('你希望使用哪种颜色？',exact=True)).to_be_visible()

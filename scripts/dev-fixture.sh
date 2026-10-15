@@ -5,14 +5,7 @@ export CARGO_INCREMENTAL=0 SQLX_OFFLINE=true
 docker compose up -d --wait
 mkdir -p var/dev
 chmod 700 var/dev
-if [[ ! -f var/vault.env ]]; then
- (umask 077; python3 - <<'KEYS' > var/vault.env
-import secrets,base64
-for name in ['RYZHUB_VAULT_KEY']:
- print(name+'='+base64.urlsafe_b64encode(secrets.token_bytes(32)).decode().rstrip('='))
-KEYS
- )
-fi
+[[ -f var/vault.env ]] || (umask 077; mkdir -p var; printf 'RYZHUB_VAULT_KEY=%s\n' "$(head -c 32 /dev/urandom | base64 | tr '+/' '-_' | tr -d '=')" > var/vault.env)
 [[ -S var/execution/host.sock ]] || ./scripts/prepare-runtimes.sh
 [[ -s var/execution/harness-image.txt ]] || ./scripts/build-harness-image.sh
 set -a
@@ -20,7 +13,7 @@ source .env.example
 source var/vault.env
 set +a
 # The development database, shared with dev-live.sh, is separate from the default one.
-if ! docker compose exec -T postgres psql -U postgres -Atc "SELECT 1 FROM pg_database WHERE datname='ryzhub_dev'" | rg -q 1; then
+if ! docker compose exec -T postgres psql -U postgres -Atc "SELECT 1 FROM pg_database WHERE datname='ryzhub_dev'" | grep -q 1; then
  docker compose exec -T postgres psql -U postgres -c 'CREATE DATABASE ryzhub_dev'
 fi
 export DATABASE_URL="${DATABASE_URL%/*}/ryzhub_dev"
@@ -35,8 +28,8 @@ p=pathlib.Path.cwd();q=json.dumps
 pathlib.Path(os.environ['RYZHUB_CONFIG']).write_text(f'''listen = "127.0.0.1:8280"
 allowed_origins = ["http://localhost:3000", "http://127.0.0.1:3000"]
 [policy]
-models = ["mock", "fixture-model", "gpt-5.4", "gpt-5.2", "claude-sonnet-4-6", "claude-opus-4-6"]
-harnesses = ["mock", "chat", "codex", "claude"]
+models = ["fixture-model", "gpt-5.4", "gpt-5.2", "claude-sonnet-4-6", "claude-opus-4-6"]
+harnesses = ["chat", "codex", "claude"]
 max_sandboxes = 8
 allow_full_auto = false
 [llm]
@@ -47,7 +40,10 @@ unix_socket = {q(str(p/'var/execution/gateway/llm-dev.sock'))}
 upstream_url = "http://127.0.0.1:9181"
 responses_url = "http://127.0.0.1:9182"
 model = "fixture-model"
-responses_model = "gpt-5.4"
+[[llm.models]]
+id = "gpt-5.4"
+protocol = "responses"
+harnesses = ["chat"]
 [[llm.models]]
 id = "gpt-5.2"
 protocol = "responses"

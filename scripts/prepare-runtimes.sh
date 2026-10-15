@@ -8,7 +8,7 @@ if [[ ! -f var/execution/bin/codex ]] || ! cmp -s "$codex_path" var/execution/bi
  cp --reflink=auto "$codex_path" var/execution/bin/codex.new
  mv var/execution/bin/codex.new var/execution/bin/codex
 fi
-if [[ ! -f var/execution/bin/runsc ]] || ! var/execution/bin/runsc --version | rg -q 'release-20260921.0'; then
+if [[ ! -f var/execution/bin/runsc ]] || ! var/execution/bin/runsc --version | grep -q 'release-20260921.0'; then
   source_url=https://storage.googleapis.com/gvisor/releases/release/20260921.0/x86_64
   curl -fsSL "$source_url/gvisor.tar.bz2" -o var/execution/gvisor.tar.bz2
   curl -fsSL "$source_url/gvisor.tar.bz2.sha512" -o var/execution/gvisor.tar.bz2.sha512
@@ -30,5 +30,5 @@ binary_name = "/state/bin/runsc-containerd"
   network = "host"
 EOF
 ./scripts/start-execution-node.sh
-# Scope these binaries to the dedicated execution node.
-docker exec ryzhub-execution sh -c 'for b in runsc containerd-shim-runsc-v1; do if ! cmp -s "/state/bin/$b" "/usr/local/bin/$b"; then cp "/state/bin/$b" "/usr/local/bin/$b.new"; mv "/usr/local/bin/$b.new" "/usr/local/bin/$b"; fi; done; if [ ! -d /usr/local/bin/gvisor-bin ]; then cp -a /state/bin/gvisor-bin /usr/local/bin/; fi' 
+# Install gVisor in the running node with the entrypoint's own install step.
+docker exec -i ryzhub-execution sh -s install-gvisor < scripts/execution-node-entrypoint.sh

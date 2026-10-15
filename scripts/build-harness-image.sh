@@ -1,9 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 cd "$(dirname "$0")/.."
-export CARGO_INCREMENTAL=0
-node=ryzhub-execution
-ctr=(docker exec "$node" ctr --address /run/ryzhub-containerd.sock --namespace ryzhub)
+ctr=(docker exec ryzhub-execution ctr --address /run/ryzhub-containerd.sock --namespace ryzhub)
 mkdir -p var/execution
 # Resolve and record an immutable base, then pin the resulting containerd image digest.
 if [[ ! -s var/execution/harness-base.txt ]]; then

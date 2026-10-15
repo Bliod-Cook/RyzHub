@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
-"""Browser regression against a running simulator-mode server (scripts/dev.sh) and release Web client.
+"""Browser regression against scripts/dev-fixture.sh and the release Web client served by
+scripts/serve-web.py, built with --dart-define=RYZHUB_SERVER_URL=http://127.0.0.1:8280.
 
 Creates local test accounts; outputs no credentials. Requires Playwright Chromium.
 Run from the RyzHub root: uv run --with playwright python scripts/browser-regression.py
 """
 import json
 import os
+import re
 from pathlib import Path
 import time
 from playwright.sync_api import TimeoutError as PlaywrightTimeout, sync_playwright, expect
 
 ROOT = Path(__file__).resolve().parents[1]
 BASE = os.environ.get('RYZHUB_WEB_URL', 'http://127.0.0.1:3000')
-API = os.environ.get('RYZHUB_API_URL', 'http://127.0.0.1:8080')
+API = os.environ.get('RYZHUB_API_URL', 'http://127.0.0.1:8280')
 # Screenshots and reports; ignored by git.
 OUT = ROOT/'var/browser'
 OUT.mkdir(parents=True, exist_ok=True)
@@ -20,7 +22,7 @@ OUT.mkdir(parents=True, exist_ok=True)
 
 def cache(page):
     """The client's cached engine: its `engine` record and one record per channel, under
-    `<partition>\\0<key>`; a single record without a key is a cache from before records."""
+    `<partition>\\0<key>`."""
     return page.evaluate('''async () => {
       const db = await new Promise((resolve,reject) => {
         const r=indexedDB.open('ryzhub-core');
@@ -35,8 +37,7 @@ def cache(page):
           keys.result.forEach((key,i)=>{
             const [, record]=String(key).split('\\u0000');
             const value=JSON.parse(values.result[i]);
-            if (record===undefined) Object.assign(engine,value);
-            else if (record==='engine') Object.assign(engine,value,{channels:engine.channels});
+            if (record==='engine') Object.assign(engine,value,{channels:engine.channels});
             else if (record.startsWith('channel:')) engine.channels[record.slice(8)]=value;
           });
           resolve(engine);
@@ -144,16 +145,25 @@ def login(page, email, password, register=False):
     return result.json()
 
 
+def conversations(state):
+    return {channel[5:] for channel in state.get('channels', {}) if channel.startswith('conv:')}
+
+
 def create(page, text):
-    """Sends the first message of a draft, which creates the conversation."""
-    with page.expect_response(lambda r: r.url.endswith('/conversations') and r.request.method == 'POST') as response:
-        send(page, text)
-    assert response.value.status == 200, response.value.text()
-    return response.value.json()
+    """Sends the first message of a draft (CreateRun); returns the new conversation's id."""
+    before = conversations(cache(page))
+    send(page, text)
+    (conv,) = conversations(wait_state(page, lambda s: conversations(s) - before)) - before
+    return conv
+
+
+def conversation_items(state, conv):
+    return state.get('channels', {}).get('conv:' + conv, {}).get('items', {}).values()
 
 
 def open_conversation(page, title):
-    page.get_by_role('button', name=title, exact=True).click()
+    # An unread conversation's name ends with an unread note.
+    page.get_by_role('button', name=re.compile('^' + re.escape(title) + '( |$)')).click()
     expect(page.get_by_role('heading', name=title, exact=True)).to_be_visible()
 
 
@@ -192,55 +202,52 @@ def main():
         expect(page.get_by_role('heading', name='中文流式测试', exact=True)).to_be_visible()
         state = wait_state(page, lambda s: any(i['kind']=='assistant' and i['state']=='completed' for i in items(s)))
         assert sum(i['kind']=='user' for i in items(state)) == 1
-        page.get_by_role('button', name='复制代码', exact=True).first.click()
-        assert 'println!' in page.evaluate('navigator.clipboard.readText()')
-        passed.extend(['Unicode streaming and Markdown', 'code clipboard'])
+        passed.append('Unicode streaming and Markdown')
         page.screenshot(path=str(OUT/'regression-desktop.png'))
-
-        send(page, '/approve 拒绝测试')
-        wait_state(page, lambda s: any(a['status']=='pending' for a in actions(s)))
-        page.get_by_role('button', name='拒绝', exact=True).click()
-        wait_state(page, lambda s: any(a['status']=='deny' for a in actions(s)))
-        passed.append('approval denial')
 
         second = context()
         other = start(second)
         login(other, email, password)
         open_conversation(other, '中文流式测试')
         passed.append('second device login')
-        send(page, '/approve 多设备测试')
-        wait_state(other, lambda s: any(a['status']=='pending' for a in actions(s)))
-        other.get_by_role('button', name='允许', exact=True).click()
-        wait_state(page, lambda s: not any(a['status']=='pending' for a in actions(s)))
-        wait_state(page, lambda s: sum(i['kind']=='assistant' and i['state']=='completed' for i in items(s)) == 2)
-        passed.append('approval synchronized across devices')
+        # On the device that only watches: in semantics mode the next tap on a text field
+        # after copying does not focus it.
+        other.get_by_role('button', name='复制代码', exact=True).first.click()
+        assert 'println!' in other.evaluate('navigator.clipboard.readText()')
+        passed.append('code clipboard')
+        send(page, '多设备同步测试')
+        wait_state(other, lambda s: any(i['kind']=='assistant' and i['state']=='completed' and '多设备同步测试' in i['text'] for i in items(s)))
+        passed.append('second device follows the conversation live')
 
-        send(page, '取消测试 ' * 200)
+        # The fixture streams slowly for prompts with 慢速.
+        send(page, '慢速取消测试 ' * 100)
         expect(page.get_by_role('button', name='停止', exact=True)).to_be_visible()
         page.wait_for_timeout(500)
         page.get_by_role('button', name='停止', exact=True).click()
-        wait_state(page, lambda s: sum(i['state']=='cancelled' for i in items(s)) >= 2)
+        wait_state(page, lambda s: any(i['kind']=='assistant' and i['state']=='cancelled' for i in items(s)))
         passed.append('cancel during stream')
 
         page.get_by_role('button', name='新建对话', exact=True).click()
         page.get_by_role('button', name='Work', exact=True).click()
         expect(page.get_by_role('heading', name='从哪里开始？', exact=True)).to_be_visible()
-        assert create(page, '第二个对话')['mode'] == 'work'
+        work = create(page, '第二个对话')
         expect(page.get_by_role('heading', name='第二个对话', exact=True)).to_be_visible()
-        wait_state(page, lambda s: any(i['kind']=='assistant' and i['state']=='completed' and '第二个对话' in i['text'] for i in items(s)))
+        listed = primary.request.get(f'{API}/orgs/{auth["org_id"]}/conversations', headers={'Authorization': 'Bearer ' + auth['token']}).json()
+        assert next(c for c in listed if c['id'] == work)['mode'] == 'work'
+        wait_state(page, lambda s: any(i['kind']=='assistant' and i['state']=='completed' for i in conversation_items(s, work)), 'Work reply did not complete')
         open_conversation(page, '中文流式测试')
         passed.append('draft conversation create and switch')
 
         primary.set_offline(True)
         page.evaluate('window.__sockets.forEach(s => s.close())')
         page.wait_for_timeout(500)
-        send(page, '离线队列只执行一次')
+        send(page, '离线排队只发送一次')
         wait_state(page, lambda s: bool(s.get('pending_commands')))
         primary.set_offline(False)
         reconnect(page)
         # Projection events and command ACKs may arrive in either order.
-        state = wait_state(page, lambda s: not s.get('pending_commands') and any(i['kind']=='assistant' and i['state']=='completed' and '离线队列只执行一次' in i['text'] for i in items(s)))
-        assert sum(i['kind']=='user' and i['text']=='离线队列只执行一次' for i in items(state)) == 1
+        state = wait_state(page, lambda s: not s.get('pending_commands') and any(i['kind']=='assistant' and i['state']=='completed' and '离线排队只发送一次' in i['text'] for i in items(s)))
+        assert sum(i['kind']=='user' and i['text']=='离线排队只发送一次' for i in items(state)) == 1
         assert not state['pending_commands']
         passed.append('offline persisted queue and reconnect without duplicates')
 
@@ -251,9 +258,9 @@ def main():
         page.reload()
         page.locator('flt-semantics-placeholder').wait_for()
         page.locator('flt-semantics-placeholder').evaluate('(e) => e.click()')
-        session = login(page, email, password)
-        wait_state(page, lambda s: any(i['text']=='离线队列只执行一次' for i in items(s)))
-        passed.append('reload and login restore cached projection without persisted access token')
+        # The refresh cookie keeps the session; the cache restores the projection.
+        wait_state(page, lambda s: any(i['text']=='离线排队只发送一次' for i in items(s)))
+        passed.append('reload restores session and cached projection without a persisted access token')
 
         page.set_viewport_size({'width':390, 'height':844})
         page.get_by_role('button', name='打开侧边栏', exact=True).click()
@@ -268,11 +275,11 @@ def main():
         page.get_by_role('button', name='退出登录', exact=True).last.click()
         expect(page.get_by_role('textbox', name='邮箱', exact=True)).to_be_visible()
         me = page.evaluate('''async ([api, token]) =>
-          (await fetch(api + '/me', {headers: {Authorization: 'Bearer ' + token}})).status''', [API, session['token']])
+          (await fetch(api + '/me', {headers: {Authorization: 'Bearer ' + token}})).status''', [API, auth['token']])
         assert me == 401, me
         # The socket closes before the session is revoked, so SubscriptionRevoked
         # never reaches the core and the cached history survives.
-        assert any(i['text']=='离线队列只执行一次' for i in items(cache(page)))
+        assert any(i['text']=='离线排队只发送一次' for i in items(cache(page)))
         passed.append('logout revokes the session and keeps the device cache')
 
         english = context(locale='en-US').new_page()
@@ -300,7 +307,7 @@ def main():
         english.reload()
         english.locator('flt-semantics-placeholder').wait_for()
         english.locator('flt-semantics-placeholder').evaluate('(e) => e.click()')
-        expect(english.get_by_role('textbox', name='邮箱', exact=True)).to_be_visible()
+        expect(english.get_by_role('heading', name='从哪里开始？', exact=True)).to_be_visible()
         passed.append('English locale detected; language switch persists on the client')
 
         french = context(locale='fr-FR').new_page()

@@ -897,7 +897,6 @@ async fn work_gateway_asks_once_for_tools_that_need_approval() -> anyhow::Result
             sandbox_id: sandbox,
             lease_epoch: 7,
             models: vec!["fixture-model".into()],
-            credential_id: None,
         },
     )
     .await?

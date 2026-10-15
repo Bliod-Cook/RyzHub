@@ -26,7 +26,7 @@ impl App {
         let revocations = Revocations::new(store.pool.clone());
         let hub = Hub::new(store.clone(), nats.clone(), revocations.clone());
         Ok(Self {
-            http: Http::new(&config)?,
+            http: Http::new()?,
             store,
             nats,
             config: Arc::new(config),
@@ -51,9 +51,12 @@ pub struct Http {
     pub identity: reqwest::Client,
 }
 
+/// Longest silence in a model response before the request fails.
+const MODEL_READ_TIMEOUT: Duration = Duration::from_secs(120);
+
 impl Http {
-    fn new(config: &Config) -> anyhow::Result<Self> {
-        let read = Duration::from_secs(config.llm.timeout_secs);
+    fn new() -> anyhow::Result<Self> {
+        let read = MODEL_READ_TIMEOUT;
         Ok(Self {
             upstream: reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())

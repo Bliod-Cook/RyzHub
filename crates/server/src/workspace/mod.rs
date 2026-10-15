@@ -34,6 +34,8 @@ use blob::BlobStore;
 
 /// A failed job is retried after this long.
 const RETRY_AFTER_SECS: i64 = 30;
+/// While a turn runs, its workspace is checkpointed at least this often.
+const CHECKPOINT_INTERVAL_SECS: i64 = 300;
 
 /// The primary store and, if configured, the secondary one, which keeps a second copy of
 /// everything written.
@@ -298,7 +300,7 @@ async fn automatic_job(
     )
     .bind(org)
     .bind(conv)
-    .bind(app.config.work.checkpoint_interval_secs as i64)
+    .bind(CHECKPOINT_INTERVAL_SECS)
     .fetch_one(&mut **tx)
     .await?;
     if checkpoint {

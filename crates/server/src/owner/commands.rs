@@ -5,7 +5,6 @@ use ryzhub_proto::{command_envelope::Command, frame::Body, *};
 use sqlx::Acquire;
 use uuid::Uuid;
 
-use super::Engine;
 use crate::{
     config::Config,
     conversation_commands,
@@ -103,11 +102,6 @@ pub async fn process_with_config(
     Ok(process_next(store, lease, config).await?.is_some())
 }
 
-/// Process one command with the default (simulated) configuration.
-pub async fn process_command(store: &Store, lease: &Lease) -> anyhow::Result<bool> {
-    process_with_config(store, lease, &Config::default()).await
-}
-
 async fn execute(
     tx: &mut Tx<'_>,
     lease: &Lease,
@@ -119,27 +113,13 @@ async fn execute(
     let ctx = context_in(tx, user, lease.org_id).await?;
     let conversation = conversation_in(tx, &ctx, lease.conversation_id).await?;
     ensure!(conversation.state == "active", Code::ConversationArchived);
-    let engine = Engine::of(config, &conversation.mode);
     let cid = envelope.cid.as_str();
     let command = envelope.command.as_ref().context(Code::InvalidCommand)?;
-    // The simulator handles messages, approvals and cancellation only.
-    ensure!(
-        engine != Engine::Mock
-            || matches!(
-                command,
-                Command::SendMessage(_)
-                    | Command::CreateRun(_)
-                    | Command::DecideApproval(_)
-                    | Command::Cancel(_)
-                    | Command::MarkRead(_)
-            ),
-        Code::UnsupportedCommand
-    );
     match command {
         Command::SendMessage(message) => {
             // Settings sent with the message apply before its run, so a separately sent
             // UpdateRunConfig cannot land after it.
-            if engine != Engine::Mock && !message.config_json.is_empty() {
+            if !message.config_json.is_empty() {
                 conversation_commands::configure(tx, lease, &message.config_json, config).await?;
             }
             let input = runs::Input {
@@ -147,7 +127,7 @@ async fn execute(
                 files: &message.attachment_ids,
                 user,
             };
-            runs::create(tx, lease, envelope, input, RunKind::Main, engine, config).await?;
+            runs::create(tx, lease, envelope, input, RunKind::Main, config).await?;
         }
         // Created with its conversation: the run configuration was set then.
         Command::CreateRun(create) => {
@@ -160,7 +140,7 @@ async fn execute(
                 files: &message.attachment_ids,
                 user,
             };
-            runs::create(tx, lease, envelope, input, RunKind::Main, engine, config).await?;
+            runs::create(tx, lease, envelope, input, RunKind::Main, config).await?;
         }
         Command::UndoMemoryUpdate(_) => anyhow::bail!(Code::InvalidCommand),
         Command::InvokeMenuCommand(invoke) => {
@@ -186,7 +166,7 @@ async fn execute(
                 files: &invoke.attachment_ids,
                 user,
             };
-            runs::create(tx, lease, envelope, input, RunKind::Main, engine, config).await?;
+            runs::create(tx, lease, envelope, input, RunKind::Main, config).await?;
         }
         Command::SideQuery(query) => {
             runs::create(
@@ -195,7 +175,6 @@ async fn execute(
                 envelope,
                 runs::Input::text(&query.text),
                 RunKind::SideQuery,
-                engine,
                 config,
             )
             .await?;
@@ -213,7 +192,7 @@ async fn execute(
                 matches!(decision.decision.as_str(), "allow" | "deny"),
                 Code::InvalidDecision
             );
-            let run = runs::resolve(
+            runs::resolve(
                 tx,
                 lease,
                 Resolution {
@@ -227,10 +206,6 @@ async fn execute(
                 },
             )
             .await?;
-            // The simulator has no tool to report a denial to; denying ends the run.
-            if engine == Engine::Mock && decision.decision == "deny" {
-                runs::finish(tx, lease, run, "cancelled", None).await?;
-            }
         }
         Command::AnswerQuestion(answer) => {
             runs::valid_text(&answer.answer)?;
@@ -262,7 +237,6 @@ async fn execute(
                 envelope,
                 runs::Input::text("/compact"),
                 RunKind::Compact,
-                engine,
                 config,
             )
             .await?;

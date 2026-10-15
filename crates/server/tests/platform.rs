@@ -175,14 +175,13 @@ async fn gateway_native_protocol_byok_usage_and_execution_fencing() -> anyhow::R
         .json()
         .await?;
     // The key lives envelope-encrypted in a secret; the credential row holds only its id.
-    let (legacy, ciphertext, wrapped): (Option<Vec<u8>>, Vec<u8>, Vec<u8>) = sqlx::query_as(
-        "SELECT c.encrypted_key,s.ciphertext,s.wrapped_dek FROM model_credentials c
+    let (ciphertext, wrapped): (Vec<u8>, Vec<u8>) = sqlx::query_as(
+        "SELECT s.ciphertext,s.wrapped_dek FROM model_credentials c
          JOIN secrets s ON s.org_id=c.org_id AND s.id=c.secret_id WHERE c.id=$1",
     )
     .bind(id(&credential, "id"))
     .fetch_one(&h.db)
     .await?;
-    assert!(legacy.is_none());
     for stored in [&ciphertext, &wrapped] {
         assert!(!stored.windows(20).any(|b| b == b"personal-fixture-key"));
     }
@@ -1388,7 +1387,6 @@ async fn virtual_key_lease_rotation_policy_rate_limit_and_interrupted_usage() ->
         sandbox_id: sandbox,
         lease_epoch,
         models: vec!["fixture-model".into()],
-        credential_id: None,
     };
     let token = keys::issue_sandbox_key(&h.app.store, request(7))
         .await?
@@ -1407,6 +1405,16 @@ async fn virtual_key_lease_rotation_policy_rate_limit_and_interrupted_usage() ->
         .error_for_status()?
         .bytes()
         .await?;
+    // A delta of a kind the gateway does not know passes through; the stream still completes.
+    let mut future = body.clone();
+    future["messages"][0]["content"] = json!("futuredelta");
+    send(token.clone(), future)
+        .await?
+        .error_for_status()?
+        .bytes()
+        .await?;
+    let usage: (bool, String, i64, i64) = sqlx::query_as("SELECT estimated,status,input_tokens,output_tokens FROM usage_records WHERE run_id=$1 ORDER BY created_at DESC LIMIT 1").bind(run).fetch_one(&h.db).await?;
+    assert_eq!(usage, (false, "completed".into(), 25, 8));
     // Owner replacement changes exec_epoch; a live sandbox key remains valid on its lease.
     sqlx::query("UPDATE runs SET exec_epoch=2 WHERE id=$1")
         .bind(run)
@@ -1620,7 +1628,7 @@ async fn guest_proxy_live_host_restart_and_terminal_cleanup_recovery() -> anyhow
 
 #[tokio::test]
 #[ignore = "requires PostgreSQL/NATS and test gateway secrets"]
-async fn explicit_credential_selection_revocation_and_tenant_boundary() -> anyhow::Result<()> {
+async fn organization_credential_revocation_and_tenant_boundary() -> anyhow::Result<()> {
     let h = Harness::new().await?;
     let user = h.user().await?;
     let outsider = h.user().await?;
@@ -1628,34 +1636,15 @@ async fn explicit_credential_selection_revocation_and_tenant_boundary() -> anyho
     let org = id(&user, "org_id");
     let client = reqwest::Client::new();
     let token = user["token"].as_str().unwrap();
-    let mut selected = Value::Null;
-    for organization in [false, true] {
-        let value: Value = client.post(format!("{}/orgs/{org}/credentials", h.base)).bearer_auth(token).json(&json!({"name":"test", "organization":organization,"api_key":if organization {"org-fixture-key"}else{"personal-fixture-key"}})).send().await?.error_for_status()?.json().await?;
-        if organization {
-            selected = value;
-        }
-    }
-    let url = format!(
-        "{}/orgs/{org}/conversations/{conv}/model-credential",
-        h.base
-    );
-    assert_eq!(
-        client
-            .post(&url)
-            .bearer_auth(outsider["token"].as_str().unwrap())
-            .json(&json!({"credential_id":selected["id"]}))
-            .send()
-            .await?
-            .status(),
-        403
-    );
-    client
-        .post(&url)
+    let credential: Value = client
+        .post(format!("{}/orgs/{org}/credentials", h.base))
         .bearer_auth(token)
-        .json(&json!({"credential_id":selected["id"]}))
+        .json(&json!({"name":"test","organization":true,"api_key":"org-fixture-key"}))
         .send()
         .await?
-        .error_for_status()?;
+        .error_for_status()?
+        .json()
+        .await?;
     h.send(&user, conv, message("hello")).await?;
     let lease = h
         .app
@@ -1664,55 +1653,45 @@ async fn explicit_credential_selection_revocation_and_tenant_boundary() -> anyho
         .await?
         .unwrap();
     owner::process_with_config(&h.app.store, &lease, &h.app.config).await?;
-    let (run, credential): (Uuid, Option<Uuid>) =
-        sqlx::query_as("SELECT id,credential_id FROM runs WHERE conversation_id=$1")
-            .bind(conv)
-            .fetch_one(&h.db)
-            .await?;
-    assert_eq!(credential, Some(id(&selected, "id")));
+    let run: Uuid = sqlx::query_scalar("SELECT id FROM runs WHERE conversation_id=$1")
+        .bind(conv)
+        .fetch_one(&h.db)
+        .await?;
     let virtual_token = h.loop_key(&lease, id(&user, "user_id"), run).await?;
     let body = json!({"model":"fixture-model","stream":true,"max_tokens":32,"messages":[{"role":"user","content":"hello"}]});
-    client
-        .post(format!("{}/v1/messages", h.gateway))
-        .bearer_auth(&virtual_token)
-        .json(&body)
-        .send()
-        .await?
-        .error_for_status()?
-        .bytes()
-        .await?;
-    assert_eq!(
-        h.requests.lock().unwrap().last().unwrap().1["x-api-key"],
-        "org-fixture-key"
-    );
-    let secrets = || {
-        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM secrets WHERE org_id=$1")
-            .bind(org)
-            .fetch_one(&h.db)
-    };
-    assert_eq!(secrets().await?, 2);
-    client
-        .delete(format!(
-            "{}/orgs/{org}/credentials/{}",
-            h.base,
-            selected["id"].as_str().unwrap()
-        ))
-        .bearer_auth(token)
-        .send()
-        .await?
-        .error_for_status()?;
-    // Revocation deletes the key outright.
-    assert_eq!(secrets().await?, 1);
-    assert_eq!(
+    let upstream_key = || async {
         client
             .post(format!("{}/v1/messages", h.gateway))
             .bearer_auth(&virtual_token)
             .json(&body)
             .send()
             .await?
-            .status(),
-        503
-    );
+            .error_for_status()?
+            .bytes()
+            .await?;
+        let key = h.requests.lock().unwrap().last().unwrap().1["x-api-key"].clone();
+        anyhow::Ok(key)
+    };
+    assert_eq!(upstream_key().await?, "org-fixture-key");
+    let secrets = || {
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM secrets WHERE org_id=$1")
+            .bind(org)
+            .fetch_one(&h.db)
+    };
+    assert_eq!(secrets().await?, 1);
+    client
+        .delete(format!(
+            "{}/orgs/{org}/credentials/{}",
+            h.base,
+            credential["id"].as_str().unwrap()
+        ))
+        .bearer_auth(token)
+        .send()
+        .await?
+        .error_for_status()?;
+    // Revocation deletes the key outright; requests fall back to the platform's.
+    assert_eq!(secrets().await?, 0);
+    assert_eq!(upstream_key().await?, "local-fixture-key");
     assert_eq!(
         client
             .get(format!("{}/orgs/{org}/usage", h.base))
@@ -1726,38 +1705,20 @@ async fn explicit_credential_selection_revocation_and_tenant_boundary() -> anyho
 }
 #[tokio::test]
 #[ignore = "requires PostgreSQL/NATS and test gateway secrets"]
-async fn legacy_credentials_move_to_secrets_and_key_rotation_rewraps_them() -> anyhow::Result<()> {
-    use aes_gcm::{
-        Aes256Gcm, KeyInit, Nonce,
-        aead::{Aead, Payload},
-    };
+async fn vault_key_rotation_rewraps_credential_secrets() -> anyhow::Result<()> {
     use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
     let h = Harness::new().await?;
     let user = h.user().await?;
     let (org, owner) = (id(&user, "org_id"), id(&user, "user_id"));
-    // A personal credential in the original format: encrypted in place under vault key 0.
-    let key = URL_SAFE_NO_PAD.decode(std::env::var("RYZHUB_TEST_VAULT_KEY")?)?;
-    let credential = Uuid::now_v7();
-    let nonce = [3u8; 12];
-    let sealed = Aes256Gcm::new_from_slice(&key)?
-        .encrypt(
-            Nonce::from_slice(&nonce),
-            Payload {
-                msg: b"legacy-fixture-key",
-                aad: format!("{org}/{credential}/{owner}").as_bytes(),
-            },
-        )
-        .map_err(|_| anyhow::anyhow!("seal"))?;
-    sqlx::query(
-        "INSERT INTO model_credentials(id,org_id,owner_user_id,name,provider,encrypted_key,key_id)
-         VALUES($1,$2,$3,'legacy','anthropic',$4,0)",
-    )
-    .bind(credential)
-    .bind(org)
-    .bind(owner)
-    .bind([nonce.as_slice(), &sealed].concat())
-    .execute(&h.db)
-    .await?;
+    let credential: Value = reqwest::Client::new()
+        .post(format!("{}/orgs/{org}/credentials", h.base))
+        .bearer_auth(user["token"].as_str().unwrap())
+        .json(&json!({"name":"personal","api_key":"personal-fixture-key"}))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
     let resolve = |app: App| async move {
         let mut tx = app.store.tx(org).await?;
         let policy = ryzhub_domain::Policy::default();
@@ -1766,7 +1727,6 @@ async fn legacy_credentials_move_to_secrets_and_key_rotation_rewraps_them() -> a
             &mut tx,
             org,
             owner,
-            None,
             &policy,
             "anthropic",
         )
@@ -1774,22 +1734,16 @@ async fn legacy_credentials_move_to_secrets_and_key_rotation_rewraps_them() -> a
         tx.commit().await?;
         anyhow::Ok(resolved)
     };
-    let expected = (Some(credential), "legacy-fixture-key".to_owned());
-    // Still readable before conversion.
+    let expected = (
+        Some(id(&credential, "id")),
+        "personal-fixture-key".to_owned(),
+    );
     assert_eq!(resolve(h.app.clone()).await?, expected);
     let migrate = ryzhub_server::vault::migrate;
-    assert_eq!(migrate(&h.db, &h.app.config.llm).await?, (1, 0));
-    let (cipher, secret): (Option<Vec<u8>>, Option<Uuid>) =
-        sqlx::query_as("SELECT encrypted_key,secret_id FROM model_credentials WHERE id=$1")
-            .bind(credential)
-            .fetch_one(&h.db)
-            .await?;
-    assert!(cipher.is_none() && secret.is_some());
-    assert_eq!(resolve(h.app.clone()).await?, expected);
     assert_eq!(
         migrate(&h.db, &h.app.config.llm).await?,
-        (0, 0),
-        "idempotent"
+        0,
+        "nothing to rewrap"
     );
 
     // Rotate: key 1 becomes current and key 0 is retired. Rewrapping makes key 0 unnecessary.
@@ -1804,11 +1758,13 @@ async fn legacy_credentials_move_to_secrets_and_key_rotation_rewraps_them() -> a
     rotated.llm.vault_key_id = 1;
     rotated.llm.vault_key_env = "RYZHUB_TEST_VAULT_KEY_NEXT".into();
     rotated.llm.vault_retired_keys = [("0".into(), "RYZHUB_TEST_VAULT_KEY".into())].into();
-    assert_eq!(migrate(&h.db, &rotated.llm).await?, (0, 1));
-    let kek: i16 = sqlx::query_scalar("SELECT kek_id FROM secrets WHERE id=$1")
-        .bind(secret)
-        .fetch_one(&h.db)
-        .await?;
+    assert_eq!(migrate(&h.db, &rotated.llm).await?, 1);
+    let kek: i16 = sqlx::query_scalar(
+        "SELECT s.kek_id FROM secrets s JOIN model_credentials c ON c.secret_id=s.id WHERE c.id=$1",
+    )
+    .bind(id(&credential, "id"))
+    .fetch_one(&h.db)
+    .await?;
     assert_eq!(kek, 1);
     rotated.llm.vault_retired_keys.clear();
     let app = App::new(h.app.store.clone(), h.app.nats.clone(), rotated)?;
@@ -2655,7 +2611,7 @@ async fn gemini_upstream(
 
 #[tokio::test]
 #[ignore = "requires PostgreSQL/NATS and test gateway secrets"]
-async fn gateway_speaks_chat_completions_and_gemini_fails_over_caps_reasoning_and_retains_content()
+async fn gateway_speaks_chat_completions_and_gemini_fails_over_and_caps_reasoning()
 -> anyhow::Result<()> {
     use std::sync::atomic::{AtomicUsize, Ordering};
     let fixtures = Requests::default();
@@ -2900,15 +2856,11 @@ async fn gateway_speaks_chat_completions_and_gemini_fails_over_caps_reasoning_an
         .await?;
     assert_eq!(anthropic["data"][0]["type"], "model");
 
-    // A reasoning cap refuses requests above it, in each protocol's terms; retention keeps
-    // what passes.
-    sqlx::query(
-        "UPDATE org_policies SET policy='{\"max_reasoning\":\"low\",\"retain_model_content_days\":3}'
-         WHERE org_id=$1",
-    )
-    .bind(org)
-    .execute(&h.db)
-    .await?;
+    // A reasoning cap refuses requests above it, in each protocol's terms.
+    sqlx::query("UPDATE org_policies SET policy='{\"max_reasoning\":\"low\"}' WHERE org_id=$1")
+        .bind(org)
+        .execute(&h.db)
+        .await?;
     let mut high = chat.clone();
     high["reasoning_effort"] = json!("high");
     let denied = post("/v1/chat/completions", high).await?;
@@ -2932,53 +2884,6 @@ async fn gateway_speaks_chat_completions_and_gemini_fails_over_caps_reasoning_an
         .error_for_status()?
         .bytes()
         .await?;
-    let kept: Uuid = last_usage().await?.get("id");
-    let expires: Option<chrono::DateTime<chrono::Utc>> =
-        sqlx::query_scalar("SELECT content_expires_at FROM usage_records WHERE id=$1")
-            .bind(kept)
-            .fetch_one(&h.db)
-            .await?;
-    let days = (expires.context("content kept")? - chrono::Utc::now()).num_hours();
-    assert!((71..=72).contains(&days), "{days}");
-    let content_url = format!("{}/orgs/{org}/usage/{kept}/content", h.base);
-    let content: Value = client
-        .get(&content_url)
-        .bearer_auth(user["token"].as_str().unwrap())
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
-    assert!(
-        content["request"]
-            .as_str()
-            .unwrap()
-            .contains("\"reasoning_effort\":\"low\"")
-    );
-    assert!(content["response"].as_str().unwrap().contains("你好"));
-
-    // Expired content goes.
-    sqlx::query(
-        "UPDATE usage_records SET content_expires_at=now()-interval '1 second' WHERE id=$1",
-    )
-    .bind(kept)
-    .execute(&h.db)
-    .await?;
-    let worker = PgPool::connect(&h.worker_url).await?;
-    gateway::purge_model_content(&h.app, &worker).await?;
-    worker.close().await;
-    let gone = client
-        .get(&content_url)
-        .bearer_auth(user["token"].as_str().unwrap())
-        .send()
-        .await?;
-    assert_eq!(gone.status(), 404);
-    let blobs = std::path::Path::new(&h.app.config.work.storage_root)
-        .join(org.to_string())
-        .join("llm")
-        .join(kept.to_string());
-    assert_eq!(std::fs::read_dir(&blobs)?.count(), 0);
-
     fixture_task.abort();
     down_task.abort();
     h.close().await

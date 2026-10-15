@@ -601,11 +601,7 @@ class _RenderComposerRow extends RenderBox
 
 /// Run settings shown as pills inside the composer.
 List<Widget> runTools(HubController hub, RunAction action) {
-  if (hub.isDraft ||
-      hub.commandCatalog.isEmpty ||
-      (!hub.realChat && !hub.realWork)) {
-    return const [];
-  }
+  if (hub.isDraft || hub.commandCatalog.isEmpty) return const [];
   final settings = hub.settings;
   final modes = (hub.commandCatalog['approval_modes'] as List? ?? const [])
       .cast<String>();
@@ -687,9 +683,7 @@ Widget? modelControl(HubController hub, RunAction action) {
       level: hub.draftReasoning,
     );
   }
-  if (hub.commandCatalog.isEmpty || (!hub.realChat && !hub.realWork)) {
-    return null;
-  }
+  if (hub.commandCatalog.isEmpty) return null;
   return conversationModelPicker(hub, action);
 }
 

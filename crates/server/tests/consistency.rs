@@ -24,8 +24,9 @@ use uuid::Uuid;
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 impl Harness {
+    /// The Chat engine, over the fixture model.
     async fn new() -> anyhow::Result<Self> {
-        Self::start(|_| {}).await
+        Self::start(|config| config.llm.enabled = true).await
     }
     async fn conversation(&self, user: &Value) -> anyhow::Result<Uuid> {
         let response: Value = reqwest::Client::new()
@@ -196,7 +197,7 @@ async fn database_idempotency_fencing_rls_and_transaction_outbox() -> anyhow::Re
         .claim(ctx.org_id, conv, Uuid::now_v7(), 3000)
         .await?
         .unwrap();
-    assert!(owner::process_command(&h.app.store, &old).await?);
+    assert!(owner::process_with_config(&h.app.store, &old, &h.app.config).await?);
     let first = h.app.store.command_result(&ctx, cid).await?.unwrap();
     assert_eq!(
         h.app
@@ -314,7 +315,61 @@ async fn database_idempotency_fencing_rls_and_transaction_outbox() -> anyhow::Re
 
 #[tokio::test]
 #[ignore = "requires PostgreSQL 18 and NATS"]
-async fn two_devices_approval_cas_and_stale_execution_epoch() -> anyhow::Result<()> {
+async fn disabled_engines_refuse_work_conversations_and_runs() -> anyhow::Result<()> {
+    // Work is off, its model still configured: an instance that turned Work off.
+    let h = Harness::start(|config| {
+        config.llm.enabled = true;
+        config.work.model = "gpt-5.4".into();
+    })
+    .await?;
+    let user = h.user().await?;
+    let org = id(&user, "org_id");
+    let created = reqwest::Client::new()
+        .post(format!("{}/orgs/{org}/conversations", h.base))
+        .bearer_auth(user["token"].as_str().unwrap())
+        .json(&json!({"title":"Work","mode":"work"}))
+        .send()
+        .await?;
+    assert_eq!(created.status(), 503);
+    assert_eq!(created.json::<Value>().await?["error"], "WORK_DISABLED");
+    // A Work conversation from before, and a Chat one where no model gateway runs.
+    let ctx = h.context(&user).await?;
+    let mut without_models = (*h.app.config).clone();
+    without_models.llm.enabled = false;
+    for (mode, config, code) in [
+        ("work", &*h.app.config, "WORK_DISABLED"),
+        ("chat", &without_models, "MODEL_GATEWAY_DISABLED"),
+    ] {
+        let conv = h
+            .app
+            .store
+            .create_conversation(&ctx, "关闭", mode)
+            .await?
+            .id;
+        let cid = Uuid::now_v7();
+        h.app
+            .store
+            .accept(&ctx, conv, "a", &message(cid, "hello"))
+            .await?;
+        let lease = h
+            .app
+            .store
+            .claim(org, conv, Uuid::now_v7(), 10_000)
+            .await?
+            .unwrap();
+        owner::process_with_config(&h.app.store, &lease, config).await?;
+        let result = h.app.store.command_result(&ctx, cid).await?.unwrap();
+        assert!(
+            matches!(&result.body, Some(Body::CommandRejected(r)) if r.code == code),
+            "{mode}: {result:?}"
+        );
+    }
+    h.close().await
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL 18 and NATS"]
+async fn two_devices_answer_cas_and_stale_execution_epoch() -> anyhow::Result<()> {
     let h = Harness::new().await?;
     let user = h.user().await?;
     let conv = h.conversation(&user).await?;
@@ -325,7 +380,7 @@ async fn two_devices_approval_cas_and_stale_execution_epoch() -> anyhow::Result<
         .await?;
     h.app
         .store
-        .accept(&ctx, conv, "a", &message(Uuid::now_v7(), "/approve test"))
+        .accept(&ctx, conv, "a", &message(Uuid::now_v7(), "question"))
         .await?;
     let lease = h
         .app
@@ -333,13 +388,23 @@ async fn two_devices_approval_cas_and_stale_execution_epoch() -> anyhow::Result<
         .claim(ctx.org_id, conv, Uuid::now_v7(), 10_000)
         .await?
         .unwrap();
-    owner::process_command(&h.app.store, &lease).await?;
-    let (action, epoch): (Uuid, i64) =
-        sqlx::query_as("SELECT id,run_epoch FROM pending_actions WHERE org_id=$1")
-            .bind(ctx.org_id)
-            .fetch_one(&h.db)
-            .await?;
-    // A takeover keeps the request visible but invalidates the old execution epoch.
+    owner::process_with_config(&h.app.store, &lease, &h.app.config).await?;
+    let run: Uuid = sqlx::query_scalar("SELECT id FROM runs WHERE conversation_id=$1")
+        .bind(conv)
+        .fetch_one(&h.db)
+        .await?;
+    // The model asks; the run waits for the answer.
+    ryzhub_server::chat::runner::drive(h.app.clone(), lease, run, OwnerLink::detached()).await?;
+    let (action, epoch) = h.action(run).await?;
+    let answer = |epoch: i64| CommandEnvelope {
+        cid: Uuid::now_v7().to_string(),
+        command: Some(Command::AnswerQuestion(AnswerQuestion {
+            action_id: action.to_string(),
+            run_epoch: epoch as u64,
+            answer: "蓝色".into(),
+        })),
+    };
+    // A takeover keeps the question visible but invalidates the old execution epoch.
     sqlx::query(
         "UPDATE channels SET lease_until=now()-interval '1 second' WHERE conversation_id=$1",
     )
@@ -352,16 +417,9 @@ async fn two_devices_approval_cas_and_stale_execution_epoch() -> anyhow::Result<
         .claim(ctx.org_id, conv, Uuid::now_v7(), 10_000)
         .await?
         .unwrap();
-    let stale = CommandEnvelope {
-        cid: Uuid::now_v7().to_string(),
-        command: Some(Command::DecideApproval(DecideApproval {
-            action_id: action.to_string(),
-            run_epoch: epoch as u64,
-            decision: "allow".into(),
-        })),
-    };
+    let stale = answer(epoch);
     h.app.store.accept(&ctx, conv, "old-device", &stale).await?;
-    owner::process_command(&h.app.store, &lease).await?;
+    owner::process_with_config(&h.app.store, &lease, &h.app.config).await?;
     assert!(matches!(
         h.app
             .store
@@ -371,27 +429,15 @@ async fn two_devices_approval_cas_and_stale_execution_epoch() -> anyhow::Result<
             .body,
         Some(Body::CommandRejected(_))
     ));
-    let epoch = lease.epoch;
-    let a = CommandEnvelope {
-        cid: Uuid::now_v7().to_string(),
-        command: Some(Command::DecideApproval(DecideApproval {
-            action_id: action.to_string(),
-            run_epoch: epoch as u64,
-            decision: "allow".into(),
-        })),
-    };
-    let b = CommandEnvelope {
-        cid: Uuid::now_v7().to_string(),
-        ..a.clone()
-    };
+    let (a, b) = (answer(lease.epoch), answer(lease.epoch));
     let (ra, rb) = tokio::join!(
         h.app.store.accept(&ctx, conv, "a", &a),
         h.app.store.accept(&ctx, conv, "b", &b)
     );
     ra?;
     rb?;
-    owner::process_command(&h.app.store, &lease).await?;
-    owner::process_command(&h.app.store, &lease).await?;
+    owner::process_with_config(&h.app.store, &lease, &h.app.config).await?;
+    owner::process_with_config(&h.app.store, &lease, &h.app.config).await?;
     let mut accepted = 0;
     let mut rejected = 0;
     for cmd in [a, b] {
@@ -434,7 +480,7 @@ async fn websocket_reconnect_owner_process_restart_snapshot_and_isolation() -> a
         &mut socket,
         frame(
             &channel,
-            Body::Command(message(cid, &"切网与接管 ".repeat(35))),
+            Body::Command(message(cid, &"切网与接管 slow ".repeat(35))),
         ),
     )
     .await?;
@@ -455,7 +501,7 @@ async fn websocket_reconnect_owner_process_restart_snapshot_and_isolation() -> a
         &mut socket,
         frame(
             &channel,
-            Body::Command(message(cid, &"切网与接管 ".repeat(35))),
+            Body::Command(message(cid, &"切网与接管 slow ".repeat(35))),
         ),
     )
     .await?;
@@ -502,7 +548,7 @@ async fn websocket_reconnect_owner_process_restart_snapshot_and_isolation() -> a
         .unwrap()
         .text
         .clone();
-    assert!(final_text.ends_with("Rust 🦀。"));
+    assert!(final_text.ends_with("你好 Rust"), "{final_text}");
     let mut intruder = connect(&h.base, &other, "intruder").await?;
     subscribe(&mut intruder, &channel, None).await?;
     assert!(matches!(
@@ -769,7 +815,7 @@ async fn member_removal_revokes_org_access_and_stops_waiting_run() -> anyhow::Re
     let conv = h
         .app
         .store
-        .create_conversation(&ctx, "待审批任务", "work")
+        .create_conversation(&ctx, "待回答任务", "chat")
         .await?
         .id;
     let channel = format!("conv:{conv}");
@@ -778,10 +824,7 @@ async fn member_removal_revokes_org_access_and_stops_waiting_run() -> anyhow::Re
     subscribe(&mut socket, &channel, None).await?;
     send(
         &mut socket,
-        frame(
-            &channel,
-            Body::Command(message(Uuid::now_v7(), "/approve member removal")),
-        ),
+        frame(&channel, Body::Command(message(Uuid::now_v7(), "question"))),
     )
     .await?;
     until(&mut socket,|f|matches!(&f.body,Some(Body::Event(e)) if matches!(e.event,Some(Event::PendingActionChanged(_))))).await?;
@@ -890,11 +933,9 @@ async fn parallel_approvals_should_both_resolve() -> anyhow::Result<()> {
         let conv = h.conversation(&user).await?;
         let ctx = h.app.store.context(id(&user, "user_id"), org).await?;
         let lease = h.app.store.claim(org, conv, Uuid::now_v7(), 60000).await?.unwrap();
-        let mut config = Config::default();
-        config.llm.enabled = true;
-        config.llm.model = "mock".into();
+        let config = &h.app.config;
         h.app.store.accept(&ctx, conv, "review", &message(Uuid::now_v7(), "parallel approval")).await?;
-        owner::process_with_config(&h.app.store, &lease, &config).await?;
+        owner::process_with_config(&h.app.store, &lease, config).await?;
         let run: Uuid = sqlx::query_scalar("SELECT id FROM runs WHERE conversation_id=$1").bind(conv).fetch_one(&h.db).await?;
         let actions = [Uuid::now_v7(), Uuid::now_v7()];
         for action in actions {
@@ -906,7 +947,7 @@ async fn parallel_approvals_should_both_resolve() -> anyhow::Result<()> {
         for (index, action) in actions.into_iter().enumerate() {
             let cmd = CommandEnvelope { cid: Uuid::now_v7().to_string(), command: Some(Command::DecideApproval(DecideApproval { action_id: action.to_string(),run_epoch:lease.epoch as u64,decision:"allow".into() })) };
             h.app.store.accept(&ctx,conv,"review",&cmd).await?;
-            owner::process_with_config(&h.app.store,&lease,&config).await?;
+            owner::process_with_config(&h.app.store,&lease,config).await?;
             let state: String = sqlx::query_scalar("SELECT state FROM runs WHERE id=$1").bind(run).fetch_one(&h.db).await?;
             ensure!(state == if index == 0 { "requires_action" } else { "running" });
             replies.push(h.app.store.command_result(&ctx,Uuid::parse_str(&cmd.cid)?).await?.unwrap());
@@ -956,7 +997,7 @@ async fn restore_failure_should_not_create_blank_workspace() -> anyhow::Result<(
         let mut config=Config::default();
         config.llm.enabled=true;
         config.work.enabled=true;
-        config.work.model="mock".into();
+        config.work.model="gpt-5.4".into();
         config.sandbox.enabled=true;
         config.sandbox.host_socket=socket.to_str().unwrap().into();
         config.sandbox.image=format!("review@sha256:{}","b".repeat(64));
@@ -1066,9 +1107,9 @@ async fn checkpoint_sync_should_not_ack_next_turn_without_projection() -> anyhow
         let lease=h.app.store.claim(org,conv,Uuid::now_v7(),60000).await?.unwrap();
         let mut config=Config::default();
         config.llm.enabled=true;
-        config.llm.model="mock".into();
+        config.llm.model="fixture-model".into();
         config.llm.unix_socket=Some("/gateway/test.sock".into());
-        config.work.model="mock".into();
+        config.work.model="gpt-5.4".into();
         config.sandbox.enabled=true;
         config.sandbox.host_socket=socket.to_str().unwrap().into();
         h.app.store.accept(&ctx,conv,"review",&message(Uuid::now_v7(),"old turn")).await?;
@@ -1206,7 +1247,7 @@ fn work_config(socket: &std::path::Path, storage: &std::path::Path) -> Config {
     config.llm.enabled = true;
     config.llm.unix_socket = Some("/gateway/test.sock".into());
     config.work.enabled = true;
-    config.work.model = "mock".into();
+    config.work.model = "gpt-5.4".into();
     config.work.storage_root = storage.to_str().unwrap().into();
     config.work.secondary_root = None;
     config.sandbox.enabled = true;

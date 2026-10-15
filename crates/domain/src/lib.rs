@@ -143,8 +143,6 @@ pub struct Policy {
     /// The most reasoning a model request may ask for: `minimal`, `low`, `medium`, `high`,
     /// `xhigh` or `max`.
     pub max_reasoning: Option<String>,
-    /// Model requests and responses are kept this many days, for review; None keeps none.
-    pub retain_model_content_days: Option<u32>,
     /// Plugins neither signed by a trusted publisher nor from the official catalog.
     pub allow_unverified_plugins: Option<bool>,
     /// Plugin tools (`<plugin>__<tool>`, `<plugin>__*` for all of a plugin's) whose every Work
@@ -245,10 +243,6 @@ impl Policy {
             attachment_bytes: cap(self.attachment_bytes, lower.attachment_bytes),
             attachment_quota_bytes: cap(self.attachment_quota_bytes, lower.attachment_quota_bytes),
             max_reasoning: least_reasoning(&self.max_reasoning, &lower.max_reasoning),
-            retain_model_content_days: cap(
-                self.retain_model_content_days,
-                lower.retain_model_content_days,
-            ),
             allow_unverified_plugins: cap(
                 self.allow_unverified_plugins,
                 lower.allow_unverified_plugins,

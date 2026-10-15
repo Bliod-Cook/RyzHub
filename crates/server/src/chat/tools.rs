@@ -130,21 +130,12 @@ fn tool(name: &str, description: &str, properties: Value, required: &[&str]) -> 
     })
 }
 
-const KNOWN: [&str; 10] = [
-    "read_tool_output",
-    "exec",
-    "exec_poll",
-    "exec_write",
-    "exec_kill",
-    "view_image",
-    "fs_upload",
-    "fs_download",
-    "ask_user",
-    "project_file_search",
-];
-/// Tools run silently; only a question waits for the user.
-fn waits_for_user(name: &str) -> bool {
-    name == "ask_user"
+/// Whether the Chat engine has a tool `name`, besides the run's plugin tools.
+fn known(name: &str) -> bool {
+    name == "load_skill"
+        || definitions()
+            .as_array()
+            .is_some_and(|tools| tools.iter().any(|tool| tool["name"] == name))
 }
 
 /// Execute every unfinished tool call of the run, in order. Returns false when a call waits
@@ -177,11 +168,7 @@ pub async fn advance(
             .await?
             .into_iter()
             .find(|tool| tool.name == name);
-        if !KNOWN.contains(&name.as_str())
-            && !crate::memory::TOOLS.contains(&name.as_str())
-            && name != "load_skill"
-            && plugin.is_none()
-        {
+        if !known(&name) && plugin.is_none() {
             tx.commit().await?;
             record(
                 app,
@@ -220,35 +207,16 @@ pub async fn advance(
             .await?;
             continue;
         }
-        if status == "planned" && waits_for_user(&name) {
-            match row.get::<Option<Uuid>, _>("action_id") {
-                Some(action) => {
-                    let decision: String = sqlx::query_scalar(
-                        "SELECT status FROM pending_actions WHERE org_id=$1 AND id=$2",
-                    )
-                    .bind(lease.org_id)
-                    .bind(action)
-                    .fetch_one(&mut *tx)
-                    .await?;
-                    if decision == "deny" {
-                        tx.commit().await?;
-                        record(app, lease, run, &call, json!({"error":"user_denied"}), link)
-                            .await?;
-                        continue;
-                    }
-                    if decision != "allow" && decision != "answered" {
-                        // Still pending (or invalidated): nothing to do until it changes.
-                        tx.commit().await?;
-                        return Ok(false);
-                    }
-                }
-                None => {
-                    ask(app, &mut tx, lease, run, &call, &args).await?;
-                    tx.commit().await?;
-                    link.committed().await;
-                    return Ok(false);
-                }
+        // Tools run silently; only a question waits, until the user's answer completes it.
+        if status == "planned" && name == "ask_user" {
+            if row.get::<Option<Uuid>, _>("action_id").is_some() {
+                tx.commit().await?;
+                return Ok(false);
             }
+            ask(app, &mut tx, lease, run, &call, &args).await?;
+            tx.commit().await?;
+            link.committed().await;
+            return Ok(false);
         }
         if status == "planned" {
             sqlx::query(

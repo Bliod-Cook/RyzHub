@@ -20,7 +20,9 @@ use tokio::{
 };
 use uuid::Uuid;
 
-use super::{Engine, fold_subject, mock, process_next, publish, publish_transient, result_subject};
+use super::{
+    Engine, LEASE_MS, fold_subject, process_next, publish, publish_transient, result_subject,
+};
 use crate::{
     app::App,
     error::{is_fenced, public_code},
@@ -193,14 +195,14 @@ pub async fn run(app: App, lease: Lease, wake: Arc<Notify>) -> anyhow::Result<()
     };
     let (events_tx, mut events) = mpsc::channel(256);
     let mut folds = app.nats.subscribe(fold_subject(&lease.channel())).await?;
-    let mut renew = tokio::time::interval(Duration::from_millis(app.config.owner_lease_ms / 3));
+    let mut renew = tokio::time::interval(Duration::from_millis(LEASE_MS / 3));
     let mut housekeeping = tokio::time::interval(HOUSEKEEPING);
     let mut flush = tokio::time::interval(FLUSH);
     for timer in [&mut renew, &mut housekeeping, &mut flush] {
         timer.set_missed_tick_behavior(MissedTickBehavior::Delay);
     }
     let mut actor = Actor {
-        engine: Engine::of(&app.config, &mode),
+        engine: Engine::of(&mode),
         app,
         lease,
         link: OwnerLink {
@@ -218,7 +220,7 @@ pub async fn run(app: App, lease: Lease, wake: Arc<Notify>) -> anyhow::Result<()
     loop {
         tokio::select! {
             _ = renew.tick() => {
-                actor.app.store.renew(&actor.lease, actor.app.config.owner_lease_ms).await?;
+                actor.app.store.renew(&actor.lease, LEASE_MS).await?;
             }
             () = wake.notified() => actor.on_wake().await?,
             _ = housekeeping.tick() => {
@@ -298,7 +300,7 @@ impl Actor {
         {
             tracing::warn!(conv = %self.lease.conversation_id, error = format!("{error:#}"), "conversation jobs failed");
         }
-        if self.jobs.is_some() || self.engine == Engine::Mock {
+        if self.jobs.is_some() {
             return;
         }
         let (app, lease, work, link) = (
@@ -333,7 +335,7 @@ impl Actor {
         .await?;
         tx.commit().await?;
         // A Work harness keeps its turn open while it waits for an approval; the Chat loop
-        // and the simulator stop and are restarted once the run is running again.
+        // stops and is restarted once the run is running again.
         let engine = self.engine;
         let wanted: HashMap<Uuid, bool> = runs
             .iter()
@@ -360,7 +362,6 @@ impl Actor {
     fn spawn_worker(&mut self, run: Uuid, read_only: bool) {
         let (app, lease, link) = (self.app.clone(), self.lease.clone(), self.link.clone());
         let handle = match (self.engine, read_only) {
-            (Engine::Mock, _) => self.exits.spawn(mock::drive(app, lease, run, link)),
             (Engine::Work, false) => self.exits.spawn(crate::work::drive(app, lease, run, link)),
             _ => self
                 .exits

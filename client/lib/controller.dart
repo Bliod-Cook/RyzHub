@@ -521,12 +521,10 @@ class HubController extends ChangeNotifier with HubApi {
         r['read_only'] != true &&
         (r['state'] == 'running' || r['state'] == 'requires_action'),
   );
-  bool get realChat =>
-      capabilities['chat'] != 'mock' &&
-      conversations.where((c) => c['id'] == selected).firstOrNull?['mode'] !=
-          'work';
+
+  /// The selected conversation is a Work one, on a server that runs Work.
   bool get realWork =>
-      capabilities['work'] != 'mock' &&
+      capabilities['work'] != null &&
       conversations.where((c) => c['id'] == selected).firstOrNull?['mode'] ==
           'work';
   String get agentLabel =>
@@ -618,7 +616,7 @@ class HubController extends ChangeNotifier with HubApi {
   /// Work conversations archive through their workspace.
   Future<void> archive(String conv) async {
     final c = conversations.where((c) => c['id'] == conv).firstOrNull;
-    if (c?['mode'] == 'work' && capabilities['work'] != 'mock') {
+    if (c?['mode'] == 'work' && capabilities['work'] != null) {
       await workspaceOperation('archive', conv: conv);
       return;
     }
@@ -1155,19 +1153,17 @@ class HubController extends ChangeNotifier with HubApi {
     sends++;
     notifyListeners();
     if (isDraft) return _createByCommand(text, carried, picked: picked);
-    final ch = channel, steerable = realChat || realWork;
+    final ch = channel;
     final pending = _pendingConfig[ch]?.isNotEmpty == true
         ? Map<String, dynamic>.of(_pendingConfig[ch]!)
         : null;
     await _schedule(
       () => _remember(
-        steerable &&
-                (_runs[ch] ?? []).any(
-                  (r) =>
-                      r['read_only'] != true &&
-                      (r['state'] == 'running' ||
-                          r['state'] == 'requires_action'),
-                )
+        (_runs[ch] ?? []).any(
+              (r) =>
+                  r['read_only'] != true &&
+                  (r['state'] == 'running' || r['state'] == 'requires_action'),
+            )
             ? _core!.steer(channel: ch, text: text, attachmentIds: files)
             : _core!.sendText(
                 channel: ch,

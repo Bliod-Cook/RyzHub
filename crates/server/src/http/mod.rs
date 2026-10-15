@@ -162,10 +162,6 @@ pub fn router(app: App) -> Router {
         .route("/orgs/{org}/models", get(orgs::models))
         .route("/orgs/{org}/audit", get(orgs::audit_log))
         .route("/orgs/{org}/usage", get(llm::gateway::usage))
-        .route(
-            "/orgs/{org}/usage/{id}/content",
-            get(llm::gateway::usage_content),
-        )
         .route("/orgs/{org}/members/{user}", delete(orgs::remove_member))
         .route(
             "/orgs/{org}/credentials",
@@ -180,10 +176,6 @@ pub fn router(app: App) -> Router {
             get(orgs::list_conversations).post(orgs::create_conversation),
         )
         .route("/orgs/{org}/conversations/{conv}/items", get(orgs::history))
-        .route(
-            "/orgs/{org}/conversations/{conv}/model-credential",
-            post(llm::credentials::select),
-        )
         .route(
             "/orgs/{org}/conversations/{conv}/workspace",
             get(workspace::status).post(workspace::enqueue),
@@ -290,13 +282,13 @@ async fn healthz(State(app): State<App>) -> ApiResult<Json<Value>> {
 async fn capabilities(State(app): State<App>) -> Json<Value> {
     let config = &app.config;
     let harnesses = crate::run_config::work_harnesses(config);
+    // Null where the engine is off.
     Json(json!({
-        "chat": if config.llm.enabled { crate::run_config::default_chat_protocol(config) } else { "mock" },
-        "model": if config.llm.enabled { config.llm.model.as_str() } else { "mock" },
-        "work": if config.work.enabled { "codex" } else { "mock" },
+        "chat": config.llm.enabled.then(|| crate::run_config::default_chat_protocol(config)),
+        "model": config.llm.enabled.then_some(&config.llm.model),
+        "work": config.work.enabled.then_some("codex"),
         "work_model": config.work.model,
         "claude_model": config.work.claude_model,
-        "responses_model": config.llm.responses_model,
         "harnesses": harnesses,
         "search": config.search.enabled,
         "memory": config.search.enabled,
@@ -345,9 +337,9 @@ async fn admin_settings(State(app): State<App>, headers: HeaderMap) -> ApiResult
         "capabilities": {
             "stream": "text/0",
             "approval": "native",
-            "resume": if config.llm.enabled { "loop_steps" } else { "emulated" },
-            "chat": if config.llm.enabled { "anthropic" } else { "mock" },
-            "work": if config.work.enabled { "codex" } else { "mock" },
+            "resume": "loop_steps",
+            "chat": config.llm.enabled.then_some("anthropic"),
+            "work": config.work.enabled.then_some("codex"),
             "terminal": config.work.enabled && config.sandbox.enabled,
         },
     })))

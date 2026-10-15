@@ -33,7 +33,7 @@ pub async fn summarize(app: &App, org: Uuid, user: Uuid, points: String) -> anyh
         Code::PolicyDenied
     );
     let (credential, secret) =
-        credentials::resolve(app, &mut tx, org, user, None, &policy, provider).await?;
+        credentials::resolve(app, &mut tx, org, user, &policy, provider).await?;
     let id = Uuid::now_v7();
     sqlx::query("INSERT INTO usage_records(id,org_id,user_id,model,credential_id,provider) VALUES($1,$2,$3,$4,$5,$6)")
         .bind(id).bind(org).bind(user).bind(model).bind(credential).bind(provider).execute(&mut *tx).await?;

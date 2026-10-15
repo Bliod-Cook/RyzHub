@@ -19,8 +19,6 @@ pub struct Notice {
     pub table: String,
     pub org_id: Option<Uuid>,
     pub user_id: Option<Uuid>,
-    pub conversation_id: Option<Uuid>,
-    pub run_id: Option<Uuid>,
     /// Channel id for writer changes (`conv:<id>`).
     pub channel: Option<String>,
     pub writer_epoch: Option<i64>,

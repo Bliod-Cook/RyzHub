@@ -32,7 +32,6 @@ const CONTEXT_DOCUMENTS: usize = 4;
 const CONTEXT_BYTES: u64 = 16 * 1024 * 1024;
 /// Larger PDFs stay in the sandbox only.
 const MAX_DOCUMENT: u64 = 10 * 1024 * 1024;
-/// Text files inlined into one message, in total.
 /// Text files a request carries in full, in bytes; older ones become notes.
 const CONTEXT_TEXT: u64 = 256 * 1024;
 /// Reference types in stored model context.

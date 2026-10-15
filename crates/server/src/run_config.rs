@@ -1,10 +1,15 @@
 //! Validated per-conversation settings. Each run receives an immutable snapshot.
 use anyhow::ensure;
+use ryzhub_domain::Policy;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use crate::{config::Config, error::Code, store::Tx};
+use crate::{
+    config::Config,
+    error::Code,
+    store::{Tx, effective_policy},
+};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -50,15 +55,11 @@ impl RunConfig {
             };
         }
         let profile = acp(config, &c.harness);
-        if c.model.is_empty() && !config.llm.enabled {
-            c.model = "mock".into();
-        }
         if c.model.is_empty() {
             c.model = match (c.harness.as_str(), profile) {
                 (_, Some(profile)) => profile.model.clone(),
                 ("codex", _) => config.work.model.clone(),
                 ("claude", _) => config.work.claude_model.clone(),
-                _ if c.protocol == "responses" => config.llm.responses_model.clone(),
                 _ => config.llm.model.clone(),
             };
         }
@@ -109,43 +110,44 @@ impl RunConfig {
         Ok(c)
     }
 
+    /// The settings may be used now: their engine is on, policy allows them and their model
+    /// is routed. Returns the organization's effective policy.
     pub async fn validate(
         &self,
         tx: &mut Tx<'_>,
         org: Uuid,
         config: &Config,
-    ) -> anyhow::Result<()> {
-        let org_policy: Option<Value> = sqlx::query_scalar(
-            "SELECT policy FROM org_policies WHERE org_id=$1 ORDER BY version DESC LIMIT 1",
-        )
-        .bind(org)
-        .fetch_optional(&mut **tx)
-        .await?;
-        let p = config
-            .policy
-            .restrict(&serde_json::from_value(org_policy.unwrap_or(json!({})))?);
+    ) -> anyhow::Result<Policy> {
         ensure!(
-            p.models.as_ref().is_none_or(|m| m.contains(&self.model))
-                && p.harnesses
-                    .as_ref()
-                    .is_none_or(|h| h.contains(&self.harness)),
-            Code::PolicyDenied
+            self.harness == "chat" || config.work.enabled,
+            Code::WorkDisabled
         );
+        let policy = effective_policy(tx, &config.policy, org).await?;
+        ensure!(self.allowed(&policy), Code::PolicyDenied);
         ensure!(
-            self.approval != "full_auto" || p.allow_full_auto != Some(false),
+            self.approval != "full_auto" || policy.allow_full_auto != Some(false),
             Code::PolicyDenied
         );
         // Catalog entries are explicit routes. Legacy default models remain routable.
         let routes = models(config, &self.harness, &self.protocol);
         ensure!(routes.contains(&self.model), Code::ModelNotRoutable);
-        Ok(())
+        Ok(policy)
+    }
+
+    /// Policy allows the model and the harness.
+    pub fn allowed(&self, policy: &Policy) -> bool {
+        policy
+            .models
+            .as_ref()
+            .is_none_or(|m| m.contains(&self.model))
+            && policy
+                .harnesses
+                .as_ref()
+                .is_none_or(|h| h.contains(&self.harness))
     }
 }
 
 pub fn models(config: &Config, harness: &str, protocol: &str) -> Vec<String> {
-    if !config.llm.enabled {
-        return vec!["mock".into()];
-    }
     catalog(config)
         .into_iter()
         .filter(|m| m.protocol == protocol && m.harnesses.iter().any(|h| h == harness))
@@ -204,17 +206,10 @@ pub struct ModelEntry {
     pub harnesses: Vec<String>,
 }
 
+/// The routable models. Work harnesses only while Work is enabled.
 pub fn catalog(config: &Config) -> Vec<ModelEntry> {
-    if !config.llm.enabled {
-        return vec![ModelEntry {
-            id: "mock".into(),
-            protocol: "anthropic".into(),
-            harnesses: vec!["chat".into(), "codex".into()],
-        }];
-    }
     let defaults = [
         (&config.llm.model, default_chat_protocol(config), "chat"),
-        (&config.llm.responses_model, "responses", "chat"),
         (&config.work.model, "responses", "codex"),
         (&config.work.claude_model, "anthropic", "claude"),
     ];
@@ -235,8 +230,9 @@ pub fn catalog(config: &Config) -> Vec<ModelEntry> {
                 .map(|(id, protocol, harness)| (id, protocol, vec![harness.to_owned()])),
         );
     let mut out: Vec<ModelEntry> = vec![];
-    for (id, protocol, harnesses) in routes {
-        if id.is_empty() {
+    for (id, protocol, mut harnesses) in routes {
+        harnesses.retain(|h| h == "chat" || config.work.enabled);
+        if id.is_empty() || harnesses.is_empty() {
             continue;
         }
         match out
@@ -333,7 +329,10 @@ mod tests {
         let mut c = Config::default();
         c.llm.enabled = true;
         c.llm.model = "fixture-model".into();
-        c.llm.responses_model = "gpt-5.4".into();
+        c.llm.unix_socket = Some("/run/ryzhub/llm.sock".into());
+        c.sandbox.enabled = true;
+        c.sandbox.image = "registry.test/base@sha256:00".into();
+        c.work.enabled = true;
         c.work.model = "gpt-5.4".into();
         c.work.claude_model = "claude-sonnet-4-6".into();
         c.llm.models = vec![
@@ -355,18 +354,23 @@ mod tests {
 
     #[test]
     fn catalog_merges_routes_and_defaults() {
-        let c = catalog(&config());
-        let gpt = c.iter().find(|m| m.id == "gpt-5.4").unwrap();
+        let mut merged = config();
+        merged.work.model = "gpt-5.2".into();
+        let c = catalog(&merged);
+        let gpt = c.iter().find(|m| m.id == "gpt-5.2").unwrap();
         assert_eq!(gpt.protocol, "responses");
-        assert_eq!(gpt.harnesses, ["chat", "codex"]);
-        assert_eq!(c.iter().filter(|m| m.id == "gpt-5.4").count(), 1);
+        assert_eq!(gpt.harnesses, ["codex", "chat"]);
+        assert_eq!(c.iter().filter(|m| m.id == "gpt-5.2").count(), 1);
         assert!(
             c.iter()
                 .any(|m| m.id == "fixture-model" && m.harnesses == ["chat"])
         );
-        let mut mock = config();
-        mock.llm.enabled = false;
-        assert_eq!(catalog(&mock)[0].id, "mock");
+        // Without Work, its harnesses and Work-only models are not offered.
+        let mut chat_only = config();
+        chat_only.work.enabled = false;
+        let c = catalog(&chat_only);
+        assert!(c.iter().all(|m| m.harnesses == ["chat"]));
+        assert!(!c.iter().any(|m| m.id == "gpt-5.4"));
     }
 
     #[test]
@@ -387,8 +391,6 @@ mod tests {
             (d.protocol.as_str(), d.model.as_str()),
             ("anthropic", "fixture-model")
         );
-        // Explicit protocols from older clients are kept as sent.
-        assert_eq!(chat(json!({"protocol":"responses"})).model, "gpt-5.4");
     }
 
     #[test]
@@ -406,13 +408,6 @@ mod tests {
         let resolved = RunConfig::resolve(json!({}), "chat", &c).unwrap();
         assert_eq!(resolved.model, "gpt-5.2");
         assert_eq!(resolved.protocol, "responses");
-        // Older clients can still request the separate Responses default explicitly.
-        assert_eq!(
-            RunConfig::resolve(json!({"protocol":"responses"}), "chat", &c)
-                .unwrap()
-                .model,
-            "gpt-5.4"
-        );
     }
 
     #[test]

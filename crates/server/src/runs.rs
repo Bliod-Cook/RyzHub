@@ -15,7 +15,6 @@ use uuid::Uuid;
 use crate::{
     config::Config,
     error::Code,
-    owner::Engine,
     run_config::RunConfig,
     store::{
         ActionRow, Lease, Store, Tx, append, effective_policy, load_item, lock_lease, upsert_item,
@@ -24,8 +23,6 @@ use crate::{
 
 /// Longest accepted user message, steer or answer.
 const MAX_INPUT: usize = 65_536;
-/// The simulator keeps its original, smaller limit.
-const MAX_MOCK_INPUT: usize = 4096;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum RunKind {
@@ -142,10 +139,10 @@ async fn announce_run(
     Ok(())
 }
 
-/// Serialize organization-wide admission and enforce the concurrent run limit.
-/// Admission under the organization's `max_sandboxes`. A conversation holds execution
-/// resources while it has an active run or a live sandbox (an idle Work sandbox keeps its
-/// container until suspended); the conversation being admitted does not count against itself.
+/// Admission under the organization's `max_sandboxes`, serialized organization-wide. A
+/// conversation holds execution resources while it has an active run or a live sandbox (an idle
+/// Work sandbox keeps its container until suspended); the conversation being admitted does not
+/// count against itself.
 async fn admit(tx: &mut Tx<'_>, lease: &Lease, limit: Option<u32>) -> anyhow::Result<()> {
     sqlx::query("SELECT id FROM organizations WHERE id=$1 FOR NO KEY UPDATE")
         .bind(lease.org_id)
@@ -187,21 +184,18 @@ pub async fn create(
     cmd: &CommandEnvelope,
     input: Input<'_>,
     kind: RunKind,
-    engine: Engine,
     config: &Config,
 ) -> anyhow::Result<Uuid> {
+    ensure!(config.llm.enabled, Code::ModelGatewayDisabled);
     // Files reach models and sandboxes of the main line only.
     ensure!(
-        input.files.is_empty() || (engine != Engine::Mock && kind == RunKind::Main),
+        input.files.is_empty() || kind == RunKind::Main,
         Code::UnsupportedCommand
     );
-    if engine == Engine::Mock {
-        return create_mock(tx, lease, cmd, input.text, config).await;
-    }
     valid_input(&input)?;
     let read_only = kind == RunKind::SideQuery;
     let conversation = sqlx::query(
-        "SELECT mode,run_config,context_seed,model_credential_id,project_id FROM conversations
+        "SELECT mode,run_config,context_seed,project_id FROM conversations
          WHERE org_id=$1 AND id=$2",
     )
     .bind(lease.org_id)
@@ -220,6 +214,7 @@ pub async fn create(
     .await?;
     ensure!(!operation_busy, Code::ConversationBusy);
     if work {
+        ensure!(config.work.enabled, Code::WorkDisabled);
         crate::work::available(tx, lease).await?;
         let workspace_busy: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM workspace_jobs WHERE org_id=$1 AND conversation_id=$2
@@ -232,24 +227,15 @@ pub async fn create(
         ensure!(!workspace_busy, Code::WorkspaceBusy);
     }
     let mut settings = RunConfig::resolve(conversation.get("run_config"), &mode, config)?;
-    if work && read_only {
+    let policy = if work && read_only {
         // A Work side question is answered by the Chat loop without touching the sandbox.
         settings.harness = "chat".into();
-    } else {
-        settings.validate(tx, lease.org_id, config).await?;
-    }
-    let policy = effective_policy(tx, &config.policy, lease.org_id).await?;
-    ensure!(
+        let policy = effective_policy(tx, &config.policy, lease.org_id).await?;
+        ensure!(settings.allowed(&policy), Code::PolicyDenied);
         policy
-            .models
-            .as_ref()
-            .is_none_or(|m| m.contains(&settings.model))
-            && policy
-                .harnesses
-                .as_ref()
-                .is_none_or(|h| h.contains(&settings.harness)),
-        Code::PolicyDenied
-    );
+    } else {
+        settings.validate(tx, lease.org_id, config).await?
+    };
     admit(tx, lease, policy.max_sandboxes).await?;
     if !read_only {
         ensure!(!main_run_busy(tx, lease).await?, Code::RunBusyUseSteer);
@@ -285,8 +271,8 @@ pub async fn create(
     sqlx::query(
         "INSERT INTO runs(id,org_id,conversation_id,harness,model,protocol,run_config,exec_epoch,state,
              response_text,assistant_item_id,cause_cid,read_only,parent_run_id,seed_messages,seed_run_id,
-             seed_step,credential_id,project_id,project_revision_id,operation)
-         VALUES($1,$2,$3,$4,$5,$6,$7,$8,'running','',$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)",
+             seed_step,project_id,project_revision_id,operation)
+         VALUES($1,$2,$3,$4,$5,$6,$7,$8,'running','',$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)",
     )
     .bind(run)
     .bind(lease.org_id)
@@ -303,7 +289,6 @@ pub async fn create(
     .bind(seed.messages)
     .bind(seed.base.map(|(run, _)| run))
     .bind(seed.base.map(|(_, step)| step))
-    .bind(conversation.get::<Option<Uuid>, _>("model_credential_id"))
     .bind(project)
     .bind(revision)
     .bind(if kind == RunKind::Compact { "compact" } else { "" })
@@ -395,90 +380,6 @@ async fn context_seed(
             base: Some(base),
         }),
     }
-}
-
-/// The simulator: fixed policy names, a canned reply streamed by the mock engine, and
-/// `/approve` for a simulated approval.
-async fn create_mock(
-    tx: &mut Tx<'_>,
-    lease: &Lease,
-    cmd: &CommandEnvelope,
-    text: &str,
-    config: &Config,
-) -> anyhow::Result<Uuid> {
-    let policy = effective_policy(tx, &config.policy, lease.org_id).await?;
-    ensure!(
-        policy.models.as_ref().is_none_or(|m| m.contains("mock"))
-            && policy.harnesses.as_ref().is_none_or(|h| h.contains("mock")),
-        Code::PolicyDenied
-    );
-    admit(tx, lease, policy.max_sandboxes).await?;
-    ensure!(
-        !text.trim().is_empty() && text.len() <= MAX_MOCK_INPUT,
-        Code::InvalidMessage
-    );
-    ensure!(!main_run_busy(tx, lease).await?, Code::RunBusy);
-    let run = Uuid::now_v7();
-    let item = Uuid::now_v7();
-    let approval = text.starts_with("/approve");
-    let state = if approval {
-        "requires_action"
-    } else {
-        "running"
-    };
-    sqlx::query(
-        "INSERT INTO runs(id,org_id,conversation_id,exec_epoch,state,response_text,assistant_item_id,cause_cid)
-         VALUES($1,$2,$3,$4,$5,'',$6,$7)",
-    )
-    .bind(run)
-    .bind(lease.org_id)
-    .bind(lease.conversation_id)
-    .bind(lease.epoch)
-    .bind(state)
-    .bind(item)
-    .bind(Uuid::parse_str(&cmd.cid)?)
-    .execute(&mut **tx)
-    .await?;
-    add_input(tx, lease, run, Input::text(text), "message", &cmd.cid).await?;
-    append(
-        tx,
-        lease.org_id,
-        &lease.channel(),
-        Some(lease),
-        &cmd.cid,
-        Event::ItemUpserted(Item {
-            id: item.to_string(),
-            revision: 1,
-            kind: "assistant".into(),
-            state: "streaming".into(),
-            run_id: run.to_string(),
-            ..Default::default()
-        }),
-    )
-    .await?;
-    announce_run(tx, lease, &cmd.cid, run, state, false).await?;
-    if approval {
-        let action = new_action(
-            tx,
-            lease,
-            run,
-            "approval",
-            "允许模拟工具继续？",
-            &["allow", "deny"],
-            config,
-        )
-        .await?;
-        append(
-            tx,
-            lease.org_id,
-            &lease.channel(),
-            Some(lease),
-            &cmd.cid,
-            Event::PendingActionChanged(action.into()),
-        )
-        .await?;
-    }
-    Ok(run)
 }
 
 /// Record a user message or steer: a timeline item plus a pending input for the engine. Its

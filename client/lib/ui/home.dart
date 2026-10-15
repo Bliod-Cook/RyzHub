@@ -733,8 +733,7 @@ class _HubPageState extends State<HubPage>
   bool get running => !hub.isDraft && hub.running;
 
   /// What is sent while the run goes instructs it.
-  bool get steerable =>
-      !hub.isDraft && (hub.realChat || hub.realWork) && hub.mainlineRunning;
+  bool get steerable => !hub.isDraft && hub.mainlineRunning;
 
   Widget composer() {
     final draft = hub.isDraft;

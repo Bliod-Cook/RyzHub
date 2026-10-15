@@ -278,23 +278,16 @@ pub fn close_turn(protocol: &str, messages: &mut Value) {
 pub struct Reply {
     /// The text before, between and after the searches, each with the pages it cites.
     pub texts: Vec<(String, Vec<Citation>)>,
-    /// Provider ids of the searches, in order; one fewer than `texts`.
-    pub searches: Vec<String>,
 }
 
 pub fn reply(protocol: &str, response: &Value) -> Reply {
     let mut reply = Reply {
         texts: vec![Default::default()],
-        searches: vec![],
-    };
-    let split = |reply: &mut Reply, id: &Value| {
-        reply.searches.push(id.as_str().unwrap_or_default().into());
-        reply.texts.push(Default::default());
     };
     if protocol == "responses" {
         for item in each(&response["output"]) {
             if item["type"] == "web_search_call" {
-                split(&mut reply, &item["id"]);
+                reply.texts.push(Default::default());
             }
             if item["type"] != "message" {
                 continue;
@@ -312,7 +305,7 @@ pub fn reply(protocol: &str, response: &Value) -> Reply {
     } else {
         for block in each(&response["content"]) {
             if block["type"] == "server_tool_use" && block["name"] == "web_search" {
-                split(&mut reply, &block["id"]);
+                reply.texts.push(Default::default());
             }
             if block["type"] != "text" {
                 continue;
@@ -789,7 +782,7 @@ mod tests {
             ]}
         ]});
         let reply = reply("anthropic", &anthropic);
-        assert_eq!(reply.searches, ["srvtoolu_1"]);
+        assert_eq!(reply.texts.len(), 2);
         assert_eq!(reply.texts[0], ("先搜索".into(), vec![]));
         assert_eq!(
             reply.texts[1].0,
@@ -810,7 +803,7 @@ mod tests {
             ]}]}
         ]});
         let reply = super::reply("responses", &responses);
-        assert_eq!(reply.searches, ["ws_1"]);
+        assert_eq!(reply.texts.len(), 2);
         assert_eq!(reply.texts[0].0, "");
         assert_eq!(reply.texts[1].0, "答案 ([a](https://a.example))");
         assert_eq!(

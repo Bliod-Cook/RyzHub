@@ -185,6 +185,12 @@ async fn messages(
     for (index, block) in content.iter().enumerate() {
         events.extend(block_events(index, block));
     }
+    if prompt.contains("futuredelta") {
+        // A delta of a kind the API adds later, in the last block before it stops.
+        let delta = json!({"type":"content_block_delta","index":content.len() - 1,
+            "delta":{"type":"future_delta","data":"opaque"}});
+        events.insert(events.len() - 1, delta);
+    }
     events.push(
         json!({"type":"message_delta","delta":{"stop_reason":stop},"usage":{"output_tokens":4}}),
     );

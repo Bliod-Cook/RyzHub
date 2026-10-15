@@ -149,7 +149,8 @@ async fn validate_defaults(
         .remove("mode")
         .unwrap_or(json!("chat"));
     let c = RunConfig::resolve(v, mode.as_str().context(Code::InvalidMode)?, &app.config)?;
-    c.validate(tx, org, &app.config).await
+    c.validate(tx, org, &app.config).await?;
+    Ok(())
 }
 
 /// `PATCH /orgs/{org}/projects/{project}`. The memory boundary cannot change.

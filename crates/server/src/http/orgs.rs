@@ -117,7 +117,6 @@ pub async fn models(
     let catalog = run_config::catalog(config);
     let list = |harness: &str| -> Vec<Value> {
         let default = match (harness, run_config::acp(config, harness)) {
-            _ if !config.llm.enabled => "mock",
             (_, Some(profile)) => profile.model.as_str(),
             ("codex", _) => config.work.model.as_str(),
             ("claude", _) => config.work.claude_model.as_str(),
@@ -137,22 +136,16 @@ pub async fn models(
         models
             .into_iter()
             .map(|m| {
-                let (provider, levels) = if config.llm.enabled {
-                    (
-                        run_config::provider(&m.protocol),
-                        run_config::reasoning_levels(harness, &m.protocol),
-                    )
-                } else {
-                    ("mock", vec![])
-                };
+                let provider = run_config::provider(&m.protocol);
+                let levels = run_config::reasoning_levels(harness, &m.protocol);
                 json!({"id":m.id,"provider":provider,"default":m.id==default,"reasoning_levels":levels})
             })
             .collect()
     };
-    let harnesses = match (config.llm.enabled, config.work.enabled) {
-        (false, _) => vec!["codex"],
-        (true, true) => run_config::work_harnesses(config),
-        (true, false) => vec![],
+    let harnesses = if config.work.enabled {
+        run_config::work_harnesses(config)
+    } else {
+        vec![]
     };
     let work: Vec<Value> = harnesses
         .into_iter()
@@ -166,6 +159,7 @@ pub async fn models(
 }
 
 /// `GET /orgs/{org}/audit`: owners and admins only.
+// TODO(org): no client reads it yet.
 pub async fn audit_log(
     State(app): State<App>,
     headers: HeaderMap,
@@ -199,6 +193,7 @@ pub async fn audit_log(
 /// gateway keys in this organization. Subscriptions and model streams in this organization end
 /// through the revocation notice; the member's sessions stay valid for their other
 /// organizations. Their conversations remain in the organization.
+// TODO(org): no client calls it; only registration adds a member (the owner).
 pub async fn remove_member(
     State(app): State<App>,
     headers: HeaderMap,

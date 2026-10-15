@@ -50,7 +50,6 @@ codes! {
     CidReused = "CID_REUSED" => CONFLICT,
     ConversationIdTaken = "CONVERSATION_ID_TAKEN" => CONFLICT,
     UnknownStream = "UNKNOWN_STREAM" => NOT_FOUND,
-    ContentNotRetained = "CONTENT_NOT_RETAINED" => NOT_FOUND,
     MemoryUndoUnavailable = "MEMORY_UNDO_UNAVAILABLE" => CONFLICT,
     MemoryCategoryForbidden = "MEMORY_CATEGORY_FORBIDDEN" => BAD_REQUEST,
     UnsupportedCommand = "UNSUPPORTED_COMMAND" => BAD_REQUEST,
@@ -102,7 +101,6 @@ codes! {
     ConversationBusy = "CONVERSATION_BUSY" => CONFLICT,
     WorkspaceNotRunning = "WORKSPACE_NOT_RUNNING" => CONFLICT,
     NoExecutionNode = "NO_EXECUTION_NODE" => SERVICE_UNAVAILABLE,
-    RunBusy = "RUN_BUSY" => CONFLICT,
     RunBusyUseSteer = "RUN_BUSY_USE_STEER" => CONFLICT,
     NoActiveRun = "NO_ACTIVE_RUN" => CONFLICT,
     ActionAlreadyResolved = "ACTION_ALREADY_RESOLVED" => CONFLICT,
@@ -119,6 +117,7 @@ codes! {
     OwnerUnavailable = "OWNER_UNAVAILABLE" => SERVICE_UNAVAILABLE,
     TemporarilyUnavailable = "TEMPORARILY_UNAVAILABLE" => SERVICE_UNAVAILABLE,
     ModelGatewayDisabled = "MODEL_GATEWAY_DISABLED" => SERVICE_UNAVAILABLE,
+    WorkDisabled = "WORK_DISABLED" => SERVICE_UNAVAILABLE,
     SandboxDisabled = "SANDBOX_DISABLED" => SERVICE_UNAVAILABLE,
     // Upstream model and tool calls.
     UpstreamUnavailable = "UPSTREAM_UNAVAILABLE" => BAD_GATEWAY,

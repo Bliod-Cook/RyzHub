@@ -53,9 +53,8 @@ impl SseDecoder {
 /// Reassembles a streamed Anthropic message, including blocks the UI never shows.
 #[derive(Default)]
 pub struct NativeMessage {
-    pub response: Value,
-    pub stopped: bool,
-    pub text_bytes: usize,
+    response: Value,
+    stopped: bool,
     blocks: BTreeMap<usize, Value>,
     json_fragments: BTreeMap<usize, String>,
 }
@@ -125,7 +124,6 @@ impl NativeMessage {
                 let length = block[field].as_str().map_or(0, str::len);
                 ensure!(length <= 16 * MAX_EVENT, Code::ContentTooLarge);
                 if field == "text" {
-                    self.text_bytes += chunk.len();
                     return Ok(Some(chunk.to_owned()));
                 }
             }
@@ -177,29 +175,6 @@ impl NativeMessage {
     pub fn finish(self) -> anyhow::Result<Value> {
         ensure!(self.stopped, Code::UpstreamStreamInterrupted);
         Ok(self.response)
-    }
-}
-
-/// Observes native Responses SSE without reconstructing or rewriting its payload.
-#[derive(Default)]
-pub struct ResponsesUsage {
-    pub usage: Value,
-    pub finished: bool,
-    pub failed: bool,
-}
-
-impl ResponsesUsage {
-    pub fn apply(&mut self, event: &Value) -> anyhow::Result<()> {
-        match event["type"].as_str().unwrap_or("") {
-            "response.completed" | "response.incomplete" | "response.failed" => {
-                self.usage = event["response"]["usage"].clone();
-                self.finished = self.usage.is_object();
-                self.failed = event["type"] != "response.completed";
-            }
-            "error" => anyhow::bail!(Code::UpstreamStreamError),
-            _ => {}
-        }
-        Ok(())
     }
 }
 
@@ -290,19 +265,5 @@ mod tests {
                 .push(&vec![b'x'; MAX_EVENT + 1])
                 .is_err()
         );
-    }
-
-    #[test]
-    fn terminal_usage_does_not_turn_failure_into_success() {
-        for kind in [
-            "response.completed",
-            "response.incomplete",
-            "response.failed",
-        ] {
-            let mut usage = ResponsesUsage::default();
-            usage.apply(&json!({"type":kind,"response":{"usage":{"input_tokens":10,"output_tokens":3}}})).unwrap();
-            assert!(usage.finished);
-            assert_eq!(usage.failed, kind != "response.completed");
-        }
     }
 }

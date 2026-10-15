@@ -656,20 +656,9 @@ async fn acceptance(h: &Harness) -> anyhow::Result<()> {
         .await?
         .context("MCP lease")?;
     let mut tx = h.app.store.fenced(&lease).await?;
-    let command = ryzhub_proto::CommandEnvelope {
-        cid: Uuid::now_v7().to_string(),
-        ..Default::default()
-    };
-    let run = ryzhub_server::runs::create(
-        &mut tx,
-        &lease,
-        &command,
-        ryzhub_server::runs::Input::text("MCP memory"),
-        ryzhub_server::runs::RunKind::Main,
-        ryzhub_server::owner::Engine::Mock,
-        &h.app.config,
-    )
-    .await?;
+    let run = Uuid::now_v7();
+    sqlx::query("INSERT INTO runs(id,org_id,conversation_id,exec_epoch,state,response_text,assistant_item_id,cause_cid) VALUES($1,$2,$3,$4,'running','',$5,$6)")
+        .bind(run).bind(fresh_org).bind(work_conv).bind(lease.epoch).bind(Uuid::now_v7()).bind(Uuid::now_v7()).execute(&mut *tx).await?;
     let sandbox = Uuid::now_v7();
     sqlx::query("INSERT INTO sandboxes(id,org_id,conversation_id,run_id,lease_epoch,exec_epoch,state,handle,persistent,node_lease_until) VALUES($1,$2,$3,$4,1,$5,'running','{}',true,now()+interval '5 minutes')")
         .bind(sandbox).bind(fresh_org).bind(work_conv).bind(run).bind(lease.epoch).execute(&mut *tx).await?;
@@ -683,8 +672,7 @@ async fn acceptance(h: &Harness) -> anyhow::Result<()> {
             run_id: run,
             sandbox_id: sandbox,
             lease_epoch: 1,
-            models: vec!["mock".into()],
-            credential_id: None,
+            models: vec!["fixture-model".into()],
         },
     )
     .await?;

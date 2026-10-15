@@ -331,7 +331,7 @@ pub async fn refresh_key(
     run: Uuid,
     sandbox: Uuid,
 ) -> anyhow::Result<DateTime<Utc>> {
-    let (user, credential) = sandbox::run_identity(app, lease, run).await?;
+    let user = sandbox::run_creator(app, lease, run).await?;
     let (generation, model): (i64, String) = {
         let mut tx = app.store.fenced(lease).await?;
         let row = sqlx::query_as(
@@ -356,7 +356,6 @@ pub async fn refresh_key(
             sandbox_id: sandbox,
             lease_epoch: generation,
             models: vec![model],
-            credential_id: credential,
         },
     )
     .await?;

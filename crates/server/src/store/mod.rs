@@ -267,6 +267,7 @@ pub async fn effective_policy(
     instance: &ryzhub_domain::Policy,
     org: Uuid,
 ) -> anyhow::Result<ryzhub_domain::Policy> {
+    // TODO(org): only registration writes an (empty) organization policy so far.
     let policy: Option<serde_json::Value> = sqlx::query_scalar(
         "SELECT policy FROM org_policies WHERE org_id=$1 ORDER BY version DESC LIMIT 1",
     )

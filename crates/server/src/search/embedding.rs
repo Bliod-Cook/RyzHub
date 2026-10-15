@@ -62,7 +62,7 @@ impl EmbeddingProvider for OpenAiEmbedding {
             Code::PolicyDenied
         );
         let (credential, secret) = if cfg.embedding_key_env.is_empty() {
-            credentials::resolve(app, &mut tx, org, user, None, &policy, "openai").await?
+            credentials::resolve(app, &mut tx, org, user, &policy, "openai").await?
         } else {
             ensure!(
                 policy.allow_platform_credentials != Some(false),

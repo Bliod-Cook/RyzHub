@@ -54,8 +54,13 @@ impl Harness {
         Self::start(|config| {
             common::work(config);
             config.work.claude_model = "claude-sonnet-4-6".into();
-            config.llm.responses_model = "gpt-5.4".into();
             config.llm.models = vec![
+                ModelRoute {
+                    id: "gpt-5.4".into(),
+                    protocol: "responses".into(),
+                    harnesses: vec!["chat".into()],
+                    ..Default::default()
+                },
                 ModelRoute {
                     id: "claude-opus-4-6".into(),
                     protocol: "anthropic".into(),
@@ -315,18 +320,16 @@ async fn models_catalog_and_provider_inference() -> anyhow::Result<()> {
             .await?;
         ensure!(stored["model"] == "fixture-model" && stored["protocol"] == "anthropic");
 
-        // A project default written by an older client does not fight the chosen model.
+        // A project default's protocol does not fight the chosen model.
         let project = h
             .json(
                 &user,
                 &format!("/orgs/{org}/projects"),
                 reqwest::Method::POST,
-                json!({"name":"Legacy defaults","defaults":{"mode":"chat","protocol":"responses"}}),
+                json!({"name":"Defaults","defaults":{"mode":"chat","protocol":"responses","model":"gpt-5.4"}}),
             )
             .await?;
         let project = id(&project, "id");
-        let inherited = create(json!({}), Some(project)).await?;
-        ensure!(inherited["run_config"]["protocol"] == "responses", "{inherited}");
         let chosen = create(json!({"model":"claude-opus-4-6"}), Some(project)).await?;
         ensure!(chosen["run_config"]["protocol"] == "anthropic", "{chosen}");
         Ok::<_, anyhow::Error>(())

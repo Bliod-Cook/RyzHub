@@ -6,11 +6,10 @@
 //! at sub-second intervals.
 mod actor;
 mod commands;
-mod mock;
 mod publish;
 
 pub use actor::{LiveRef, OwnerLink, TERMINAL_OUTPUT, TEXT, WorkerEvent};
-pub use commands::{Processed, process_command, process_next, process_with_config};
+pub use commands::{Processed, process_next, process_with_config};
 pub use publish::{publish, publish_transient};
 
 use futures_util::StreamExt;
@@ -23,6 +22,8 @@ use uuid::Uuid;
 
 use crate::{app::App, config::Config, store::Lease};
 
+/// Conversation Owner lease; renewed every third of it.
+const LEASE_MS: u64 = 3000;
 /// How often an Owner process looks for conversations that need an actor without a wake-up.
 const RECONCILE: Duration = Duration::from_secs(1);
 /// How often user and organization channels are published.
@@ -51,8 +52,6 @@ pub fn result_subject(user: Uuid, cid: Uuid) -> String {
 /// What drives a conversation's runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Engine {
-    /// The simulator (model gateway disabled).
-    Mock,
     /// The platform's own agent loop.
     Chat,
     /// A native harness in a persistent sandbox.
@@ -60,12 +59,11 @@ pub enum Engine {
 }
 
 impl Engine {
-    pub fn of(config: &Config, mode: &str) -> Self {
-        match (config.llm.enabled, mode) {
-            (false, _) => Self::Mock,
-            (true, "work") if config.work.enabled => Self::Work,
-            (true, "work") => Self::Mock,
-            _ => Self::Chat,
+    pub fn of(mode: &str) -> Self {
+        if mode == "work" {
+            Self::Work
+        } else {
+            Self::Chat
         }
     }
 }
@@ -126,11 +124,7 @@ impl Claims {
         }
         let app = app.clone();
         let handle = self.tasks.spawn(async move {
-            match app
-                .store
-                .claim(org, conv, owner, app.config.owner_lease_ms)
-                .await
-            {
+            match app.store.claim(org, conv, owner, LEASE_MS).await {
                 Ok(lease) => lease,
                 Err(error) => {
                     tracing::warn!(%conv, %error, "claim failed");

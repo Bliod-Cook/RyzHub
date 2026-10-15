@@ -13,6 +13,8 @@ use crate::{config::PluginsConfig, error::Code};
 
 /// Redirects followed at most.
 const MAX_REDIRECTS: usize = 3;
+/// Address lookups and connections give up after this long, whole requests after four times it.
+const TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 pub struct Fetch {
@@ -24,7 +26,7 @@ impl Fetch {
     pub fn new(config: &PluginsConfig) -> Self {
         Self {
             insecure: config.insecure_hosts.clone(),
-            timeout: Duration::from_secs(config.fetch_timeout_secs.max(1)),
+            timeout: TIMEOUT,
         }
     }
 

@@ -1,6 +1,5 @@
 use crate::{
     app::App,
-    config::LlmConfig,
     error::{ApiResult, Code},
     store::{Tx, audit, effective_policy},
     vault,
@@ -25,62 +24,6 @@ fn purpose(id: Uuid, owner: Option<Uuid>) -> String {
     )
 }
 
-/// Associated data of a credential encrypted before secrets existed.
-fn legacy_aad(org: Uuid, id: Uuid, owner: Option<Uuid>) -> String {
-    format!(
-        "{org}/{id}/{}",
-        owner.map(|u| u.to_string()).unwrap_or_default()
-    )
-}
-
-fn open_legacy(
-    config: &LlmConfig,
-    org: Uuid,
-    id: Uuid,
-    owner: Option<Uuid>,
-    cipher: &[u8],
-    key_id: i16,
-) -> anyhow::Result<String> {
-    let key = vault::kek(config, key_id)?;
-    Ok(String::from_utf8(vault::unseal(
-        &key,
-        &legacy_aad(org, id, owner),
-        cipher,
-    )?)?)
-}
-
-/// Move the organization's credentials that are still encrypted the old way into secrets,
-/// and drop the ciphertext of revoked ones. Returns how many were moved.
-pub async fn convert_legacy(tx: &mut Tx<'_>, config: &LlmConfig, org: Uuid) -> anyhow::Result<u64> {
-    let legacy: Vec<(Uuid, Option<Uuid>, Vec<u8>, i16)> = sqlx::query_as(
-        "SELECT id,owner_user_id,encrypted_key,key_id FROM model_credentials
-         WHERE org_id=$1 AND encrypted_key IS NOT NULL AND revoked_at IS NULL FOR UPDATE",
-    )
-    .bind(org)
-    .fetch_all(&mut **tx)
-    .await?;
-    for (id, owner, cipher, key_id) in &legacy {
-        let plain = open_legacy(config, org, *id, *owner, cipher, *key_id)?;
-        let secret = vault::put(tx, config, org, &purpose(*id, *owner), plain.as_bytes()).await?;
-        sqlx::query(
-            "UPDATE model_credentials SET secret_id=$3,encrypted_key=NULL WHERE org_id=$1 AND id=$2",
-        )
-        .bind(org)
-        .bind(id)
-        .bind(secret)
-        .execute(&mut **tx)
-        .await?;
-    }
-    sqlx::query(
-        "UPDATE model_credentials SET encrypted_key=NULL
-         WHERE org_id=$1 AND revoked_at IS NOT NULL AND encrypted_key IS NOT NULL",
-    )
-    .bind(org)
-    .execute(&mut **tx)
-    .await?;
-    Ok(legacy.len() as u64)
-}
-
 fn default_provider() -> String {
     "anthropic".into()
 }
@@ -93,84 +36,6 @@ pub struct CredentialInput {
     pub provider: String,
     #[serde(default)]
     pub organization: bool,
-}
-
-#[derive(Deserialize)]
-pub struct CredentialSelection {
-    pub credential_id: Option<Uuid>,
-}
-
-/// A credential the conversation's creator may use under current policy.
-async fn usable(
-    tx: &mut Tx<'_>,
-    policy: &ryzhub_domain::Policy,
-    org: Uuid,
-    id: Uuid,
-    user: Uuid,
-) -> anyhow::Result<bool> {
-    Ok(sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM model_credentials WHERE org_id=$1 AND id=$2 AND revoked_at IS NULL
-         AND (owner_user_id IS NULL OR (owner_user_id=$3 AND $4)))",
-    )
-    .bind(org)
-    .bind(id)
-    .bind(user)
-    .bind(policy.allow_personal_credentials != Some(false))
-    .fetch_one(&mut **tx)
-    .await?)
-}
-
-/// `POST /orgs/{org}/conversations/{conv}/model-credential`: pin (or clear) the credential for
-/// the conversation's future runs.
-pub async fn select(
-    State(app): State<App>,
-    headers: HeaderMap,
-    Path((org, conv)): Path<(Uuid, Uuid)>,
-    Json(input): Json<CredentialSelection>,
-) -> ApiResult<StatusCode> {
-    let (ctx, mut tx) = crate::http::member_tx(&app, &headers, org).await?;
-    let owner: Uuid = sqlx::query_scalar(
-        "SELECT creator_id FROM conversations WHERE org_id=$1 AND id=$2 AND state='active' FOR UPDATE",
-    )
-    .bind(org)
-    .bind(conv)
-    .fetch_optional(&mut *tx)
-    .await?
-    .context(Code::Forbidden)?;
-    authorize(
-        &Principal::User(ctx.clone()),
-        Action::UseConversation,
-        &Resource {
-            org_id: org,
-            id: conv,
-            owner_user_id: Some(owner),
-            target_role: None,
-        },
-    )
-    .map_err(|_| Code::Forbidden)?;
-    if let Some(id) = input.credential_id {
-        let policy = effective_policy(&mut tx, &app.config.policy, org).await?;
-        require!(
-            usable(&mut tx, &policy, org, id, owner).await?,
-            Code::Forbidden
-        );
-    }
-    sqlx::query("UPDATE conversations SET model_credential_id=$3 WHERE org_id=$1 AND id=$2")
-        .bind(org)
-        .bind(conv)
-        .bind(input.credential_id)
-        .execute(&mut *tx)
-        .await?;
-    audit(
-        &mut tx,
-        &ctx,
-        "credential.select",
-        &conv.to_string(),
-        "allowed",
-    )
-    .await?;
-    tx.commit().await?;
-    Ok(StatusCode::NO_CONTENT)
 }
 
 /// `POST /orgs/{org}/credentials`: store a personal or (owner/admin) organization key.
@@ -270,7 +135,8 @@ pub async fn list(
     Ok(Json(rows))
 }
 
-/// `DELETE /orgs/{org}/credentials/{id}`: revoke a key and every gateway key bound to it.
+/// `DELETE /orgs/{org}/credentials/{id}`: revoke a key. Model streams using it end through the
+/// revocation notice.
 pub async fn revoke(
     State(app): State<App>,
     headers: HeaderMap,
@@ -303,7 +169,7 @@ pub async fn revoke(
     .map_err(|_| Code::Forbidden)?;
     // The key is no longer needed by anything: drop it rather than keep it encrypted.
     sqlx::query(
-        "UPDATE model_credentials SET revoked_at=coalesce(revoked_at,now()),secret_id=NULL,encrypted_key=NULL
+        "UPDATE model_credentials SET revoked_at=coalesce(revoked_at,now()),secret_id=NULL
          WHERE org_id=$1 AND id=$2",
     )
     .bind(org)
@@ -313,11 +179,6 @@ pub async fn revoke(
     if let Some(secret) = secret {
         vault::delete(&mut tx, org, secret).await?;
     }
-    sqlx::query("UPDATE virtual_keys SET revoked_at=now() WHERE org_id=$1 AND credential_id=$2")
-        .bind(org)
-        .bind(id)
-        .execute(&mut *tx)
-        .await?;
     audit(
         &mut tx,
         &ctx,
@@ -330,32 +191,19 @@ pub async fn revoke(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// A credential's key as stored: in a secret, or (before `migrate-secrets`) encrypted in place.
-#[derive(sqlx::FromRow)]
-struct StoredKey {
-    id: Uuid,
-    owner_user_id: Option<Uuid>,
-    secret_id: Option<Uuid>,
-    encrypted_key: Option<Vec<u8>>,
-    key_id: i16,
-}
-
-/// The upstream key for a request: the explicitly selected credential, else the user's
-/// personal key, else the organization's, else the platform key when policy allows it.
-/// An explicit selection never falls back.
+/// The upstream key for a request: the user's personal key, else the organization's, else the
+/// platform key when policy allows it.
 pub async fn resolve(
     app: &App,
     tx: &mut Tx<'_>,
     org: Uuid,
     user: Uuid,
-    explicit: Option<Uuid>,
     policy: &ryzhub_domain::Policy,
     provider: &str,
 ) -> anyhow::Result<(Option<Uuid>, String)> {
-    if let Some((id, key)) = member_key(app, tx, org, user, explicit, policy, provider).await? {
+    if let Some((id, key)) = member_key(app, tx, org, user, policy, provider).await? {
         return Ok((Some(id), key));
     }
-    ensure!(explicit.is_none(), Code::CredentialUnavailable);
     ensure!(
         policy.allow_platform_credentials != Some(false),
         Code::PlatformCredentialDenied
@@ -371,42 +219,34 @@ pub async fn resolve(
     ))
 }
 
-/// The member's or organization's own key for `provider`: `explicit` when given, else the
-/// member's, else the organization's. None when there is none: the platform's keys apply.
+/// The member's or organization's own key for `provider`: the member's, else the
+/// organization's. None when there is none: the platform's keys apply.
 pub async fn member_key(
     app: &App,
     tx: &mut Tx<'_>,
     org: Uuid,
     user: Uuid,
-    explicit: Option<Uuid>,
     policy: &ryzhub_domain::Policy,
     provider: &str,
 ) -> anyhow::Result<Option<(Uuid, String)>> {
-    let row: Option<StoredKey> = sqlx::query_as(
-        "SELECT id,owner_user_id,secret_id,encrypted_key,key_id FROM model_credentials
-         WHERE org_id=$1 AND provider=$5 AND revoked_at IS NULL AND ($3::uuid IS NULL OR id=$3)
-           AND (owner_user_id IS NULL OR (owner_user_id=$2 AND $4))
+    let row: Option<(Uuid, Option<Uuid>, Option<Uuid>)> = sqlx::query_as(
+        "SELECT id,owner_user_id,secret_id FROM model_credentials
+         WHERE org_id=$1 AND provider=$4 AND revoked_at IS NULL
+           AND (owner_user_id IS NULL OR (owner_user_id=$2 AND $3))
          ORDER BY owner_user_id NULLS LAST,created_at DESC LIMIT 1",
     )
     .bind(org)
     .bind(user)
-    .bind(explicit)
     .bind(policy.allow_personal_credentials != Some(false))
     .bind(provider)
     .fetch_optional(&mut **tx)
     .await?;
-    let Some(row) = row else {
+    let Some((id, owner, secret)) = row else {
         return Ok(None);
     };
-    let (config, id, owner) = (&app.config.llm, row.id, row.owner_user_id);
-    let key = match (row.secret_id, row.encrypted_key) {
-        (Some(secret), _) => {
-            String::from_utf8(vault::get(tx, config, org, secret, &purpose(id, owner)).await?)?
-        }
-        (None, Some(cipher)) => open_legacy(config, org, id, owner, &cipher, row.key_id)?,
-        (None, None) => anyhow::bail!(Code::CredentialUnavailable),
-    };
-    Ok(Some((id, key)))
+    let secret = secret.context(Code::CredentialUnavailable)?;
+    let key = vault::get(tx, &app.config.llm, org, secret, &purpose(id, owner)).await?;
+    Ok(Some((id, String::from_utf8(key)?)))
 }
 
 #[cfg(test)]

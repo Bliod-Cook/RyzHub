@@ -14,7 +14,6 @@ use axum::{
 use futures_util::StreamExt;
 use ryzhub_domain::{Action, Policy, Principal, Resource, authorize};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use sqlx::Row;
 use std::time::Duration;
 use uuid::Uuid;
@@ -27,14 +26,14 @@ use crate::{
     app::App,
     config::{LlmConfig, Upstream},
     error::{ApiResult, Code},
-    provider::{NativeMessage, ResponsesUsage, SseDecoder},
+    provider::SseDecoder,
     store::{Tx, context_in, effective_policy},
 };
 
 /// Fallback re-validation of an accepted stream when no revocation notice arrives.
 const STREAM_RECHECK: Duration = Duration::from_secs(5);
-/// Largest response kept when a policy retains model content.
-const RETAINED_BYTES: usize = 8 * 1024 * 1024;
+/// Model requests an organization may make per minute.
+const REQUESTS_PER_MINUTE_ORG: i32 = 120;
 
 pub fn router(app: App) -> Router {
     Router::new()
@@ -58,12 +57,6 @@ pub fn bearer(headers: &HeaderMap) -> anyhow::Result<&str> {
         .context(Code::Unauthorized)
 }
 
-/// What a valid key is currently bound to.
-pub struct Binding {
-    /// The credential the caller asked for explicitly (run or key selection).
-    pub credential: Option<Uuid>,
-}
-
 /// Identity and liveness: the caller is still a member, the run is active, and the key's
 /// binding (Owner epoch for loop keys, sandbox lease for sandbox keys) is current. Once a
 /// stream has been accepted (`streaming`), expiry and supersession no longer interrupt it.
@@ -71,10 +64,10 @@ pub async fn validate_key(
     tx: &mut Tx<'_>,
     key: &GatewayKey,
     streaming: bool,
-) -> anyhow::Result<Binding> {
+) -> anyhow::Result<()> {
     let ctx = context_in(tx, key.user_id, key.org_id).await?;
     let run = sqlx::query(
-        "SELECT r.exec_epoch,r.state,r.credential_id,c.creator_id,c.owner_epoch,
+        "SELECT r.exec_epoch,r.state,c.creator_id,c.owner_epoch,
                 ch.lease_until>clock_timestamp() AS live,
                 v.revoked_at IS NULL AS unrevoked,v.superseded_at IS NULL AS current,v.expires_at>now() AS unexpired
          FROM runs r
@@ -104,7 +97,7 @@ pub async fn validate_key(
     if !streaming {
         ensure!(run.get::<bool, _>("unexpired"), Code::Unauthorized);
     }
-    let credential = match key.kind() {
+    match key.kind() {
         KeyKind::Loop => {
             let epoch = key.exec_epoch;
             ensure!(
@@ -113,7 +106,6 @@ pub async fn validate_key(
                     && run.get::<Option<bool>, _>("live") == Some(true),
                 Code::Fenced
             );
-            run.get("credential_id")
         }
         KeyKind::Sandbox => {
             if !streaming {
@@ -129,9 +121,8 @@ pub async fn validate_key(
             .fetch_one(&mut **tx)
             .await?;
             ensure!(sandbox_live, lost);
-            key.credential_id
         }
-    };
+    }
     authorize(
         &Principal::User(ctx),
         Action::UseModel,
@@ -143,7 +134,7 @@ pub async fn validate_key(
         },
     )
     .map_err(|_| Code::Forbidden)?;
-    Ok(Binding { credential })
+    Ok(())
 }
 
 /// The model is allowed for this key and by current policy.
@@ -165,7 +156,7 @@ async fn authorize_model(
 /// Fixed one-minute windows per organization and per key (loop keys: per run).
 async fn rate_limit(app: &App, tx: &mut Tx<'_>, key: &GatewayKey) -> anyhow::Result<()> {
     let scopes = [
-        ("org".to_owned(), app.config.llm.requests_per_minute_org),
+        ("org".to_owned(), REQUESTS_PER_MINUTE_ORG),
         (
             match key.kind() {
                 KeyKind::Loop => format!("run:{}", key.run_id),
@@ -414,22 +405,13 @@ async fn targets(
     tx: &mut Tx<'_>,
     key: &GatewayKey,
     policy: &Policy,
-    explicit: Option<Uuid>,
     call: &Call,
 ) -> anyhow::Result<(Option<Uuid>, Vec<Target>)> {
     let llm = &app.config.llm;
     let (default_url, default_env) = call.protocol.default_upstream(llm);
     let credential = call.protocol.credential();
-    if let Some((id, secret)) = credentials::member_key(
-        app,
-        tx,
-        key.org_id,
-        key.user_id,
-        explicit,
-        policy,
-        credential,
-    )
-    .await?
+    if let Some((id, secret)) =
+        credentials::member_key(app, tx, key.org_id, key.user_id, policy, credential).await?
     {
         let target = Target {
             url: default_url.to_owned(),
@@ -438,7 +420,6 @@ async fn targets(
         };
         return Ok((Some(id), vec![target]));
     }
-    ensure!(explicit.is_none(), Code::CredentialUnavailable);
     ensure!(
         policy.allow_platform_credentials != Some(false),
         Code::PlatformCredentialDenied
@@ -486,15 +467,12 @@ fn order(mut upstreams: Vec<Upstream>, mut random: impl FnMut() -> u64) -> Vec<U
             .iter()
             .take_while(|u| u.priority == priority)
             .count();
-        let total: u64 = upstreams[..tier]
-            .iter()
-            .map(|u| u.weight.max(1) as u64)
-            .sum();
+        let total: u64 = upstreams[..tier].iter().map(|u| u.weight as u64).sum();
         let mut pick = random() % total;
         let index = upstreams[..tier]
             .iter()
             .position(|u| {
-                let weight = u.weight.max(1) as u64;
+                let weight = u.weight as u64;
                 if pick < weight {
                     true
                 } else {
@@ -502,7 +480,7 @@ fn order(mut upstreams: Vec<Upstream>, mut random: impl FnMut() -> u64) -> Vec<U
                     false
                 }
             })
-            .unwrap_or(0);
+            .expect("a pick below the tier's total weight");
         ordered.push(upstreams.remove(index));
     }
     ordered
@@ -521,7 +499,7 @@ async fn proxy(app: App, headers: HeaderMap, body: Bytes, call: Call) -> anyhow:
     ensure!(app.config.llm.enabled, Code::ModelGatewayDisabled);
     let key = keys::resolve(&app.store, bearer(&headers)?).await?;
     let mut tx = app.store.tx(key.org_id).await?;
-    let binding = validate_key(&mut tx, &key, false).await?;
+    validate_key(&mut tx, &key, false).await?;
     let policy = authorize_model(&app, &mut tx, &key, &call.model).await?;
     if let (Some(limit), Some(asked)) = (
         &policy.max_reasoning,
@@ -532,8 +510,7 @@ async fn proxy(app: App, headers: HeaderMap, body: Bytes, call: Call) -> anyhow:
             Code::ReasoningDenied
         );
     }
-    let (credential, targets) =
-        targets(&app, &mut tx, &key, &policy, binding.credential, &call).await?;
+    let (credential, targets) = targets(&app, &mut tx, &key, &policy, &call).await?;
     let request_id = Uuid::now_v7();
     if !call.count_only {
         rate_limit(&app, &mut tx, &key).await?;
@@ -578,26 +555,12 @@ async fn proxy(app: App, headers: HeaderMap, body: Bytes, call: Call) -> anyhow:
     }
     tx.commit().await?;
 
-    // Content never outlives its usage record, whose month is dropped after `usage_days`.
-    let usage_days = app.config.retention.usage_days;
-    let retain_days = policy
-        .retain_model_content_days
-        .filter(|_| !call.count_only)
-        .map(|days| {
-            if usage_days > 0 {
-                days.min(usage_days)
-            } else {
-                days
-            }
-        });
     let meter = Meter {
         app: app.clone(),
         key,
         model: call.model.clone(),
         credential,
         request_id,
-        request: retain_days.map(|_| body.clone()),
-        retain_days,
         input_bytes: body.len(),
         protocol: call.protocol,
         streaming: call.streaming,
@@ -659,7 +622,7 @@ async fn proxy(app: App, headers: HeaderMap, body: Bytes, call: Call) -> anyhow:
     let Some(upstream) = upstream else {
         if !call.count_only {
             meter
-                .finish(Value::Null, 0, false, "upstream_unreachable", None, None)
+                .finish(Value::Null, 0, false, "upstream_unreachable", None)
                 .await?;
         }
         anyhow::bail!(Code::UpstreamUnavailable);
@@ -710,9 +673,6 @@ struct Meter {
     model: String,
     credential: Option<Uuid>,
     request_id: Uuid,
-    /// The request, kept with the response when the policy retains model content.
-    request: Option<Bytes>,
-    retain_days: Option<u32>,
     input_bytes: usize,
     protocol: Protocol,
     streaming: bool,
@@ -720,22 +680,45 @@ struct Meter {
     count_only: bool,
 }
 
-/// Usage as the protocols' streams report it.
+/// Usage as a stream reports it, observed without keeping the content.
 #[derive(Default)]
 struct StreamUsage {
-    anthropic: NativeMessage,
-    openai: ResponsesUsage,
-    /// Chat Completions' and Gemini's usage so far, and whether the stream has finished.
     usage: Value,
+    /// The stream reached its end.
     finished: bool,
+    /// It ended as a failure.
+    failed: bool,
 }
 
 impl StreamUsage {
-    fn apply(&mut self, protocol: Protocol, event: &Value) -> anyhow::Result<()> {
+    fn observe(&mut self, protocol: Protocol, event: &Value) {
         match protocol {
-            Protocol::Responses => self.openai.apply(event)?,
-            Protocol::Messages => {
-                self.anthropic.apply(event)?;
+            // Usage starts in `message_start`; each `message_delta` updates some of its counts.
+            Protocol::Messages => match event["type"].as_str() {
+                Some("message_start") => self.usage = event["message"]["usage"].clone(),
+                Some("message_delta") => {
+                    if let Some(counts) = event["usage"].as_object() {
+                        if !self.usage.is_object() {
+                            self.usage = json!({});
+                        }
+                        for (name, count) in counts {
+                            self.usage[name] = count.clone();
+                        }
+                    }
+                }
+                Some("message_stop") => self.finished = true,
+                _ => {}
+            },
+            Protocol::Responses => {
+                let kind = event["type"].as_str().unwrap_or("");
+                if matches!(
+                    kind,
+                    "response.completed" | "response.incomplete" | "response.failed"
+                ) {
+                    self.usage = event["response"]["usage"].clone();
+                    self.finished = true;
+                    self.failed = kind != "response.completed";
+                }
             }
             // The last chunk carries the usage the request asked for.
             Protocol::ChatCompletions => {
@@ -754,7 +737,6 @@ impl StreamUsage {
                 }
             }
         }
-        Ok(())
     }
 }
 
@@ -807,7 +789,6 @@ impl Meter {
         recheck.tick().await;
         let (mut parse_ok, mut completed, mut received) = (true, true, 0usize);
         let mut json_body = Vec::new();
-        let mut kept = self.request.as_ref().map(|_| Vec::new());
         loop {
             let chunk = tokio::select! {
                 () = sender.closed() => { completed = false; break; }
@@ -839,18 +820,16 @@ impl Meter {
                 break;
             };
             received += bytes.len();
-            if let Some(kept) = &mut kept
-                && kept.len() + bytes.len() <= RETAINED_BYTES
-            {
-                kept.extend_from_slice(&bytes);
-            }
             if self.streaming && status.is_success() {
                 if parse_ok {
-                    parse_ok = decoder.push(&bytes).is_ok_and(|events| {
-                        events
-                            .iter()
-                            .all(|event| parsed.apply(self.protocol, event).is_ok())
-                    });
+                    match decoder.push(&bytes) {
+                        Ok(events) => {
+                            for event in &events {
+                                parsed.observe(self.protocol, event);
+                            }
+                        }
+                        Err(_) => parse_ok = false,
+                    }
                 }
             } else if json_body.len() + bytes.len() <= 4 * 1024 * 1024 {
                 json_body.extend_from_slice(&bytes);
@@ -865,34 +844,19 @@ impl Meter {
         if self.count_only {
             return;
         }
-        let (usage, final_usage, output_bytes) = match (self.streaming, self.protocol) {
-            (true, Protocol::Responses) => (
-                parsed.openai.usage.clone(),
-                completed && parse_ok && parsed.openai.finished,
-                received,
-            ),
-            (true, Protocol::Messages) => (
-                parsed.anthropic.response["usage"].clone(),
-                completed && parse_ok && parsed.anthropic.stopped,
-                parsed.anthropic.text_bytes,
-            ),
-            (true, _) => (
-                parsed.usage.clone(),
-                completed && parse_ok && parsed.finished && parsed.usage.is_object(),
-                received,
-            ),
-            (false, protocol) => {
-                let value: Value = serde_json::from_slice(&json_body).unwrap_or(Value::Null);
-                let usage = if protocol == Protocol::Gemini {
-                    value["usageMetadata"].clone()
-                } else {
-                    value["usage"].clone()
-                };
-                let final_usage = completed && parse_ok && usage.is_object();
-                (usage, final_usage, received)
-            }
+        let (usage, finished) = if self.streaming {
+            (parsed.usage, parsed.finished)
+        } else {
+            let value: Value = serde_json::from_slice(&json_body).unwrap_or(Value::Null);
+            let usage = if self.protocol == Protocol::Gemini {
+                value["usageMetadata"].clone()
+            } else {
+                value["usage"].clone()
+            };
+            (usage, true)
         };
-        let outcome = if !status.is_success() || parsed.openai.failed {
+        let final_usage = completed && parse_ok && finished && usage.is_object();
+        let outcome = if !status.is_success() || parsed.failed {
             "upstream_error"
         } else if completed && final_usage {
             "completed"
@@ -902,11 +866,10 @@ impl Meter {
         if let Err(error) = self
             .finish(
                 usage,
-                output_bytes,
+                received,
                 final_usage,
                 outcome,
                 Some(status.as_u16() as i32),
-                kept,
             )
             .await
         {
@@ -958,8 +921,7 @@ impl Meter {
         Ok(())
     }
 
-    /// Record usage. Without final provider usage, tokens are estimated from bytes. A policy
-    /// that retains model content keeps the request and `response` for review.
+    /// Record usage. Without final provider usage, tokens are estimated from bytes.
     async fn finish(
         &self,
         usage: Value,
@@ -967,30 +929,15 @@ impl Meter {
         final_usage: bool,
         status: &str,
         upstream_status: Option<i32>,
-        response: Option<Vec<u8>>,
     ) -> anyhow::Result<()> {
         let (input, output) = tokens(self.protocol, &usage);
         let input = input.unwrap_or(self.input_bytes.div_ceil(4) as i64);
         let output = output.unwrap_or(output_bytes.div_ceil(4) as i64);
         let raw = if usage.is_object() { usage } else { json!({}) };
-        let (mut expires, mut retained) = (None, None);
-        if let (Some(request), Some(response), Some(days)) =
-            (&self.request, response, self.retain_days)
-        {
-            let store = model_content(&self.app, self.key.org_id, self.request_id)?;
-            let mut keys = json!({});
-            for (part, bytes) in [("request", &request[..]), ("response", &response[..])] {
-                let key = format!("{:x}", Sha256::digest(bytes));
-                store.put(&key, bytes).await?;
-                keys[part] = json!(key);
-            }
-            expires = Some(chrono::Utc::now() + chrono::Duration::days(days.into()));
-            retained = Some(keys);
-        }
         let mut tx = self.app.store.tx(self.key.org_id).await?;
         sqlx::query(
             "UPDATE usage_records SET input_tokens=$3,output_tokens=$4,raw_usage=$5,estimated=$6,status=$7,
-                 upstream_status=$8,content_expires_at=$9,retained_content=$10,finished_at=now()
+                 upstream_status=$8,finished_at=now()
              WHERE org_id=$1 AND id=$2",
         )
         .bind(self.key.org_id)
@@ -1001,57 +948,11 @@ impl Meter {
         .bind(!final_usage)
         .bind(status)
         .bind(upstream_status)
-        .bind(expires)
-        .bind(retained)
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
         Ok(())
     }
-}
-
-/// Where a request's retained content is kept: `llm/<usage record id>/` in the organization's
-/// primary store, by content address. The record's `retained_content` names the request's and
-/// the response's.
-pub fn model_content(
-    app: &App,
-    org: Uuid,
-    id: Uuid,
-) -> anyhow::Result<crate::workspace::blob::BlobStore> {
-    Ok(
-        crate::workspace::blob::BlobStore::configured(&app.config.work.storage_root)?
-            .scoped(org)
-            .within("llm")
-            .within(&id.to_string()),
-    )
-}
-
-/// Deletes retained model content once its days are over.
-pub async fn purge_model_content(app: &App, worker: &sqlx::PgPool) -> anyhow::Result<()> {
-    let expired: Vec<(Uuid, Uuid, Option<Value>)> = sqlx::query_as(
-        "SELECT org_id,id,retained_content FROM usage_records WHERE content_expires_at<now() LIMIT 1000",
-    )
-    .fetch_all(worker)
-    .await?;
-    for (org, id, retained) in expired {
-        let store = model_content(app, org, id)?;
-        for part in ["request", "response"] {
-            if let Some(key) = retained.as_ref().and_then(|r| r[part].as_str()) {
-                store.delete(key).await?;
-            }
-        }
-        let mut tx = app.store.tx(org).await?;
-        sqlx::query(
-            "UPDATE usage_records SET content_expires_at=NULL,retained_content=NULL
-             WHERE org_id=$1 AND id=$2",
-        )
-        .bind(org)
-        .bind(id)
-        .execute(&mut *tx)
-        .await?;
-        tx.commit().await?;
-    }
-    Ok(())
 }
 
 /// `GET /orgs/{org}/usage`: the caller's records, or the organization's for owners/admins.
@@ -1084,45 +985,6 @@ pub async fn usage(
     .await?;
     tx.commit().await?;
     Ok(axum::Json(rows))
-}
-
-/// `GET /orgs/{org}/usage/{id}/content`: a request's retained content, for owners and admins.
-pub async fn usage_content(
-    State(app): State<App>,
-    headers: HeaderMap,
-    Path((org, id)): Path<(Uuid, Uuid)>,
-) -> ApiResult<axum::Json<Value>> {
-    let ctx = crate::http::member(&app, &headers, org).await?;
-    authorize(
-        &Principal::User(ctx),
-        Action::ViewOrgUsage,
-        &Resource {
-            org_id: org,
-            id: org,
-            owner_user_id: None,
-            target_role: None,
-        },
-    )
-    .map_err(|_| Code::Forbidden)?;
-    let mut tx = app.store.tx(org).await?;
-    let retained: Option<Value> = sqlx::query_scalar(
-        "SELECT retained_content FROM usage_records WHERE org_id=$1 AND id=$2 AND content_expires_at>now()",
-    )
-    .bind(org)
-    .bind(id)
-    .fetch_optional(&mut *tx)
-    .await?
-    .flatten();
-    tx.commit().await?;
-    let retained = retained.ok_or(Code::ContentNotRetained)?;
-    let store = model_content(&app, org, id)?;
-    let mut content = json!({});
-    for part in ["request", "response"] {
-        let key = retained[part].as_str().context(Code::ContentNotRetained)?;
-        let bytes = store.get(key).await?;
-        content[part] = json!(String::from_utf8_lossy(&bytes));
-    }
-    Ok(axum::Json(content))
 }
 
 #[cfg(test)]
@@ -1226,6 +1088,22 @@ mod tests {
                 ),
                 None
             );
+        }
+    }
+
+    #[test]
+    fn terminal_usage_does_not_turn_failure_into_success() {
+        for kind in [
+            "response.completed",
+            "response.incomplete",
+            "response.failed",
+        ] {
+            let mut usage = StreamUsage::default();
+            let terminal =
+                json!({"type":kind,"response":{"usage":{"input_tokens":10,"output_tokens":3}}});
+            usage.observe(Protocol::Responses, &terminal);
+            assert!(usage.finished && usage.usage.is_object());
+            assert_eq!(usage.failed, kind != "response.completed");
         }
     }
 

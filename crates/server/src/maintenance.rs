@@ -179,10 +179,6 @@ async fn drop_months(
 }
 
 pub async fn maintain(pool: &PgPool, config: &Config) -> anyhow::Result<()> {
-    ensure!(
-        config.events_retention_days >= 7,
-        "retention must be at least seven days"
-    );
     let mut tx = pool.begin().await?;
     sqlx::query("SELECT pg_advisory_xact_lock(724998201)")
         .execute(&mut *tx)
@@ -241,9 +237,6 @@ pub async fn maintain(pool: &PgPool, config: &Config) -> anyhow::Result<()> {
             drop_months(&mut tx, parent, today - Duration::days(days as i64)).await?;
         }
     }
-    sqlx::query("DELETE FROM ws_tickets WHERE expires_at<now()")
-        .execute(&mut *tx)
-        .await?;
     tx.commit().await?;
     Ok(())
 }

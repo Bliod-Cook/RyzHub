@@ -523,8 +523,13 @@ fn betas(body: &Value) -> Option<&'static str> {
 /// What the model is asked when its context is compacted by a summary.
 const SUMMARY_REQUEST: &str = "Summarize our conversation so far so that you can continue it from the summary alone: the user's goals and preferences, decisions made, facts and results you found (with file paths, commands and identifiers), work in progress and what remains. Write the summary only.";
 
-/// A gateway call that answers at once, as JSON.
-async fn call_model(app: &App, key: &str, path: &str, body: &Value) -> anyhow::Result<Value> {
+/// A model request through the gateway; fails unless it is answered with success.
+async fn gateway_request(
+    app: &App,
+    key: &str,
+    path: &str,
+    body: &Value,
+) -> anyhow::Result<reqwest::Response> {
     let mut request = app
         .http
         .gateway
@@ -547,7 +552,12 @@ async fn call_model(app: &App, key: &str, path: &str, body: &Value) -> anyhow::R
         let body: Value = response.json().await.unwrap_or(Value::Null);
         anyhow::bail!(gateway_error(status, &body));
     }
-    Ok(response.json().await?)
+    Ok(response)
+}
+
+/// A gateway call that answers at once, as JSON.
+async fn call_model(app: &App, key: &str, path: &str, body: &Value) -> anyhow::Result<Value> {
+    Ok(gateway_request(app, key, path, body).await?.json().await?)
 }
 
 /// Compact the context the provider's way: Responses' compaction endpoint, or Anthropic's
@@ -898,28 +908,7 @@ async fn model(
         return Ok((value, layout));
     }
     let path = if responses { "responses" } else { "messages" };
-    let mut request = app
-        .http
-        .gateway
-        .post(format!(
-            "{}/v1/{path}",
-            app.config.llm.gateway_url.trim_end_matches('/')
-        ))
-        .bearer_auth(&key)
-        .header("anthropic-version", "2023-06-01");
-    if let Some(beta) = betas(&body) {
-        request = request.header("anthropic-beta", beta);
-    }
-    let response = request
-        .json(&body)
-        .send()
-        .await
-        .context(Code::ModelConnectionFailed)?;
-    if !response.status().is_success() {
-        let status = response.status();
-        let body: Value = response.json().await.unwrap_or(Value::Null);
-        anyhow::bail!(gateway_error(status, &body));
-    }
+    let response = gateway_request(app, &key, path, &body).await?;
     mark_steers_handed(app, lease, run, step.number, link).await?;
     let mut stream = response.bytes_stream();
     let mut decoder = SseDecoder::default();

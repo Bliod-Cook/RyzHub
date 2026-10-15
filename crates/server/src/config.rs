@@ -14,10 +14,6 @@ pub struct Config {
     pub allowed_origins: Vec<String>,
     /// Whole weekly event partitions older than this are dropped by `maintain`.
     pub events_retention_days: u32,
-    /// Conversation Owner lease; renewed every third of it.
-    pub owner_lease_ms: u64,
-    /// Simulator stream interval.
-    pub mock_chunk_ms: u64,
     /// Pending approvals and questions expire after this long.
     pub approval_ttl_secs: u64,
     /// Instance policy; organizations can only narrow it.
@@ -49,8 +45,6 @@ impl Default for Config {
                 "http://127.0.0.1:3000".into(),
             ],
             events_retention_days: 30,
-            owner_lease_ms: 3000,
-            mock_chunk_ms: 40,
             approval_ttl_secs: 24 * 3600,
             policy: Policy::default(),
             llm: LlmConfig::default(),
@@ -263,7 +257,6 @@ pub struct LlmConfig {
     /// Gemini API base URL (no `/v1beta` suffix), and its key.
     pub gemini_url: String,
     pub gemini_key_env: String,
-    pub responses_model: String,
     pub models: Vec<ModelRoute>,
     /// Default Chat model; its protocol follows an explicit `models` route, else Anthropic.
     pub model: String,
@@ -274,10 +267,8 @@ pub struct LlmConfig {
     pub vault_key_id: i16,
     /// Retired vault keys by id; still used to decrypt older credentials.
     pub vault_retired_keys: BTreeMap<String, String>,
-    pub requests_per_minute_org: i32,
     pub requests_per_minute_key: i32,
     pub max_tokens: u32,
-    pub timeout_secs: u64,
     /// Socket bind-mounted into sandboxes for the guest credential proxy (Work requires it).
     pub unix_socket: Option<String>,
     /// Chat requests estimated above this many tokens move their oldest tool results out of
@@ -307,17 +298,14 @@ impl Default for LlmConfig {
             chat_completions_key_env: "OPENAI_API_KEY".into(),
             gemini_url: "https://generativelanguage.googleapis.com".into(),
             gemini_key_env: "GEMINI_API_KEY".into(),
-            responses_model: String::new(),
             models: vec![],
             model: String::new(),
             platform_key_env: "ANTHROPIC_API_KEY".into(),
             vault_key_env: "RYZHUB_VAULT_KEY".into(),
             vault_key_id: 0,
             vault_retired_keys: BTreeMap::new(),
-            requests_per_minute_org: 120,
             requests_per_minute_key: 30,
             max_tokens: 4096,
-            timeout_secs: 120,
             unix_socket: None,
             context_budget_tokens: 120_000,
             compaction_models: [
@@ -376,8 +364,6 @@ pub struct WorkConfig {
     pub storage_root: String,
     /// Optional second copy of every checkpoint.
     pub secondary_root: Option<String>,
-    /// While a turn runs, checkpoint at least this often.
-    pub checkpoint_interval_secs: u64,
     /// Superseded checkpoints older than this are retired (0 keeps them by age).
     pub checkpoint_retention_days: u32,
     /// At most this many checkpoints per conversation are kept (0 disables the bound).
@@ -398,7 +384,6 @@ impl Default for WorkConfig {
             model: String::new(),
             storage_root: "var/blobs".into(),
             secondary_root: None,
-            checkpoint_interval_secs: 300,
             checkpoint_retention_days: 30,
             checkpoint_keep_last: 20,
             checkpoint_gc_grace_secs: 86400,
@@ -407,16 +392,10 @@ impl Default for WorkConfig {
     }
 }
 
-/// How long operational records are kept. The Owner role deletes expired rows in batches.
+/// How long partitioned records are kept.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RetentionConfig {
-    /// Processed commands (the idempotency window for retried cids).
-    pub command_days: u32,
-    /// Acknowledged guest events.
-    pub guest_event_days: u32,
-    /// Expired, revoked or superseded gateway keys.
-    pub gateway_key_days: u32,
     /// Monthly usage partitions older than this are dropped by `maintain` (0 keeps them).
     pub usage_days: u32,
     /// Monthly audit partitions older than this are dropped by `maintain` (0 keeps them).
@@ -426,9 +405,6 @@ pub struct RetentionConfig {
 impl Default for RetentionConfig {
     fn default() -> Self {
         Self {
-            command_days: 7,
-            guest_event_days: 7,
-            gateway_key_days: 7,
             usage_days: 0,
             audit_days: 400,
         }
@@ -457,12 +433,8 @@ impl Config {
         let mut providers = std::collections::BTreeSet::new();
         for provider in &self.auth.oidc {
             ensure!(
-                !provider.name.is_empty()
+                slug(&provider.name)
                     && provider.name != "github"
-                    && provider
-                        .name
-                        .bytes()
-                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
                     && providers.insert(&provider.name)
                     && reqwest::Url::parse(&provider.issuer).is_ok()
                     && !provider.client_id.is_empty(),
@@ -473,12 +445,8 @@ impl Config {
         let mut names = std::collections::BTreeSet::new();
         for profile in &self.harness.acp {
             ensure!(
-                !profile.name.is_empty()
+                slug(&profile.name)
                     && profile.name.len() <= 32
-                    && profile
-                        .name
-                        .bytes()
-                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
                     && !matches!(profile.name.as_str(), "chat" | "codex" | "claude")
                     && names.insert(&profile.name),
                 "invalid ACP harness name {:?}",
@@ -501,16 +469,8 @@ impl Config {
             "events retention must be at least one week"
         );
         ensure!(
-            self.owner_lease_ms >= 1000 && self.mock_chunk_ms >= 10,
-            "invalid owner timing"
-        );
-        ensure!(
             self.approval_ttl_secs >= 60,
             "approval_ttl_secs is too short"
-        );
-        ensure!(
-            self.retention.command_days >= 1,
-            "processed commands must be kept at least one day"
         );
         ensure!(
             self.search.max_attempts > 0 && self.search.memory_budget_chars <= 100_000,
@@ -519,13 +479,7 @@ impl Config {
         if !self.search.embedding_url.is_empty() {
             let url = reqwest::Url::parse(&self.search.embedding_url)?;
             ensure!(
-                matches!(url.scheme(), "http" | "https")
-                    && url.host_str().is_some()
-                    && url.username().is_empty()
-                    && url.password().is_none()
-                    && url.query().is_none()
-                    && url.fragment().is_none()
-                    && !self.search.embedding_model.is_empty(),
+                plain_url(&url) && !self.search.embedding_model.is_empty(),
                 "invalid embedding configuration"
             );
             ensure!(
@@ -538,10 +492,7 @@ impl Config {
             let llm = &self.llm;
             ensure!(!llm.model.trim().is_empty(), "llm.model required");
             ensure!(
-                llm.max_tokens > 0
-                    && llm.timeout_secs > 0
-                    && llm.requests_per_minute_org > 0
-                    && llm.requests_per_minute_key > 0,
+                llm.max_tokens > 0 && llm.requests_per_minute_key > 0,
                 "invalid llm limits"
             );
             let upstreams = llm.models.iter().flat_map(|m| &m.upstreams).map(|u| &u.url);
@@ -555,14 +506,8 @@ impl Config {
             .into_iter()
             .chain(upstreams)
             {
-                let url = reqwest::Url::parse(url)?;
                 ensure!(
-                    matches!(url.scheme(), "http" | "https")
-                        && url.host_str().is_some()
-                        && url.username().is_empty()
-                        && url.password().is_none()
-                        && url.query().is_none()
-                        && url.fragment().is_none(),
+                    plain_url(&reqwest::Url::parse(url)?),
                     "invalid llm endpoint"
                 );
             }
@@ -598,8 +543,7 @@ impl Config {
                 self.llm.enabled
                     && self.sandbox.enabled
                     && self.llm.unix_socket.is_some()
-                    && !self.work.model.is_empty()
-                    && self.work.checkpoint_interval_secs >= 30,
+                    && !self.work.model.is_empty(),
                 "invalid Work configuration"
             );
         }
@@ -630,11 +574,8 @@ impl Config {
             for node in self.sandbox.nodes() {
                 ensure!(
                     names.insert(node.name.clone())
-                        && (1..=63).contains(&node.name.len())
-                        && node
-                            .name
-                            .bytes()
-                            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+                        && slug(&node.name)
+                        && node.name.len() <= 63
                         && !node.name.starts_with('-')
                         && if node.address.is_empty() {
                             std::path::Path::new(&node.host_socket).is_absolute()
@@ -660,6 +601,24 @@ impl Config {
             None => self.work.idle_suspend_secs,
         }
     }
+}
+
+/// A name for addresses and records: lowercase letters, digits and hyphens.
+fn slug(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// An http(s) base address without credentials, query or fragment.
+fn plain_url(url: &reqwest::Url) -> bool {
+    matches!(url.scheme(), "http" | "https")
+        && url.host_str().is_some()
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.query().is_none()
+        && url.fragment().is_none()
 }
 
 /// Signing in with other accounts: OpenID Connect providers and GitHub.
@@ -761,7 +720,6 @@ pub struct PluginsConfig {
     /// Hosts reached over plain HTTP and at private addresses. For local development and tests
     /// only: everything else must be HTTPS to a public address.
     pub insecure_hosts: Vec<String>,
-    pub fetch_timeout_secs: u64,
     /// Where browsers return after connecting an account.
     pub client_url: String,
     /// MCP Apps are served from this origin, which must differ from the client's; it is
@@ -779,7 +737,6 @@ impl Default for PluginsConfig {
             trusted_keys: BTreeMap::new(),
             catalog_url: String::new(),
             insecure_hosts: vec![],
-            fetch_timeout_secs: 30,
             client_url: "http://127.0.0.1:3000".into(),
             content_origin: "http://127.0.0.1:8082".into(),
             content_listen: "127.0.0.1:8082".into(),

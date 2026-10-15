@@ -356,7 +356,6 @@ async fn bypassing_harness_still_requires_one_use_mcp_approval() -> anyhow::Resu
             sandbox_id: sandbox,
             lease_epoch: epoch,
             models: vec![h.app.config.work.model.clone()],
-            credential_id: None,
         },
     )
     .await?

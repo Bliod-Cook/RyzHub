@@ -8,7 +8,6 @@ import 'icons.dart';
 String providerLabel(String provider) => switch (provider) {
   'anthropic' => 'Anthropic',
   'openai' => 'OpenAI',
-  'mock' => tr('模拟', 'Mock'),
   _ => provider,
 };
 

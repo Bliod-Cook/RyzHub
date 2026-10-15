@@ -38,7 +38,6 @@ pub struct GatewayKey {
     pub sandbox_id: Option<Uuid>,
     pub lease_epoch: Option<i64>,
     pub models: Vec<String>,
-    pub credential_id: Option<Uuid>,
     pub expires_at: DateTime<Utc>,
 }
 
@@ -89,7 +88,6 @@ pub struct SandboxKeyRequest {
     pub sandbox_id: Uuid,
     pub lease_epoch: i64,
     pub models: Vec<String>,
-    pub credential_id: Option<Uuid>,
 }
 
 pub struct IssuedKey {
@@ -128,8 +126,8 @@ pub async fn issue_sandbox_key(
     .await?;
     let expires_at: DateTime<Utc> = sqlx::query_scalar(
         "INSERT INTO virtual_keys(id,org_id,user_id,conversation_id,run_id,kind,sandbox_id,lease_epoch,models,
-             credential_id,token_hash,expires_at)
-         VALUES($1,$2,$3,$4,$5,'sandbox',$6,$7,$8,$9,$10,now()+($11::bigint * interval '1 second'))
+             token_hash,expires_at)
+         VALUES($1,$2,$3,$4,$5,'sandbox',$6,$7,$8,$9,now()+($10::bigint * interval '1 second'))
          RETURNING expires_at",
     )
     .bind(Uuid::now_v7())
@@ -140,7 +138,6 @@ pub async fn issue_sandbox_key(
     .bind(request.sandbox_id)
     .bind(request.lease_epoch)
     .bind(&request.models)
-    .bind(request.credential_id)
     .bind(hash_token(&token))
     .bind(SANDBOX_TTL_SECS)
     .fetch_one(&mut *tx)
@@ -163,7 +160,7 @@ pub async fn resolve(store: &Store, token: &str) -> anyhow::Result<GatewayKey> {
     let mut tx = store.tx(org).await?;
     let key: GatewayKey = sqlx::query_as(
         "SELECT id,org_id,user_id,conversation_id,run_id,kind,exec_epoch,sandbox_id,lease_epoch,models,
-                credential_id,expires_at
+                expires_at
          FROM virtual_keys WHERE org_id=$1 AND id=$2",
     )
     .bind(org)

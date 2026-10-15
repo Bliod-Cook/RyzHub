@@ -405,7 +405,7 @@ pub async fn ensure_sandbox(
     crate::attachments::sandbox::sync(app, lease, id).await?;
     // A fresh key per dispatch supersedes the previous one; accepted streams continue.
     if app.config.llm.unix_socket.is_some() {
-        let (user, credential) = run_identity(app, lease, run).await?;
+        let user = run_creator(app, lease, run).await?;
         let key = keys::issue_sandbox_key(
             &app.store,
             keys::SandboxKeyRequest {
@@ -416,7 +416,6 @@ pub async fn ensure_sandbox(
                 sandbox_id: id,
                 lease_epoch: 1,
                 models: vec![app.config.llm.model.clone()],
-                credential_id: credential,
             },
         )
         .await?;
@@ -426,15 +425,11 @@ pub async fn ensure_sandbox(
     Ok(id)
 }
 
-/// The conversation creator and the run's selected credential.
-pub async fn run_identity(
-    app: &App,
-    lease: &Lease,
-    run: Uuid,
-) -> anyhow::Result<(Uuid, Option<Uuid>)> {
+/// The creator of the run's conversation.
+pub async fn run_creator(app: &App, lease: &Lease, run: Uuid) -> anyhow::Result<Uuid> {
     let mut tx = app.store.tx(lease.org_id).await?;
-    let row: (Uuid, Option<Uuid>) = sqlx::query_as(
-        "SELECT c.creator_id,r.credential_id FROM runs r
+    let user = sqlx::query_scalar(
+        "SELECT c.creator_id FROM runs r
          JOIN conversations c ON c.org_id=r.org_id AND c.id=r.conversation_id
          WHERE r.org_id=$1 AND r.id=$2",
     )
@@ -443,7 +438,7 @@ pub async fn run_identity(
     .fetch_one(&mut *tx)
     .await?;
     tx.commit().await?;
-    Ok(row)
+    Ok(user)
 }
 
 /// Hand the guest a new sandbox key; it lives only in guest memory.

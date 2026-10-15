@@ -28,7 +28,7 @@ pub fn secret(name: &str) -> anyhow::Result<Vec<u8>> {
 }
 
 /// The vault key with `id`: the current one, or a retired one kept for decryption.
-pub(crate) fn kek(config: &LlmConfig, id: i16) -> anyhow::Result<Vec<u8>> {
+fn kek(config: &LlmConfig, id: i16) -> anyhow::Result<Vec<u8>> {
     if id == config.vault_key_id {
         return secret(&config.vault_key_env);
     }
@@ -40,7 +40,7 @@ pub(crate) fn kek(config: &LlmConfig, id: i16) -> anyhow::Result<Vec<u8>> {
 }
 
 /// AES-256-GCM with a random nonce prepended to the ciphertext.
-pub(crate) fn seal(key: &[u8], associated: &str, plain: &[u8]) -> anyhow::Result<Vec<u8>> {
+fn seal(key: &[u8], associated: &str, plain: &[u8]) -> anyhow::Result<Vec<u8>> {
     let cipher =
         Aes256Gcm::new_from_slice(key).map_err(|_| anyhow::anyhow!("INVALID_VAULT_KEY"))?;
     let nonce: [u8; 12] = rand::random();
@@ -56,7 +56,7 @@ pub(crate) fn seal(key: &[u8], associated: &str, plain: &[u8]) -> anyhow::Result
     Ok([nonce.as_slice(), &encrypted].concat())
 }
 
-pub(crate) fn unseal(key: &[u8], associated: &str, bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
+fn unseal(key: &[u8], associated: &str, bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
     ensure!(bytes.len() >= 28, "VAULT_CORRUPT");
     let cipher =
         Aes256Gcm::new_from_slice(key).map_err(|_| anyhow::anyhow!("INVALID_VAULT_KEY"))?;
@@ -158,26 +158,24 @@ pub async fn rewrap(tx: &mut Tx<'_>, config: &LlmConfig, org: Uuid) -> anyhow::R
     Ok(stale.len() as u64)
 }
 
-/// `ryzhub-server migrate-secrets`: move credentials still encrypted the old way into
-/// secrets, then rewrap data keys under the current vault key. Each organization is handled
-/// in its own transaction under its row-level-security scope, so the command works for a
-/// migration role with or without BYPASSRLS. Returns (credentials converted, keys rewrapped).
-pub async fn migrate(pool: &sqlx::PgPool, config: &LlmConfig) -> anyhow::Result<(u64, u64)> {
+/// `ryzhub-server migrate-secrets`: rewrap data keys under the current vault key. Each
+/// organization is handled in its own transaction under its row-level-security scope, so the
+/// command works for a migration role with or without BYPASSRLS. Returns how many were rewrapped.
+pub async fn migrate(pool: &sqlx::PgPool, config: &LlmConfig) -> anyhow::Result<u64> {
     let orgs: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM organizations ORDER BY id")
         .fetch_all(pool)
         .await?;
-    let (mut converted, mut rewrapped) = (0, 0);
+    let mut rewrapped = 0;
     for org in orgs {
         let mut tx = pool.begin().await?;
         sqlx::query("SELECT set_config('app.org_id',$1,true)")
             .bind(org.to_string())
             .execute(&mut *tx)
             .await?;
-        converted += crate::llm::credentials::convert_legacy(&mut tx, config, org).await?;
         rewrapped += rewrap(&mut tx, config, org).await?;
         tx.commit().await?;
     }
-    Ok((converted, rewrapped))
+    Ok(rewrapped)
 }
 
 #[cfg(test)]

@@ -1,7 +1,10 @@
 //! `ryzhub-server <role>`: all | gateway | owner | llm-gateway | migrate | maintain [--loop] |
 //! reindex | migrate-secrets.
 use anyhow::{Context, ensure};
-use ryzhub_server::{app::App, config::Config, store::Store};
+use ryzhub_server::{
+    app::App, attachments, config::Config, jobs, lifecycle, memory, projects, retention, sandbox,
+    search, store::Store, workspace,
+};
 use sqlx::PgPool;
 use std::{future::Future, time::Duration};
 use tokio::task::JoinSet;
@@ -53,69 +56,42 @@ async fn run(args: Vec<String>) -> anyhow::Result<()> {
     // Servers are required: if one stops, the process exits. Background loops are supervised.
     let mut servers = JoinSet::new();
     if let (true, Some(worker)) = (owner, &worker) {
-        supervise("owner", {
-            let (app, worker) = (app.clone(), worker.clone());
-            move || ryzhub_server::owner::run(app.clone(), worker.clone())
-        });
-        supervise("project collector", {
-            let (app, worker) = (app.clone(), worker.clone());
-            move || ryzhub_server::projects::collector(app.clone(), worker.clone())
-        });
+        supervise("owner", &app, worker, ryzhub_server::owner::run);
+        supervise("project collector", &app, worker, projects::collector);
         if app.config.search.enabled {
-            supervise("search index", {
-                let (app, worker) = (app.clone(), worker.clone());
-                move || ryzhub_server::search::worker(app.clone(), worker.clone())
+            supervise("search index", &app, worker, search::worker);
+        }
+        supervise(
+            "memory and conversation collector",
+            &app,
+            worker,
+            memory::collector,
+        );
+        supervise(
+            "attachment collector",
+            &app,
+            worker,
+            attachments::gc::collector,
+        );
+        if !jobs::handlers().is_empty() {
+            supervise("jobs", &app, worker, |app, worker| {
+                jobs::worker(app, worker, jobs::handlers())
             });
         }
-        supervise("memory and conversation collector", {
-            let (app, worker) = (app.clone(), worker.clone());
-            move || ryzhub_server::memory::collector(app.clone(), worker.clone())
-        });
-        supervise("attachment collector", {
-            let (app, worker) = (app.clone(), worker.clone());
-            move || ryzhub_server::attachments::gc::collector(app.clone(), worker.clone())
-        });
-        if !ryzhub_server::jobs::handlers().is_empty() {
-            supervise("jobs", {
-                let (app, worker) = (app.clone(), worker.clone());
-                move || {
-                    ryzhub_server::jobs::worker(
-                        app.clone(),
-                        worker.clone(),
-                        ryzhub_server::jobs::handlers(),
-                    )
-                }
-            });
-        }
-        supervise("conversation lifecycle", {
-            let (app, worker) = (app.clone(), worker.clone());
-            move || ryzhub_server::lifecycle::collector(app.clone(), worker.clone())
-        });
-        supervise("retention", {
-            let (app, worker) = (app.clone(), worker.clone());
-            move || ryzhub_server::retention::collector(app.clone(), worker.clone())
-        });
-        if app.config.work.enabled || ryzhub_server::sandbox::chat_checkpoints(&app) {
-            supervise("checkpoint collector", {
-                let (app, worker) = (app.clone(), worker.clone());
-                move || ryzhub_server::workspace::collector(app.clone(), worker.clone())
-            });
+        supervise("conversation lifecycle", &app, worker, lifecycle::collector);
+        supervise("retention", &app, worker, retention::collector);
+        if app.config.work.enabled || sandbox::chat_checkpoints(&app) {
+            supervise("checkpoint collector", &app, worker, workspace::collector);
         }
     }
     if let (true, true, Some(worker)) = (owner, app.config.sandbox.enabled, &worker) {
-        supervise("node reclamation", {
-            let (app, worker) = (app.clone(), worker.clone());
-            move || ryzhub_server::sandbox::reclaim(app.clone(), worker.clone())
-        });
+        supervise("node reclamation", &app, worker, sandbox::reclaim);
     }
     if app.config.work.enabled
         && let Some(worker) = &worker
     {
         // Both roles renew node leases, so a rolling restart of either keeps them alive.
-        supervise("sandbox heartbeat", {
-            let (app, worker) = (app.clone(), worker.clone());
-            move || ryzhub_server::sandbox::heartbeat(app.clone(), worker.clone())
-        });
+        supervise("sandbox heartbeat", &app, worker, sandbox::heartbeat);
     }
     if model_gateway {
         start_model_gateway(&app, &mut servers).await?;
@@ -145,16 +121,17 @@ fn env(name: &str) -> anyhow::Result<String> {
 }
 
 /// Run a background loop forever, restarting it with backoff when it fails.
-fn supervise<F, Fut>(name: &'static str, task: F)
+fn supervise<F, Fut>(name: &'static str, app: &App, worker: &PgPool, task: F)
 where
-    F: Fn() -> Fut + Send + 'static,
+    F: Fn(App, PgPool) -> Fut + Send + 'static,
     Fut: Future<Output = anyhow::Result<()>> + Send,
 {
+    let (app, worker) = (app.clone(), worker.clone());
     tokio::spawn(async move {
         let mut backoff = Duration::from_millis(500);
         loop {
             let started = tokio::time::Instant::now();
-            match task().await {
+            match task(app.clone(), worker.clone()).await {
                 Ok(()) => tracing::warn!(task = name, "background task returned; restarting"),
                 Err(error) => tracing::error!(
                     task = name,
@@ -176,7 +153,6 @@ async fn start_model_gateway(
     servers: &mut JoinSet<anyhow::Result<()>>,
 ) -> anyhow::Result<()> {
     let llm = &app.config.llm;
-    ensure!(!llm.model.is_empty(), "llm.model required");
     ryzhub_server::vault::secret(&llm.vault_key_env)?;
     let listener = tokio::net::TcpListener::bind(&llm.listen).await?;
     if let Some(path) = &llm.unix_socket {
@@ -222,8 +198,8 @@ async fn maintain(role: &str, repeat: bool) -> anyhow::Result<()> {
     }
     let config = Config::load()?;
     if role == "migrate-secrets" {
-        let (converted, rewrapped) = ryzhub_server::vault::migrate(&pool, &config.llm).await?;
-        tracing::info!(converted, rewrapped, "secrets migrated");
+        let rewrapped = ryzhub_server::vault::migrate(&pool, &config.llm).await?;
+        tracing::info!(rewrapped, "secrets migrated");
         return Ok(());
     }
     if role == "reindex" {

@@ -148,10 +148,10 @@ fn package(base: &str) -> Vec<u8> {
         "version": "1.0.0",
         "description": "Acme tickets",
         "extensions": {NS: {
-            "permissions": {"tools": {"default": "allow", "readOnly": "allow", "tools": {"purge": "deny"}}},
+            "permissions": {"deny": ["purge"]},
             "commands": [{"name": "triage", "title": "Triage", "prompt": format!("{NS}/commands/triage.md"),
                           "params": {"project": {"type": "string"}}}],
-            "ui": {"declarative": true, "mcpApps": true},
+            "ui": {"mcpApps": true},
             "userConfig": {"apiToken": {"type": "string", "secret": true, "header": "Authorization", "prefix": "Bearer "}},
         }},
     });
@@ -581,11 +581,14 @@ async fn plugins_install_on_confirmation_and_serve_chat() -> anyhow::Result<()> 
         "{csp}"
     );
     assert!(page.text().await?.contains("<p>tickets</p>"));
+    // The page calls its server's tools by their names there.
+    let lookup = &opened["tools"]["lookup"];
+    assert_eq!(lookup, "acme-tracker__lookup");
     let called = member
         .ok(
             Method::POST,
             &format!("/orgs/{{org}}/conversations/{conv}/tool-calls"),
-            json!({"item_id": item, "tool": "acme-tracker__lookup", "arguments": {"id": "9"}}),
+            json!({"item_id": item, "tool": lookup, "arguments": {"id": "9"}}),
         )
         .await?;
     assert!(called.to_string().contains("ticket 9 is open"));
@@ -962,7 +965,7 @@ async fn work_gateway_asks_once_for_tools_that_need_approval() -> anyhow::Result
         .await?;
     sqlx::query("INSERT INTO approval_grants(id,org_id,run_id,exec_epoch,tool,args_digest,expires_at) VALUES($1,$2,$3,$4,$5,$6,now()+interval '1 hour')")
         .bind(Uuid::now_v7()).bind(org).bind(run).bind(epoch).bind("acme-tracker__lookup")
-        .bind(ryzhub_server::mcp::args_digest(&json!({"id":"8"})))
+        .bind(ryzhub_server::mcp::digest("acme-tracker__lookup", &json!({"id":"8"})))
         .execute(&h.db).await?;
     let granted = mcp(json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"acme-tracker__lookup","arguments":{"id":"8"}}})).await?;
     assert!(granted["result"].to_string().contains("ticket 8 is open"));

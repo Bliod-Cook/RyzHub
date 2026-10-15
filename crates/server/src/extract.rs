@@ -8,11 +8,8 @@ use std::{
 };
 
 use anyhow::{Context, ensure};
-use serde_json::{Value, json};
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    sync::Semaphore,
-};
+use serde_json::json;
+use tokio::sync::Semaphore;
 
 use crate::error::Code;
 
@@ -90,39 +87,11 @@ pub async fn extract(program: &Path, format: Format, path: &Path) -> anyhow::Res
         return Ok(bounded(text));
     }
     let _permit = EXTRACTIONS.acquire().await?;
-    let mut child = tokio::process::Command::new(program)
-        .arg("extract-text")
-        .arg(format.arg())
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-        .with_context(|| format!("starting {}", program.display()))?;
-    let (mut stdin, mut stdout) = (
-        child.stdin.take().context("extractor input")?,
-        child.stdout.take().context("extractor output")?,
-    );
-    let exchange = async {
-        let feed = async move {
-            let mut source = tokio::fs::File::open(path).await?;
-            tokio::io::copy(&mut source, &mut stdin).await?;
-            stdin.shutdown().await?;
-            Ok::<_, std::io::Error>(())
-        };
-        let mut reply = vec![];
-        let mut limited = (&mut stdout).take(4 * MAX_TEXT as u64);
-        let read = limited.read_to_end(&mut reply);
-        let (_, read) = tokio::join!(feed, read);
-        read?;
-        child.wait().await?;
-        Ok::<_, std::io::Error>(reply)
-    };
-    let reply = tokio::time::timeout(TIMEOUT, exchange)
+    let input = tokio::fs::File::open(path).await?;
+    let args = ["extract-text", format.arg()];
+    let reply = crate::child::run(program, &args, input, 4 * MAX_TEXT as u64, TIMEOUT)
         .await
-        .context(Code::DocumentUnreadable)?
         .context(Code::DocumentUnreadable)?;
-    let reply: Value = serde_json::from_slice(&reply).context(Code::DocumentUnreadable)?;
     if let Some(error) = reply["error"].as_str() {
         tracing::info!(error, "document not read");
         return Err(anyhow::Error::new(crate::error::Detail(error.to_owned()))

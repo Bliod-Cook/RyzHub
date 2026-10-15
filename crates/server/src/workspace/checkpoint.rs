@@ -67,8 +67,7 @@ pub async fn suspended_head(app: &App, lease: &Lease) -> anyhow::Result<Option<U
 ///
 /// 1. The node freezes the sandbox only to copy its upper layer, then builds the archive.
 /// 2. Guest events up to the freeze point are projected, fixing the timeline watermark.
-/// 3. The checkpoint is registered as `uploading` (so garbage collection keeps the object),
-///    the archive is streamed to every store, and only then committed as the head.
+/// 3. The checkpoint is published: registered, stored, then committed as the head.
 ///
 /// No database transaction is open while bytes move.
 pub async fn create(
@@ -107,11 +106,6 @@ pub async fn create(
         .as_u64()
         .context("checkpoint without watermark")?;
     work::sync_through(app, lease, run, sandbox_id, gseq, link).await?;
-    let key = manifest["sha256"]
-        .as_str()
-        .context("checkpoint without checksum")?
-        .to_owned();
-    let size = manifest["size"].as_u64().unwrap_or(0);
     let settings = work::run_settings(app, lease, run).await?;
     manifest["thread_id"] = json!(thread);
     manifest["harness"] = json!(settings.harness);
@@ -119,7 +113,46 @@ pub async fn create(
         &app.config,
         &settings.harness
     ));
-    manifest["secondary"] = json!(app.config.work.secondary_root.is_some());
+    publish(app, lease, sandbox_id, artifact, manifest, Some(gseq)).await?;
+    Ok(artifact)
+}
+
+/// Checkpoint the Chat workspace on `sandbox`'s node into a new checkpoint and make it the
+/// head. Taken between runs, when nothing writes to it, so its watermark is the channel head;
+/// nothing on the timeline is tied to it.
+pub async fn workspace(app: &App, lease: &Lease, sandbox: Uuid) -> anyhow::Result<Uuid> {
+    let artifact = Uuid::now_v7();
+    let manifest = sandbox::host_job(
+        app,
+        lease.org_id,
+        sandbox,
+        HostCommand::WorkspaceCheckpoint {
+            org_id: lease.org_id,
+            workspace_id: lease.conversation_id,
+            artifact,
+        },
+    )
+    .await?;
+    publish(app, lease, sandbox, artifact, manifest, None).await?;
+    Ok(artifact)
+}
+
+/// Register the archive the node built for `sandbox` as checkpoint `artifact`, `uploading` so
+/// garbage collection keeps the object, stream it to every store, then commit it as the head.
+/// Its timeline watermark is where the guest event `gseq` was recorded; without one, the
+/// channel head.
+async fn publish(
+    app: &App,
+    lease: &Lease,
+    sandbox: Uuid,
+    artifact: Uuid,
+    mut manifest: Value,
+    gseq: Option<u64>,
+) -> anyhow::Result<()> {
+    let key = manifest["sha256"]
+        .as_str()
+        .context("checkpoint without checksum")?
+        .to_owned();
     manifest
         .as_object_mut()
         .context("manifest")?
@@ -128,15 +161,18 @@ pub async fn create(
         let mut tx = app.store.tx(lease.org_id).await?;
         blob_lock(&mut tx, lease.org_id, &key).await?;
         lock_lease(&mut tx, lease).await?;
-        let recorded: Option<i64> = sqlx::query_scalar(
-            "SELECT channel_seq FROM guest_events WHERE org_id=$1 AND sandbox_id=$2 AND gseq=$3",
-        )
-        .bind(lease.org_id)
-        .bind(sandbox_id)
-        .bind(gseq as i64)
-        .fetch_optional(&mut *tx)
-        .await?
-        .flatten();
+        let recorded: Option<i64> = match gseq {
+            Some(gseq) => sqlx::query_scalar(
+                "SELECT channel_seq FROM guest_events WHERE org_id=$1 AND sandbox_id=$2 AND gseq=$3",
+            )
+            .bind(lease.org_id)
+            .bind(sandbox)
+            .bind(gseq as i64)
+            .fetch_optional(&mut *tx)
+            .await?
+            .flatten(),
+            None => None,
+        };
         // No harness event yet means nothing on the timeline depends on this sandbox.
         let channel_seq = match recorded {
             Some(seq) => seq,
@@ -149,15 +185,21 @@ pub async fn create(
         .bind(artifact)
         .bind(lease.org_id)
         .bind(lease.conversation_id)
-        .bind(sandbox_id)
+        .bind(sandbox)
         .bind(&manifest)
         .bind(channel_seq)
-        .bind(gseq as i64)
+        .bind(gseq.unwrap_or(0) as i64)
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
     }
-    if let Err(error) = upload(app, lease, sandbox_id, artifact, &key, size).await {
+    let stored = async {
+        let node = &sandbox::endpoint(app, lease.org_id, sandbox).await?;
+        let download = &HostCommand::ArtifactDownload { artifact };
+        let archive = || ryzhub_execution::download(node, download);
+        stores(app, lease.org_id)?.put(&key, archive).await
+    };
+    if let Err(error) = stored.await {
         // Leave nothing half-published: the collector deletes the object unless shared.
         let mut tx = app.store.tx(lease.org_id).await?;
         sqlx::query(
@@ -175,100 +217,10 @@ pub async fn create(
     let _ = sandbox::host(
         app,
         lease.org_id,
-        sandbox_id,
-        HostCommand::DeleteArtifact { artifact },
-    )
-    .await;
-    Ok(artifact)
-}
-
-/// Checkpoint the Chat workspace on `sandbox`'s node into a new checkpoint and make it the
-/// head. Taken between runs, when nothing writes to it, so its watermark is the channel head;
-/// nothing on the timeline is tied to it.
-pub async fn workspace(app: &App, lease: &Lease, sandbox: Uuid) -> anyhow::Result<Uuid> {
-    let artifact = Uuid::now_v7();
-    let mut manifest = sandbox::host_job(
-        app,
-        lease.org_id,
-        sandbox,
-        HostCommand::WorkspaceCheckpoint {
-            org_id: lease.org_id,
-            workspace_id: lease.conversation_id,
-            artifact,
-        },
-    )
-    .await?;
-    let key = manifest["sha256"]
-        .as_str()
-        .context("checkpoint without checksum")?
-        .to_owned();
-    let size = manifest["size"].as_u64().unwrap_or(0);
-    manifest["secondary"] = json!(app.config.work.secondary_root.is_some());
-    manifest
-        .as_object_mut()
-        .context("manifest")?
-        .remove("state");
-    {
-        let mut tx = app.store.tx(lease.org_id).await?;
-        blob_lock(&mut tx, lease.org_id, &key).await?;
-        lock_lease(&mut tx, lease).await?;
-        let channel_seq = head_seq(&mut tx, lease.org_id, &lease.channel()).await? as i64;
-        sqlx::query(
-            "INSERT INTO checkpoints(id,org_id,conversation_id,sandbox_id,manifest,channel_seq,gseq,state)
-             VALUES($1,$2,$3,$4,$5,$6,0,'uploading')",
-        )
-        .bind(artifact)
-        .bind(lease.org_id)
-        .bind(lease.conversation_id)
-        .bind(sandbox)
-        .bind(&manifest)
-        .bind(channel_seq)
-        .execute(&mut *tx)
-        .await?;
-        tx.commit().await?;
-    }
-    if let Err(error) = upload(app, lease, sandbox, artifact, &key, size).await {
-        let mut tx = app.store.tx(lease.org_id).await?;
-        sqlx::query(
-            "UPDATE checkpoints SET state='tombstoned',delete_after=now() WHERE org_id=$1 AND id=$2 AND state='uploading'",
-        )
-        .bind(lease.org_id)
-        .bind(artifact)
-        .execute(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        return Err(error);
-    }
-    commit(app, lease, artifact, &manifest).await?;
-    let _ = sandbox::host(
-        app,
-        lease.org_id,
         sandbox,
         HostCommand::DeleteArtifact { artifact },
     )
     .await;
-    Ok(artifact)
-}
-
-/// Stream the artifact on `sandbox`'s node into the primary and (if configured) secondary
-/// store.
-async fn upload(
-    app: &App,
-    lease: &Lease,
-    sandbox: Uuid,
-    artifact: Uuid,
-    key: &str,
-    size: u64,
-) -> anyhow::Result<()> {
-    let (primary, secondary) = stores(app, lease.org_id)?;
-    let socket = sandbox::endpoint(app, lease.org_id, sandbox).await?;
-    for store in std::iter::once(primary).chain(secondary) {
-        let (length, reader) =
-            ryzhub_execution::download(&socket, &HostCommand::ArtifactDownload { artifact })
-                .await?;
-        anyhow::ensure!(size == 0 || length == size, "artifact size changed");
-        store.put_stream(key, reader, length).await?;
-    }
     Ok(())
 }
 

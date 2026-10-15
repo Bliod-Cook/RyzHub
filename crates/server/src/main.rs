@@ -14,7 +14,7 @@ fn main() -> anyhow::Result<()> {
     }
     // Reads one plugin package, likewise in a process of its own.
     if args.get(1).is_some_and(|role| role == "parse-plugin") {
-        return ryzhub_server::plugins::package::child_main(&args[2..]);
+        return ryzhub_server::plugins::package::child_main();
     }
     // Reads one document's text, likewise.
     if args.get(1).is_some_and(|role| role == "extract-text") {

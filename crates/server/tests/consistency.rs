@@ -974,7 +974,7 @@ async fn restore_failure_should_not_create_blank_workspace() -> anyhow::Result<(
         use sha2::Digest;
         let bytes=b"checkpoint fixture";
         let checksum=format!("{:x}",sha2::Sha256::digest(bytes));
-        let manifest=json!({"image":config.sandbox.image,"format":1,"encoding":"tar.zst","codex_version":"0.154.0","sha256":checksum,"thread_id":"original-thread"});
+        let manifest=json!({"image":config.sandbox.image,"format":1,"encoding":"tar.zst","harness":"codex","harness_version":"0.154.0","sha256":checksum,"thread_id":"original-thread"});
         sqlx::query("INSERT INTO checkpoints(id,org_id,conversation_id,sandbox_id,manifest,channel_seq,gseq) VALUES($1,$2,$3,$4,$5,0,0)")
             .bind(checkpoint).bind(org).bind(conv).bind(sandbox).bind(manifest).execute(&h.db).await?;
         sqlx::query("INSERT INTO workspace_heads(org_id,conversation_id,checkpoint_id) VALUES($1,$2,$3)").bind(org).bind(conv).bind(checkpoint).execute(&h.db).await?;
@@ -1098,8 +1098,8 @@ async fn checkpoint_sync_should_not_ack_next_turn_without_projection() -> anyhow
         println!("checkpoint sync: acked_gseq={ack}, new-turn projected items={projected}");
         ensure!(ack==3, "historical usage notification must not block replay after restore");
         ensure!(projected==1,"checkpoint consumed and acknowledged a newer turn event without projecting it");
-        let (action,options):(Uuid,Vec<String>)=sqlx::query_as("SELECT id,options FROM pending_actions WHERE run_id=$1").bind(new).fetch_one(&h.db).await?;
-        ensure!(options==vec!["__answer__"], "Work question must render an answer field");
+        let (action,kind):(Uuid,String)=sqlx::query_as("SELECT id,kind FROM pending_actions WHERE run_id=$1").bind(new).fetch_one(&h.db).await?;
+        ensure!(kind=="question", "a Work question must render an answer field");
         // Rotation also works while waiting for user input, without starting a new turn, and
         // supersedes the previous key for new requests.
         ryzhub_server::work::refresh_key(&app,&lease,new,sandbox).await?;

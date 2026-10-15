@@ -9,7 +9,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use uuid::Uuid;
 
 use super::{Kind, TEXT_INLINE, content_lock, render, sniff};
-use crate::{app::App, error::Code, store::Tx, workspace::attachment_stores};
+use crate::{app::App, error::Code, workspace::attachment_stores};
 
 /// A source that sends nothing for this long is dropped.
 const IDLE: Duration = Duration::from_secs(30);
@@ -148,7 +148,7 @@ pub(crate) async fn ingest(
     let id = Uuid::now_v7();
     {
         let mut tx = app.store.tx(org).await?;
-        lock(&mut tx, &format!("attachment-quota:{org}:{user}")).await?;
+        crate::store::advisory_lock(&mut tx, &format!("attachment-quota:{org}:{user}")).await?;
         content_lock(&mut tx, org, &spool.sha256).await?;
         if let Some(quota) = quota {
             let used: i64 = sqlx::query_scalar(
@@ -192,7 +192,10 @@ pub(crate) async fn ingest(
         .await?;
         tx.commit().await?;
     }
-    if let Err(error) = store(app, org, spool).await {
+    let stores = attachment_stores(app, org)?;
+    let (path, size) = (&spool.path, spool.size);
+    let file = || async move { anyhow::Ok((size, tokio::fs::File::open(path).await?)) };
+    if let Err(error) = stores.put(&spool.sha256, file).await {
         let mut tx = app.store.tx(org).await?;
         sqlx::query(
             "UPDATE attachments SET state='deleted',deleted_at=now() WHERE org_id=$1 AND id=$2",
@@ -214,22 +217,4 @@ pub(crate) async fn ingest(
     .await?;
     tx.commit().await?;
     Ok(id)
-}
-
-async fn lock(tx: &mut Tx<'_>, key: &str) -> anyhow::Result<()> {
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))")
-        .bind(key)
-        .execute(&mut **tx)
-        .await?;
-    Ok(())
-}
-
-/// Store the spooled content in the primary store and, if configured, the secondary one.
-async fn store(app: &App, org: Uuid, spool: &Spool) -> anyhow::Result<()> {
-    let (primary, secondary) = attachment_stores(app, org)?;
-    for store in std::iter::once(primary).chain(secondary) {
-        let file = tokio::fs::File::open(&spool.path).await?;
-        store.put_stream(&spool.sha256, file, spool.size).await?;
-    }
-    Ok(())
 }

@@ -35,6 +35,18 @@ macro_rules! conversation_columns {
          (extract(epoch FROM pinned_at)*1000)::bigint AS pinned_at_ms"
     };
 }
+/// Running Work sandbox `s` is in use, yet its last committed checkpoint is older than the
+/// recovery point objective allows; `$1` is `sandbox::CHECKPOINT_STALE_SECS`.
+macro_rules! stale_checkpoint {
+    () => {
+        "s.persistent AND s.state='running'
+         AND coalesce((SELECT max(c.created_at) FROM checkpoints c WHERE c.org_id=s.org_id
+             AND c.conversation_id=s.conversation_id AND c.state='committed'),s.created_at)
+             <now()-($1::bigint*interval '1 second')
+         AND EXISTS(SELECT 1 FROM runs r WHERE r.org_id=s.org_id AND r.conversation_id=s.conversation_id
+             AND coalesce(r.ended_at,'infinity')>now()-($1::bigint*interval '1 second'))"
+    };
+}
 /// A run's start and end in Unix milliseconds, as `RunState` carries them.
 macro_rules! run_times {
     () => {
@@ -45,6 +57,7 @@ macro_rules! run_times {
 pub mod app;
 pub mod attachments;
 pub mod chat;
+pub mod child;
 pub mod config;
 pub mod conversation_commands;
 pub mod drafts;

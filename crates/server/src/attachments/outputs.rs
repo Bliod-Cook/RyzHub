@@ -8,8 +8,9 @@ use ryzhub_proto::{AnswerDetail, Attachment, Item, ItemDetail, SharedFile, item_
 use uuid::Uuid;
 
 use super::{
-    DEFAULT_BYTES, MAX_BYTES, bind, display_name,
+    bind, display_name,
     ingest::{Spool, ingest},
+    limit,
 };
 use crate::{
     app::App,
@@ -286,10 +287,7 @@ async fn owner(app: &App, lease: &Lease) -> anyhow::Result<Owner> {
     tx.commit().await?;
     Ok(Owner {
         user,
-        limit: policy
-            .attachment_bytes
-            .unwrap_or(DEFAULT_BYTES)
-            .min(MAX_BYTES),
+        limit: limit(&policy),
         quota: policy.attachment_quota_bytes,
     })
 }

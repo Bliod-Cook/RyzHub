@@ -15,8 +15,6 @@ pub struct RunConfig {
     pub reasoning: String,
     pub approval: String,
     pub plan: bool,
-    /// A `sandbox.profiles` name; empty is the default environment.
-    pub env_profile: String,
 }
 
 impl Default for RunConfig {
@@ -29,7 +27,6 @@ impl Default for RunConfig {
             reasoning: "medium".into(),
             approval: "ask".into(),
             plan: false,
-            env_profile: String::new(),
         }
     }
 }
@@ -137,15 +134,6 @@ impl RunConfig {
         ensure!(
             self.approval != "full_auto" || p.allow_full_auto != Some(false),
             Code::PolicyDenied
-        );
-        ensure!(
-            self.env_profile.is_empty()
-                || config
-                    .sandbox
-                    .profiles
-                    .iter()
-                    .any(|p| p.name == self.env_profile),
-            Code::InvalidArguments
         );
         // Catalog entries are explicit routes. Legacy default models remain routable.
         let routes = models(config, &self.harness, &self.protocol);

@@ -13,8 +13,9 @@ use tokio::sync::Semaphore;
 use uuid::Uuid;
 
 use super::{
-    DEFAULT_BYTES, Kind, MAX_BYTES, display_name,
+    Kind, display_name,
     ingest::{Spool, ingest},
+    limit,
 };
 use crate::{
     app::App,
@@ -51,10 +52,7 @@ pub async fn upload(
         tx.commit().await?;
         (ctx, policy)
     };
-    let limit = policy
-        .attachment_bytes
-        .unwrap_or(DEFAULT_BYTES)
-        .min(MAX_BYTES);
+    let limit = limit(&policy);
     let declared = headers
         .get(header::CONTENT_LENGTH)
         .and_then(|value| value.to_str().ok()?.parse::<u64>().ok());
@@ -223,14 +221,7 @@ pub async fn content(
     let (ctx, mut tx) = member_tx(&app, &headers, org).await?;
     let (_, sha256, size, name) = owned(&mut tx, org, ctx.user_id, id).await?;
     tx.commit().await?;
-    let (primary, secondary) = attachment_stores(&app, org)?;
-    let reader = match primary.open(&sha256).await {
-        Ok((_, reader)) => reader,
-        Err(error) => match &secondary {
-            Some(secondary) => secondary.open(&sha256).await?.1,
-            None => return Err(error.into()),
-        },
-    };
+    let (_, reader) = attachment_stores(&app, org)?.open(&sha256).await?;
     let mut response = Body::from_stream(tokio_util::io::ReaderStream::new(reader)).into_response();
     let headers = response.headers_mut();
     headers.insert(

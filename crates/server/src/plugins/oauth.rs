@@ -58,11 +58,10 @@ pub async fn client_document(State(app): State<App>) -> Json<Value> {
 }
 
 async fn get_json(app: &App, url: &str) -> anyhow::Result<Value> {
-    let fetched = fetcher(app)
+    let body = fetcher(app)
         .send(Method::GET, url, HeaderMap::new(), None, MAX_ANSWER)
         .await?;
-    ensure!(fetched.status.is_success(), Code::PluginOAuthFailed);
-    serde_json::from_slice(&fetched.body).context(Code::PluginOAuthFailed)
+    serde_json::from_slice(&body).context(Code::PluginOAuthFailed)
 }
 
 /// `https://host/a/b` + `.well-known/x` → `https://host/.well-known/x/a/b`.
@@ -112,35 +111,23 @@ pub async fn start(
     installation: Uuid,
     server: &str,
 ) -> anyhow::Result<String> {
+    let installed = super::installed(app, org, installation).await?;
+    let server = installed
+        .manifest
+        .servers
+        .iter()
+        .find(|s| s.name == server && s.enabled)
+        .context(Code::PluginNotFound)?;
     // The server says where its authorization is described when it refuses us.
-    let challenge = match super::session(app, org, installation, server).await {
+    let challenge = match super::open(app, org, &installed, server).await {
         Err(error) => match error.downcast::<client::AuthRequired>() {
             Ok(challenge) => challenge,
             Err(error) => return Err(error),
         },
         Ok(_) => anyhow::bail!(Code::PluginAuthNotRequired),
     };
-    let mut tx = app.store.tx(org).await?;
-    let manifest: Value = sqlx::query_scalar(
-        "SELECT v.manifest FROM plugin_installations i JOIN plugin_versions v ON v.org_id=i.org_id AND v.id=i.version_id
-         WHERE i.org_id=$1 AND i.id=$2 AND i.user_id=$3",
-    )
-    .bind(org)
-    .bind(installation)
-    .bind(user)
-    .fetch_optional(&mut *tx)
-    .await?
-    .context(Code::PluginNotFound)?;
-    tx.commit().await?;
-    let server_url = manifest["servers"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .find(|s| s["name"] == server)
-        .and_then(|s| s["url"].as_str())
-        .context(Code::PluginNotFound)?
-        .to_owned();
-    let resource_url = Url::parse(&server_url).context(Code::PluginOAuthFailed)?;
+    let server_url = &server.url;
+    let resource_url = Url::parse(server_url).context(Code::PluginOAuthFailed)?;
     let resource_metadata = match &challenge.resource_metadata {
         Some(url) => get_json(app, url).await?,
         None => match get_json(app, &well_known(&resource_url, "oauth-protected-resource")).await {
@@ -161,7 +148,7 @@ pub async fn start(
         .to_owned();
     let resource = resource_metadata["resource"]
         .as_str()
-        .unwrap_or(&server_url)
+        .unwrap_or(server_url)
         .to_owned();
     let metadata = server_metadata(app, &issuer).await?;
     let authorize = metadata["authorization_endpoint"]
@@ -195,7 +182,7 @@ pub async fn start(
         });
         let mut headers = HeaderMap::new();
         headers.insert("content-type", "application/json".parse()?);
-        let fetched = fetcher(app)
+        let registered = fetcher(app)
             .send(
                 Method::POST,
                 registration,
@@ -204,9 +191,8 @@ pub async fn start(
                 MAX_ANSWER,
             )
             .await?;
-        ensure!(fetched.status.is_success(), Code::PluginOAuthFailed);
         let registered: Value =
-            serde_json::from_slice(&fetched.body).context(Code::PluginOAuthFailed)?;
+            serde_json::from_slice(&registered).context(Code::PluginOAuthFailed)?;
         (
             registered["client_id"]
                 .as_str()
@@ -263,7 +249,7 @@ pub async fn start(
     .bind(org)
     .bind(user)
     .bind(installation)
-    .bind(server)
+    .bind(&server.name)
     .bind(metadata["issuer"].as_str().unwrap_or(&issuer))
     .bind(&verifier)
     .bind(&client)
@@ -381,7 +367,7 @@ async fn token_request(
     let mut headers = HeaderMap::new();
     headers.insert("content-type", "application/x-www-form-urlencoded".parse()?);
     headers.insert("accept", "application/json".parse()?);
-    let fetched = fetcher(app)
+    let tokens = fetcher(app)
         .send(
             Method::POST,
             endpoint,
@@ -390,8 +376,7 @@ async fn token_request(
             MAX_ANSWER,
         )
         .await?;
-    ensure!(fetched.status.is_success(), Code::PluginOAuthFailed);
-    let tokens: Value = serde_json::from_slice(&fetched.body).context(Code::PluginOAuthFailed)?;
+    let tokens: Value = serde_json::from_slice(&tokens).context(Code::PluginOAuthFailed)?;
     ensure!(tokens["access_token"].is_string(), Code::PluginOAuthFailed);
     Ok(tokens)
 }

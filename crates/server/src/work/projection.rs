@@ -464,7 +464,7 @@ async fn request(
         return Ok(());
     }
     let options: &[&str] = if kind == "question" {
-        &["__answer__"]
+        &[]
     } else {
         &["allow", "deny"]
     };

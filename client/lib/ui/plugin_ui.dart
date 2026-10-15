@@ -17,12 +17,6 @@ class PluginHost extends InheritedWidget {
   bool updateShouldNotify(PluginHost old) => old.hub != hub;
 }
 
-/// The model's name for a plugin's tool, as the server forms it.
-String pluginToolName(String plugin, String tool) {
-  String clean(String text) => text.replaceAll(RegExp(r'[^A-Za-z0-9_-]'), '_');
-  return tool.contains('__') ? tool : '${clean(plugin)}__${clean(tool)}';
-}
-
 /// A plugin tool's MCP App page, opened from its result. Nothing for other
 /// tools.
 class PluginResult extends StatelessWidget {
@@ -91,9 +85,10 @@ class _PluginAppPanelState extends State<PluginAppPanel> {
         toolInput: opened['arguments'],
         toolResult: opened['result'],
         dark: Theme.of(context).brightness == Brightness.dark,
+        // The page names its own server's tools; the server says what the run calls them.
         callTool: (name, arguments) => widget.hub.pluginToolCall(
           widget.item,
-          pluginToolName(widget.plugin, name),
+          '${(opened['tools'] as Map?)?[name] ?? ''}',
           arguments,
         ),
         sendMessage: (text) async {

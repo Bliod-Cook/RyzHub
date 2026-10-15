@@ -19,9 +19,10 @@ use tokio::io::AsyncReadExt;
 use uuid::Uuid;
 
 use super::{
-    DEFAULT_BYTES, MAX_BYTES, display_name,
+    display_name,
     http::{UPLOADS, describe},
     ingest::{Spool, ingest},
+    limit,
 };
 use crate::{
     app::App,
@@ -41,7 +42,7 @@ const PRESIGNED: Duration = Duration::from_secs(3600);
 /// Where the parts of upload `id` wait: under their digests in a namespace of their own.
 fn parts_store(app: &App, org: Uuid, id: Uuid) -> anyhow::Result<BlobStore> {
     Ok(attachment_stores(app, org)?
-        .0
+        .primary
         .within("uploads")
         .within(&id.to_string()))
 }
@@ -49,7 +50,7 @@ fn parts_store(app: &App, org: Uuid, id: Uuid) -> anyhow::Result<BlobStore> {
 /// The bucket object a direct upload is assembled into, and its key there.
 fn direct_object(app: &App, org: Uuid, id: Uuid) -> anyhow::Result<(BlobStore, String)> {
     let key = format!("{:x}", Sha256::digest(format!("upload:{id}")));
-    Ok((attachment_stores(app, org)?.0.within("uploads"), key))
+    Ok((attachment_stores(app, org)?.primary.within("uploads"), key))
 }
 
 #[derive(sqlx::FromRow)]
@@ -144,16 +145,13 @@ pub async fn start(
     let name = display_name(&input.name).context(Code::InvalidAttachmentName)?;
     let (ctx, mut tx) = member_tx(&app, &headers, org).await?;
     let policy = effective_policy(&mut tx, &app.config.policy, org).await?;
-    let limit = policy
-        .attachment_bytes
-        .unwrap_or(DEFAULT_BYTES)
-        .min(MAX_BYTES);
+    let limit = limit(&policy);
     require!(
         input.size > 0 && input.size <= limit,
         Code::AttachmentTooLarge
     );
     let id = Uuid::now_v7();
-    let direct = attachment_stores(&app, org)?.0.direct();
+    let direct = attachment_stores(&app, org)?.primary.direct();
     let s3_upload_id = if direct {
         let (store, key) = direct_object(&app, org, id)?;
         Some(store.start_direct(&key).await?)
@@ -342,10 +340,7 @@ pub async fn complete(
     let _permit = UPLOADS.try_acquire().map_err(|_| Code::UploadBusy);
     let result = async {
         let _permit = _permit?;
-        let limit = policy
-            .attachment_bytes
-            .unwrap_or(DEFAULT_BYTES)
-            .min(MAX_BYTES);
+        let limit = limit(&policy);
         let size = row.size as u64;
         let spool = if row.direct {
             let (store, key) = direct_object(&app, org, id)?;

@@ -188,7 +188,7 @@ async fn documents_become_knowledge_files_and_keep_their_source() -> anyhow::Res
         ryzhub_server::workspace::blob::BlobStore::configured(&h.app.config.work.storage_root)?
             .scoped(org)
             .within("attachments");
-    assert!(store.verify(&sha).await?);
+    assert!(store.get(&sha).await.is_ok());
     let library = h.upload(&user, "plan.pdf", report.clone()).await?;
     client
         .delete(format!(
@@ -199,7 +199,7 @@ async fn documents_become_knowledge_files_and_keep_their_source() -> anyhow::Res
         .send()
         .await?
         .error_for_status()?;
-    assert!(store.verify(&sha).await?, "the library still holds it");
+    assert!(store.get(&sha).await.is_ok(), "the library still holds it");
     client
         .delete(format!(
             "{}/orgs/{org}/attachments/{}",
@@ -211,19 +211,16 @@ async fn documents_become_knowledge_files_and_keep_their_source() -> anyhow::Res
         .await?
         .error_for_status()?;
     ryzhub_server::attachments::gc::collect_org(&h.app, org).await?;
-    assert!(
-        !store.verify(&sha).await.unwrap_or(false),
-        "gone with the last holder"
-    );
+    assert!(store.get(&sha).await.is_err(), "gone with the last holder");
 
     // Replacing a document releases the one it replaced.
     let notes = by_name("Notes.docx")["source_sha256"]
         .as_str()
         .unwrap()
         .to_owned();
-    assert!(store.verify(&notes).await?);
+    assert!(store.get(&notes).await.is_ok());
     let (status, _) = upload(&h, &user, project, "Notes.docx", docx(&["Rewritten"])).await?;
     assert_eq!(status, 200);
-    assert!(!store.verify(&notes).await.unwrap_or(false));
+    assert!(store.get(&notes).await.is_err());
     h.close().await
 }

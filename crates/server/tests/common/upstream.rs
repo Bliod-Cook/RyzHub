@@ -554,6 +554,10 @@ async fn mcp(
     Json(if body["method"] == "initialize" {
         json!({"jsonrpc":"2.0","id":body["id"],"result":{"protocolVersion":"2025-03-26",
             "capabilities":{"tools":{}},"serverInfo":{"name":"fixture","version":"1"}}})
+    } else if body["method"] == "tools/list" {
+        json!({"jsonrpc":"2.0","id":body["id"],"result":{"tools":[{"name":"write_note",
+            "description":"Local test tool","inputSchema":{"type":"object","required":["text"],
+            "properties":{"text":{"type":"string"}}}}]}})
     } else {
         json!({"jsonrpc":"2.0","id":body["id"],"result":{
             "content":[{"type":"text","text":"tool executed"}],"isError":false}})

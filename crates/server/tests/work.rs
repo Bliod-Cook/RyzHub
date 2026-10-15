@@ -14,14 +14,9 @@ impl Harness {
     async fn new() -> anyhow::Result<Self> {
         Self::start(|config| {
             common::work(config);
-            config.work.mcp_tools = vec![ryzhub_server::mcp::Tool {
-                name: "write_note".into(),
-                description: "Local test tool".into(),
-                input_schema: json!({"type":"object","required":["text"],
-                    "properties":{"text":{"type":"string"}}}),
-                url: format!("{}/mcp", config.llm.upstream_url),
-                remote_name: "write_note".into(),
-            }];
+            // The fixture upstream's MCP server is a plugin some tests install.
+            config.plugins.insecure_hosts = vec!["127.0.0.1".into()];
+            config.policy.approval_required_tools = Some(["notes__write_note".to_owned()].into());
         })
         .await
     }
@@ -34,6 +29,65 @@ impl Harness {
             .await?
             .id)
     }
+    /// Install the fixture upstream's MCP server for `user` as the plugin `notes`.
+    async fn install_notes(&self, user: &Value) -> anyhow::Result<()> {
+        let org = id(user, "org_id");
+        let post = |path: &str, body: Value| {
+            reqwest::Client::new()
+                .post(format!("{}/orgs/{org}/plugins{path}", self.base))
+                .bearer_auth(user["token"].as_str().unwrap())
+                .json(&body)
+                .send()
+        };
+        let url = format!("{}/mcp", self.app.config.llm.upstream_url);
+        let preview: Value = post(
+            "/preview",
+            json!({"source":{"kind":"mcp","url":url,"name":"notes"}}),
+        )
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+        post("", json!({"version_id": preview["version_id"]}))
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL/NATS/containerd and actual Codex binary"]
+async fn plugin_tools_reach_the_harness_without_search() -> anyhow::Result<()> {
+    let h = Harness::start(|config| {
+        common::work(config);
+        config.search.enabled = false;
+        config.plugins.insecure_hosts = vec!["127.0.0.1".into()];
+    })
+    .await?;
+    let user = h.user().await?;
+    h.install_notes(&user).await?;
+    let conv = h.conversation(&user).await?;
+    let mut owner = h.owner()?;
+    h.send(&user, conv, message("hello codex")).await?;
+    h.wait_state(conv, "completed").await?;
+    // Codex defers MCP tools behind `tool_search`, which names the servers that have some. With
+    // search off, only the plugin gives the ryzhub server tools.
+    let offered = h
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(body, _)| body.get("model").is_some())
+        .flat_map(|(body, _)| body["tools"].as_array().cloned().unwrap_or_default())
+        .any(|tool| {
+            tool["type"] == "tool_search"
+                && tool["description"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("\n- ryzhub\n"))
+        });
+    assert!(offered, "the plugin's tools reach Codex");
+    owner.kill().await?;
+    h.close().await
 }
 
 #[tokio::test]
@@ -194,6 +248,14 @@ async fn actual_codex_native_turn_and_checkpoint_restore() -> anyhow::Result<()>
         .bind(restored)
         .fetch_one(&h.db)
         .await?;
+    // The restored workspace runs with the limits the fresh one had.
+    let specs: Vec<Value> = sqlx::query_scalar(
+        "SELECT handle-'{id,exec_epoch}'::text[] FROM sandboxes WHERE id=ANY($1) ORDER BY created_at",
+    )
+    .bind([sandbox, restored])
+    .fetch_all(&h.db)
+    .await?;
+    assert_eq!(specs[0], specs[1]);
     let result=guest_exec(host,restored,restored_epoch,"verify-restored","cat /workspace/untracked; stat -c %a /workspace/untracked; test ! -d /etc/periodic; test -d /etc/renamed-periodic; stat -c %a /etc/renamed-periodic").await?;
     assert_eq!(result["exit_code"], 0);
     assert_eq!(result["stdout_head"], "checkpoint751\n700\n");
@@ -263,6 +325,7 @@ async fn wait_workspace_idle(h: &Harness, conv: Uuid) -> anyhow::Result<()> {
 async fn bypassing_harness_still_requires_one_use_mcp_approval() -> anyhow::Result<()> {
     let h = Harness::new().await?;
     let user = h.user().await?;
+    h.install_notes(&user).await?;
     let conv = h.conversation(&user).await?;
     let org = id(&user, "org_id");
     h.send(&user, conv, message("manual gateway test")).await?;
@@ -298,7 +361,7 @@ async fn bypassing_harness_still_requires_one_use_mcp_approval() -> anyhow::Resu
     )
     .await?
     .token;
-    let request = json!({"jsonrpc":"2.0","id":"once","method":"tools/call","params":{"name":"write_note","arguments":{"text":"approved parameters"}}});
+    let request = json!({"jsonrpc":"2.0","id":"once","method":"tools/call","params":{"name":"notes__write_note","arguments":{"text":"approved parameters"}}});
     let url = format!("{}/mcp", h.gateway);
     let client = reqwest::Client::new();
     let pending = tokio::spawn(client.post(&url).bearer_auth(&token).json(&request).send());
@@ -432,7 +495,7 @@ async fn restore_pin_blocks_expired_checkpoint_gc_and_secondary_repairs_primary(
         .fetch_one(&h.db)
         .await?;
     let sandbox = Uuid::now_v7();
-    sqlx::query("INSERT INTO sandboxes(id,org_id,conversation_id,run_id,lease_epoch,exec_epoch,state,handle,persistent) VALUES($1,$2,$3,$4,1,1,'stopped','{}',true)").bind(sandbox).bind(org).bind(conv).bind(run).execute(&h.db).await?;
+    sqlx::query("INSERT INTO sandboxes(id,org_id,conversation_id,run_id,lease_epoch,exec_epoch,state,handle,persistent) VALUES($1,$2,$3,$4,1,1,'suspended','{}',true)").bind(sandbox).bind(org).bind(conv).bind(run).execute(&h.db).await?;
     use sha2::{Digest, Sha256};
     let bytes = b"immutable archive fixture";
     let key = format!("{:x}", Sha256::digest(bytes));

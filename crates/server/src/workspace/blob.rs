@@ -269,26 +269,6 @@ impl BlobStore {
         }
     }
 
-    /// Whether the stored object still matches its content address.
-    pub async fn verify(&self, key: &str) -> anyhow::Result<bool> {
-        let Ok((_, mut reader)) = self.open(key).await else {
-            return Ok(false);
-        };
-        let mut hasher = Sha256::new();
-        let mut buffer = vec![0; 1024 * 1024];
-        loop {
-            let n = match reader.read(&mut buffer).await {
-                Ok(n) => n,
-                Err(_) => return Ok(false),
-            };
-            if n == 0 {
-                break;
-            }
-            hasher.update(&buffer[..n]);
-        }
-        Ok(format!("{:x}", hasher.finalize()) == key)
-    }
-
     /// The whole object, verified against its key. For small objects and tests.
     pub async fn get(&self, key: &str) -> anyhow::Result<Vec<u8>> {
         let (_, mut reader) = self.open(key).await?;
@@ -395,9 +375,6 @@ impl BlobStore {
 
     /// Replace a missing or corrupt object here with a verified copy from `source`.
     pub async fn repair_from(&self, source: &BlobStore, key: &str) -> anyhow::Result<()> {
-        if self.verify(key).await? {
-            return Ok(());
-        }
         self.delete(key).await?;
         let (size, reader) = source.open(key).await?;
         self.put_stream(key, reader, size).await

@@ -20,16 +20,6 @@ pub struct Fetch {
     timeout: Duration,
 }
 
-/// A response, read whole.
-#[derive(Debug)]
-pub struct Fetched {
-    pub status: StatusCode,
-    pub headers: HeaderMap,
-    /// Where it came from, after redirects.
-    pub url: Url,
-    pub body: Bytes,
-}
-
 impl Fetch {
     pub fn new(config: &PluginsConfig) -> Self {
         Self {
@@ -87,8 +77,8 @@ impl Fetch {
             .build()?)
     }
 
-    /// Send a request and read at most `max` bytes of the answer. GETs follow redirects, each
-    /// checked again; other methods only follow 307 and 308.
+    /// Send a request and read at most `max` bytes of its successful answer. GETs follow
+    /// redirects, each checked again; other methods only follow 307 and 308.
     pub async fn send(
         &self,
         method: Method,
@@ -96,7 +86,7 @@ impl Fetch {
         headers: HeaderMap,
         body: Option<Bytes>,
         max: usize,
-    ) -> anyhow::Result<Fetched> {
+    ) -> anyhow::Result<Bytes> {
         let mut url = Url::parse(url).context(Code::UnsafeDestination)?;
         for _ in 0..=MAX_REDIRECTS {
             let response = self
@@ -116,14 +106,8 @@ impl Fetch {
                     .context(Code::PluginFetchFailed)?;
                 continue;
             }
-            let headers = response.headers().clone();
-            let body = read(response, max).await?;
-            return Ok(Fetched {
-                status,
-                headers,
-                url,
-                body,
-            });
+            ensure!(status.is_success(), Code::PluginFetchFailed);
+            return read(response, max).await;
         }
         anyhow::bail!(Code::PluginFetchFailed)
     }

@@ -10,10 +10,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     io::{Read, Write},
 };
 
+/// The platform's extension namespace in packages: its key under `extensions`, and a directory.
+pub const NAMESPACE: &str = "app.ryzhub";
 pub const PLUGIN_SCHEMA: &str = "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json";
 pub const MCP_SCHEMA: &str = "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json";
 /// Most files, bytes and bytes per file a package may hold, unpacked.
@@ -85,50 +87,16 @@ pub struct Command {
     pub params: BTreeMap<String, Value>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct Permissions {
-    /// How tool calls are treated: `allow`, `ask` or `deny` by default, for tools annotated
-    /// read-only, and per tool.
-    pub tools: ToolRules,
-    /// Workspace access a remote plugin asks for; always `none` for now.
-    pub workspace: String,
-    /// Hosts a plugin running in the sandbox may reach (v2).
-    pub network: Vec<String>,
-}
-
-impl Default for Permissions {
-    fn default() -> Self {
-        Self {
-            tools: ToolRules::default(),
-            workspace: "none".into(),
-            network: vec![],
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(default, rename_all = "camelCase")]
-pub struct ToolRules {
-    pub default: String,
-    pub read_only: String,
-    pub tools: BTreeMap<String, String>,
-}
-
-impl Default for ToolRules {
-    fn default() -> Self {
-        Self {
-            default: "ask".into(),
-            read_only: "allow".into(),
-            tools: BTreeMap::new(),
-        }
-    }
+    /// Tools never offered, by their names at the server.
+    pub deny: BTreeSet<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default, rename_all = "camelCase")]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 pub struct Ui {
-    pub declarative: bool,
     pub mcp_apps: bool,
 }
 
@@ -151,40 +119,16 @@ pub struct ConfigField {
 }
 
 impl Manifest {
-    /// Everything that is a prompt or reaches a server: what the member confirms.
-    pub fn permissions_digest(&self) -> String {
-        let asked = json!({
-            "servers": self.servers.iter().map(|s| json!({"name":s.name,"url":s.url,"headers":s.headers})).collect::<Vec<_>>(),
-            "permissions": self.permissions,
-            "ui": self.ui,
-            "user_config": self.user_config,
-        });
-        format!("{:x}", Sha256::digest(asked.to_string()))
-    }
-
-    /// Whether `other` asks for more than this: servers, tool rules, UI or settings it did not.
+    /// Whether `other` asks for more than this: servers, tools it no longer denies, UI or
+    /// settings it did not.
     pub fn widened_by(&self, other: &Manifest) -> bool {
-        let looser = |was: &str, now: &str| rank(now) > rank(was);
-        let tools = &other.permissions.tools;
         other.servers.iter().any(|s| {
             !self
                 .servers
                 .iter()
                 .any(|t| t.url == s.url && t.headers == s.headers)
-        }) || looser(&self.permissions.tools.default, &tools.default)
-            || looser(&self.permissions.tools.read_only, &tools.read_only)
-            || tools.tools.iter().any(|(name, rule)| {
-                let was = self
-                    .permissions
-                    .tools
-                    .tools
-                    .get(name)
-                    .unwrap_or(&self.permissions.tools.default);
-                looser(was, rule)
-            })
+        }) || !self.permissions.deny.is_subset(&other.permissions.deny)
             || (other.ui.mcp_apps && !self.ui.mcp_apps)
-            || (other.ui.declarative && !self.ui.declarative)
-            || other.permissions.workspace != self.permissions.workspace
             || other
                 .user_config
                 .iter()
@@ -192,18 +136,9 @@ impl Manifest {
     }
 }
 
-/// How permissive a tool rule is.
-fn rank(rule: &str) -> u8 {
-    match rule {
-        "deny" => 0,
-        "ask" => 1,
-        _ => 2,
-    }
-}
-
 /// The digest of a package's content: every file but its signature, by path.
-pub fn content_hash(files: &Files, namespace: &str) -> String {
-    let signature = format!("{namespace}/signature.json");
+pub fn content_hash(files: &Files) -> String {
+    let signature = format!("{NAMESPACE}/signature.json");
     let mut hasher = Sha256::new();
     for (path, bytes) in files.iter().filter(|(path, _)| **path != signature) {
         hasher.update(path.as_bytes());
@@ -405,9 +340,9 @@ fn valid_name(name: &str) -> bool {
 }
 
 /// Read a package.
-pub fn parse(files: &Files, namespace: &str) -> anyhow::Result<Manifest> {
+pub fn parse(files: &Files) -> anyhow::Result<Manifest> {
     if files.contains_key("plugin.json") {
-        agent_plugin(files, namespace)
+        agent_plugin(files)
     } else if files.contains_key(".claude-plugin/plugin.json") {
         claude_plugin(files)
     } else {
@@ -428,7 +363,7 @@ const PLUGIN_KEYS: [&str; 10] = [
     "extensions",
 ];
 
-fn agent_plugin(files: &Files, namespace: &str) -> anyhow::Result<Manifest> {
+fn agent_plugin(files: &Files) -> anyhow::Result<Manifest> {
     let plugin = json_file(files, "plugin.json")?.context("plugin.json")?;
     let object = plugin.as_object().context("plugin.json is not an object")?;
     for key in object.keys() {
@@ -471,10 +406,10 @@ fn agent_plugin(files: &Files, namespace: &str) -> anyhow::Result<Manifest> {
     }
     manifest.skills = skills(files, "skills/")?;
     // Other vendors' extensions are ignored, as the standard requires.
-    if let Some(extension) = plugin["extensions"].get(namespace) {
-        extend(&mut manifest, extension, files, namespace)?;
+    if let Some(extension) = plugin["extensions"].get(NAMESPACE) {
+        extend(&mut manifest, extension, files)?;
     }
-    manifest.signature = signature(files, namespace)?;
+    manifest.signature = signature(files)?;
     Ok(manifest)
 }
 
@@ -590,27 +525,10 @@ fn skills(files: &Files, root: &str) -> anyhow::Result<Vec<Skill>> {
 }
 
 /// The platform's extension: commands, permissions, UI and settings.
-fn extend(
-    manifest: &mut Manifest,
-    extension: &Value,
-    files: &Files,
-    namespace: &str,
-) -> anyhow::Result<()> {
+fn extend(manifest: &mut Manifest, extension: &Value, files: &Files) -> anyhow::Result<()> {
     if let Some(permissions) = extension.get("permissions") {
         manifest.permissions =
             serde_json::from_value(permissions.clone()).context("invalid permissions")?;
-        for rule in [
-            &manifest.permissions.tools.default,
-            &manifest.permissions.tools.read_only,
-        ]
-        .into_iter()
-        .chain(manifest.permissions.tools.tools.values())
-        {
-            ensure!(
-                matches!(rule.as_str(), "allow" | "ask" | "deny"),
-                "invalid tool rule {rule:?}"
-            );
-        }
     }
     if let Some(ui) = extension.get("ui") {
         manifest.ui = serde_json::from_value(ui.clone()).context("invalid ui")?;
@@ -639,8 +557,8 @@ fn extend(
         ensure!(valid_name(name), "invalid command name {name:?}");
         let path = command["prompt"].as_str().unwrap_or_default();
         ensure!(
-            path.starts_with(&format!("{namespace}/")),
-            "command {name}: its prompt must be a file under {namespace}/"
+            path.starts_with(&format!("{NAMESPACE}/")),
+            "command {name}: its prompt must be a file under {NAMESPACE}/"
         );
         let prompt =
             text(files, path)?.with_context(|| format!("command {name}: {path} missing"))?;
@@ -658,8 +576,8 @@ fn extend(
     Ok(())
 }
 
-fn signature(files: &Files, namespace: &str) -> anyhow::Result<Option<(String, String)>> {
-    let Some(signature) = json_file(files, &format!("{namespace}/signature.json"))? else {
+fn signature(files: &Files) -> anyhow::Result<Option<(String, String)>> {
+    let Some(signature) = json_file(files, &format!("{NAMESPACE}/signature.json"))? else {
         return Ok(None);
     };
     Ok(Some((
@@ -814,13 +732,12 @@ pub fn render(command: &Command, args: &Map<String, Value>) -> anyhow::Result<St
     Ok(prompt)
 }
 
-/// `ryzhub-server parse-plugin <namespace>`: read an archive on stdin, write what it holds as
-/// JSON on stdout, under memory and CPU limits.
-pub fn child_main(args: &[String]) -> anyhow::Result<()> {
+/// `ryzhub-server parse-plugin`: read an archive on stdin, write what it holds as JSON on
+/// stdout, under memory and CPU limits.
+pub fn child_main() -> anyhow::Result<()> {
     use nix::sys::resource::{Resource, setrlimit};
     setrlimit(Resource::RLIMIT_AS, CHILD_MEMORY, CHILD_MEMORY)?;
     setrlimit(Resource::RLIMIT_CPU, CHILD_CPU_SECS, CHILD_CPU_SECS)?;
-    let namespace = args.first().context("namespace")?;
     let mut archive = vec![];
     std::io::stdin()
         .lock()
@@ -832,8 +749,8 @@ pub fn child_main(args: &[String]) -> anyhow::Result<()> {
             "package is larger than {MAX_BYTES} bytes"
         );
         let files = unpack(&archive)?;
-        let manifest = parse(&files, namespace)?;
-        Ok(json!({"manifest": manifest, "content_hash": content_hash(&files, namespace)}))
+        let manifest = parse(&files)?;
+        Ok(json!({"manifest": manifest, "content_hash": content_hash(&files)}))
     })() {
         Ok(value) => value,
         Err(error) => json!({"error": format!("{error:#}")}),

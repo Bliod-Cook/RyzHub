@@ -9,13 +9,9 @@ pub mod outputs;
 pub mod sandbox;
 pub mod uploads;
 
-use std::{
-    path::{Path, PathBuf},
-    time::Duration,
-};
+use std::{path::Path, time::Duration};
 
-use serde_json::Value;
-use tokio::{io::AsyncReadExt, sync::Semaphore};
+use tokio::sync::Semaphore;
 use uuid::Uuid;
 
 use anyhow::Context;
@@ -29,9 +25,9 @@ use crate::{
 };
 
 /// Largest file anyone may upload; policy may only lower it.
-pub const MAX_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_BYTES: u64 = 64 * 1024 * 1024;
 /// Upload limit when policy sets none.
-pub const DEFAULT_BYTES: u64 = 50 * 1024 * 1024;
+const DEFAULT_BYTES: u64 = 50 * 1024 * 1024;
 /// Files one message may carry.
 pub const MAX_PER_MESSAGE: usize = 10;
 /// UTF-8 files up to this size are inlined into model context.
@@ -316,11 +312,15 @@ pub(crate) async fn bind(
 
 /// Serialize storing and reclaiming one content address of `org`'s library.
 pub(crate) async fn content_lock(tx: &mut Tx<'_>, org: Uuid, sha256: &str) -> anyhow::Result<()> {
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))")
-        .bind(format!("attachment:{org}:{sha256}"))
-        .execute(&mut **tx)
-        .await?;
-    Ok(())
+    crate::store::advisory_lock(tx, &format!("attachment:{org}:{sha256}")).await
+}
+
+/// The largest file `policy` lets a member add to their library.
+pub fn limit(policy: &ryzhub_domain::Policy) -> u64 {
+    policy
+        .attachment_bytes
+        .unwrap_or(DEFAULT_BYTES)
+        .min(MAX_BYTES)
 }
 
 /// An uploaded image as models see it.
@@ -343,57 +343,19 @@ pub(crate) async fn render(app: &App, file: &Path) -> Option<Rendition> {
     }
 }
 
-/// The program that renders images: the configured one, or else this very binary. The kernel's
-/// link to the running binary still works once a rebuild or an upgrade has replaced the file
-/// it was started from, which the path `current_exe` names no longer does.
-pub(crate) fn renderer(configured: &str) -> std::io::Result<PathBuf> {
-    if !configured.is_empty() {
-        return Ok(configured.into());
-    }
-    let running = Path::new("/proc/self/exe");
-    if running.exists() {
-        return Ok(running.to_path_buf());
-    }
-    std::env::current_exe()
-}
-
 async fn rendition(app: &App, file: &Path) -> anyhow::Result<Rendition> {
     let _permit = RENDERS.acquire().await?;
-    let program = renderer(&app.config.attachment_renderer).context("finding the renderer")?;
-    let mut child = tokio::process::Command::new(&program)
-        .arg("render-image")
-        .arg(images::MAX_EDGE.to_string())
-        .arg(images::MAX_BYTES.to_string())
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-        .with_context(|| format!("starting {}", program.display()))?;
-    let (mut stdin, mut stdout) = (
-        child.stdin.take().context("renderer input")?,
-        child.stdout.take().context("renderer output")?,
-    );
-    let output = async {
-        // A refusal may close stdin early; the reply says why. Dropping stdin ends the input.
-        let feed = async move {
-            let mut source = tokio::fs::File::open(file).await?;
-            tokio::io::copy(&mut source, &mut stdin).await?;
-            Ok::<_, std::io::Error>(())
-        };
-        let mut reply = Vec::new();
-        let mut limited = (&mut stdout).take(2 * images::MAX_BYTES as u64);
-        let read = limited.read_to_end(&mut reply);
-        let (_, read) = tokio::join!(feed, read);
-        read?;
-        child.wait().await?;
-        Ok::<_, std::io::Error>(reply)
-    };
-    let reply = tokio::time::timeout(RENDER_TIMEOUT, output)
-        .await
-        .context("timed out")?
-        .context("talking to the renderer")?;
-    let reply: Value = serde_json::from_slice(&reply).context("unreadable reply")?;
+    let program = crate::child::program(&app.config.attachment_renderer)?;
+    let input = tokio::fs::File::open(file).await?;
+    let (edge, bytes) = (images::MAX_EDGE.to_string(), images::MAX_BYTES.to_string());
+    let reply = crate::child::run(
+        &program,
+        &["render-image", &edge, &bytes],
+        input,
+        2 * images::MAX_BYTES as u64,
+        RENDER_TIMEOUT,
+    )
+    .await?;
     let (media_type, data, width, height) =
         images::checked(&reply).with_context(|| match reply["error"].as_str() {
             Some(code) => format!("refused: {code}: {}", reply["message"]),
@@ -418,15 +380,6 @@ async fn rendition(app: &App, file: &Path) -> anyhow::Result<Rendition> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn the_renderer_outlives_a_rebuild_of_the_binary() {
-        assert_eq!(renderer("/opt/render").unwrap(), Path::new("/opt/render"));
-        // The kernel's link, not the file's path, which a rebuild replaces.
-        if cfg!(target_os = "linux") {
-            assert_eq!(renderer("").unwrap(), Path::new("/proc/self/exe"));
-        }
-    }
 
     #[test]
     fn sniffing_trusts_content_over_names() {

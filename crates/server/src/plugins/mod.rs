@@ -16,7 +16,6 @@ pub mod package;
 
 use anyhow::{Context, ensure};
 use base64::Engine as _;
-use bytes::Bytes;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -84,7 +83,7 @@ pub async fn obtain(app: &App, source: &Source, upload: Option<&[u8]>) -> anyhow
     let fetch = fetcher(app);
     let (manifest, content_hash, commit) = match source {
         Source::Url { url } => {
-            let fetched = fetch
+            let archive = fetch
                 .send(
                     reqwest::Method::GET,
                     url,
@@ -93,8 +92,7 @@ pub async fn obtain(app: &App, source: &Source, upload: Option<&[u8]>) -> anyhow
                     package::MAX_BYTES,
                 )
                 .await?;
-            ensure!(fetched.status.is_success(), Code::PluginFetchFailed);
-            let (manifest, hash) = parse_archive(app, &fetched.body).await?;
+            let (manifest, hash) = parse_archive(app, &archive).await?;
             (manifest, hash, None)
         }
         Source::Git { url, reference } => {
@@ -193,7 +191,7 @@ pub async fn catalog(app: &App) -> anyhow::Result<Vec<Value>> {
     if url.is_empty() {
         return Ok(vec![]);
     }
-    let fetched = fetcher(app)
+    let index = fetcher(app)
         .send(
             reqwest::Method::GET,
             url,
@@ -202,13 +200,7 @@ pub async fn catalog(app: &App) -> anyhow::Result<Vec<Value>> {
             2 * 1024 * 1024,
         )
         .await?;
-    ensure!(fetched.status.is_success(), Code::PluginFetchFailed);
-    let index: Value = serde_json::from_slice(&fetched.body).context(Code::PluginFetchFailed)?;
-    Ok(index
-        .as_array()
-        .or_else(|| index["plugins"].as_array())
-        .cloned()
-        .unwrap_or_default())
+    serde_json::from_slice(&index).context(Code::PluginFetchFailed)
 }
 
 async fn catalog_entry(app: &App, name: &str) -> anyhow::Result<Value> {
@@ -221,38 +213,12 @@ async fn catalog_entry(app: &App, name: &str) -> anyhow::Result<Value> {
 
 /// Unpack and read an archive in a `parse-plugin` process of its own.
 async fn parse_archive(app: &App, archive: &[u8]) -> anyhow::Result<(Manifest, String)> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     ensure!(archive.len() <= package::MAX_BYTES, Code::PluginTooLarge);
-    let program = crate::attachments::renderer(&app.config.attachment_renderer)?;
-    let mut child = tokio::process::Command::new(program)
-        .arg("parse-plugin")
-        .arg(&app.config.plugins.namespace)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .kill_on_drop(true)
-        .spawn()?;
-    let mut stdin = child.stdin.take().context("parser input")?;
-    let mut stdout = child.stdout.take().context("parser output")?;
-    let archive = archive.to_vec();
-    let exchange = async move {
-        let feed = async move {
-            stdin.write_all(&archive).await?;
-            drop(stdin);
-            Ok::<_, std::io::Error>(())
-        };
-        let mut reply = vec![];
-        let mut limited = (&mut stdout).take(8 * 1024 * 1024);
-        let read = limited.read_to_end(&mut reply);
-        let (_, read) = tokio::join!(feed, read);
-        read?;
-        child.wait().await?;
-        Ok::<_, std::io::Error>(reply)
-    };
-    let reply = tokio::time::timeout(std::time::Duration::from_secs(30), exchange)
+    let program = crate::child::program(&app.config.attachment_renderer)?;
+    let timeout = std::time::Duration::from_secs(30);
+    let reply = crate::child::run(&program, &["parse-plugin"], archive, 8 << 20, timeout)
         .await
-        .context(Code::PluginInvalid)??;
-    let reply: Value = serde_json::from_slice(&reply).context(Code::PluginInvalid)?;
+        .context(Code::PluginInvalid)?;
     if let Some(error) = reply["error"].as_str() {
         tracing::info!(error, "plugin package refused");
         return Err(
@@ -422,8 +388,7 @@ pub async fn snapshot(tx: &mut Tx<'_>, org: Uuid, conversation: Uuid) -> anyhow:
          JOIN conversations c ON c.org_id=i.org_id AND c.id=$2
          LEFT JOIN conversation_plugins cp ON cp.conversation_id=c.id AND cp.installation_id=i.id
          LEFT JOIN project_plugins pp ON pp.project_id=c.project_id AND pp.installation_id=i.id
-         WHERE i.org_id=$1 AND i.user_id=c.creator_id AND i.state<>'pending'
-           AND coalesce(cp.enabled,pp.enabled,i.enabled)
+         WHERE i.org_id=$1 AND i.user_id=c.creator_id AND coalesce(cp.enabled,pp.enabled,i.enabled)
          ORDER BY i.created_at",
     )
     .bind(org)
@@ -467,8 +432,6 @@ pub struct RunTool {
     /// The tool's name at its server.
     pub remote: String,
     pub definition: Value,
-    /// `allow`, `ask` or `deny`: how the plugin's permissions treat it.
-    pub rule: String,
     /// An MCP App page that shows its results (`ui://…`), when the plugin may use them.
     pub ui: Option<String>,
 }
@@ -523,7 +486,7 @@ pub async fn run_tools(
          JOIN plugins p ON p.org_id=i.org_id AND p.id=i.plugin_id
          JOIN plugin_versions v ON v.org_id=i.org_id AND v.id=i.version_id
          JOIN plugin_tools t ON t.installation_id=i.id AND t.approved_digest=t.digest
-         WHERE r.org_id=$1 AND r.id=$2 AND i.enabled AND i.state<>'pending'
+         WHERE r.org_id=$1 AND r.id=$2 AND i.enabled
            AND NOT EXISTS(SELECT 1 FROM plugin_blocks b WHERE b.name=p.name OR b.content_hash=v.content_hash)
          ORDER BY p.name,t.server,t.tool",
     )
@@ -536,16 +499,7 @@ pub async fn run_tools(
     let mut tools = vec![];
     for (installation, plugin, manifest, server, remote, definition) in rows {
         let manifest: Manifest = serde_json::from_value(manifest)?;
-        let rules = &manifest.permissions.tools;
-        let read_only = definition["annotations"]["readOnlyHint"] == true;
-        let rule = rules.tools.get(&remote).cloned().unwrap_or_else(|| {
-            if read_only {
-                rules.read_only.clone()
-            } else {
-                rules.default.clone()
-            }
-        });
-        if rule == "deny" {
+        if manifest.permissions.deny.contains(&remote) {
             continue;
         }
         let ui = definition["_meta"]["ui"]["resourceUri"]
@@ -560,7 +514,6 @@ pub async fn run_tools(
             server,
             remote,
             definition,
-            rule,
             ui,
         });
     }
@@ -578,7 +531,7 @@ pub async fn run_skills(
          JOIN plugin_installations i ON i.org_id=r.org_id AND i.id=(e->>'installation')::uuid
          JOIN plugins p ON p.org_id=i.org_id AND p.id=i.plugin_id
          JOIN plugin_versions v ON v.org_id=i.org_id AND v.id=i.version_id
-         WHERE r.org_id=$1 AND r.id=$2 AND i.enabled AND i.state<>'pending'
+         WHERE r.org_id=$1 AND r.id=$2 AND i.enabled
            AND NOT EXISTS(SELECT 1 FROM plugin_blocks b WHERE b.name=p.name OR b.content_hash=v.content_hash)
          ORDER BY p.name",
     )
@@ -679,15 +632,8 @@ pub async fn command_prompt(
     Ok(format!("/{plugin}:{name}\n\n{prompt}"))
 }
 
-/// The headers a plugin server's requests carry: the package's fixed ones, settings sent as
-/// headers, and the member's connected account.
-async fn server_headers(
-    app: &App,
-    org: Uuid,
-    user: Uuid,
-    installation: Uuid,
-    server: &package::Server,
-) -> anyhow::Result<HeaderMap> {
+/// The fixed request headers a package gives a server.
+fn package_headers(server: &package::Server) -> anyhow::Result<HeaderMap> {
     let mut headers = HeaderMap::new();
     for (name, value) in &server.headers {
         headers.insert(
@@ -695,37 +641,71 @@ async fn server_headers(
             HeaderValue::from_str(value).context(Code::PluginInvalid)?,
         );
     }
+    Ok(headers)
+}
+
+/// An installation, as its servers are called.
+struct Installed {
+    id: Uuid,
+    /// The member it belongs to.
+    user: Uuid,
+    manifest: Manifest,
+    config: Value,
+    secrets: Value,
+}
+
+async fn installed(app: &App, org: Uuid, id: Uuid) -> anyhow::Result<Installed> {
     let mut tx = app.store.tx(org).await?;
-    let (manifest, config, secrets): (Value, Value, Value) = sqlx::query_as(
-        "SELECT v.manifest,i.config,i.secrets FROM plugin_installations i
+    let (manifest, user, config, secrets): (Value, Uuid, Value, Value) = sqlx::query_as(
+        "SELECT v.manifest,i.user_id,i.config,i.secrets FROM plugin_installations i
          JOIN plugin_versions v ON v.org_id=i.org_id AND v.id=i.version_id
          WHERE i.org_id=$1 AND i.id=$2",
     )
     .bind(org)
-    .bind(installation)
-    .fetch_one(&mut *tx)
-    .await?;
-    let manifest: Manifest = serde_json::from_value(manifest)?;
-    for (field, spec) in manifest
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .context(Code::PluginNotFound)?;
+    tx.commit().await?;
+    Ok(Installed {
+        id,
+        user,
+        manifest: serde_json::from_value(manifest)?,
+        config,
+        secrets,
+    })
+}
+
+/// Open a session with `server` of `installed`, for its member. Requests carry the package's
+/// fixed headers, settings sent as headers, and the member's connected account.
+async fn open(
+    app: &App,
+    org: Uuid,
+    installed: &Installed,
+    server: &package::Server,
+) -> anyhow::Result<client::Session> {
+    let mut headers = package_headers(server)?;
+    let installation = installed.id;
+    for (field, spec) in installed
+        .manifest
         .user_config
         .iter()
         .filter(|(_, s)| !s.header.is_empty())
     {
         let value = if spec.secret {
-            match secrets[field]
+            let Some(id) = installed.secrets[field]
                 .as_str()
                 .and_then(|id| id.parse::<Uuid>().ok())
-            {
-                Some(id) => {
-                    let purpose = format!("plugin:{installation}:{field}");
-                    String::from_utf8(
-                        crate::vault::get(&mut tx, &app.config.llm, org, id, &purpose).await?,
-                    )?
-                }
-                None => continue,
-            }
+            else {
+                continue;
+            };
+            let purpose = format!("plugin:{installation}:{field}");
+            let mut tx = app.store.tx(org).await?;
+            let secret = crate::vault::get(&mut tx, &app.config.llm, org, id, &purpose).await?;
+            tx.commit().await?;
+            String::from_utf8(secret)?
         } else {
-            match &config[field] {
+            match &installed.config[field] {
                 Value::Null => continue,
                 Value::String(text) => text.clone(),
                 other => other.to_string(),
@@ -737,34 +717,13 @@ async fn server_headers(
                 .context(Code::InvalidArguments)?,
         );
     }
-    tx.commit().await?;
-    if let Some(token) = oauth::token(app, org, user, installation, &server.name).await? {
+    if let Some(token) = oauth::token(app, org, installed.user, installation, &server.name).await? {
         headers.insert(
             "authorization",
             HeaderValue::from_str(&format!("Bearer {token}")).context(Code::PluginAuthRequired)?,
         );
     }
-    Ok(headers)
-}
-
-/// An installation's version, plugin name and owner.
-async fn installation(
-    tx: &mut Tx<'_>,
-    org: Uuid,
-    id: Uuid,
-) -> anyhow::Result<(String, Manifest, Uuid, String)> {
-    let (name, manifest, user, state): (String, Value, Uuid, String) = sqlx::query_as(
-        "SELECT p.name,v.manifest,i.user_id,i.state FROM plugin_installations i
-         JOIN plugins p ON p.org_id=i.org_id AND p.id=i.plugin_id
-         JOIN plugin_versions v ON v.org_id=i.org_id AND v.id=i.version_id
-         WHERE i.org_id=$1 AND i.id=$2",
-    )
-    .bind(org)
-    .bind(id)
-    .fetch_optional(&mut **tx)
-    .await?
-    .context(Code::PluginNotFound)?;
-    Ok((name, serde_json::from_value(manifest)?, user, state))
+    client::Session::open(&fetcher(app), &server.url, headers).await
 }
 
 /// Open a session with a server of an installation, for its member.
@@ -774,16 +733,14 @@ pub async fn session(
     installation: Uuid,
     server: &str,
 ) -> anyhow::Result<client::Session> {
-    let mut tx = app.store.tx(org).await?;
-    let (_, manifest, user, _) = self::installation(&mut tx, org, installation).await?;
-    tx.commit().await?;
-    let server = manifest
+    let installed = installed(app, org, installation).await?;
+    let server = installed
+        .manifest
         .servers
         .iter()
         .find(|s| s.name == server && s.enabled)
         .context(Code::PluginNotFound)?;
-    let headers = server_headers(app, org, user, installation, server).await?;
-    client::Session::open(&fetcher(app), &server.url, headers).await
+    open(app, org, &installed, server).await
 }
 
 /// Call a run's plugin tool. `answers` respond to an earlier `input_required`.
@@ -819,12 +776,10 @@ pub async fn refresh_tools(
     installation: Uuid,
     approve: bool,
 ) -> anyhow::Result<Listed> {
-    let mut tx = app.store.tx(org).await?;
-    let (_, manifest, _, _) = self::installation(&mut tx, org, installation).await?;
-    tx.commit().await?;
+    let installed = installed(app, org, installation).await?;
     let mut listed = Listed::default();
-    for server in manifest.servers.iter().filter(|s| s.enabled) {
-        let tools = match session(app, org, installation, &server.name).await {
+    for server in installed.manifest.servers.iter().filter(|s| s.enabled) {
+        let tools = match open(app, org, &installed, server).await {
             Ok(session) => session.tools().await,
             Err(error) => Err(error),
         };
@@ -897,14 +852,6 @@ pub async fn refresh_tools(
         tx.commit().await?;
     }
     Ok(listed)
-}
-
-/// The base64 of `bytes`, for uploads carried in JSON.
-pub fn decode_upload(text: &str) -> anyhow::Result<Bytes> {
-    Ok(base64::engine::general_purpose::STANDARD
-        .decode(text)
-        .context(Code::InvalidInput)?
-        .into())
 }
 
 #[cfg(test)]

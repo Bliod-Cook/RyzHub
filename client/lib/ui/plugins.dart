@@ -366,9 +366,12 @@ class PluginDescription extends StatelessWidget {
   Widget build(BuildContext context) {
     final c = HubColors.of(context);
     final heading = TextStyle(fontWeight: FontWeight.w600, color: c.text);
-    final permissions = preview['permissions'] as Map? ?? {};
-    final rules = permissions['tools'] as Map? ?? {};
-    final ui = preview['ui'] as Map? ?? {};
+    final denied = (preview['permissions']?['deny'] as List? ?? []).join(', ');
+    final permissions = [
+      if (denied.isNotEmpty) '${tr('不提供的工具', 'Tools never offered')}: $denied',
+      if (preview['ui']?['mcpApps'] == true)
+        tr('可显示网页界面（MCP Apps）', 'May show web pages (MCP Apps)'),
+    ];
     Widget block(String text) => Container(
       width: double.infinity,
       margin: const EdgeInsets.only(top: 6),
@@ -430,22 +433,17 @@ class PluginDescription extends StatelessWidget {
               style: const TextStyle(fontSize: FontSizes.label),
             ),
           ),
-        const SizedBox(height: 12),
-        Text(tr('权限', 'Permissions'), style: heading),
-        Padding(
-          padding: const EdgeInsets.only(top: 4),
-          child: Text(
-            [
-              '${tr('工具默认', 'Tools by default')}: ${rules['default'] ?? 'ask'}',
-              '${tr('只读工具', 'Read-only tools')}: ${rules['readOnly'] ?? 'allow'}',
-              for (final e in (rules['tools'] as Map? ?? {}).entries)
-                '${e.key}: ${e.value}',
-              if (ui['mcpApps'] == true)
-                tr('可显示网页界面（MCP Apps）', 'May show web pages (MCP Apps)'),
-            ].join('\n'),
-            style: const TextStyle(fontSize: FontSizes.label),
+        if (permissions.isNotEmpty) ...[
+          const SizedBox(height: 12),
+          Text(tr('权限', 'Permissions'), style: heading),
+          Padding(
+            padding: const EdgeInsets.only(top: 4),
+            child: Text(
+              permissions.join('\n'),
+              style: const TextStyle(fontSize: FontSizes.label),
+            ),
           ),
-        ),
+        ],
         if ((preview['tools'] as List? ?? []).isNotEmpty) ...[
           const SizedBox(height: 12),
           Text(tr('工具', 'Tools'), style: heading),
@@ -1035,18 +1033,14 @@ class _ConversationPluginsState extends State<_ConversationPlugins> {
                   SwitchListTile(
                     contentPadding: EdgeInsets.zero,
                     title: Text('${p['name']}'),
-                    subtitle: p['state'] == 'pending'
-                        ? Text(tr('尚未确认', 'Not confirmed yet'))
-                        : p['conversation'] == null
+                    subtitle: p['conversation'] == null
                         ? Text(
                             tr('跟随默认', 'Following the default'),
                             style: TextStyle(color: c.muted),
                           )
                         : null,
                     value: p['enabled'] == true,
-                    onChanged: p['state'] == 'pending'
-                        ? null
-                        : (v) => toggle('${p['id']}', v),
+                    onChanged: (v) => toggle('${p['id']}', v),
                   ),
                 if (error.isNotEmpty)
                   Text(error, style: TextStyle(color: c.danger)),

@@ -493,14 +493,7 @@ async fn load(
                 if stores.is_none() {
                     stores = Some(attachment_stores(app, org)?);
                 }
-                let (primary, secondary) = stores.as_ref().context("stores")?;
-                let data = match primary.get(&sha256).await {
-                    Ok(data) => data,
-                    Err(error) => match secondary {
-                        Some(secondary) => secondary.get(&sha256).await?,
-                        None => return Err(error),
-                    },
-                };
+                let data = stores.as_ref().context("stores")?.get(&sha256).await?;
                 ("application/pdf".to_owned(), data)
             }
             _ => continue,

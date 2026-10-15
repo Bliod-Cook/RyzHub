@@ -20,6 +20,7 @@ use axum::{
 };
 use ryzhub_execution::HostCommand;
 use serde_json::{Value, json};
+use tokio::io::AsyncRead;
 use uuid::Uuid;
 
 use crate::{
@@ -34,38 +35,78 @@ use blob::BlobStore;
 /// A failed job is retried after this long.
 const RETRY_AFTER_SECS: i64 = 30;
 
-/// Primary and optional secondary store, scoped to `org`.
-fn stores(app: &App, org: Uuid) -> anyhow::Result<(BlobStore, Option<BlobStore>)> {
-    let primary = BlobStore::configured(&app.config.work.storage_root)?.scoped(org);
-    let secondary = app
-        .config
-        .work
-        .secondary_root
-        .as_deref()
-        .map(|root| BlobStore::configured(root).map(|store| store.scoped(org)))
-        .transpose()?;
-    Ok((primary, secondary))
+/// The primary store and, if configured, the secondary one, which keeps a second copy of
+/// everything written.
+pub(crate) struct Stores {
+    pub primary: BlobStore,
+    secondary: Option<BlobStore>,
 }
 
-/// Primary and optional secondary store for `org`'s file library.
-pub(crate) fn attachment_stores(
-    app: &App,
-    org: Uuid,
-) -> anyhow::Result<(BlobStore, Option<BlobStore>)> {
-    let (primary, secondary) = stores(app, org)?;
-    Ok((
-        primary.within("attachments"),
-        secondary.map(|store| store.within("attachments")),
-    ))
+impl Stores {
+    /// Store `key` in every store, `source` giving the content and its size anew for each.
+    pub async fn put<R: AsyncRead + Unpin, F: Future<Output = anyhow::Result<(u64, R)>>>(
+        &self,
+        key: &str,
+        mut source: impl FnMut() -> F,
+    ) -> anyhow::Result<()> {
+        for store in std::iter::once(&self.primary).chain(&self.secondary) {
+            let (size, reader) = source().await?;
+            store.put_stream(key, reader, size).await?;
+        }
+        Ok(())
+    }
+
+    /// A reader over `key` and its size, from the secondary store if the primary fails.
+    pub async fn open(&self, key: &str) -> anyhow::Result<(u64, blob::Reader)> {
+        match (self.primary.open(key).await, &self.secondary) {
+            (Err(_), Some(secondary)) => secondary.open(key).await,
+            (opened, _) => opened,
+        }
+    }
+
+    /// The whole object, verified, from the secondary store if the primary fails.
+    pub async fn get(&self, key: &str) -> anyhow::Result<Vec<u8>> {
+        match (self.primary.get(key).await, &self.secondary) {
+            (Err(_), Some(secondary)) => secondary.get(key).await,
+            (read, _) => read,
+        }
+    }
+
+    pub async fn delete(&self, key: &str) -> anyhow::Result<()> {
+        for store in std::iter::once(&self.primary).chain(&self.secondary) {
+            store.delete(key).await?;
+        }
+        Ok(())
+    }
+}
+
+/// The checkpoint stores, scoped to `org`.
+fn stores(app: &App, org: Uuid) -> anyhow::Result<Stores> {
+    let store = |root: &str| anyhow::Ok(BlobStore::configured(root)?.scoped(org));
+    Ok(Stores {
+        primary: store(&app.config.work.storage_root)?,
+        secondary: app
+            .config
+            .work
+            .secondary_root
+            .as_deref()
+            .map(store)
+            .transpose()?,
+    })
+}
+
+/// The stores of `org`'s file library.
+pub(crate) fn attachment_stores(app: &App, org: Uuid) -> anyhow::Result<Stores> {
+    let Stores { primary, secondary } = stores(app, org)?;
+    Ok(Stores {
+        primary: primary.within("attachments"),
+        secondary: secondary.map(|store| store.within("attachments")),
+    })
 }
 
 /// Serialize publication and reclamation of one tenant's content-addressed object.
 async fn blob_lock(tx: &mut Tx<'_>, org: Uuid, key: &str) -> anyhow::Result<()> {
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))")
-        .bind(format!("checkpoint:{org}:{key}"))
-        .execute(&mut **tx)
-        .await?;
-    Ok(())
+    crate::store::advisory_lock(tx, &format!("checkpoint:{org}:{key}")).await
 }
 
 /// `GET /orgs/{org}/conversations/{conv}/workspace`
@@ -110,19 +151,14 @@ pub async fn status(
     .bind(conv)
     .fetch_one(&mut *tx)
     .await?;
-    // In use, yet its last committed checkpoint is older than the recovery point objective.
-    let stale: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM sandboxes s WHERE s.org_id=$1 AND s.conversation_id=$2
-           AND s.persistent AND s.state='running'
-           AND coalesce((SELECT max(c.created_at) FROM checkpoints c WHERE c.org_id=s.org_id
-               AND c.conversation_id=s.conversation_id AND c.state='committed'),s.created_at)
-               <now()-($3::bigint*interval '1 second')
-           AND EXISTS(SELECT 1 FROM runs r WHERE r.org_id=s.org_id AND r.conversation_id=s.conversation_id
-               AND coalesce(r.ended_at,'infinity')>now()-($3::bigint*interval '1 second')))",
-    )
+    let stale: bool = sqlx::query_scalar(concat!(
+        "SELECT EXISTS(SELECT 1 FROM sandboxes s WHERE s.org_id=$2 AND s.conversation_id=$3 AND ",
+        stale_checkpoint!(),
+        ")"
+    ))
+    .bind(sandbox::CHECKPOINT_STALE_SECS)
     .bind(org)
     .bind(conv)
-    .bind(sandbox::CHECKPOINT_STALE_SECS)
     .fetch_one(&mut *tx)
     .await?;
     tx.commit().await?;

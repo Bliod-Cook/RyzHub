@@ -3,7 +3,6 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:ryzhub/ui/plugin_app_bridge.dart';
-import 'package:ryzhub/ui/plugin_ui.dart';
 import 'package:ryzhub/ui/plugins.dart';
 
 import 'kernel.dart';
@@ -138,11 +137,7 @@ void main() {
               },
             ],
             'permissions': {
-              'tools': {
-                'default': 'ask',
-                'readOnly': 'allow',
-                'tools': {'purge': 'deny'},
-              },
+              'deny': ['purge'],
             },
             'ui': {'mcpApps': true},
             'skills': [
@@ -163,8 +158,7 @@ void main() {
     expect(find.text('acme: https://mcp.acme.example/mcp'), findsOneWidget);
     expect(find.text('Read each ticket.'), findsOneWidget);
     expect(find.text('Triage the tickets of {{project}}.'), findsOneWidget);
-    expect(find.textContaining('purge: deny'), findsOneWidget);
+    expect(find.textContaining('Tools never offered: purge'), findsOneWidget);
     expect(find.textContaining('local server not run'), findsOneWidget);
-    expect(pluginToolName('acme.tracker', 'look up'), 'acme_tracker__look_up');
   });
 }

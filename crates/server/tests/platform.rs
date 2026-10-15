@@ -2263,28 +2263,25 @@ async fn nodes_shed_unused_workspaces_and_stopped_sandboxes_and_report_stale_che
         .await?;
     assert_eq!(result["stdout_head"], "onceonce", "restored on demand");
 
-    // A suspended Work sandbox, or a Chat one an earlier version only stopped, is destroyed
-    // once its grace period is over; a running one whose checkpoints fall behind is reported
-    // once.
+    // A suspended Work sandbox is destroyed once its grace period is over; a running one whose
+    // checkpoints fall behind is reported once.
     let other = h.conversation(&user).await?;
     h.send(&user, other, message("hello")).await?;
     let run = h.wait_state(other, "completed").await?;
-    let (suspended, stopped, running) = (Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7());
-    for (sandbox, state, persistent, age) in [
-        (suspended, "suspended", true, "2 days"),
-        (stopped, "stopped", false, "2 days"),
-        (running, "running", true, "1 hour"),
+    let (suspended, running) = (Uuid::now_v7(), Uuid::now_v7());
+    for (sandbox, state, age) in [
+        (suspended, "suspended", "2 days"),
+        (running, "running", "1 hour"),
     ] {
         sqlx::query(
             "INSERT INTO sandboxes(id,org_id,conversation_id,run_id,lease_epoch,exec_epoch,state,handle,persistent,node_lease_until,created_at)
-             VALUES($1,$2,$3,$4,1,1,$5,'{}',$6,now()-$7::interval,now()-$7::interval)",
+             VALUES($1,$2,$3,$4,1,1,$5,'{}',true,now()-$6::interval,now()-$6::interval)",
         )
         .bind(sandbox)
         .bind(org)
         .bind(other)
         .bind(run)
         .bind(state)
-        .bind(persistent)
         .bind(age)
         .execute(&h.db)
         .await?;
@@ -2292,13 +2289,11 @@ async fn nodes_shed_unused_workspaces_and_stopped_sandboxes_and_report_stale_che
     for _ in 0..2 {
         ryzhub_server::sandbox::reclaim_once(&h.app, &worker).await?;
     }
-    for sandbox in [suspended, stopped] {
-        let state: String = sqlx::query_scalar("SELECT state FROM sandboxes WHERE id=$1")
-            .bind(sandbox)
-            .fetch_one(&h.db)
-            .await?;
-        assert_eq!(state, "deleted");
-    }
+    let state: String = sqlx::query_scalar("SELECT state FROM sandboxes WHERE id=$1")
+        .bind(suspended)
+        .fetch_one(&h.db)
+        .await?;
+    assert_eq!(state, "deleted");
     let reports: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM audit_logs WHERE org_id=$1 AND action='workspace.checkpoint_stale' AND resource=$2",
     )
@@ -2374,8 +2369,7 @@ async fn files_move_between_attachments_the_workspace_and_the_library() -> anyho
 }
 #[tokio::test]
 #[ignore = "requires PostgreSQL/NATS, Docker and an execution node"]
-async fn profiles_layer_dependencies_and_unused_images_leave_the_node() -> anyhow::Result<()> {
-    use ryzhub_server::config::ProfileConfig;
+async fn a_dependency_layer_mounts_and_leaves_the_node_once_unused() -> anyhow::Result<()> {
     // A dependency layer holding one marker file.
     let tree = tempfile::tempdir()?;
     let marker = format!("deps-{}", Uuid::now_v7().simple());
@@ -2394,26 +2388,9 @@ async fn profiles_layer_dependencies_and_unused_images_leave_the_node() -> anyho
         String::from_utf8_lossy(&built.stderr)
     );
     let deps = String::from_utf8(built.stdout)?.trim().to_owned();
-    let h = Harness::with(|config| {
-        config.sandbox.profiles = vec![ProfileConfig {
-            name: "with-deps".into(),
-            deps: deps.clone(),
-            ..Default::default()
-        }];
-    })
-    .await?;
+    let h = Harness::with(|config| config.sandbox.deps = deps.clone()).await?;
     let user = h.user().await?;
-    let org = id(&user, "org_id");
-    let created: Value = reqwest::Client::new()
-        .post(format!("{}/orgs/{org}/conversations", h.base))
-        .bearer_auth(user["token"].as_str().unwrap())
-        .json(&json!({"title": "deps", "mode": "chat", "run_config": {"env_profile": "with-deps"}}))
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
-    let conv = id(&created, "id");
+    let conv = h.conversation(&user).await?;
     let mut owner = h.owner()?;
     h.send(&user, conv, message("depscheck")).await?;
     let run = h.wait_state(conv, "completed").await?;
@@ -2471,8 +2448,8 @@ async fn profiles_layer_dependencies_and_unused_images_leave_the_node() -> anyho
         ryzhub_server::sandbox::collect_images(&app, &worker).await?;
     }
     assert!(held().await?, "a configured layer stays");
-    // Once no profile names it and nothing uses it, it leaves the node.
-    keep.sandbox.profiles.clear();
+    // Once configuration no longer names it and nothing uses it, it leaves the node.
+    keep.sandbox.deps.clear();
     let app = App::new(h.app.store.clone(), h.app.nats.clone(), keep)?;
     ryzhub_server::sandbox::collect_images(&app, &worker).await?;
     tokio::time::sleep(Duration::from_millis(1100)).await;

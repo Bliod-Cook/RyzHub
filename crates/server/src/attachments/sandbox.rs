@@ -43,19 +43,12 @@ pub async fn sync(app: &App, lease: &Lease, sandbox: Uuid) -> anyhow::Result<()>
     if missing.is_empty() {
         return Ok(());
     }
-    let (primary, secondary) = attachment_stores(app, lease.org_id)?;
+    let stores = attachment_stores(app, lease.org_id)?;
     for name in missing {
         let Some(file) = files.get(&name) else {
             continue;
         };
-        let opened = match primary.open(&file.sha256).await {
-            Ok(opened) => Ok(opened),
-            Err(error) => match &secondary {
-                Some(secondary) => secondary.open(&file.sha256).await,
-                None => Err(error),
-            },
-        };
-        let (size, reader) = match opened {
+        let (size, reader) = match stores.open(&file.sha256).await {
             Ok(opened) => opened,
             Err(error) => {
                 tracing::warn!(%error, sha256 = file.sha256, "attachment content missing");

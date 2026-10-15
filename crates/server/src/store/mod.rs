@@ -252,6 +252,15 @@ pub async fn audit_as(
     Ok(())
 }
 
+/// Hold the lock named `key` until `tx` ends.
+pub async fn advisory_lock(tx: &mut Tx<'_>, key: &str) -> anyhow::Result<()> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))")
+        .bind(key)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
 /// Latest organization policy restricted by the instance policy.
 pub async fn effective_policy(
     tx: &mut Tx<'_>,

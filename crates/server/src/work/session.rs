@@ -60,7 +60,6 @@ enum Source {
 /// The conversation's running sandbox, provisioning or resuming it first. Returns its id.
 pub async fn ensure_work(app: &App, lease: &Lease, run: Uuid) -> anyhow::Result<Uuid> {
     let settings = run_settings(app, lease, run).await?;
-    let cfg = &app.config.sandbox;
     // An idle suspension checkpoints and then stops the sandbox. A run admitted meanwhile must
     // not start using it: wait, then resume from the checkpoint the suspension took. No new
     // suspension can start once this run exists, and the check shares the lease lock with the
@@ -89,23 +88,7 @@ pub async fn ensure_work(app: &App, lease: &Lease, run: Uuid) -> anyhow::Result<
             .fetch_one(&mut *tx)
             .await?;
     let limits = sandbox::limits(&mut tx, app, lease.org_id).await?;
-    let env = sandbox::environment(app, &settings.env_profile, true)?;
-    let mut spec = SandboxSpec {
-        id: Uuid::now_v7(),
-        org_id: lease.org_id,
-        workspace_id: lease.conversation_id,
-        exec_epoch: lease.epoch as u64,
-        image: env.image,
-        runtime: cfg.runtime.clone(),
-        memory_bytes: env.memory_bytes,
-        pids_limit: env.pids_limit,
-        persistent: true,
-        egress: limits.egress,
-        disk_bytes: env
-            .disk_cap
-            .map_or(limits.disk_bytes, |cap| cap.min(limits.disk_bytes)),
-        deps: env.deps,
-    };
+    let mut spec = sandbox::spec(app, lease, Uuid::now_v7(), true, limits);
     let source = match (running, fork) {
         (Some((id, handle, node_lease)), _) => {
             ensure!(
@@ -257,7 +240,8 @@ pub async fn ensure_work(app: &App, lease: &Lease, run: Uuid) -> anyhow::Result<
         GuestCommand::NativeStart {
             harness: settings.harness.clone(),
             model: settings.model.clone(),
-            mcp: app.config.search.enabled || !app.config.work.mcp_tools.is_empty(),
+            // What the gateway serves: memory tools and the run's plugin tools.
+            mcp: app.config.search.enabled || app.config.plugins.enabled,
             acp: crate::run_config::acp(&app.config, &settings.harness).cloned(),
             models: crate::run_config::models(&app.config, &settings.harness, &settings.protocol),
         },

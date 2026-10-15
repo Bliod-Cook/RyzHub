@@ -57,7 +57,8 @@ async fn tool_call(
 }
 
 /// `POST /orgs/{org}/conversations/{conv}/apps`: the address of the MCP App page that shows
-/// a tool item, with the input and result to hand it.
+/// a tool item, with the input and result to hand it, and what the run calls the tools of its
+/// server, which the page knows by their names there.
 pub async fn open(
     State(app): State<App>,
     headers: HeaderMap,
@@ -67,12 +68,17 @@ pub async fn open(
     let (ctx, mut tx) = member_tx(&app, &headers, org).await?;
     let (run, name, arguments, result) =
         tool_call(&mut tx, org, ctx.user_id, conv, request.item_id).await?;
-    let tool = super::run_tools(&app, &mut tx, org, run)
-        .await?
-        .into_iter()
+    let tools = super::run_tools(&app, &mut tx, org, run).await?;
+    tx.commit().await?;
+    let tool = tools
+        .iter()
         .find(|tool| tool.name == name)
         .context(Code::PluginNotFound)?;
-    tx.commit().await?;
+    let names: serde_json::Map<String, Value> = tools
+        .iter()
+        .filter(|t| t.installation == tool.installation && t.server == tool.server)
+        .map(|t| (t.remote.clone(), json!(t.name)))
+        .collect();
     let uri = tool.ui.clone().context(Code::PluginNotFound)?;
     let session = super::session(&app, org, tool.installation, &tool.server).await?;
     let read = session.resource(&uri).await?;
@@ -117,6 +123,7 @@ pub async fn open(
         "origin": app.config.plugins.content_origin.trim_end_matches('/'),
         "tool": tool.name,
         "plugin": tool.plugin,
+        "tools": names,
         "arguments": arguments,
         "result": result,
     })))
@@ -197,16 +204,16 @@ async fn page(State(app): State<App>, Path(token): Path<String>) -> Response {
 
 #[derive(Deserialize)]
 pub struct CallRequest {
-    /// The tool item the app or component belongs to.
+    /// The tool item the app belongs to.
     item_id: Uuid,
     tool: String,
     #[serde(default)]
     arguments: Value,
 }
 
-/// `POST /orgs/{org}/conversations/{conv}/tool-calls`: a call an MCP App or a declarative
-/// component makes. It may call the tools of the run its item belongs to, as the model could;
-/// tools that need the member's approval each time are not callable from there.
+/// `POST /orgs/{org}/conversations/{conv}/tool-calls`: a call an MCP App makes. It may call the
+/// tools of the run its item belongs to, as the model could; tools that need the member's
+/// approval each time are not callable from there.
 pub async fn call(
     State(app): State<App>,
     headers: HeaderMap,

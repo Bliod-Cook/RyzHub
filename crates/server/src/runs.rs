@@ -679,7 +679,7 @@ pub async fn resolve(tx: &mut Tx<'_>, lease: &Lease, r: Resolution<'_>) -> anyho
             .bind(action.run_id)
             .bind(action.run_epoch)
             .bind(tool)
-            .bind(crate::mcp::args_digest(&request["arguments"]))
+            .bind(crate::mcp::digest(tool, &request["arguments"]))
             .execute(&mut **tx)
             .await?;
         }

@@ -54,7 +54,7 @@ pub async fn upload(
         })?;
     let (format, media_type) =
         Format::of(spool.head(), &query.name).context(Code::UnsupportedProjectFile)?;
-    let program = crate::attachments::renderer(&app.config.attachment_renderer)?;
+    let program = crate::child::program(&app.config.attachment_renderer)?;
     let extracted = extract::extract(&program, format, spool.path()).await?;
     require!(!extracted.text.trim().is_empty(), Code::DocumentUnreadable);
     // Text is its own source; a document is kept as it came.
@@ -114,13 +114,11 @@ pub async fn upload(
     .fetch_one(&mut *tx)
     .await?;
     if let Some(source) = source {
-        let (primary, secondary) = attachment_stores(&app, org)?;
-        for store in std::iter::once(primary).chain(secondary) {
-            let reader = tokio::fs::File::open(source.path()).await?;
-            store
-                .put_stream(&source.sha256, reader, source.size)
-                .await?;
-        }
+        let (path, size) = (source.path(), source.size);
+        let file = || async move { anyhow::Ok((size, tokio::fs::File::open(path).await?)) };
+        attachment_stores(&app, org)?
+            .put(&source.sha256, file)
+            .await?;
     }
     tx.commit().await?;
     if let Some(old) = replaced.filter(|old| Some(old) != source.map(|s| &s.sha256)) {
@@ -153,14 +151,7 @@ pub async fn source(
     let (name, Some(sha256), Some(size)) = row.context(Code::NoDocument)? else {
         return Err(Code::NoDocument.into());
     };
-    let (primary, secondary) = attachment_stores(&app, org)?;
-    let reader = match primary.open(&sha256).await {
-        Ok((_, reader)) => reader,
-        Err(error) => match &secondary {
-            Some(secondary) => secondary.open(&sha256).await?.1,
-            None => return Err(error.into()),
-        },
-    };
+    let (_, reader) = attachment_stores(&app, org)?.open(&sha256).await?;
     let mut response = Body::from_stream(tokio_util::io::ReaderStream::new(reader)).into_response();
     let headers = response.headers_mut();
     headers.insert(
@@ -203,11 +194,7 @@ pub(crate) async fn release(app: &App, org: Uuid, sha256: &str) {
         .fetch_one(&mut *tx)
         .await?;
         if !used {
-            let (primary, secondary) = attachment_stores(app, org)?;
-            primary.delete(sha256).await?;
-            if let Some(secondary) = secondary {
-                secondary.delete(sha256).await?;
-            }
+            attachment_stores(app, org)?.delete(sha256).await?;
         }
         tx.commit().await?;
         anyhow::Ok(())

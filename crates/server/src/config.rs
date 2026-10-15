@@ -127,28 +127,10 @@ pub struct SandboxConfig {
     /// Optional read-only dependency layer over the base image (package caches, common
     /// tools), pinned by digest; `scripts/build-deps.sh` builds one.
     pub deps: String,
-    /// Environments a run may choose by name (`env_profile`); without one it gets the image,
-    /// layer and resources above.
-    pub profiles: Vec<ProfileConfig>,
     /// `runc` or `runsc` (gVisor).
     pub runtime: String,
     pub memory_bytes: u64,
     pub pids_limit: u64,
-}
-
-/// A named sandbox environment.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct ProfileConfig {
-    pub name: String,
-    /// Base image, pinned by digest; empty uses `sandbox.image`.
-    pub image: String,
-    /// Dependency layer, pinned by digest; empty means none.
-    pub deps: String,
-    pub memory_bytes: Option<u64>,
-    pub pids_limit: Option<u64>,
-    /// At most this writable layer, within policy.
-    pub disk_bytes: Option<u64>,
 }
 
 /// An execution node.
@@ -200,7 +182,6 @@ impl Default for SandboxConfig {
             image_gc_after_secs: 7 * 24 * 3600,
             image: String::new(),
             deps: String::new(),
-            profiles: vec![],
             runtime: "runc".into(),
             memory_bytes: 256 * 1024 * 1024,
             pids_limit: 128,
@@ -407,7 +388,6 @@ pub struct WorkConfig {
     /// An idle Work sandbox is checkpointed and stopped after this long; the next message
     /// resumes it from that checkpoint (0 keeps sandboxes running).
     pub idle_suspend_secs: u64,
-    pub mcp_tools: Vec<crate::mcp::Tool>,
 }
 
 impl Default for WorkConfig {
@@ -423,7 +403,6 @@ impl Default for WorkConfig {
             checkpoint_keep_last: 20,
             checkpoint_gc_grace_secs: 86400,
             idle_suspend_secs: 1800,
-            mcp_tools: vec![],
         }
     }
 }
@@ -623,20 +602,6 @@ impl Config {
                     && self.work.checkpoint_interval_secs >= 30,
                 "invalid Work configuration"
             );
-            let mut names = std::collections::BTreeSet::new();
-            for tool in &self.work.mcp_tools {
-                let url = reqwest::Url::parse(&tool.url)?;
-                ensure!(
-                    matches!(url.scheme(), "http" | "https")
-                        && url.username().is_empty()
-                        && url.password().is_none()
-                        && names.insert(&tool.name)
-                        && !crate::memory::TOOLS.contains(&tool.name.as_str())
-                        && !tool.name.is_empty()
-                        && tool.input_schema.is_object(),
-                    "invalid MCP catalog"
-                );
-            }
         }
         if self.sandbox.enabled {
             ensure!(
@@ -657,33 +622,10 @@ impl Config {
                         .all(|rule| ryzhub_execution::egress::valid_rule(rule)),
                 "invalid sandbox.egress_allow"
             );
-            let pinned = ryzhub_execution::host::pinned;
             ensure!(
-                self.sandbox.deps.is_empty() || pinned(&self.sandbox.deps),
+                self.sandbox.deps.is_empty() || ryzhub_execution::host::pinned(&self.sandbox.deps),
                 "sandbox.deps must be pinned by digest"
             );
-            let mut profiles = std::collections::BTreeSet::new();
-            for profile in &self.sandbox.profiles {
-                ensure!(
-                    profiles.insert(&profile.name)
-                        && (1..=63).contains(&profile.name.len())
-                        && profile
-                            .name
-                            .bytes()
-                            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-                        && (profile.image.is_empty() || pinned(&profile.image))
-                        && (profile.deps.is_empty() || pinned(&profile.deps))
-                        && profile
-                            .memory_bytes
-                            .is_none_or(|m| (64 << 20..=4 << 30).contains(&m))
-                        && profile.pids_limit.is_none_or(|p| (16..=1024).contains(&p))
-                        && profile
-                            .disk_bytes
-                            .is_none_or(|d| (256 << 20..=1 << 40).contains(&d)),
-                    "invalid sandbox profile {:?}",
-                    profile.name
-                );
-            }
             let mut names = std::collections::BTreeSet::new();
             for node in self.sandbox.nodes() {
                 ensure!(
@@ -811,9 +753,6 @@ impl Default for PushConfig {
 #[serde(default)]
 pub struct PluginsConfig {
     pub enabled: bool,
-    /// The platform's extension namespace in packages (`extensions.<namespace>` and the
-    /// directory of that name).
-    pub namespace: String,
     /// Publishers whose signed packages are trusted: key id → ed25519 public key (base64).
     pub trusted_keys: BTreeMap<String, String>,
     /// The official catalog: a JSON list of `{name, description, source, content_hash}`.
@@ -837,7 +776,6 @@ impl Default for PluginsConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            namespace: "app.ryzhub".into(),
             trusted_keys: BTreeMap::new(),
             catalog_url: String::new(),
             insecure_hosts: vec![],

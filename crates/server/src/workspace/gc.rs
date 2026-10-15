@@ -62,11 +62,7 @@ pub async fn gc(app: &App, org: Uuid, id: Uuid) -> anyhow::Result<bool> {
     .fetch_one(&mut *tx)
     .await?;
     if !shared {
-        let (primary, secondary) = stores(app, org)?;
-        primary.delete(key).await?;
-        if let Some(secondary) = secondary {
-            secondary.delete(key).await?;
-        }
+        stores(app, org)?.delete(key).await?;
     }
     sqlx::query("UPDATE checkpoints SET state='deleted' WHERE org_id=$1 AND id=$2")
         .bind(org)

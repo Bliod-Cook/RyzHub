@@ -320,8 +320,7 @@ async fn capabilities(State(app): State<App>) -> Json<Value> {
         "push": config.push.enabled,
         "plugin_content_origin": config.plugins.content_origin,
         "attachments": {
-            "max_bytes": config.policy.attachment_bytes.unwrap_or(crate::attachments::DEFAULT_BYTES)
-                .min(crate::attachments::MAX_BYTES),
+            "max_bytes": crate::attachments::limit(&config.policy),
             "max_per_message": crate::attachments::MAX_PER_MESSAGE,
             // Larger files go in parts of this size through `/orgs/{org}/uploads`.
             "part_bytes": crate::attachments::uploads::PART_SIZE,

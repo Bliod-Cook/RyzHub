@@ -75,7 +75,7 @@ async fn idle_conversations_archive_and_expired_workspaces_are_deleted() -> anyh
     let store =
         ryzhub_server::workspace::blob::BlobStore::configured(&h.app.config.work.storage_root)?
             .scoped(org);
-    assert!(store.verify(&key).await?);
+    assert!(store.get(&key).await.is_ok());
 
     // Without a policy nothing happens, however old.
     let age = "UPDATE conversations SET created_at=now()-interval '2 hours' WHERE org_id=$1;
@@ -144,14 +144,14 @@ async fn idle_conversations_archive_and_expired_workspaces_are_deleted() -> anyh
         .fetch_one(&h.db)
         .await?;
     assert_eq!(retired, "tombstoned");
-    assert!(store.verify(&key).await?, "pinned object kept");
+    assert!(store.get(&key).await.is_ok(), "pinned object kept");
     sqlx::query("DELETE FROM restore_pins WHERE id=$1")
         .bind(pin)
         .execute(&h.db)
         .await?;
     ryzhub_server::lifecycle::sweep(&h.app, &worker).await?;
     assert_eq!(storage(&h, conv).await?, ("deleted".into(), None));
-    assert!(!store.verify(&key).await.unwrap_or(false), "object deleted");
+    assert!(store.get(&key).await.is_err(), "object deleted");
     let purges: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM audit_logs WHERE org_id=$1 AND action='workspace.purge'",
     )

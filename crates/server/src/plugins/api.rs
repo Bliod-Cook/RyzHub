@@ -7,6 +7,7 @@ use axum::{
     extract::{Path, State},
     http::HeaderMap,
 };
+use base64::Engine as _;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use uuid::Uuid;
@@ -57,8 +58,9 @@ pub async fn preview(
     let upload = request
         .archive
         .as_deref()
-        .map(super::decode_upload)
-        .transpose()?;
+        .map(|archive| base64::engine::general_purpose::STANDARD.decode(archive))
+        .transpose()
+        .context(Code::InvalidInput)?;
     let obtained = obtain(&app, &request.source, upload.as_deref()).await?;
     require!(
         obtained.trust != "unverified" || policy.allow_unverified_plugins != Some(false),
@@ -94,7 +96,7 @@ pub async fn preview(
     let mut tools = vec![];
     let mut unlisted = vec![];
     for server in obtained.manifest.servers.iter().filter(|s| s.enabled) {
-        let headers = static_headers(server);
+        let headers = super::package_headers(server)?;
         let listed = async {
             let session = client::Session::open(&fetcher(&app), &server.url, headers).await?;
             session.tools().await
@@ -126,19 +128,6 @@ pub async fn preview(
 fn ensure_enabled(app: &App) -> anyhow::Result<()> {
     ensure!(app.config.plugins.enabled, Code::PluginsDisabled);
     Ok(())
-}
-
-fn static_headers(server: &super::package::Server) -> HeaderMap {
-    let mut headers = HeaderMap::new();
-    for (name, value) in &server.headers {
-        if let (Ok(name), Ok(value)) = (
-            reqwest::header::HeaderName::from_bytes(name.as_bytes()),
-            reqwest::header::HeaderValue::from_str(value),
-        ) {
-            headers.insert(name, value);
-        }
-    }
-    headers
 }
 
 async fn insert_version(
@@ -245,6 +234,8 @@ pub async fn install(
         &request.secrets,
     )
     .await?;
+    // TODO(org): organization-wide installations (`scope='org'`) need their management UI;
+    // every installation is a member's, the column's default.
     sqlx::query(
         "INSERT INTO plugin_installations(id,org_id,plugin_id,user_id,version_id,state,config,secrets,confirmed_at)
          VALUES($1,$2,$3,$4,$5,'active',$6,$7,now())",
@@ -257,15 +248,6 @@ pub async fn install(
     .bind(Value::Object(config))
     .bind(Value::Object(secrets))
     .execute(&mut *tx)
-    .await?;
-    grant(
-        &mut tx,
-        org,
-        installation,
-        request.version_id,
-        &manifest,
-        ctx.user_id,
-    )
     .await?;
     crate::store::audit(
         &mut tx,
@@ -282,28 +264,6 @@ pub async fn install(
     Ok(Json(entry))
 }
 
-async fn grant(
-    tx: &mut Tx<'_>,
-    org: Uuid,
-    installation: Uuid,
-    version: Uuid,
-    manifest: &Manifest,
-    user: Uuid,
-) -> anyhow::Result<()> {
-    sqlx::query(
-        "INSERT INTO plugin_grants(org_id,installation_id,version_id,permissions_digest,granted_by)
-         VALUES($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING",
-    )
-    .bind(org)
-    .bind(installation)
-    .bind(version)
-    .bind(manifest.permissions_digest())
-    .bind(user)
-    .execute(&mut **tx)
-    .await?;
-    Ok(())
-}
-
 /// Checked settings: plain values in `config`, secret ones in the vault. `old_*` are the
 /// current values; a setting left out keeps its value, a null clears it.
 #[allow(clippy::too_many_arguments)]
@@ -318,14 +278,18 @@ async fn settings(
     config: &Map<String, Value>,
     secrets: &Map<String, Value>,
 ) -> anyhow::Result<(Map<String, Value>, Map<String, Value>)> {
-    for name in config.keys().chain(secrets.keys()) {
-        ensure!(fields.contains_key(name), Code::InvalidArguments);
+    let plain = config.keys().map(|name| (name, false));
+    for (name, secret) in plain.chain(secrets.keys().map(|name| (name, true))) {
+        ensure!(
+            fields.get(name).is_some_and(|field| field.secret == secret),
+            Code::InvalidArguments
+        );
     }
     let mut kept_config = old_config.clone();
     let mut kept_secrets = old_secrets.clone();
     for (name, field) in fields {
         let given = if field.secret {
-            secrets.get(name).or_else(|| config.get(name))
+            secrets.get(name)
         } else {
             config.get(name)
         };
@@ -700,7 +664,6 @@ pub async fn update(
         .bind(version)
         .execute(&mut *tx)
         .await?;
-        grant(&mut tx, org, id, version, &obtained.manifest, ctx.user_id).await?;
     }
     tx.commit().await?;
     let listed = refresh_tools(&app, org, id, false).await?;
@@ -718,26 +681,6 @@ pub async fn confirm(
 ) -> ApiResult<Json<Value>> {
     let (ctx, mut tx) = member_tx(&app, &headers, org).await?;
     owned(&mut tx, &ctx, id).await?;
-    let pending: Option<(Uuid, Value)> = sqlx::query_as(
-        "SELECT v.id,v.manifest FROM plugin_installations i JOIN plugin_versions v
-           ON v.org_id=i.org_id AND v.id=i.pending_version_id WHERE i.org_id=$1 AND i.id=$2",
-    )
-    .bind(org)
-    .bind(id)
-    .fetch_optional(&mut *tx)
-    .await?;
-    if let Some((version, manifest)) = pending {
-        let manifest: Manifest = serde_json::from_value(manifest)?;
-        sqlx::query(
-            "UPDATE plugin_installations SET version_id=$3,pending_version_id=NULL WHERE org_id=$1 AND id=$2",
-        )
-        .bind(org)
-        .bind(id)
-        .bind(version)
-        .execute(&mut *tx)
-        .await?;
-        grant(&mut tx, org, id, version, &manifest, ctx.user_id).await?;
-    }
     sqlx::query(
         "UPDATE plugin_tools SET approved_digest=digest WHERE org_id=$1 AND installation_id=$2",
     )
@@ -746,7 +689,9 @@ pub async fn confirm(
     .execute(&mut *tx)
     .await?;
     sqlx::query(
-        "UPDATE plugin_installations SET state='active',confirmed_at=now(),updated_at=now() WHERE org_id=$1 AND id=$2",
+        "UPDATE plugin_installations SET version_id=coalesce(pending_version_id,version_id),
+           pending_version_id=NULL,state='active',confirmed_at=now(),updated_at=now()
+         WHERE org_id=$1 AND id=$2",
     )
     .bind(org)
     .bind(id)
@@ -889,9 +834,9 @@ pub async fn conversation_plugins(
 }
 
 async fn conversation_states(tx: &mut Tx<'_>, org: Uuid, conv: Uuid) -> anyhow::Result<Value> {
-    type Row = (Uuid, String, bool, Option<bool>, Option<bool>, String);
+    type Row = (Uuid, String, bool, Option<bool>, Option<bool>);
     let rows: Vec<Row> = sqlx::query_as(
-        "SELECT i.id,p.name,i.enabled,cp.enabled,pp.enabled,i.state FROM plugin_installations i
+        "SELECT i.id,p.name,i.enabled,cp.enabled,pp.enabled FROM plugin_installations i
          JOIN plugins p ON p.org_id=i.org_id AND p.id=i.plugin_id
          JOIN conversations c ON c.org_id=i.org_id AND c.id=$2
          LEFT JOIN conversation_plugins cp ON cp.conversation_id=c.id AND cp.installation_id=i.id
@@ -904,9 +849,9 @@ async fn conversation_states(tx: &mut Tx<'_>, org: Uuid, conv: Uuid) -> anyhow::
     .await?;
     let commands = super::commands(tx, org, conv).await?;
     Ok(json!({
-        "plugins": rows.into_iter().map(|(id, name, own, conversation, project, state)| json!({
-            "id": id, "name": name, "state": state,
-            "enabled": state != "pending" && conversation.or(project).unwrap_or(own),
+        "plugins": rows.into_iter().map(|(id, name, own, conversation, project)| json!({
+            "id": id, "name": name,
+            "enabled": conversation.or(project).unwrap_or(own),
             "conversation": conversation, "project": project, "own": own,
         })).collect::<Vec<_>>(),
         "commands": commands,

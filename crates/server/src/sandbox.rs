@@ -149,49 +149,28 @@ pub async fn limits(tx: &mut Tx<'_>, app: &App, org: Uuid) -> anyhow::Result<Lim
     Ok(Limits { egress, disk_bytes })
 }
 
-/// The image, dependency layer and resources of a sandbox environment.
-pub struct Environment {
-    pub image: String,
-    pub deps: Option<String>,
-    pub memory_bytes: u64,
-    pub pids_limit: u64,
-    /// The profile's own disk limit, below policy's.
-    pub disk_cap: Option<u64>,
-}
-
-/// The environment of `profile` (a `sandbox.profiles` name; empty is the default). Work
-/// sandboxes get at least 512 MiB of memory.
-pub fn environment(app: &App, profile: &str, work: bool) -> anyhow::Result<Environment> {
+/// A new sandbox of the lease's conversation: the configured image, layer and resources,
+/// within `limits`. Work sandboxes (`persistent`) get at least 512 MiB of memory.
+pub fn spec(app: &App, lease: &Lease, id: Uuid, persistent: bool, limits: Limits) -> SandboxSpec {
     let config = &app.config.sandbox;
-    let chosen = if profile.is_empty() {
-        None
-    } else {
-        Some(
-            config
-                .profiles
-                .iter()
-                .find(|p| p.name == profile)
-                .context(Code::InvalidArguments)?,
-        )
-    };
-    let image = chosen
-        .map(|p| p.image.as_str())
-        .filter(|image| !image.is_empty())
-        .unwrap_or(&config.image)
-        .to_owned();
-    let deps = chosen.map_or(config.deps.as_str(), |p| p.deps.as_str());
-    let memory = chosen
-        .and_then(|p| p.memory_bytes)
-        .unwrap_or(config.memory_bytes);
-    Ok(Environment {
-        image,
-        deps: (!deps.is_empty()).then(|| deps.to_owned()),
-        memory_bytes: if work { memory.max(512 << 20) } else { memory },
-        pids_limit: chosen
-            .and_then(|p| p.pids_limit)
-            .unwrap_or(config.pids_limit),
-        disk_cap: chosen.and_then(|p| p.disk_bytes),
-    })
+    SandboxSpec {
+        id,
+        org_id: lease.org_id,
+        workspace_id: lease.conversation_id,
+        exec_epoch: lease.epoch as u64,
+        image: config.image.clone(),
+        runtime: config.runtime.clone(),
+        memory_bytes: if persistent {
+            config.memory_bytes.max(512 << 20)
+        } else {
+            config.memory_bytes
+        },
+        pids_limit: config.pids_limit,
+        persistent,
+        egress: limits.egress,
+        disk_bytes: limits.disk_bytes,
+        deps: (!config.deps.is_empty()).then(|| config.deps.clone()),
+    }
 }
 
 /// Where to stream artifacts and files for `sandbox`: its node.
@@ -372,31 +351,13 @@ pub async fn ensure_sandbox(
         }
         let existing = live.map(|(id, _)| id);
         let id = existing.unwrap_or_else(Uuid::now_v7);
-        let limits = limits(&mut tx, app, lease.org_id).await?;
-        let profile: Option<String> = sqlx::query_scalar(
-            "SELECT run_config->>'env_profile' FROM runs WHERE org_id=$1 AND id=$2",
-        )
-        .bind(lease.org_id)
-        .bind(run)
-        .fetch_one(&mut *tx)
-        .await?;
-        let env = environment(app, profile.as_deref().unwrap_or_default(), false)?;
-        let spec = SandboxSpec {
+        let spec = spec(
+            app,
+            lease,
             id,
-            org_id: lease.org_id,
-            workspace_id: lease.conversation_id,
-            exec_epoch: lease.epoch as u64,
-            image: env.image,
-            runtime: app.config.sandbox.runtime.clone(),
-            memory_bytes: env.memory_bytes,
-            pids_limit: env.pids_limit,
-            persistent: false,
-            egress: limits.egress,
-            disk_bytes: env
-                .disk_cap
-                .map_or(limits.disk_bytes, |cap| cap.min(limits.disk_bytes)),
-            deps: env.deps,
-        };
+            false,
+            limits(&mut tx, app, lease.org_id).await?,
+        );
         if existing.is_none() {
             // Its workspace is restored onto the node below if the node has no copy.
             sqlx::query(
@@ -659,7 +620,6 @@ async fn checkpoint_if_changed(app: &App, lease: &Lease, sandbox: Uuid) {
 /// Chat sandboxes after their run: each stays up `sandbox.chat_idle_secs` for the next run to
 /// reuse, with the workspace checkpointed once the run ends, then is destroyed. Destroy
 /// unmounts the sandbox's overlay and image and keeps the separate `/workspace` directory.
-/// Sandboxes earlier versions only stopped are destroyed too.
 ///
 /// A run about to use the sandbox (`reusing`) does not wait for the previous run's checkpoint:
 /// its own end checkpoints both runs' changes.
@@ -680,7 +640,7 @@ pub async fn cleanup(app: &App, lease: &Lease, reusing: bool) -> anyhow::Result<
         .await?;
         let expired = sqlx::query_scalar(
             "SELECT id FROM sandboxes WHERE org_id=$1 AND conversation_id=$2 AND NOT persistent
-             AND (state='stopped' OR (state IN ('running','provisioning') AND idle_until<=now()))",
+             AND state IN ('running','provisioning') AND idle_until<=now()",
         )
         .bind(lease.org_id)
         .bind(lease.conversation_id)
@@ -738,12 +698,11 @@ pub async fn reclaim_once(app: &App, worker: &sqlx::PgPool) -> anyhow::Result<()
     let config = &app.config.sandbox;
     // A stopped sandbox is never used again: resuming, restoring and recovering a Work
     // workspace all start a new one from a checkpoint, and a Chat run only reuses a running
-    // one. ('stopped' is what earlier versions left Chat sandboxes in; Destroy keeps the
-    // workspace.) With no writer left to fence out, it is destroyed under the last epoch:
-    // fences the node took after its row last changed (later owners', or another runtime's
-    // before 0012) do not hold it up, and the node's tombstone refuses a late Create.
+    // one. With no writer left to fence out, it is destroyed under the last epoch: fences the
+    // node took after its row last changed (later owners') do not hold it up, and the node's
+    // tombstone refuses a late Create.
     let stopped: Vec<(Uuid, Uuid)> = sqlx::query_as(
-        "SELECT org_id,id FROM sandboxes WHERE state IN ('suspended','archived','lost','stopped')
+        "SELECT org_id,id FROM sandboxes WHERE state IN ('suspended','archived','lost')
          AND coalesce(node_lease_until,created_at)<now()-($1::bigint*interval '1 second') LIMIT 100",
     )
     .bind(config.reclaim_after_secs as i64)
@@ -761,7 +720,7 @@ pub async fn reclaim_once(app: &App, worker: &sqlx::PgPool) -> anyhow::Result<()
         let mut tx = app.store.tx(org).await?;
         sqlx::query(
             "UPDATE sandboxes SET state='deleted' WHERE org_id=$1 AND id=$2
-             AND state IN ('suspended','archived','lost','stopped')",
+             AND state IN ('suspended','archived','lost')",
         )
         .bind(org)
         .bind(id)
@@ -800,7 +759,6 @@ async fn image_references(
     let config = &app.config.sandbox;
     let configured = [&config.image, &config.deps]
         .into_iter()
-        .chain(config.profiles.iter().flat_map(|p| [&p.image, &p.deps]))
         .filter(|image| !image.is_empty())
         .cloned();
     let query = |live: bool| {
@@ -955,14 +913,10 @@ async fn evict_workspaces(app: &App, worker: &sqlx::PgPool) -> anyhow::Result<()
 /// Warn about, and audit at most hourly, running Work workspaces in use whose last committed
 /// checkpoint is older than [`CHECKPOINT_STALE_SECS`].
 async fn report_stale_checkpoints(app: &App, worker: &sqlx::PgPool) -> anyhow::Result<()> {
-    let stale: Vec<(Uuid, Uuid, Uuid)> = sqlx::query_as(
-        "SELECT s.org_id,s.conversation_id,s.id FROM sandboxes s WHERE s.persistent AND s.state='running'
-         AND coalesce((SELECT max(c.created_at) FROM checkpoints c WHERE c.org_id=s.org_id
-             AND c.conversation_id=s.conversation_id AND c.state='committed'),s.created_at)
-             <now()-($1::bigint*interval '1 second')
-         AND EXISTS(SELECT 1 FROM runs r WHERE r.org_id=s.org_id AND r.conversation_id=s.conversation_id
-             AND coalesce(r.ended_at,'infinity')>now()-($1::bigint*interval '1 second'))",
-    )
+    let stale: Vec<(Uuid, Uuid, Uuid)> = sqlx::query_as(concat!(
+        "SELECT s.org_id,s.conversation_id,s.id FROM sandboxes s WHERE ",
+        stale_checkpoint!()
+    ))
     .bind(CHECKPOINT_STALE_SECS)
     .fetch_all(worker)
     .await?;
@@ -1058,19 +1012,14 @@ pub async fn collect_egress(app: &App, node: &str) -> anyhow::Result<usize> {
 /// keeps leases alive.
 pub async fn heartbeat(app: App, worker: sqlx::PgPool) -> anyhow::Result<()> {
     loop {
-        let nodes = app.config.sandbox.nodes();
-        let single = nodes.len() == 1;
-        for node in &nodes {
+        for node in &app.config.sandbox.nodes() {
             let Ok(status) = host_on(&app, &node.name, HostCommand::Status).await else {
                 continue;
             };
             let alive: Vec<Uuid> = serde_json::from_value(status["running"].clone())?;
-            // With one node every sandbox is on it, whatever name an older row recorded.
             let persistent: Vec<(Uuid, Uuid)> = sqlx::query_as(
-                "SELECT org_id,id FROM sandboxes WHERE persistent AND state='running'
-                 AND ($1 OR node=$2)",
+                "SELECT org_id,id FROM sandboxes WHERE persistent AND state='running' AND node=$1",
             )
-            .bind(single)
             .bind(&node.name)
             .fetch_all(&worker)
             .await?;

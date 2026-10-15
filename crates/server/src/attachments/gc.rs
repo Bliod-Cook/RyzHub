@@ -44,11 +44,7 @@ pub async fn reclaim(app: &App, org: Uuid, id: Uuid) -> anyhow::Result<()> {
     .fetch_one(&mut *tx)
     .await?;
     if !shared {
-        let (primary, secondary) = attachment_stores(app, org)?;
-        primary.delete(&sha256).await?;
-        if let Some(secondary) = secondary {
-            secondary.delete(&sha256).await?;
-        }
+        attachment_stores(app, org)?.delete(&sha256).await?;
     }
     sqlx::query(
         "UPDATE attachments SET state='reclaimed',name='',model_data=NULL,text_content=NULL

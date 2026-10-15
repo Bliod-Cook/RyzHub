@@ -1,7 +1,5 @@
 use super::*;
 
-const NS: &str = "app.ryzhub";
-
 fn files(entries: &[(&str, &str)]) -> Files {
     entries
         .iter()
@@ -16,11 +14,11 @@ fn agent_plugin() -> Files {
         "version": "1.2.0",
         "description": "Acme tickets",
         "extensions": {
-            NS: {
-                "permissions": {"tools": {"default": "ask", "readOnly": "allow", "tools": {"purge": "deny"}}},
+            NAMESPACE: {
+                "permissions": {"deny": ["purge"]},
                 "commands": [{"name": "triage", "title": "Triage", "prompt": "app.ryzhub/commands/triage.md",
                               "params": {"project": {"type": "string"}}}],
-                "ui": {"declarative": true, "mcpApps": true},
+                "ui": {"mcpApps": true},
                 "userConfig": {"apiToken": {"type": "string", "secret": true, "header": "Authorization", "prefix": "Bearer "}},
             },
             "com.other.vendor": {"anything": true},
@@ -67,7 +65,7 @@ fn an_agent_plugin_with_the_platform_extension() {
         "{:?}",
         unpacked.keys()
     );
-    let manifest = parse(&unpacked, NS).unwrap();
+    let manifest = parse(&unpacked).unwrap();
     assert_eq!(
         (manifest.name.as_str(), manifest.format.as_str()),
         ("acme-tracker", "agent-plugins")
@@ -82,7 +80,7 @@ fn an_agent_plugin_with_the_platform_extension() {
         manifest.commands[0].prompt,
         "Triage the tickets of {{project}}."
     );
-    assert_eq!(manifest.permissions.tools.tools["purge"], "deny");
+    assert!(manifest.permissions.deny.contains("purge"));
     assert!(manifest.ui.mcp_apps);
     assert!(manifest.user_config["apiToken"].secret);
     let rendered = render(
@@ -113,17 +111,23 @@ fn the_standard_is_strict_where_it_says_so() {
     let mut plugin: Value = serde_json::from_slice(&extra["plugin.json"]).unwrap();
     plugin["commands"] = json!("not here");
     extra.insert("plugin.json".into(), plugin.to_string().into_bytes());
-    assert!(parse(&extra, NS).is_err());
+    assert!(parse(&extra).is_err());
     let mut named = agent_plugin();
     let mut plugin: Value = serde_json::from_slice(&named["plugin.json"]).unwrap();
     plugin["name"] = json!("Acme Tracker");
     named.insert("plugin.json".into(), plugin.to_string().into_bytes());
-    assert!(parse(&named, NS).is_err());
+    assert!(parse(&named).is_err());
     let mut outside = agent_plugin();
     let mut plugin: Value = serde_json::from_slice(&outside["plugin.json"]).unwrap();
-    plugin["extensions"][NS]["commands"][0]["prompt"] = json!("../secrets");
+    plugin["extensions"][NAMESPACE]["commands"][0]["prompt"] = json!("../secrets");
     outside.insert("plugin.json".into(), plugin.to_string().into_bytes());
-    assert!(parse(&outside, NS).is_err());
+    assert!(parse(&outside).is_err());
+    // Permissions are denials; other rules are refused rather than dropped.
+    let mut ruled = agent_plugin();
+    let mut plugin: Value = serde_json::from_slice(&ruled["plugin.json"]).unwrap();
+    plugin["extensions"][NAMESPACE]["permissions"] = json!({"tools": {"default": "deny"}});
+    ruled.insert("plugin.json".into(), plugin.to_string().into_bytes());
+    assert!(parse(&ruled).is_err());
 }
 
 #[test]
@@ -163,7 +167,7 @@ fn claude_code_plugins_are_converted() {
         ),
         ("agents/helper.md", "helper"),
     ]);
-    let manifest = parse(&package, NS).unwrap();
+    let manifest = parse(&package).unwrap();
     assert_eq!(
         (manifest.name.as_str(), manifest.format.as_str()),
         ("review-kit", "claude-code")
@@ -194,35 +198,35 @@ fn claude_code_plugins_are_converted() {
 #[test]
 fn the_content_hash_leaves_out_the_signature() {
     let mut package = agent_plugin();
-    let hash = content_hash(&package, NS);
+    let hash = content_hash(&package);
     package.insert(
-        format!("{NS}/signature.json"),
+        format!("{NAMESPACE}/signature.json"),
         br#"{"key":"k","signature":"c2ln"}"#.to_vec(),
     );
-    assert_eq!(content_hash(&package, NS), hash);
+    assert_eq!(content_hash(&package), hash);
     assert_eq!(
-        parse(&package, NS).unwrap().signature,
+        parse(&package).unwrap().signature,
         Some(("k".into(), "c2ln".into()))
     );
     package.insert(
         "skills/triage/SKILL.md".into(),
         b"---\nname: triage\ndescription: x\n---\nother".to_vec(),
     );
-    assert_ne!(content_hash(&package, NS), hash);
+    assert_ne!(content_hash(&package), hash);
 }
 
 #[test]
 fn a_version_asking_for_more_is_noticed() {
-    let manifest = parse(&agent_plugin(), NS).unwrap();
+    let manifest = parse(&agent_plugin()).unwrap();
     assert!(!manifest.widened_by(&manifest));
     let mut looser = manifest.clone();
-    looser.permissions.tools.default = "allow".into();
+    looser.permissions.deny.clear();
     assert!(manifest.widened_by(&looser));
     let mut elsewhere = manifest.clone();
     elsewhere.servers[0].url = "https://other.example/mcp".into();
     assert!(manifest.widened_by(&elsewhere));
     let mut stricter = manifest.clone();
-    stricter.permissions.tools.default = "deny".into();
+    stricter.permissions.deny.insert("lookup".into());
     assert!(!manifest.widened_by(&stricter));
     assert_eq!(
         minimal("https://mcp.example.com/mcp", None).unwrap().name,

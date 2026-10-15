@@ -6,7 +6,7 @@ use serde_json::Value;
 use sqlx::Row;
 use uuid::Uuid;
 
-use super::stores;
+use super::{blob::Reader, stores};
 use crate::{
     app::App,
     error::Code,
@@ -17,38 +17,48 @@ use crate::{
 
 /// A checkpoint can be restored only by the harness version that wrote its native session.
 fn compatible(config: &crate::config::Config, manifest: &Value) -> bool {
-    let harness = manifest["harness"].as_str().unwrap_or("codex");
-    let version = manifest["harness_version"]
+    let written = manifest["harness"]
         .as_str()
-        .or_else(|| manifest["codex_version"].as_str());
+        .zip(manifest["harness_version"].as_str());
     manifest["image"]
         .as_str()
         .is_some_and(|image| image.contains("@sha256:"))
         && manifest["format"] == 1
         && manifest["encoding"] == "tar.zst"
-        && version == Some(crate::run_config::harness_version(config, harness).as_str())
+        && written.is_some_and(|(harness, version)| {
+            version == crate::run_config::harness_version(config, harness)
+        })
 }
 
-/// Make the primary store's copy valid (repairing it from the secondary if needed) and
-/// stream it to execution node `node` as `artifact`.
+/// Stream checkpoint `key` from the primary store to execution node `node` as `artifact`. A
+/// copy that is missing, or that the node finds is not `key`'s, is first repaired from the
+/// secondary store.
 async fn upload(app: &App, org: Uuid, key: &str, artifact: Uuid, node: &str) -> anyhow::Result<()> {
-    let (primary, secondary) = stores(app, org)?;
-    if !primary.verify(key).await? {
-        let secondary = secondary.context("checkpoint missing and no secondary store")?;
-        primary.repair_from(&secondary, key).await?;
-    }
-    let (size, reader) = primary.open(key).await?;
-    ryzhub_execution::upload(
-        &sandbox::node_endpoint(app, node)?,
-        &HostCommand::ArtifactUpload {
+    let stores = stores(app, org)?;
+    let endpoint = &sandbox::node_endpoint(app, node)?;
+    let send = |(size, reader): (u64, Reader)| {
+        let sha256 = key.into();
+        let command = HostCommand::ArtifactUpload {
             artifact,
             size,
-            sha256: key.into(),
-        },
-        size,
-        reader,
-    )
-    .await?;
+            sha256,
+        };
+        async move { ryzhub_execution::upload(endpoint, &command, size, reader).await }
+    };
+    if let Ok(opened) = stores.primary.open(key).await {
+        match send(opened).await {
+            Err(error)
+                if error
+                    .downcast_ref::<ryzhub_execution::Rejected>()
+                    .is_some_and(|rejected| rejected.0 == "CHECKSUM_MISMATCH") => {}
+            sent => return sent.map(drop),
+        }
+    }
+    let secondary = stores
+        .secondary
+        .context("checkpoint missing and no secondary store")?;
+    stores.primary.repair_from(&secondary, key).await?;
+    send(stores.primary.open(key).await?).await?;
     Ok(())
 }
 
@@ -273,26 +283,14 @@ pub async fn restore(app: &App, lease: &Lease, job: Uuid, link: &OwnerLink) -> a
             .fetch_one(&mut *tx)
             .await?,
         };
-        let cfg = &app.config.sandbox;
         let limits = sandbox::limits(&mut tx, app, lease.org_id).await?;
-        let spec = SandboxSpec {
-            id: job,
-            org_id: lease.org_id,
-            workspace_id: lease.conversation_id,
-            exec_epoch: lease.epoch as u64,
-            image: manifest["image"]
-                .as_str()
-                .context("manifest without image")?
-                .into(),
-            runtime: cfg.runtime.clone(),
-            memory_bytes: cfg.memory_bytes.max(512 * 1024 * 1024),
-            pids_limit: cfg.pids_limit,
-            persistent: true,
-            egress: limits.egress,
-            disk_bytes: limits.disk_bytes,
-            // A workspace comes back on the layers it was checkpointed on.
-            deps: manifest["deps"].as_str().map(Into::into),
-        };
+        let mut spec = sandbox::spec(app, lease, job, true, limits);
+        // A workspace comes back on the layers it was checkpointed on.
+        spec.image = manifest["image"]
+            .as_str()
+            .context("manifest without image")?
+            .into();
+        spec.deps = manifest["deps"].as_str().map(Into::into);
         sqlx::query(
             "INSERT INTO sandboxes(id,org_id,conversation_id,run_id,lease_epoch,exec_epoch,state,handle,persistent,native_thread_id,node)
              VALUES($1,$2,$3,$4,$5,$6,'provisioning',$7,true,$8,$9) ON CONFLICT DO NOTHING",

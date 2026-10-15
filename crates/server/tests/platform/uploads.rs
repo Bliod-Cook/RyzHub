@@ -122,10 +122,7 @@ async fn large_files_upload_in_parts_that_resume_and_complete_once() -> anyhow::
             .within("uploads")
             .within(&upload.to_string());
     let first = format!("{:x}", Sha256::digest(chunk(1)));
-    assert!(
-        !parts.verify(&first).await.unwrap_or(false),
-        "parts discarded"
-    );
+    assert!(parts.get(&first).await.is_err(), "parts discarded");
     let late = put(3, chunk(3)).await?;
     assert_eq!(late.status(), 409, "closed once completed");
 
@@ -153,13 +150,13 @@ async fn large_files_upload_in_parts_that_resume_and_complete_once() -> anyhow::
             .within("attachments")
             .within("uploads")
             .within(&gone.to_string());
-    assert!(parts.verify(&first).await?);
+    assert!(parts.get(&first).await.is_ok());
     sqlx::query("UPDATE uploads SET expires_at=now()-interval '1 minute' WHERE id=$1")
         .bind(gone)
         .execute(&h.db)
         .await?;
     ryzhub_server::attachments::gc::collect_org(&h.app, org).await?;
-    assert!(!parts.verify(&first).await.unwrap_or(false));
+    assert!(parts.get(&first).await.is_err());
     let state: Option<String> = sqlx::query_scalar("SELECT state FROM uploads WHERE id=$1")
         .bind(gone)
         .fetch_optional(&h.db)

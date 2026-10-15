@@ -1,4 +1,4 @@
-use crate::*;
+use crate::{archive::Tree, *};
 use anyhow::{Context, ensure};
 use serde_json::json;
 use std::{
@@ -128,49 +128,6 @@ impl Drop for CheckpointActivity<'_> {
     fn drop(&mut self) {
         self.active.lock().unwrap().remove(&self.id);
     }
-}
-
-/// The control channel to one sandbox's guest agent.
-pub struct GuestChannel {
-    socket: PathBuf,
-}
-
-impl GuestChannel {
-    /// One request and its reply.
-    pub async fn call(&self, request: &impl serde::Serialize) -> anyhow::Result<Value> {
-        call(&self.socket, request).await
-    }
-
-    /// A request whose connection stays open after the reply (see [`crate::attach`]).
-    pub async fn attach(
-        &self,
-        request: &impl serde::Serialize,
-    ) -> anyhow::Result<(Value, crate::ReadSide, crate::WriteSide)> {
-        crate::attach(&self.socket, request).await
-    }
-}
-
-pub trait SandboxBackend {
-    fn capabilities(&self) -> Value;
-    /// The control channel to the guest agent of sandbox `id`.
-    fn connect(
-        &self,
-        id: Uuid,
-    ) -> impl std::future::Future<Output = anyhow::Result<GuestChannel>> + Send;
-    fn create(
-        &self,
-        spec: SandboxSpec,
-    ) -> impl std::future::Future<Output = anyhow::Result<Value>> + Send;
-    fn stop(
-        &self,
-        id: Uuid,
-        epoch: u64,
-    ) -> impl std::future::Future<Output = anyhow::Result<Value>> + Send;
-    fn destroy(
-        &self,
-        id: Uuid,
-        epoch: u64,
-    ) -> impl std::future::Future<Output = anyhow::Result<Value>> + Send;
 }
 
 impl Host {
@@ -318,7 +275,7 @@ impl Host {
         }
         drop(state);
         // Hold the sandbox fence through guest acknowledgement. New dispatch follows this barrier.
-        self.connect(request.sandbox_id).await?.call(&request).await
+        call(self.connect(request.sandbox_id).await?, &request).await
     }
 
     pub async fn handle(self: &Arc<Self>, command: HostCommand) -> anyhow::Result<Value> {
@@ -329,30 +286,16 @@ impl Host {
                 files,
             } => {
                 let _operation = self.operation(sandbox_id).await;
-                let state = self.state.lock().await;
-                let entry = state
-                    .sandboxes
-                    .get(&sandbox_id)
-                    .context("UNKNOWN_SANDBOX")?;
-                ensure!(
-                    entry.epoch == exec_epoch && entry.state == "running",
-                    "FENCED"
-                );
-                drop(state);
+                self.fenced(sandbox_id, exec_epoch).await?;
                 ensure!(
                     files.values().map(String::len).sum::<usize>() <= 2 * 1024 * 1024,
                     "PROJECT_FILE_LIMIT"
                 );
+                ensure!(
+                    files.keys().all(|name| valid_name(name)),
+                    "INVALID_PROJECT_FILE"
+                );
                 let directory = self.dir(sandbox_id).join("project");
-                for name in files.keys() {
-                    ensure!(
-                        !name.is_empty()
-                            && name.len() <= 128
-                            && !name.starts_with('.')
-                            && !name.contains(['/', '\\', '\0']),
-                        "INVALID_PROJECT_FILE"
-                    );
-                }
                 std::fs::create_dir_all(&directory)?;
                 for file in std::fs::read_dir(&directory)? {
                     std::fs::remove_file(file?.path())?;
@@ -372,7 +315,7 @@ impl Host {
                 for (name, file) in &files {
                     valid_attachment(name, file)?;
                 }
-                let directory = self.attachments(&spec);
+                let directory = self.attachments(spec.org_id, spec.workspace_id);
                 std::fs::create_dir_all(&directory)?;
                 let mut manifest: BTreeMap<String, String> =
                     journal::load(&directory.with_extension("json"))?;
@@ -418,29 +361,7 @@ impl Host {
                     "WORKSPACE_BUSY"
                 );
                 drop(state);
-                let workspace = workspace_path(org_id, workspace_id);
-                let attachments = self
-                    .config
-                    .root
-                    .join("org")
-                    .join(org_id.to_string())
-                    .join("attachments")
-                    .join(workspace_id.to_string());
-                for path in [
-                    self.config.root.join(&workspace),
-                    self.data().join(&workspace),
-                    attachments.with_extension("parts"),
-                    attachments.clone(),
-                ] {
-                    match tokio::fs::remove_dir_all(path).await {
-                        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
-                        _ => {}
-                    }
-                }
-                match tokio::fs::remove_file(attachments.with_extension("json")).await {
-                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
-                    _ => {}
-                }
+                self.remove_workspace_files(org_id, workspace_id).await?;
                 Ok(json!({"evicted": true}))
             }
             HostCommand::Images => {
@@ -488,22 +409,10 @@ impl Host {
                 artifact,
                 sha256,
                 disk_bytes,
-            } => {
-                if let Some(state) = claim_job(&mut self.jobs.lock().unwrap(), artifact) {
-                    return Ok(state);
-                }
-                let this = self.clone();
-                tokio::spawn(async move {
-                    let result = this
-                        .workspace_restore(org_id, workspace_id, artifact, sha256, disk_bytes)
-                        .await;
-                    this.jobs
-                        .lock()
-                        .unwrap()
-                        .insert(artifact, Some(result.map_err(|e| e.to_string())));
-                });
-                Ok(job_state(&None))
-            }
+            } => Ok(self.spawn_job(artifact, move |this| async move {
+                this.workspace_restore(org_id, workspace_id, artifact, sha256, disk_bytes)
+                    .await
+            })),
             HostCommand::Egress { boot, after } => {
                 let (boot, records) = self.egress.collect(boot, after, 1000);
                 Ok(json!({"boot": boot, "records": records}))
@@ -536,16 +445,13 @@ impl Host {
                 anyhow::bail!("streams need a dedicated connection")
             }
             HostCommand::DeleteArtifact { artifact } => {
+                let path = self.artifact(artifact);
                 for path in [
-                    self.artifact(artifact),
-                    self.artifact(artifact).with_extension("json"),
-                    self.artifact(artifact).with_extension("part"),
+                    path.with_extension("json"),
+                    path.with_extension("part"),
+                    path,
                 ] {
-                    match tokio::fs::remove_file(path).await {
-                        Ok(()) => {}
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                        Err(e) => return Err(e.into()),
-                    }
+                    remove_if_exists(&path).await?;
                 }
                 self.jobs.lock().unwrap().remove(&artifact);
                 Ok(json!({"deleted":true}))
@@ -577,41 +483,11 @@ impl Host {
                 // The durable tombstone fences Create; filesystem reclamation must
                 // not hold the global lock needed by other sandboxes' heartbeats.
                 drop(state);
-                let workspace = workspace_path(org_id, workspace_id);
-                let paths = [
-                    self.config.root.join(&workspace),
-                    self.data().join(&workspace),
-                ];
-                let attachments = self
-                    .config
-                    .root
-                    .join("org")
-                    .join(org_id.to_string())
-                    .join("attachments")
-                    .join(workspace_id.to_string());
-                for path in paths
-                    .into_iter()
-                    .chain([attachments.with_extension("parts"), attachments.clone()])
-                {
-                    match tokio::fs::remove_dir_all(path).await {
-                        Ok(()) => {}
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                        Err(e) => return Err(e.into()),
-                    }
-                }
-                match tokio::fs::remove_file(attachments.with_extension("json")).await {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => return Err(e.into()),
-                }
+                self.remove_workspace_files(org_id, workspace_id).await?;
                 for id in artifacts {
-                    for path in [self.artifact(id), self.artifact(id).with_extension("json")] {
-                        match tokio::fs::remove_file(path).await {
-                            Ok(()) => {}
-                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                            Err(e) => return Err(e.into()),
-                        }
-                    }
+                    let path = self.artifact(id);
+                    remove_if_exists(&path.with_extension("json")).await?;
+                    remove_if_exists(&path).await?;
                 }
                 Ok(json!({"purged":true}))
             }
@@ -626,13 +502,29 @@ impl Host {
     /// The workspace's `/attachments`, outside the sandbox's own directory so it outlives it.
     /// Beside it: `<dir>.json`, each file's content address, and `<dir>.parts`, uploads in
     /// progress.
-    fn attachments(&self, spec: &SandboxSpec) -> PathBuf {
+    fn attachments(&self, org: Uuid, workspace: Uuid) -> PathBuf {
         self.config
             .root
             .join("org")
-            .join(spec.org_id.to_string())
+            .join(org.to_string())
             .join("attachments")
-            .join(spec.workspace_id.to_string())
+            .join(workspace.to_string())
+    }
+
+    /// Remove this node's copy of a workspace: its directory and its `/attachments`.
+    async fn remove_workspace_files(&self, org: Uuid, workspace: Uuid) -> anyhow::Result<()> {
+        let relative = workspace_path(org, workspace);
+        let attachments = self.attachments(org, workspace);
+        for path in [
+            self.config.root.join(&relative),
+            self.data().join(&relative),
+            attachments.with_extension("parts"),
+            attachments.with_extension("json"),
+            attachments,
+        ] {
+            remove_if_exists(&path).await?;
+        }
+        Ok(())
     }
 
     /// The workspace directory a sandbox without its own copy mounts at `/workspace`.
@@ -679,7 +571,7 @@ impl Host {
         let _operation = self.operation(sandbox_id).await;
         let spec = self.fenced(sandbox_id, exec_epoch).await?;
         valid_attachment(name, &file)?;
-        let directory = self.attachments(&spec);
+        let directory = self.attachments(spec.org_id, spec.workspace_id);
         let parts = directory.with_extension("parts");
         std::fs::create_dir_all(&directory)?;
         std::fs::create_dir_all(&parts)?;
@@ -687,16 +579,9 @@ impl Host {
         let mut out = tokio::fs::File::create(&partial).await?;
         let copied = copy_exact(body, &mut out, file.size).await;
         let result = async {
-            ensure!(
-                copied? == file.size,
-                "attachment ended before {} bytes",
-                file.size
-            );
+            copied?;
             out.sync_all().await?;
-            let check = partial.clone();
-            let (actual, _) =
-                tokio::task::spawn_blocking(move || crate::archive::digest(&check)).await??;
-            ensure!(actual == file.sha256, "CHECKSUM_MISMATCH");
+            verify_digest(&partial, &file.sha256).await?;
             std::fs::set_permissions(&partial, std::fs::Permissions::from_mode(0o444))?;
             tokio::fs::rename(&partial, directory.join(name)).await?;
             let path = directory.with_extension("json");
@@ -720,15 +605,12 @@ impl Host {
         epoch: u64,
         artifact: Uuid,
     ) -> anyhow::Result<Value> {
-        let manifest = self.artifact(artifact).with_extension("json");
-        if manifest.exists() {
-            let value: Value = serde_json::from_slice(&std::fs::read(&manifest)?)?;
-            ensure!(
-                value["sandbox_id"] == id.to_string()
-                    && value["epoch"].as_u64().is_some_and(|old| old <= epoch),
-                "ARTIFACT_ID_REUSED"
-            );
-            return Ok(job_state(&Some(Ok(value))));
+        let done = self.checkpointed(artifact, |manifest| {
+            manifest["sandbox_id"] == id.to_string()
+                && manifest["epoch"].as_u64().is_some_and(|old| old <= epoch)
+        })?;
+        if let Some(done) = done {
+            return Ok(done);
         }
         if let Some(state) = poll_job(&mut self.jobs.lock().unwrap(), artifact) {
             return Ok(state);
@@ -741,18 +623,9 @@ impl Host {
                 "FENCED"
             );
         }
-        if let Some(state) = claim_job(&mut self.jobs.lock().unwrap(), artifact) {
-            return Ok(state);
-        }
-        let this = self.clone();
-        tokio::spawn(async move {
-            let result = this.checkpoint(id, epoch, artifact).await;
-            this.jobs
-                .lock()
-                .unwrap()
-                .insert(artifact, Some(result.map_err(|e| e.to_string())));
-        });
-        Ok(job_state(&None))
+        Ok(self.spawn_job(artifact, move |this| async move {
+            this.checkpoint(id, epoch, artifact).await
+        }))
     }
 
     async fn checkpoint(&self, id: Uuid, epoch: u64, artifact: Uuid) -> anyhow::Result<Value> {
@@ -766,15 +639,9 @@ impl Host {
             );
             (entry.spec.image.clone(), entry.spec.deps.clone())
         };
-        std::fs::create_dir_all(self.data().join("artifacts"))?;
         let dir = self.dir(id);
-        let local = self.artifact(artifact).with_extension("upper");
-        if local.exists() {
-            std::fs::remove_dir_all(&local)?;
-        }
-        let captured_at_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_millis() as u64;
+        let local = self.staging(artifact, "upper")?;
+        let captured_at_ms = now_ms();
         self.checkpointing.lock().unwrap().insert(id);
         let activity = CheckpointActivity {
             active: &self.checkpointing,
@@ -783,18 +650,8 @@ impl Host {
         self.ctr(&["tasks", "pause", &id.to_string()]).await?;
         let frozen = async {
             run("sync", &["-f", dir.join("merged").to_str().unwrap()]).await?;
-            std::fs::create_dir_all(&local)?;
             // Reflinks make the frozen window independent of the upper's size where supported.
-            run(
-                "cp",
-                &[
-                    "-a",
-                    "--reflink=auto",
-                    &format!("{}/.", dir.join("upper").display()),
-                    local.to_str().unwrap(),
-                ],
-            )
-            .await?;
+            copy_tree(&dir.join("upper"), &local).await?;
             // The watermark: every guest event up to here is reflected in the copied files.
             crate::guest::journal_head(&dir.join("control"))
         }
@@ -803,20 +660,9 @@ impl Host {
         drop(activity);
         let gseq = frozen?;
         thaw?;
-        let archive = self.artifact(artifact);
-        let source = local.clone();
-        let path = archive.clone();
-        let (sha256, size) = tokio::task::spawn_blocking(move || {
-            crate::archive::export(&source, &path)?;
-            crate::archive::digest(&path)
-        })
-        .await??;
-        let excluded = crate::archive::excluded(&local)?;
-        let value = json!({"format":1,"encoding":"tar.zst","captured_at_ms":captured_at_ms,"sandbox_id":id,
-            "epoch":epoch,"image":image,"deps":deps,"gseq":gseq,"sha256":sha256,"size":size,"excluded":excluded});
-        journal::save(&self.artifact(artifact).with_extension("json"), &value)?;
-        std::fs::remove_dir_all(local)?;
-        Ok(value)
+        let manifest = json!({"captured_at_ms":captured_at_ms,"sandbox_id":id,"epoch":epoch,
+            "image":image,"deps":deps,"gseq":gseq});
+        self.archive(artifact, local, Tree::Upper, manifest).await
     }
 
     /// Report on the workspace checkpoint into `artifact`, starting it on first request.
@@ -826,27 +672,15 @@ impl Host {
         workspace: Uuid,
         artifact: Uuid,
     ) -> anyhow::Result<Value> {
-        let manifest = self.artifact(artifact).with_extension("json");
-        if manifest.exists() {
-            let value: Value = serde_json::from_slice(&std::fs::read(&manifest)?)?;
-            ensure!(
-                value["workspace_id"] == workspace.to_string(),
-                "ARTIFACT_ID_REUSED"
-            );
-            return Ok(job_state(&Some(Ok(value))));
+        let done = self.checkpointed(artifact, |manifest| {
+            manifest["workspace_id"] == workspace.to_string()
+        })?;
+        if let Some(done) = done {
+            return Ok(done);
         }
-        if let Some(state) = claim_job(&mut self.jobs.lock().unwrap(), artifact) {
-            return Ok(state);
-        }
-        let this = self.clone();
-        tokio::spawn(async move {
-            let result = this.workspace_checkpoint(org, workspace, artifact).await;
-            this.jobs
-                .lock()
-                .unwrap()
-                .insert(artifact, Some(result.map_err(|e| e.to_string())));
-        });
-        Ok(job_state(&None))
+        Ok(self.spawn_job(artifact, move |this| async move {
+            this.workspace_checkpoint(org, workspace, artifact).await
+        }))
     }
 
     /// Archive a workspace directory. It is copied (as reflinks where the filesystem has them)
@@ -869,39 +703,81 @@ impl Host {
         );
         let dir = self.located(&workspace_path(org, workspace));
         ensure!(dir.exists(), "UNKNOWN_WORKSPACE");
-        std::fs::create_dir_all(self.data().join("artifacts"))?;
-        let local = self.artifact(artifact).with_extension("workspace");
+        let local = self.staging(artifact, "workspace")?;
+        let captured_at_ms = now_ms();
+        copy_tree(&dir, &local).await?;
+        let manifest =
+            json!({"scope":"workspace","captured_at_ms":captured_at_ms,"workspace_id":workspace});
+        self.archive(artifact, local, Tree::Directory, manifest)
+            .await
+    }
+
+    /// An empty directory beside `artifact` to copy what it archives into.
+    fn staging(&self, artifact: Uuid, extension: &str) -> anyhow::Result<PathBuf> {
+        let local = self.artifact(artifact).with_extension(extension);
         if local.exists() {
             std::fs::remove_dir_all(&local)?;
         }
-        let captured_at_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_millis() as u64;
         std::fs::create_dir_all(&local)?;
-        run(
-            "cp",
-            &[
-                "-a",
-                "--reflink=auto",
-                &format!("{}/.", dir.display()),
-                local.to_str().context("INVALID_PATH")?,
-            ],
-        )
-        .await?;
-        let archive = self.artifact(artifact);
-        let (source, path) = (local.clone(), archive.clone());
+        Ok(local)
+    }
+
+    /// Archive `local`, a copy of a `tree`, as `artifact`, then remove the copy. The manifest
+    /// is `manifest` with the archive's format, digest, size and the secrets left out.
+    async fn archive(
+        &self,
+        artifact: Uuid,
+        local: PathBuf,
+        tree: Tree,
+        mut manifest: Value,
+    ) -> anyhow::Result<Value> {
+        let path = self.artifact(artifact);
+        let (source, archive) = (local.clone(), path.clone());
         let (sha256, size) = tokio::task::spawn_blocking(move || {
-            crate::archive::export_tree(&source, &path, crate::archive::Tree::Directory)?;
-            crate::archive::digest(&path)
+            crate::archive::export(&source, &archive, tree)?;
+            crate::archive::digest(&archive)
         })
         .await??;
-        let excluded = crate::archive::excluded_in(&local, crate::archive::Tree::Directory)?;
-        let value = json!({"format":1,"encoding":"tar.zst","scope":"workspace",
-            "captured_at_ms":captured_at_ms,"workspace_id":workspace,"sha256":sha256,"size":size,
-            "excluded":excluded});
-        journal::save(&archive.with_extension("json"), &value)?;
+        manifest["format"] = json!(1);
+        manifest["encoding"] = json!("tar.zst");
+        manifest["sha256"] = json!(sha256);
+        manifest["size"] = json!(size);
+        manifest["excluded"] = json!(crate::archive::excluded(&local, tree)?);
+        journal::save(&path.with_extension("json"), &manifest)?;
         std::fs::remove_dir_all(local)?;
-        Ok(value)
+        Ok(manifest)
+    }
+
+    /// The finished checkpoint's state if `artifact` has a manifest, which `matches` must
+    /// accept as the one asked for.
+    fn checkpointed(
+        &self,
+        artifact: Uuid,
+        matches: impl FnOnce(&Value) -> bool,
+    ) -> anyhow::Result<Option<Value>> {
+        let path = self.artifact(artifact).with_extension("json");
+        if !path.exists() {
+            return Ok(None);
+        }
+        let manifest: Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+        ensure!(matches(&manifest), "ARTIFACT_ID_REUSED");
+        Ok(Some(job_state(&Some(Ok(manifest)))))
+    }
+
+    /// Run `job` as `artifact`'s job unless it is already known, and report its state.
+    fn spawn_job<F>(self: &Arc<Self>, artifact: Uuid, job: impl FnOnce(Arc<Self>) -> F) -> Value
+    where
+        F: Future<Output = anyhow::Result<Value>> + Send + 'static,
+    {
+        if let Some(state) = claim_job(&mut self.jobs.lock().unwrap(), artifact) {
+            return state;
+        }
+        let (this, job) = (self.clone(), job(self.clone()));
+        tokio::spawn(async move {
+            let result = job.await.map_err(|e| e.to_string());
+            this.jobs.lock().unwrap().insert(artifact, Some(result));
+        });
+        job_state(&None)
     }
 
     /// Unpack `artifact` as the workspace's directory if this node has none. It is unpacked
@@ -921,10 +797,7 @@ impl Host {
             return Ok(json!({"restored": false}));
         }
         let path = self.artifact(artifact);
-        let digest_path = path.clone();
-        let (actual, _) =
-            tokio::task::spawn_blocking(move || crate::archive::digest(&digest_path)).await??;
-        ensure!(actual == sha256, "CHECKSUM_MISMATCH");
+        verify_digest(&path, &sha256).await?;
         let staging = self.data().join(&relative).with_extension("restoring");
         if staging.exists() {
             std::fs::remove_dir_all(&staging)?;
@@ -959,18 +832,9 @@ impl Host {
         sha256: String,
     ) -> anyhow::Result<Value> {
         ensure!(spec.persistent, "WORK_ONLY");
-        if let Some(state) = claim_job(&mut self.jobs.lock().unwrap(), artifact) {
-            return Ok(state);
-        }
-        let this = self.clone();
-        tokio::spawn(async move {
-            let result = this.restore(spec, artifact, sha256).await;
-            this.jobs
-                .lock()
-                .unwrap()
-                .insert(artifact, Some(result.map_err(|e| e.to_string())));
-        });
-        Ok(job_state(&None))
+        Ok(self.spawn_job(artifact, move |this| async move {
+            this.restore(spec, artifact, sha256).await
+        }))
     }
 
     async fn restore(
@@ -981,10 +845,7 @@ impl Host {
     ) -> anyhow::Result<Value> {
         let _operation = self.operation(spec.id).await;
         let path = self.artifact(artifact);
-        let digest_path = path.clone();
-        let (actual, _) =
-            tokio::task::spawn_blocking(move || crate::archive::digest(&digest_path)).await??;
-        ensure!(actual == sha256, "CHECKSUM_MISMATCH");
+        verify_digest(&path, &sha256).await?;
         // The writable layer gets its limit before the checkpoint is unpacked into it.
         let dir = self.create_dirs(&mut *self.state.lock().await, &spec)?;
         if !dir.join("restored.json").exists() {
@@ -1071,17 +932,10 @@ impl Host {
         let path = self.artifact(artifact);
         let partial = path.with_extension("part");
         let mut file = tokio::fs::File::create(&partial).await?;
-        let copied = copy_exact(body, &mut file, size).await?;
-        ensure!(
-            copied == size,
-            "artifact ended after {copied} of {size} bytes"
-        );
+        copy_exact(body, &mut file, size).await?;
         file.sync_all().await?;
         drop(file);
-        let check = partial.clone();
-        let (actual, _) =
-            tokio::task::spawn_blocking(move || crate::archive::digest(&check)).await??;
-        ensure!(actual == sha256, "CHECKSUM_MISMATCH");
+        verify_digest(&partial, sha256).await?;
         tokio::fs::rename(&partial, &path).await?;
         Ok(json!({"size":size}))
     }
@@ -1172,17 +1026,11 @@ impl Host {
             Ok(HostCommand::TerminalAttach {
                 sandbox_id,
                 exec_epoch,
-                session,
                 cols,
                 rows,
                 since,
             }) => {
-                let command = GuestCommand::PtyAttach {
-                    session,
-                    cols,
-                    rows,
-                    since,
-                };
+                let command = GuestCommand::PtyAttach { cols, rows, since };
                 self.terminal(sandbox_id, exec_epoch, command, reader, write)
                     .await;
                 return;
@@ -1210,21 +1058,14 @@ impl Host {
         };
         let _ = write.write_all(&reply.line()).await;
     }
-}
 
-impl SandboxBackend for Host {
-    fn capabilities(&self) -> Value {
-        json!({"backend":"containerd","runtimes":["runc","runsc"],"memory_snapshot":false,"gpu":false,"network":"egress-proxy","pty":false,"terminal":true})
-    }
-
-    async fn connect(&self, id: Uuid) -> anyhow::Result<GuestChannel> {
+    /// The socket of sandbox `id`'s guest agent.
+    async fn connect(&self, id: Uuid) -> anyhow::Result<PathBuf> {
         ensure!(
             self.state.lock().await.sandboxes.contains_key(&id),
             "UNKNOWN_SANDBOX"
         );
-        Ok(GuestChannel {
-            socket: self.dir(id).join("control/guest.sock"),
-        })
+        Ok(self.dir(id).join("control/guest.sock"))
     }
 
     async fn create(&self, spec: SandboxSpec) -> anyhow::Result<Value> {
@@ -1241,9 +1082,7 @@ impl SandboxBackend for Host {
         let _operation = self.operation(id).await;
         self.destroy_inner(id, epoch).await
     }
-}
 
-impl Host {
     async fn create_inner(&self, spec: SandboxSpec) -> anyhow::Result<Value> {
         validate_spec(&spec, self.config.multi_tenant)?;
         ensure!(
@@ -1317,7 +1156,7 @@ impl Host {
         let base = dir.join("base");
         let merged = dir.join("merged");
         // Images are prepared by the operator; no mutable tags or implicit pulls on a user request.
-        if mount_options(&base)?.is_none() {
+        if mountinfo(&base)?.is_none() {
             self.ctr(&["images", "mount", &spec.image, base.to_str().unwrap()])
                 .await?;
         }
@@ -1326,13 +1165,13 @@ impl Host {
         if let Some(deps) = &spec.deps {
             let layer = dir.join("deps");
             std::fs::create_dir_all(&layer)?;
-            if mount_options(&layer)?.is_none() {
+            if mountinfo(&layer)?.is_none() {
                 self.ctr(&["images", "mount", deps, layer.to_str().unwrap()])
                     .await?;
             }
             lower = format!("{}:{lower}", layer.display());
         }
-        if mount_options(&merged)?.is_none() {
+        if mountinfo(&merged)?.is_none() {
             run(
                 "mount",
                 &[
@@ -1350,7 +1189,7 @@ impl Host {
             )
             .await?;
         }
-        let options = mount_options(&merged)?.context("OVERLAY_NOT_MOUNTED")?;
+        let options = mountinfo(&merged)?.context("OVERLAY_NOT_MOUNTED")?.options;
         validate_overlay(
             &options,
             &std::fs::read_to_string("/sys/module/overlay/parameters/redirect_dir")
@@ -1384,7 +1223,7 @@ impl Host {
             &project,
             &["bind", "ro", "nosuid", "nodev", "noexec"],
         ));
-        let attachments = self.attachments(&spec);
+        let attachments = self.attachments(spec.org_id, spec.workspace_id);
         std::fs::create_dir_all(&attachments)?;
         mounts(&mut config).push(bind(
             "/attachments",
@@ -1479,16 +1318,13 @@ impl Host {
         mut write: crate::WriteSide,
     ) {
         let attached = async {
-            let state = self.state.lock().await;
-            let entry = state.sandboxes.get(&id).context("UNKNOWN_SANDBOX")?;
-            ensure!(entry.state == "running" && entry.epoch == epoch, "FENCED");
-            drop(state);
+            self.fenced(id, epoch).await?;
             let request = GuestRequest {
                 sandbox_id: id,
                 exec_epoch: epoch,
                 command,
             };
-            self.connect(id).await?.attach(&request).await
+            crate::attach(self.connect(id).await?, &request).await
         }
         .await;
         let (reply, mut guest_read, mut guest_write) = match attached {
@@ -1653,7 +1489,7 @@ impl Host {
         let _ = self.ctr(&["containers", "delete", &id_text]).await;
         let dir = self.dir(id);
         for target in [dir.join("merged"), dir.join("deps"), dir.join("base")] {
-            if mount_options(&target)?.is_some() {
+            if mountinfo(&target)?.is_some() {
                 run("umount", &[target.to_str().unwrap()]).await?;
             }
         }
@@ -1762,12 +1598,30 @@ fn disk_bytes(spec: &SandboxSpec) -> u64 {
     }
 }
 
-pub(crate) fn mount_options(path: &Path) -> anyhow::Result<Option<String>> {
+/// A mount as `/proc/self/mountinfo` lists it.
+pub(crate) struct Mount {
+    pub source: String,
+    /// The superblock options.
+    pub options: String,
+}
+
+/// The mount at `path`, if there is one.
+pub(crate) fn mountinfo(path: &Path) -> anyhow::Result<Option<Mount>> {
     let path = path.to_str().context("INVALID_PATH")?;
     for line in std::fs::read_to_string("/proc/self/mountinfo")?.lines() {
         let parts: Vec<_> = line.split_whitespace().collect();
         if parts.get(4) == Some(&path) {
-            return Ok(parts.last().map(|s| s.to_string()));
+            // After the separator: the filesystem type, the source and the options.
+            let separator = parts.iter().position(|p| *p == "-");
+            let field = |n: usize| {
+                separator
+                    .and_then(|i| parts.get(i + n))
+                    .map(|s| s.to_string())
+            };
+            return Ok(Some(Mount {
+                source: field(2).unwrap_or_default(),
+                options: field(3).unwrap_or_default(),
+            }));
         }
     }
     Ok(None)
@@ -1881,15 +1735,17 @@ fn mounts(config: &mut Value) -> &mut Vec<Value> {
         .expect("OCI spec has mounts")
 }
 
+/// Whether `name` may name a file of `/project` or `/attachments`.
+fn valid_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && !name.starts_with('.')
+        && !name.contains(['/', '\\', '\0'])
+}
+
 /// A name and content address `/attachments` may hold.
 fn valid_attachment(name: &str, file: &AttachmentFile) -> anyhow::Result<()> {
-    ensure!(
-        !name.is_empty()
-            && name.len() <= 128
-            && !name.starts_with('.')
-            && !name.contains(['/', '\\', '\0']),
-        "INVALID_ATTACHMENT"
-    );
+    ensure!(valid_name(name), "INVALID_ATTACHMENT");
     ensure!(
         file.sha256.len() == 64 && file.sha256.bytes().all(|c| c.is_ascii_hexdigit()),
         "INVALID_ATTACHMENT"
@@ -1901,6 +1757,35 @@ fn valid_attachment(name: &str, file: &AttachmentFile) -> anyhow::Result<()> {
 /// A bind mount in OCI form.
 fn bind(destination: &str, source: &Path, options: &[&str]) -> Value {
     json!({"destination": destination, "type": "bind", "source": source, "options": options})
+}
+
+/// Copy what `source` holds into `destination`, as reflinks where the filesystem has them.
+async fn copy_tree(source: &Path, destination: &Path) -> anyhow::Result<()> {
+    let source = format!("{}/.", source.display());
+    let destination = destination.to_str().context("INVALID_PATH")?;
+    run("cp", &["-a", "--reflink=auto", &source, destination]).await?;
+    Ok(())
+}
+
+/// Fail unless the file at `path` has the SHA-256 digest `sha256`.
+async fn verify_digest(path: &Path, sha256: &str) -> anyhow::Result<()> {
+    let path = path.to_owned();
+    let (actual, _) = tokio::task::spawn_blocking(move || crate::archive::digest(&path)).await??;
+    ensure!(actual == sha256, "CHECKSUM_MISMATCH");
+    Ok(())
+}
+
+/// Remove the file or directory at `path`, if there is one.
+async fn remove_if_exists(path: &Path) -> anyhow::Result<()> {
+    let removed = if path.is_dir() {
+        tokio::fs::remove_dir_all(path).await
+    } else {
+        tokio::fs::remove_file(path).await
+    };
+    match removed {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+        _ => Ok(()),
+    }
 }
 
 /// Open `path`, relative to `/workspace`, as a regular file of at most `limit` bytes under
@@ -1950,6 +1835,48 @@ fn open_inside(root: &Path, path: &str, limit: u64) -> Result<(std::fs::File, u6
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A host over `root` that reaches no containerd.
+    fn test_host(root: &Path) -> Arc<Host> {
+        Arc::new(Host {
+            config: Config {
+                root: root.into(),
+                containerd: String::new(),
+                guest_binary: "/unused".into(),
+                multi_tenant: false,
+                allowed_uid: 0,
+                runsc_config: None,
+                egress_per_minute: 600,
+                volume: None,
+            },
+            state: Mutex::new(State::default()),
+            operations: Mutex::new(BTreeMap::new()),
+            checkpointing: std::sync::Mutex::new(BTreeSet::new()),
+            jobs: std::sync::Mutex::new(BTreeMap::new()),
+            egress: crate::egress::Egress::new(600),
+            volume: None,
+            terminals: std::sync::Mutex::new(BTreeMap::new()),
+            _lock: std::fs::File::create(root.join("host.lock")).unwrap(),
+        })
+    }
+
+    /// A valid spec of a new sandbox of workspace `workspace`.
+    fn spec(org: Uuid, workspace: Uuid) -> SandboxSpec {
+        SandboxSpec {
+            id: Uuid::now_v7(),
+            org_id: org,
+            workspace_id: workspace,
+            exec_epoch: 1,
+            image: format!("registry.test/base@sha256:{}", "a".repeat(64)),
+            runtime: "runc".into(),
+            memory_bytes: 256 * 1024 * 1024,
+            pids_limit: 64,
+            persistent: false,
+            egress: vec![],
+            disk_bytes: 0,
+            deps: None,
+        }
+    }
 
     #[test]
     fn workspace_files_open_only_inside_the_workspace() {
@@ -2042,26 +1969,7 @@ mod tests {
         let root = tempfile::tempdir()?;
         let tls = root.path().join("tls");
         std::fs::create_dir_all(&tls)?;
-        let host = Arc::new(Host {
-            config: Config {
-                root: root.path().to_path_buf(),
-                containerd: String::new(),
-                guest_binary: "/unused".into(),
-                multi_tenant: false,
-                allowed_uid: 0,
-                runsc_config: None,
-                egress_per_minute: 600,
-                volume: None,
-            },
-            state: Mutex::new(State::default()),
-            operations: Mutex::new(BTreeMap::new()),
-            checkpointing: std::sync::Mutex::new(BTreeSet::new()),
-            jobs: std::sync::Mutex::new(BTreeMap::new()),
-            egress: crate::egress::Egress::new(600),
-            volume: None,
-            terminals: std::sync::Mutex::new(BTreeMap::new()),
-            _lock: std::fs::File::create(root.path().join("host.lock"))?,
-        });
+        let host = test_host(root.path());
         let (ca, issuer) = authority(&tls, "ca");
         let (node_cert, node_key) = issue(&tls, "node", "node.test", &issuer);
         let (client_cert, client_key) = issue(&tls, "client", "control.test", &issuer);
@@ -2094,43 +2002,14 @@ mod tests {
     #[tokio::test]
     async fn a_destroyed_sandbox_cannot_be_created_again() -> anyhow::Result<()> {
         let root = tempfile::tempdir()?;
-        let host = Arc::new(Host {
-            config: Config {
-                root: root.path().to_path_buf(),
-                containerd: String::new(),
-                guest_binary: "/unused".into(),
-                multi_tenant: false,
-                allowed_uid: 0,
-                runsc_config: None,
-                egress_per_minute: 600,
-                volume: None,
-            },
-            state: Mutex::new(State::default()),
-            operations: Mutex::new(BTreeMap::new()),
-            checkpointing: std::sync::Mutex::new(BTreeSet::new()),
-            jobs: std::sync::Mutex::new(BTreeMap::new()),
-            egress: crate::egress::Egress::new(600),
-            volume: None,
-            terminals: std::sync::Mutex::new(BTreeMap::new()),
-            _lock: std::fs::File::create(root.path().join("host.lock"))?,
-        });
+        let host = test_host(root.path());
         let id = Uuid::now_v7();
         // Destroying a sandbox the node never had still fences a late Create.
         host.destroy(id, 1).await?;
         let late = host
             .create(SandboxSpec {
                 id,
-                org_id: Uuid::now_v7(),
-                workspace_id: Uuid::now_v7(),
-                exec_epoch: 1,
-                image: format!("registry.test/base@sha256:{}", "a".repeat(64)),
-                runtime: "runc".into(),
-                memory_bytes: 256 * 1024 * 1024,
-                pids_limit: 64,
-                persistent: false,
-                egress: vec![],
-                disk_bytes: 0,
-                deps: None,
+                ..spec(Uuid::now_v7(), Uuid::now_v7())
             })
             .await;
         assert!(late.unwrap_err().to_string().contains("SANDBOX_DESTROYED"));
@@ -2143,26 +2022,7 @@ mod tests {
     async fn a_workspace_checkpoint_restores_where_the_node_lacks_the_workspace()
     -> anyhow::Result<()> {
         let root = tempfile::tempdir()?;
-        let host = Arc::new(Host {
-            config: Config {
-                root: root.path().to_path_buf(),
-                containerd: String::new(),
-                guest_binary: "/unused".into(),
-                multi_tenant: false,
-                allowed_uid: 0,
-                runsc_config: None,
-                egress_per_minute: 600,
-                volume: None,
-            },
-            state: Mutex::new(State::default()),
-            operations: Mutex::new(BTreeMap::new()),
-            checkpointing: std::sync::Mutex::new(BTreeSet::new()),
-            jobs: std::sync::Mutex::new(BTreeMap::new()),
-            egress: crate::egress::Egress::new(600),
-            volume: None,
-            terminals: std::sync::Mutex::new(BTreeMap::new()),
-            _lock: std::fs::File::create(root.path().join("host.lock"))?,
-        });
+        let host = test_host(root.path());
         let (org, workspace, artifact) = (Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7());
         let dir = root.path().join(workspace_path(org, workspace));
         // Top-level names an upper layer leaves out are ordinary files in a workspace.
@@ -2199,26 +2059,7 @@ mod tests {
     #[tokio::test]
     async fn workspace_purge_is_scoped_idempotent_and_prevents_recreation() -> anyhow::Result<()> {
         let root = tempfile::tempdir()?;
-        let host = Arc::new(Host {
-            config: Config {
-                root: root.path().to_path_buf(),
-                containerd: String::new(),
-                guest_binary: "/unused".into(),
-                multi_tenant: false,
-                allowed_uid: 0,
-                runsc_config: None,
-                egress_per_minute: 600,
-                volume: None,
-            },
-            state: Mutex::new(State::default()),
-            operations: Mutex::new(BTreeMap::new()),
-            checkpointing: std::sync::Mutex::new(BTreeSet::new()),
-            jobs: std::sync::Mutex::new(BTreeMap::new()),
-            egress: crate::egress::Egress::new(600),
-            volume: None,
-            terminals: std::sync::Mutex::new(BTreeMap::new()),
-            _lock: std::fs::File::create(root.path().join("host.lock"))?,
-        });
+        let host = test_host(root.path());
         let org = Uuid::now_v7();
         let workspace = Uuid::now_v7();
         let other = Uuid::now_v7();
@@ -2245,23 +2086,7 @@ mod tests {
         assert!(path(other).join("secret").exists());
         let stored: State = journal::load(&root.path().join("host.json"))?;
         assert!(stored.deleted_workspaces.contains(&(org, workspace)));
-        let err = host
-            .create(SandboxSpec {
-                id: Uuid::now_v7(),
-                org_id: org,
-                workspace_id: workspace,
-                exec_epoch: 1,
-                image: format!("local@sha256:{}", "a".repeat(64)),
-                runtime: "runc".into(),
-                memory_bytes: 512 * 1024 * 1024,
-                pids_limit: 64,
-                persistent: true,
-                egress: vec![],
-                disk_bytes: 0,
-                deps: None,
-            })
-            .await
-            .unwrap_err();
+        let err = host.create(spec(org, workspace)).await.unwrap_err();
         assert_eq!(err.to_string(), "WORKSPACE_DELETED");
         Ok(())
     }
@@ -2270,45 +2095,14 @@ mod tests {
     async fn attachments_hold_exactly_the_listed_verified_files() -> anyhow::Result<()> {
         use sha2::{Digest, Sha256};
         let root = tempfile::tempdir()?;
-        let host = Arc::new(Host {
-            config: Config {
-                root: root.path().to_path_buf(),
-                containerd: String::new(),
-                guest_binary: "/unused".into(),
-                multi_tenant: false,
-                allowed_uid: 0,
-                runsc_config: None,
-                egress_per_minute: 600,
-                volume: None,
-            },
-            state: Mutex::new(State::default()),
-            operations: Mutex::new(BTreeMap::new()),
-            checkpointing: std::sync::Mutex::new(BTreeSet::new()),
-            jobs: std::sync::Mutex::new(BTreeMap::new()),
-            egress: crate::egress::Egress::new(600),
-            volume: None,
-            terminals: std::sync::Mutex::new(BTreeMap::new()),
-            _lock: std::fs::File::create(root.path().join("host.lock"))?,
-        });
-        let (sandbox, org, workspace) = (Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7());
-        let spec = SandboxSpec {
-            id: sandbox,
-            org_id: org,
-            workspace_id: workspace,
-            exec_epoch: 2,
-            image: String::new(),
-            runtime: "runc".into(),
-            memory_bytes: 0,
-            pids_limit: 0,
-            persistent: false,
-            egress: vec![],
-            disk_bytes: 0,
-            deps: None,
-        };
+        let host = test_host(root.path());
+        let (org, workspace) = (Uuid::now_v7(), Uuid::now_v7());
+        let spec = spec(org, workspace);
+        let sandbox = spec.id;
         host.state.lock().await.sandboxes.insert(
             sandbox,
             Entry {
-                spec: spec.clone(),
+                spec,
                 epoch: 2,
                 state: "running".into(),
             },
@@ -2333,7 +2127,7 @@ mod tests {
         assert_eq!(wrong.unwrap_err().to_string(), "CHECKSUM_MISMATCH");
         host.attachment_upload(sandbox, 2, "a.txt", file(b"alpha"), &b"alpha"[..])
             .await?;
-        let directory = host.attachments(&spec);
+        let directory = host.attachments(org, workspace);
         assert_eq!(std::fs::read(directory.join("a.txt"))?, b"alpha");
         assert_eq!(sync(listed, 2).await?["missing"], json!([]));
         // The same name with other content is replaced; unlisted files go.
@@ -2365,44 +2159,16 @@ mod tests {
     #[tokio::test]
     async fn blocked_guest_keeps_host_state_and_other_sandboxes_available() -> anyhow::Result<()> {
         let root = tempfile::tempdir()?;
-        let id = Uuid::now_v7();
-        let host = Arc::new(Host {
-            config: Config {
-                root: root.path().into(),
-                containerd: String::new(),
-                guest_binary: "/unused".into(),
-                multi_tenant: false,
-                allowed_uid: 0,
-                runsc_config: None,
-                egress_per_minute: 600,
-                volume: None,
-            },
-            state: Mutex::new(State::default()),
-            operations: Mutex::new(BTreeMap::new()),
-            checkpointing: std::sync::Mutex::new(BTreeSet::new()),
-            jobs: std::sync::Mutex::new(BTreeMap::new()),
-            egress: crate::egress::Egress::new(600),
-            volume: None,
-            terminals: std::sync::Mutex::new(BTreeMap::new()),
-            _lock: std::fs::File::create(root.path().join("host.lock"))?,
-        });
+        let host = test_host(root.path());
+        let spec = SandboxSpec {
+            persistent: true,
+            ..spec(Uuid::now_v7(), Uuid::now_v7())
+        };
+        let id = spec.id;
         host.state.lock().await.sandboxes.insert(
             id,
             Entry {
-                spec: SandboxSpec {
-                    id,
-                    org_id: Uuid::now_v7(),
-                    workspace_id: Uuid::now_v7(),
-                    exec_epoch: 1,
-                    image: String::new(),
-                    runtime: "runc".into(),
-                    memory_bytes: 0,
-                    pids_limit: 0,
-                    persistent: true,
-                    egress: vec![],
-                    disk_bytes: 0,
-                    deps: None,
-                },
+                spec,
                 epoch: 1,
                 state: "running".into(),
             },
@@ -2474,20 +2240,7 @@ mod tests {
         assert!(validate_overlay("redirect_dir=on,metacopy=off", "N", "N").is_err());
         assert!(validate_overlay("redirect_dir=off,metacopy=on", "N", "N").is_err());
         assert!(validate_overlay("rw", "Y", "N").is_err());
-        let mut spec = SandboxSpec {
-            id: Uuid::now_v7(),
-            org_id: Uuid::now_v7(),
-            workspace_id: Uuid::now_v7(),
-            exec_epoch: 1,
-            image: format!("example/image@sha256:{}", "a".repeat(64)),
-            runtime: "runc".into(),
-            memory_bytes: 128 * 1024 * 1024,
-            pids_limit: 64,
-            persistent: false,
-            egress: vec![],
-            disk_bytes: 0,
-            deps: None,
-        };
+        let mut spec = spec(Uuid::now_v7(), Uuid::now_v7());
         assert!(validate_spec(&spec, false).is_ok());
         assert!(validate_spec(&spec, true).is_err());
         spec.image = "alpine:latest".into();

@@ -163,7 +163,6 @@ codes! {
     TooManyToolCalls = "TOO_MANY_TOOL_CALLS" => BAD_GATEWAY,
     ReadOnlyToolRequestRejected = "READ_ONLY_TOOL_REQUEST_REJECTED" => BAD_GATEWAY,
     ContentTooLarge = "CONTENT_TOO_LARGE" => BAD_GATEWAY,
-    PtyUnsupported = "PTY_UNSUPPORTED" => BAD_REQUEST,
     NativeTurnFailed = "NATIVE_TURN_FAILED" => BAD_GATEWAY,
     NativeOutcomeUnknown = "NATIVE_OUTCOME_UNKNOWN" => BAD_GATEWAY,
     CheckpointRecoveryRpo = "CHECKPOINT_RECOVERY_RPO" => CONFLICT,

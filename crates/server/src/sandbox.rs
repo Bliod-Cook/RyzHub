@@ -260,14 +260,13 @@ pub async fn host_workspace(
 }
 
 /// Peer rejections that mean something to callers carry their [`Code`]: a newer writer
-/// (`FENCED`), a busy workspace, an unsupported request. Other peer errors stay internal; the
-/// guest is not trusted to choose what clients see.
+/// (`FENCED`), a busy workspace. Other peer errors stay internal; the guest is not trusted to
+/// choose what clients see.
 fn peer_code(error: anyhow::Error) -> anyhow::Error {
     let code = match error.downcast_ref::<ryzhub_execution::Rejected>() {
         Some(rejected) => match rejected.0.as_str() {
             "FENCED" => Code::Fenced,
             "WORKSPACE_BUSY" => Code::WorkspaceBusy,
-            "PTY_UNSUPPORTED" => Code::PtyUnsupported,
             _ => return error,
         },
         None => return error,
@@ -1114,8 +1113,8 @@ mod tests {
         let rejected = |text: &str| anyhow::Error::from(ryzhub_execution::Rejected(text.into()));
         assert_eq!(code_of(&peer_code(rejected("FENCED"))), Some(Code::Fenced));
         assert_eq!(
-            code_of(&peer_code(rejected("PTY_UNSUPPORTED"))),
-            Some(Code::PtyUnsupported)
+            code_of(&peer_code(rejected("WORKSPACE_BUSY"))),
+            Some(Code::WorkspaceBusy)
         );
         // A guest cannot make clients see an arbitrary code.
         assert_eq!(

@@ -8,8 +8,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use std::{collections::HashMap, sync::Arc, time::Duration};
-use tokio::sync::Mutex;
+use std::{sync::Arc, time::Duration};
 
 use crate::guest::Guest;
 
@@ -28,18 +27,33 @@ const FORWARDED: [&str; 7] = [
     "x-claude-code-parent-agent-id",
 ];
 
-struct Proxy {
-    guest: Arc<Guest>,
-    /// Pooled clients per gateway socket: (model, mcp).
-    clients: Mutex<HashMap<String, (reqwest::Client, reqwest::Client)>>,
+/// The sandbox key, with clients for the gateway socket it is good for.
+#[derive(Clone)]
+pub(crate) struct Gateway {
+    token: String,
+    model: reqwest::Client,
+    mcp: reqwest::Client,
 }
 
-pub fn router(guest: Arc<Guest>) -> anyhow::Result<Router> {
-    let proxy = Arc::new(Proxy {
-        guest,
-        clients: Mutex::new(HashMap::new()),
-    });
-    Ok(Router::new()
+impl Gateway {
+    pub(crate) fn new(token: String, socket_name: &str) -> anyhow::Result<Self> {
+        let client = |read| {
+            reqwest::Client::builder()
+                .unix_socket(format!("/gateway/{socket_name}"))
+                .redirect(reqwest::redirect::Policy::none())
+                .read_timeout(read)
+                .build()
+        };
+        Ok(Self {
+            token,
+            model: client(MODEL_READ_TIMEOUT)?,
+            mcp: client(MCP_READ_TIMEOUT)?,
+        })
+    }
+}
+
+pub fn router(guest: Arc<Guest>) -> Router {
+    Router::new()
         .route("/v1/messages", post(forward))
         .route("/v1/messages/count_tokens", post(forward))
         .route("/v1/responses", post(forward))
@@ -49,45 +63,28 @@ pub fn router(guest: Arc<Guest>) -> anyhow::Result<Router> {
         .route("/v1/models", get(forward))
         .route("/mcp", post(forward))
         .layer(axum::extract::DefaultBodyLimit::max(16 * 1024 * 1024))
-        .with_state(proxy))
-}
-
-impl Proxy {
-    async fn client(&self, socket_name: &str, mcp: bool) -> anyhow::Result<reqwest::Client> {
-        let mut clients = self.clients.lock().await;
-        if !clients.contains_key(socket_name) {
-            let build = |read| {
-                reqwest::Client::builder()
-                    .unix_socket(format!("/gateway/{socket_name}"))
-                    .redirect(reqwest::redirect::Policy::none())
-                    .read_timeout(read)
-                    .build()
-            };
-            clients.insert(
-                socket_name.into(),
-                (build(MODEL_READ_TIMEOUT)?, build(MCP_READ_TIMEOUT)?),
-            );
-        }
-        let (model, tools) = &clients[socket_name];
-        Ok(if mcp { tools.clone() } else { model.clone() })
-    }
+        .with_state(guest)
 }
 
 async fn forward(
-    State(proxy): State<Arc<Proxy>>,
+    State(guest): State<Arc<Guest>>,
     method: Method,
     OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let Some((key, socket_name)) = proxy.guest.key.read().await.clone() else {
+    let Some(gateway) = guest.gateway.read().await.clone() else {
         return (StatusCode::SERVICE_UNAVAILABLE, "credential unavailable").into_response();
     };
     let result = async {
-        let client = proxy.client(&socket_name, uri.path() == "/mcp").await?;
+        let client = if uri.path() == "/mcp" {
+            &gateway.mcp
+        } else {
+            &gateway.model
+        };
         let mut request = client
             .request(method.clone(), format!("http://gateway{}", uri.path()))
-            .bearer_auth(key);
+            .bearer_auth(&gateway.token);
         if method == Method::POST {
             request = request
                 .header("content-type", "application/json")

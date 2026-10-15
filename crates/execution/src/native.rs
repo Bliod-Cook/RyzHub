@@ -7,10 +7,10 @@
 use anyhow::{Context, ensure};
 use base64::Engine as _;
 use serde_json::{Value, json};
-use std::{process::Stdio, sync::Arc};
+use std::{ffi::OsStr, process::Stdio, sync::Arc};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    process::ChildStdin,
+    process::{Child, ChildStdin},
     sync::{Mutex, mpsc},
 };
 
@@ -41,8 +41,6 @@ const MCP_TOOL_TIMEOUT_SECS: u64 = 25 * 3600;
 pub enum Harness {
     Codex,
     Claude,
-    /// An agent spoken to over ACP, as its profile says.
-    Acp,
 }
 
 impl Harness {
@@ -63,65 +61,63 @@ pub fn harness_version(harness: &str) -> &'static str {
     }
 }
 
-/// What each harness supports natively, as reported to clients.
-pub fn capabilities(harness: &str, acp: Option<&AcpProfile>) -> Value {
-    if let Some(profile) = acp {
-        return json!({
-            "harness": harness,
-            "protocol": "acp",
-            "tested_version": profile.version,
-            "steer": "emulated",
-            "interrupt": "native",
-            "resume": "native",
-            "approval": "native",
-            "question": "unsupported",
-            "fork": "unsupported",
-            "compact": "native",
-            "pty": false,
-        });
-    }
-    if harness == "claude" {
-        return json!({
-            "harness": "claude",
-            "protocol": "agent-sdk",
-            "tested_version": CLAUDE_SDK_VERSION,
-            "steer": "emulated",
-            "interrupt": "native",
-            "resume": "native",
-            "approval": "native",
-            "question": "native",
-            "fork": "native",
-            "compact": "native",
-            "pty": false,
-        });
-    }
-    json!({
-        "harness": "codex",
-        "protocol": "app-server",
-        "tested_version": CODEX_VERSION,
-        "send": "native",
-        "steer": "native",
-        "interrupt": "native",
-        "resume": "native",
-        "approval": "native",
-        "question": "native",
-        "side_query": "unsupported",
-        "fork": "native",
-        "pty": false,
-    })
-}
-
 pub struct Native {
     input: Mutex<ChildStdin>,
-    harness: Harness,
-    /// An ACP agent's bridge, and where the lines it makes for the guest go, in order.
-    bridge: Option<(std::sync::Mutex<Bridge>, mpsc::UnboundedSender<Incoming>)>,
+    dialect: Dialect,
     home: String,
+}
+
+/// How the guest speaks to the harness.
+enum Dialect {
+    /// Codex's JSON-RPC, which the Claude adapter speaks too.
+    Codex(Harness),
+    /// ACP: an agent's bridge, and where the lines it makes for the guest go, in order.
+    Acp(
+        Box<std::sync::Mutex<Bridge>>,
+        mpsc::UnboundedSender<Incoming>,
+    ),
 }
 
 /// Where an ACP agent finds the platform's instructions for the session (`{instructions}`).
 fn instructions_path(home: &str) -> String {
     format!("{home}/.ryzhub/instructions.md")
+}
+
+/// Start a harness in `/workspace` with only the base environment and `env`, speaking on stdio.
+fn spawn_harness<K: AsRef<OsStr>, V: AsRef<OsStr>>(
+    mut command: tokio::process::Command,
+    home: &str,
+    env: impl IntoIterator<Item = (K, V)>,
+) -> anyhow::Result<Child> {
+    command
+        .env_clear()
+        .env("HOME", home)
+        .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+        .env("TERM", "dumb")
+        .envs(crate::egress::child_env())
+        .envs(env)
+        .current_dir("/workspace")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    crate::guest::killable_first(&mut command);
+    Ok(command.spawn()?)
+}
+
+/// The exit of a harness whose output ended with `result`; one still running is killed.
+async fn exited(child: &mut Child, result: anyhow::Result<()>) -> HarnessEvent {
+    let status = match child.try_wait() {
+        Ok(Some(status)) => Some(status),
+        _ => {
+            let _ = child.kill().await;
+            child.wait().await.ok()
+        }
+    };
+    HarnessEvent::Exited {
+        exit_code: status.and_then(|s| s.code()),
+        error: result.err().map(|e| e.to_string()),
+    }
 }
 
 impl Native {
@@ -141,11 +137,11 @@ impl Native {
                     .all(|c| c.is_ascii_alphanumeric() || "-._:/@+".contains(c)),
             "invalid model"
         );
+        let home = std::env::var("HOME")?;
         if let Some(profile) = acp {
-            return Self::start_acp(guest, model, mcp, profile, models).await;
+            return Self::start_acp(guest, model, mcp, profile, models, home).await;
         }
         let harness = Harness::parse(harness)?;
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/home/agent".into());
         let config_dir = std::path::Path::new(&home).join(".codex");
         std::fs::create_dir_all(&config_dir)?;
         // The harness talks only to the guest's local proxy, which adds the gateway key.
@@ -171,7 +167,7 @@ stream_max_retries = 0
         }
         // No provider or gateway credential ever enters the durable home directory.
         crate::journal::atomic_bytes(&config_dir.join("config.toml"), config.as_bytes())?;
-        let mut command = match harness {
+        let command = match harness {
             Harness::Claude => {
                 let mut command = tokio::process::Command::new("/usr/local/bin/node");
                 command.arg("/opt/ryzhub-claude/dist/adapter.js");
@@ -182,39 +178,27 @@ stream_max_retries = 0
                 command.arg("app-server");
                 command
             }
-            Harness::Acp => anyhow::bail!("ACP agents start from their profile"),
         };
-        command
-            .env_clear()
-            .env("HOME", &home)
-            .env("CODEX_HOME", &config_dir)
-            .env("PATH", "/usr/local/bin:/usr/bin:/bin")
-            .env("TERM", "dumb")
-            .env("ANTHROPIC_BASE_URL", "http://127.0.0.1:8090")
-            .env("ANTHROPIC_API_KEY", "guest-proxy")
-            .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
+        let env = [
+            ("CODEX_HOME", config_dir.display().to_string()),
+            ("ANTHROPIC_BASE_URL", PROXY.into()),
+            ("ANTHROPIC_API_KEY", "guest-proxy".into()),
+            ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1".into()),
             // Every model request belongs to a platform run: subagents and commands finish
             // within the turn that started them instead of outliving it in the background.
-            .env("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS", "1")
-            .env(
+            ("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS", "1".into()),
+            (
                 "MCP_TOOL_TIMEOUT",
                 (MCP_TOOL_TIMEOUT_SECS * 1000).to_string(),
-            )
-            .env("RYZHUB_CLAUDE_MODEL", model)
-            .env("RYZHUB_MCP", if mcp { "1" } else { "0" })
-            .env("TOKIO_WORKER_THREADS", "2")
-            .envs(crate::egress::child_env())
-            .current_dir("/workspace")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .kill_on_drop(true);
-        crate::guest::killable_first(&mut command);
-        let mut child = command.spawn()?;
+            ),
+            ("RYZHUB_CLAUDE_MODEL", model.into()),
+            ("RYZHUB_MCP", if mcp { "1" } else { "0" }.into()),
+            ("TOKIO_WORKER_THREADS", "2".into()),
+        ];
+        let mut child = spawn_harness(command, &home, env)?;
         let native = Arc::new(Self {
             input: Mutex::new(child.stdin.take().context("harness stdin")?),
-            harness,
-            bridge: None,
+            dialect: Dialect::Codex(harness),
             home,
         });
         let mut lines = BufReader::new(child.stdout.take().context("harness stdout")?).lines();
@@ -228,7 +212,7 @@ stream_max_retries = 0
                         this.send(json!({"method":"initialized"})).await?;
                         // Codex reports its commands (skills) when asked; the Claude adapter
                         // announces them itself.
-                        if this.harness == Harness::Codex {
+                        if harness == Harness::Codex {
                             this.send(json!({"id":"__skills","method":"skills/list","params":{}}))
                                 .await?;
                         }
@@ -253,17 +237,7 @@ stream_max_retries = 0
                 Ok::<(), anyhow::Error>(())
             }
             .await;
-            let status = match child.try_wait() {
-                Ok(Some(status)) => Some(status),
-                _ => {
-                    let _ = child.kill().await;
-                    child.wait().await.ok()
-                }
-            };
-            let exited = HarnessEvent::Exited {
-                exit_code: status.and_then(|s| s.code()),
-                error: result.err().map(|e| e.to_string()),
-            };
+            let exited = exited(&mut child, result).await;
             let _ = guest.native_line(Incoming::Event(exited)).await;
         });
         native
@@ -286,12 +260,12 @@ stream_max_retries = 0
         mcp: bool,
         profile: AcpProfile,
         models: Vec<String>,
+        home: String,
     ) -> anyhow::Result<Arc<Self>> {
         ensure!(
             std::path::Path::new(&profile.command).is_absolute(),
             "invalid ACP command"
         );
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/home/agent".into());
         let instructions = instructions_path(&home);
         if let Some(dir) = std::path::Path::new(&instructions).parent() {
             std::fs::create_dir_all(dir)?;
@@ -311,28 +285,15 @@ stream_max_retries = 0
                 .replace("{instructions}", &instructions)
         };
         let mut command = tokio::process::Command::new(&profile.command);
-        command
-            .args(&profile.args)
-            .env_clear()
-            .env("HOME", &home)
-            .env("PATH", "/usr/local/bin:/usr/bin:/bin")
-            .env("TERM", "dumb")
-            .envs(crate::egress::child_env())
-            .envs(profile.env.iter().map(|(k, v)| (k.clone(), fill(v))))
-            .current_dir("/workspace")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .kill_on_drop(true);
-        crate::guest::killable_first(&mut command);
-        let mut child = command.spawn()?;
+        command.args(&profile.args);
+        let env = profile.env.iter().map(|(k, v)| (k, fill(v)));
+        let mut child = spawn_harness(command, &home, env)?;
         let (deliver, mut delivered) = mpsc::unbounded_channel();
         let mut bridge = Bridge::new(profile, models, mcp);
         let initialize = bridge.initialize();
         let native = Arc::new(Self {
             input: Mutex::new(child.stdin.take().context("harness stdin")?),
-            harness: Harness::Acp,
-            bridge: Some((std::sync::Mutex::new(bridge), deliver)),
+            dialect: Dialect::Acp(Box::new(std::sync::Mutex::new(bridge)), deliver),
             home,
         });
         // One task hands the guest what the bridge makes of both sides, in order.
@@ -353,33 +314,26 @@ stream_max_retries = 0
                         // Agents may log to stdout; only JSON-RPC lines count.
                         continue;
                     };
-                    let outs = this.bridge()?.lock().unwrap().incoming(&value);
-                    this.route(outs).await?;
+                    if let Dialect::Acp(bridge, _) = &this.dialect {
+                        let outs = bridge.lock().unwrap().incoming(&value);
+                        this.route(outs).await?;
+                    }
                 }
                 Ok::<(), anyhow::Error>(())
             }
             .await;
-            let status = match child.try_wait() {
-                Ok(Some(status)) => Some(status),
-                _ => {
-                    let _ = child.kill().await;
-                    child.wait().await.ok()
-                }
-            };
-            let exited = HarnessEvent::Exited {
-                exit_code: status.and_then(|s| s.code()),
-                error: result.err().map(|e| e.to_string()),
-            };
-            if let Some((_, deliver)) = &this.bridge {
-                let _ = deliver.send(Incoming::Event(exited));
-            }
+            let exited = exited(&mut child, result).await;
+            this.deliver(Incoming::Event(exited));
         });
         native.send(initialize).await?;
         Ok(native)
     }
 
-    fn bridge(&self) -> anyhow::Result<&std::sync::Mutex<Bridge>> {
-        Ok(&self.bridge.as_ref().context("not an ACP agent")?.0)
+    /// Hand a line of an ACP agent's to the guest, after those before it.
+    fn deliver(&self, incoming: Incoming) {
+        if let Dialect::Acp(_, deliver) = &self.dialect {
+            deliver.send(incoming).ok();
+        }
     }
 
     /// Send what the bridge made: messages to the agent, lines to the guest.
@@ -387,11 +341,7 @@ stream_max_retries = 0
         for out in outs {
             match out {
                 Out::Agent(message) => self.send(message).await?,
-                Out::Guest(incoming) => {
-                    if let Some((_, deliver)) = &self.bridge {
-                        deliver.send(*incoming).ok();
-                    }
-                }
+                Out::Guest(incoming) => self.deliver(*incoming),
             }
         }
         Ok(())
@@ -400,15 +350,17 @@ stream_max_retries = 0
     /// Start platform operation `op_id`. False when the harness needs no call for it: the
     /// operation is complete.
     pub async fn dispatch(&self, op_id: &str, request: &HarnessRequest) -> anyhow::Result<bool> {
-        if self.bridge.is_none() {
-            return match self.request(op_id, request) {
-                Some(message) => {
-                    self.send(message).await?;
-                    Ok(true)
-                }
-                None => Ok(false),
-            };
-        }
+        let bridge = match &self.dialect {
+            Dialect::Codex(harness) => {
+                let Some((method, params)) = translate(*harness, request) else {
+                    return Ok(false);
+                };
+                self.send(json!({"id":op_id,"method":method,"params":params}))
+                    .await?;
+                return Ok(true);
+            }
+            Dialect::Acp(bridge, _) => bridge,
+        };
         if let HarnessRequest::StartThread { instructions, .. }
         | HarnessRequest::ResumeThread { instructions, .. }
         | HarnessRequest::ForkThread { instructions, .. }
@@ -425,19 +377,15 @@ stream_max_retries = 0
             }
             _ => vec![],
         };
-        let outs = self
-            .bridge()?
-            .lock()
-            .unwrap()
-            .request(op_id, request, images);
+        let outs = bridge.lock().unwrap().request(op_id, request, images);
         self.route(outs).await?;
         Ok(true)
     }
 
     /// Deliver the user's decision on a harness approval or question.
     pub async fn answer(&self, request_id: &str, answer: &HarnessAnswer) -> anyhow::Result<()> {
-        if self.bridge.is_some() {
-            let outs = self.bridge()?.lock().unwrap().answer(request_id, answer);
+        if let Dialect::Acp(bridge, _) = &self.dialect {
+            let outs = bridge.lock().unwrap().answer(request_id, answer);
             return self.route(outs).await;
         }
         self.send(Self::answer_message(request_id, answer)?).await
@@ -453,12 +401,6 @@ stream_max_retries = 0
         )
         .await??;
         Ok(())
-    }
-
-    /// The native call for `request`, or None when this harness needs no call for it.
-    pub fn request(&self, op_id: &str, request: &HarnessRequest) -> Option<Value> {
-        let (method, params) = translate(self.harness, request)?;
-        Some(json!({"id":op_id,"method":method,"params":params}))
     }
 
     /// The native reply to a harness approval or question.

@@ -37,7 +37,7 @@ pub fn definitions() -> Value {
         tool(
             "exec",
             "Execute a shell command in the sandbox. Only /workspace persists; installed system \
-             packages may be discarded. Full output is saved on the execution node. PTY is unsupported.",
+             packages may be discarded. Full output is saved on the execution node.",
             json!({
                 "cmd": string(),
                 "cwd": string(),
@@ -293,7 +293,6 @@ pub async fn advance(
                 Some(
                     code @ (Code::SandboxDisabled
                     | Code::InvalidToolArguments
-                    | Code::PtyUnsupported
                     | Code::PolicyDenied
                     | Code::Forbidden
                     | Code::InvalidArguments),

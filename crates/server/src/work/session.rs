@@ -263,7 +263,7 @@ pub async fn ensure_work(app: &App, lease: &Lease, run: Uuid) -> anyhow::Result<
         },
     )
     .await?;
-    discover_models(app, lease, id, &settings).await?;
+    discover_models(app, lease, id).await?;
     Ok(id)
 }
 
@@ -279,16 +279,11 @@ async fn suspending(tx: &mut Tx<'_>, lease: &Lease) -> anyhow::Result<bool> {
     .await?)
 }
 
-/// Record the harness's models with the sandbox's capabilities. Discovery runs once per
-/// sandbox: the guest keeps an operation's result only for a limited time, so a fixed
-/// operation id cannot be asked again forever, and the model list does not change while the
-/// sandbox (and so the harness version) stays the same.
-async fn discover_models(
-    app: &App,
-    lease: &Lease,
-    id: Uuid,
-    settings: &RunConfig,
-) -> anyhow::Result<()> {
+/// Record the harness's models with the sandbox. Discovery runs once per sandbox: the guest
+/// keeps an operation's result only for a limited time, so a fixed operation id cannot be
+/// asked again forever, and the model list does not change while the sandbox (and so the
+/// harness version) stays the same.
+async fn discover_models(app: &App, lease: &Lease, id: Uuid) -> anyhow::Result<()> {
     let known: bool = {
         let mut tx = app.store.tx(lease.org_id).await?;
         let known = sqlx::query_scalar(
@@ -312,13 +307,11 @@ async fn discover_models(
         HarnessRequest::ListModels,
     )
     .await?;
-    let mut capabilities = crate::run_config::capabilities(&settings.harness, &settings.protocol);
-    capabilities["models"] = serde_json::to_value(listed.models)?;
     let mut tx = app.store.fenced(lease).await?;
     sqlx::query("UPDATE sandboxes SET capabilities=$3 WHERE org_id=$1 AND id=$2")
         .bind(lease.org_id)
         .bind(id)
-        .bind(capabilities)
+        .bind(serde_json::json!({"models": listed.models}))
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;

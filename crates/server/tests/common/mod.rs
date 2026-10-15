@@ -326,7 +326,6 @@ pub async fn guest_exec(
         env: Default::default(),
         timeout_ms: 10000,
         background: false,
-        pty: false,
     };
     let exec = GuestCommand::Exec {
         op_id: op.into(),

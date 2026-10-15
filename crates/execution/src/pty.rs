@@ -1,12 +1,12 @@
 //! Interactive terminals in sandboxes.
 //!
-//! A terminal session is a login shell on a pseudo-terminal in the guest, kept outside the
-//! journal. A client attaches over a dedicated connection (gateway, host, guest) that carries
-//! [`Frame`]s after the request's reply line. The guest keeps the last [`BUFFER`] bytes of
-//! output with their byte offsets, so a client that reconnects resumes from the offset it has
-//! seen; a session nobody is attached to ends after [`DETACHED`].
+//! A sandbox has one terminal session: a login shell on a pseudo-terminal in the guest, kept
+//! outside the journal. A client attaches over a dedicated connection (gateway, host, guest)
+//! that carries [`Frame`]s after the request's reply line. The guest keeps the last [`BUFFER`]
+//! bytes of output with their byte offsets, so a client that reconnects resumes from the offset
+//! it has seen; a session nobody is attached to ends after [`DETACHED`].
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::VecDeque,
     io::{Read, Write},
     os::fd::{AsRawFd, OwnedFd},
     sync::{
@@ -16,7 +16,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context, ensure};
+use anyhow::Context;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     sync::Notify,
@@ -26,8 +26,6 @@ use tokio::{
 pub const BUFFER: usize = 256 * 1024;
 /// How long a session lives with nobody attached.
 pub const DETACHED: Duration = Duration::from_secs(600);
-/// Sessions one sandbox may have.
-pub const MAX_SESSIONS: usize = 4;
 /// Largest frame on the wire.
 const MAX_FRAME: u32 = 1 << 20;
 
@@ -127,17 +125,16 @@ impl Session {
     }
 }
 
-/// A sandbox's terminal sessions, by name.
+/// A sandbox's terminal session.
 pub struct Terminals {
     /// Where shells start.
     cwd: std::path::PathBuf,
-    sessions: Mutex<HashMap<String, Arc<Session>>>,
+    session: Mutex<Option<Arc<Session>>>,
 }
 
 /// What a client sees on attaching: the session, and the oldest offset still buffered.
 pub struct Attached {
     session: Arc<Session>,
-    name: String,
     pub start: u64,
 }
 
@@ -145,33 +142,23 @@ impl Terminals {
     pub fn new(cwd: impl Into<std::path::PathBuf>) -> Arc<Self> {
         Arc::new(Self {
             cwd: cwd.into(),
-            sessions: Mutex::new(HashMap::new()),
+            session: Mutex::new(None),
         })
     }
 
-    /// Attach to session `name`, starting a shell sized `cols`×`rows` if there is none (or it
-    /// has exited).
-    pub fn open(self: &Arc<Self>, name: &str, cols: u16, rows: u16) -> anyhow::Result<Attached> {
-        ensure!(
-            !name.is_empty()
-                && name.len() <= 64
-                && name
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
-            "INVALID_TERMINAL_SESSION"
-        );
-        let mut sessions = self.sessions.lock().unwrap();
-        let live = sessions
-            .get(name)
+    /// Attach to the session, starting a shell sized `cols`×`rows` if there is none (or it has
+    /// exited).
+    pub fn open(self: &Arc<Self>, cols: u16, rows: u16) -> anyhow::Result<Attached> {
+        let mut current = self.session.lock().unwrap();
+        let live = current
+            .as_ref()
             .filter(|s| s.output.lock().unwrap().exit.is_none())
             .cloned();
         let session = match live {
             Some(session) => session,
             None => {
-                sessions.remove(name);
-                ensure!(sessions.len() < MAX_SESSIONS, "TOO_MANY_TERMINALS");
                 let session = spawn(&self.cwd, cols, rows)?;
-                sessions.insert(name.to_owned(), session.clone());
+                *current = Some(session.clone());
                 session
             }
         };
@@ -179,11 +166,7 @@ impl Terminals {
         session.attached.fetch_add(1, Ordering::SeqCst);
         session.generation.fetch_add(1, Ordering::SeqCst);
         let start = session.output.lock().unwrap().start;
-        Ok(Attached {
-            session,
-            name: name.to_owned(),
-            start,
-        })
+        Ok(Attached { session, start })
     }
 
     /// Serve an attachment: output from offset `since` on, and the client's input, until the
@@ -268,20 +251,17 @@ impl Terminals {
                 && session.generation.load(Ordering::SeqCst) == generation
             {
                 session.end();
-                let mut sessions = this.sessions.lock().unwrap();
-                if sessions
-                    .get(&attached.name)
-                    .is_some_and(|s| Arc::ptr_eq(s, &session))
-                {
-                    sessions.remove(&attached.name);
+                let mut current = this.session.lock().unwrap();
+                if current.as_ref().is_some_and(|s| Arc::ptr_eq(s, &session)) {
+                    *current = None;
                 }
             }
         });
     }
 
-    /// End every session (the sandbox is stopping).
-    pub fn end_all(&self) {
-        for session in self.sessions.lock().unwrap().drain().map(|(_, s)| s) {
+    /// End the session (the sandbox is stopping).
+    pub fn end(&self) {
+        if let Some(session) = self.session.lock().unwrap().take() {
             session.end();
         }
     }
@@ -315,22 +295,18 @@ fn spawn(cwd: &std::path::Path, cols: u16, rows: u16) -> anyhow::Result<Arc<Sess
         .stdout(std::process::Stdio::from(slave.try_clone()?))
         .stderr(std::process::Stdio::from(slave));
     // SAFETY: between fork and exec only async-signal-safe calls, allocating nothing: a new
-    // session with the terminal as its controlling terminal, and the shell made the first
-    // choice of the out-of-memory killer (see `guest::killable_first`).
+    // session with the terminal as its controlling terminal.
     unsafe {
         use std::os::unix::process::CommandExt;
         command.pre_exec(|| {
             libc::setsid();
             libc::ioctl(0, libc::TIOCSCTTY as _, 0);
-            let fd = libc::open(c"/proc/self/oom_score_adj".as_ptr(), libc::O_WRONLY);
-            if fd >= 0 {
-                libc::write(fd, b"0".as_ptr().cast(), 1);
-                libc::close(fd);
-            }
             Ok(())
         });
     }
-    let mut child = tokio::process::Command::from(command)
+    let mut command = tokio::process::Command::from(command);
+    crate::guest::killable_first(&mut command);
+    let mut child = command
         .kill_on_drop(false)
         .spawn()
         .context("starting the terminal shell")?;
@@ -390,7 +366,7 @@ mod tests {
         let terminals = Terminals::new(dir.path());
         let (client, server) = tokio::io::duplex(1 << 16);
         let (server_read, server_write) = tokio::io::split(server);
-        let attached = terminals.open("default", 80, 24).unwrap();
+        let attached = terminals.open(80, 24).unwrap();
         let serving = tokio::spawn({
             let terminals = terminals.clone();
             async move {
@@ -420,7 +396,7 @@ mod tests {
         // Leaving keeps the session: a new attachment replays from the offset it asks for.
         drop((from_shell, to_shell));
         serving.await.unwrap().ok();
-        let again = terminals.open("default", 100, 30).unwrap();
+        let again = terminals.open(100, 30).unwrap();
         assert_eq!(again.start, 0);
         let (client, server) = tokio::io::duplex(1 << 16);
         let (server_read, server_write) = tokio::io::split(server);

@@ -86,7 +86,6 @@ async fn actual_codex_native_turn_and_checkpoint_restore() -> anyhow::Result<()>
                     env: Default::default(),
                     timeout_ms: 10000,
                     background: false,
-                    pty: false,
                 },
             },
         },

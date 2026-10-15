@@ -75,35 +75,9 @@ impl<S: Replay> Log<S> {
     /// Load `<name>.json` and replay `<name>.log`. A torn final line (crash mid-append) is
     /// discarded; it was never acknowledged. The result is compacted immediately.
     pub fn open(directory: &Path, name: &str) -> anyhow::Result<(Self, S)> {
+        let (state, applied) = Self::load_state(directory, name)?;
         let snapshot = directory.join(format!("{name}.json"));
         let log = directory.join(format!("{name}.log"));
-        let Snapshot {
-            mut applied,
-            mut state,
-        } = match std::fs::read(&snapshot) {
-            Ok(bytes) => serde_json::from_slice(&bytes)
-                .or_else(|_| {
-                    // A snapshot written before the log existed is the bare state.
-                    serde_json::from_slice(&bytes).map(|state| Snapshot { applied: 0, state })
-                })
-                .context("unreadable journal snapshot")?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Snapshot {
-                applied: 0,
-                state: S::default(),
-            },
-            Err(e) => return Err(e.into()),
-        };
-        if let Ok(file) = File::open(&log) {
-            for line in BufReader::new(file).lines() {
-                let Ok(record) = serde_json::from_str::<Record<S::Entry>>(&line?) else {
-                    break;
-                };
-                if record.n > applied {
-                    state.apply(&record.entry);
-                    applied = record.n;
-                }
-            }
-        }
         save(
             &snapshot,
             &Snapshot {
@@ -133,16 +107,16 @@ impl<S: Replay> Log<S> {
     /// The state as of the last complete entry, without modifying any file. Safe to call on a
     /// journal another process is appending to (a torn final line is ignored).
     pub fn read(directory: &Path, name: &str) -> anyhow::Result<S> {
-        let snapshot = directory.join(format!("{name}.json"));
+        Ok(Self::load_state(directory, name)?.0)
+    }
+
+    /// The snapshot with the log replayed over it, and the number of the last entry applied.
+    fn load_state(directory: &Path, name: &str) -> anyhow::Result<(S, u64)> {
         let Snapshot {
             mut applied,
             mut state,
-        } = match std::fs::read(&snapshot) {
-            Ok(bytes) => serde_json::from_slice(&bytes)
-                .or_else(|_| {
-                    serde_json::from_slice(&bytes).map(|state| Snapshot { applied: 0, state })
-                })
-                .context("unreadable journal snapshot")?,
+        } = match std::fs::read(directory.join(format!("{name}.json"))) {
+            Ok(bytes) => serde_json::from_slice(&bytes).context("unreadable journal snapshot")?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Snapshot {
                 applied: 0,
                 state: S::default(),
@@ -160,7 +134,7 @@ impl<S: Replay> Log<S> {
                 }
             }
         }
-        Ok(state)
+        Ok((state, applied))
     }
 
     /// Durably record `entry`. Apply it to the in-memory state after this returns.

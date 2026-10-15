@@ -7,13 +7,13 @@
 //! the host creates on first start, so it needs no particular host filesystem.
 use std::{
     ffi::CString,
-    os::{fd::AsRawFd, unix::ffi::OsStrExt},
+    os::fd::AsRawFd,
     path::{Path, PathBuf},
 };
 
 use anyhow::{Context, ensure};
 
-use crate::host::{mount_options, run};
+use crate::host::{mountinfo, run};
 
 /// The quota volume: where it is mounted and its block device.
 #[derive(Debug)]
@@ -106,7 +106,7 @@ impl Volume {
             std::fs::rename(&partial, image)?;
         }
         std::fs::create_dir_all(mountpoint)?;
-        if mount_options(mountpoint)?.is_none() {
+        if mountinfo(mountpoint)?.is_none() {
             let device = match attached(image_text).await? {
                 Some(device) => device,
                 None => attach(image_text).await?,
@@ -124,17 +124,17 @@ impl Volume {
             )
             .await?;
         }
-        let options = mount_options(mountpoint)?.unwrap_or_default();
+        let mount = mountinfo(mountpoint)?.context("QUOTA_VOLUME_NOT_MOUNTED")?;
         ensure!(
-            options
+            mount
+                .options
                 .split(',')
                 .any(|o| matches!(o, "prjquota" | "pquota")),
             "QUOTA_VOLUME_WITHOUT_PROJECT_QUOTA"
         );
-        let device = mount_source(mountpoint)?.context("QUOTA_VOLUME_NOT_MOUNTED")?;
         Ok(Self {
             mountpoint: mountpoint.into(),
-            device: CString::new(device)?,
+            device: CString::new(mount.source)?,
         })
     }
 
@@ -241,21 +241,6 @@ async fn attach(image: &str) -> anyhow::Result<String> {
     }
     run("losetup", &[&device, image]).await?;
     Ok(device)
-}
-
-/// The source (block device) of the mount at `path`.
-fn mount_source(path: &Path) -> anyhow::Result<Option<String>> {
-    let wanted = path.as_os_str().as_bytes();
-    for line in std::fs::read_to_string("/proc/self/mountinfo")?.lines() {
-        let parts: Vec<_> = line.split_whitespace().collect();
-        if parts.get(4).map(|p| p.as_bytes()) == Some(wanted) {
-            let separator = parts.iter().position(|p| *p == "-");
-            return Ok(separator
-                .and_then(|i| parts.get(i + 2))
-                .map(|s| s.to_string()));
-        }
-    }
-    Ok(None)
 }
 
 #[cfg(test)]

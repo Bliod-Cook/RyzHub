@@ -47,8 +47,6 @@ pub struct ExecSpec {
     pub timeout_ms: u64,
     #[serde(default)]
     pub background: bool,
-    #[serde(default)]
-    pub pty: bool,
 }
 
 fn codex() -> String {
@@ -105,10 +103,9 @@ pub struct AcpProfile {
 pub enum GuestCommand {
     /// Adopt a new execution epoch; older epochs are rejected from now on.
     Fence,
-    /// Attach to terminal `session` (see [`pty`]), sized `cols`×`rows`, replaying output from
-    /// offset `since`. The connection carries terminal frames after the reply.
+    /// Attach to the sandbox's terminal (see [`pty`]), sized `cols`×`rows`, replaying output
+    /// from offset `since`. The connection carries terminal frames after the reply.
     PtyAttach {
-        session: String,
         cols: u16,
         rows: u16,
         #[serde(default)]
@@ -370,7 +367,6 @@ pub enum HostCommand {
     TerminalAttach {
         sandbox_id: Uuid,
         exec_epoch: u64,
-        session: String,
         cols: u16,
         rows: u16,
         #[serde(default)]
@@ -505,28 +501,29 @@ pub async fn upload(
     body: impl AsyncRead + Unpin,
 ) -> anyhow::Result<Value> {
     let (mut reader, mut write) = send_request(&endpoint.into(), request).await?;
-    let copied = copy_exact(body, &mut write, size).await?;
-    ensure!(
-        copied == size,
-        "artifact ended after {copied} of {size} bytes"
-    );
+    copy_exact(body, &mut write, size).await?;
     write.flush().await?;
     read_reply(&mut reader).await
 }
 
-/// Copy exactly `size` bytes, failing if either side stalls for [`STREAM_IDLE`].
+/// Copy exactly `size` bytes, failing if the reader ends early or either side stalls for
+/// [`STREAM_IDLE`].
 pub async fn copy_exact(
     reader: impl AsyncRead + Unpin,
     writer: &mut (impl tokio::io::AsyncWrite + Unpin),
     size: u64,
-) -> anyhow::Result<u64> {
+) -> anyhow::Result<()> {
     let mut reader = reader.take(size);
     let mut buffer = vec![0; 256 * 1024];
     let mut copied = 0;
     loop {
         let n = tokio::time::timeout(STREAM_IDLE, reader.read(&mut buffer)).await??;
         if n == 0 {
-            return Ok(copied);
+            ensure!(
+                copied == size,
+                "stream ended after {copied} of {size} bytes"
+            );
+            return Ok(());
         }
         tokio::time::timeout(STREAM_IDLE, writer.write_all(&buffer[..n])).await??;
         copied += n as u64;

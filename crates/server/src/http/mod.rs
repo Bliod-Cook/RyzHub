@@ -289,13 +289,6 @@ async fn healthz(State(app): State<App>) -> ApiResult<Json<Value>> {
 
 async fn capabilities(State(app): State<App>) -> Json<Value> {
     let config = &app.config;
-    let mut work = ryzhub_execution::native::capabilities("codex", None);
-    if let (Some(work), Some(extra)) = (
-        work.as_object_mut(),
-        crate::run_config::capabilities("codex", "responses").as_object(),
-    ) {
-        work.extend(extra.clone());
-    }
     let harnesses = crate::run_config::work_harnesses(config);
     Json(json!({
         "chat": if config.llm.enabled { crate::run_config::default_chat_protocol(config) } else { "mock" },
@@ -305,7 +298,6 @@ async fn capabilities(State(app): State<App>) -> Json<Value> {
         "claude_model": config.work.claude_model,
         "responses_model": config.llm.responses_model,
         "harnesses": harnesses,
-        "work_capabilities": if config.work.enabled { work } else { json!({}) },
         "search": config.search.enabled,
         "memory": config.search.enabled,
         "conversation_temporary": config.search.enabled,

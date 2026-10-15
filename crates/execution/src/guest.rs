@@ -266,7 +266,8 @@ pub struct Guest {
     folds: Mutex<Folds>,
     /// Signalled whenever an event, a result or streaming text arrives.
     changed: Notify,
-    pub(crate) key: tokio::sync::RwLock<Option<(String, String)>>,
+    /// The sandbox key, which exists only here.
+    pub(crate) gateway: tokio::sync::RwLock<Option<crate::proxy::Gateway>>,
     terminals: Arc<crate::pty::Terminals>,
     _lock: std::fs::File,
 }
@@ -328,7 +329,7 @@ impl Guest {
             native: Mutex::new(None),
             folds: Mutex::new(Folds::default()),
             changed: Notify::new(),
-            key: tokio::sync::RwLock::new(None),
+            gateway: tokio::sync::RwLock::new(None),
             terminals: crate::pty::Terminals::new("/workspace"),
             _lock: process_lock,
         }))
@@ -357,8 +358,7 @@ impl Guest {
             }
             GuestCommand::InstallSkills { skills } => {
                 drop(journal);
-                let home = std::env::var("HOME").unwrap_or_else(|_| "/home/agent".into());
-                install_skills(std::path::Path::new(&home), &skills)?;
+                install_skills(std::path::Path::new(&std::env::var("HOME")?), &skills)?;
                 Ok(json!({"installed":skills.len()}))
             }
             GuestCommand::NativeStart {
@@ -369,14 +369,13 @@ impl Guest {
                 models,
             } => {
                 drop(journal);
-                let capabilities = crate::native::capabilities(&harness, acp.as_ref());
                 let mut native = self.native.lock().await;
                 if native.is_none() {
                     *native = Some(
                         Native::start(self.clone(), &model, mcp, &harness, acp, models).await?,
                     );
                 }
-                Ok(json!({"running":true,"capabilities":capabilities}))
+                Ok(json!({"running":true}))
             }
             GuestCommand::Harness { op_id, request } => {
                 let reserved = journal.reserve(&op_id, &request, |fingerprint| Operation {
@@ -423,15 +422,8 @@ impl Guest {
                 Ok(result)
             }
             GuestCommand::RotateKey { token, socket_name } => {
-                ensure!(token.len() <= 8192, "INVALID_KEY");
-                ensure!(
-                    socket_name.starts_with("llm")
-                        && socket_name.ends_with(".sock")
-                        && !socket_name.contains('/')
-                        && !socket_name.contains(".."),
-                    "INVALID_GATEWAY_SOCKET"
-                );
-                *self.key.write().await = Some((token, socket_name));
+                *self.gateway.write().await =
+                    Some(crate::proxy::Gateway::new(token, &socket_name)?);
                 Ok(json!({"rotated":true}))
             }
             GuestCommand::Exec { op_id, spec } => {
@@ -443,7 +435,6 @@ impl Guest {
                         && spec.timeout_ms <= 600_000,
                     "INVALID_EXEC"
                 );
-                ensure!(!spec.pty, "PTY_UNSUPPORTED");
                 let pending = json!({"state":"running","handle":op_id});
                 let reserved = journal.reserve(&op_id, &spec, |fingerprint| Operation {
                     result: pending.clone(),
@@ -535,10 +526,7 @@ impl Guest {
             } => {
                 drop(journal);
                 ensure!(
-                    !path.is_empty()
-                        && path.len() <= 4096
-                        && (64..=8000).contains(&max_edge)
-                        && max_bytes <= 8 * 1024 * 1024,
+                    !path.is_empty() && path.len() <= 4096,
                     "INVALID_IMAGE_REQUEST"
                 );
                 Ok(tokio::task::spawn_blocking(move || {
@@ -750,8 +738,8 @@ impl Guest {
         let live = (self.clone(), op.clone());
         let live_err = live.clone();
         tokio::spawn(async move {
-            let out = tokio::spawn(capture(stdout, stdout_path.clone(), Some(live)));
-            let err = tokio::spawn(capture(stderr, stderr_path.clone(), Some(live_err)));
+            let out = tokio::spawn(capture(stdout, stdout_path.clone(), live));
+            let err = tokio::spawn(capture(stderr, stderr_path.clone(), live_err));
             let (mut timed_out, mut cancelled) = (false, false);
             let group = Pid::from_raw(pid as i32);
             let status = tokio::select! {
@@ -804,7 +792,7 @@ impl Guest {
         }
         let listener = UnixListener::bind(&socket)?;
         let proxy = tokio::net::TcpListener::bind("127.0.0.1:8090").await?;
-        let app = crate::proxy::router(self.clone())?;
+        let app = crate::proxy::router(self.clone());
         tokio::spawn(async move {
             let _ = axum::serve(proxy, app).await;
         });
@@ -833,19 +821,13 @@ impl Guest {
                 if let Ok(GuestRequest {
                     sandbox_id,
                     exec_epoch,
-                    command:
-                        GuestCommand::PtyAttach {
-                            session,
-                            cols,
-                            rows,
-                            since,
-                        },
+                    command: GuestCommand::PtyAttach { cols, rows, since },
                 }) = &request
                 {
                     let attached = this
                         .terminal_epoch(*sandbox_id, *exec_epoch)
                         .await
-                        .and_then(|()| this.terminals.open(session, *cols, *rows));
+                        .and_then(|()| this.terminals.open(*cols, *rows));
                     let attached = match attached {
                         Ok(attached) => attached,
                         Err(error) => {
@@ -853,8 +835,7 @@ impl Guest {
                             return;
                         }
                     };
-                    let header =
-                        Reply::from(Ok(json!({"session": session, "start": attached.start})));
+                    let header = Reply::from(Ok(json!({"start": attached.start})));
                     if write.write_all(&header.line()).await.is_ok() {
                         let read = read.into_inner();
                         let _ = this.terminals.serve(attached, *since, read, write).await;
@@ -881,49 +862,19 @@ impl Guest {
     }
 
     pub async fn stop_jobs(&self) {
-        self.terminals.end_all();
+        self.terminals.end();
         for job in self.jobs.lock().await.values() {
             let _ = killpg(Pid::from_raw(job.pid as i32), Signal::SIGKILL);
         }
     }
 }
 
-/// Write the project instructions and make both harnesses' memory files import them.
 /// Where harnesses read skills from: Codex, Claude Code, OpenCode.
 const SKILL_DIRS: [&str; 3] = [".codex/skills", ".claude/skills", ".config/opencode/skills"];
 /// Marks a skill directory the platform wrote, which it may replace.
 const SKILL_MARK: &str = ".ryzhub-plugin";
 
 pub fn install_skills(home: &std::path::Path, skills: &[crate::SkillFiles]) -> anyhow::Result<()> {
-    let total: usize = skills
-        .iter()
-        .flat_map(|s| s.files.values())
-        .map(String::len)
-        .sum();
-    ensure!(
-        skills.len() <= 200 && total <= 8 * 1024 * 1024,
-        "SKILLS_TOO_LARGE"
-    );
-    for skill in skills {
-        ensure!(
-            !skill.name.is_empty()
-                && skill.name.len() <= 64
-                && skill
-                    .name
-                    .bytes()
-                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'),
-            "INVALID_SKILL_NAME"
-        );
-        for path in skill.files.keys() {
-            ensure!(
-                !path.starts_with('/')
-                    && path
-                        .split('/')
-                        .all(|part| !part.is_empty() && part != "." && part != ".."),
-                "INVALID_SKILL_PATH"
-            );
-        }
-    }
     for dir in SKILL_DIRS {
         let root = home.join(dir);
         std::fs::create_dir_all(&root)?;
@@ -952,6 +903,7 @@ pub fn install_skills(home: &std::path::Path, skills: &[crate::SkillFiles]) -> a
     Ok(())
 }
 
+/// Write the project instructions and make both harnesses' memory files import them.
 fn install_project_instructions(text: &str) -> anyhow::Result<()> {
     ensure!(text.len() <= 600_000, "INVALID_PROJECT_INSTRUCTIONS");
     let dir = std::path::Path::new("/workspace/.platform");
@@ -993,13 +945,12 @@ struct Captured {
     truncated: bool,
 }
 
-/// Keep the first and last 8 KiB for the model; the full output (up to 16 MiB) goes to disk.
-/// Keeps a command's output: in full in `path` (up to 16 MiB), its head and tail for the
-/// result, and as it comes in `live`'s output for a command still running.
+/// Keeps a command's output: in full in `path` (up to 16 MiB), its first and last 8 KiB for
+/// the result, and as it comes in the guest's output of operation `op` while it runs.
 async fn capture(
     mut reader: impl AsyncRead + Unpin,
     path: PathBuf,
-    live: Option<(Arc<Guest>, String)>,
+    (guest, op): (Arc<Guest>, String),
 ) -> anyhow::Result<Captured> {
     const EDGE: usize = 8192;
     let mut file = tokio::fs::File::create(path).await?;
@@ -1013,9 +964,7 @@ async fn capture(
         if total < 16 * 1024 * 1024 {
             file.write_all(&buffer[..n]).await?;
         }
-        if let Some((guest, op)) = &live {
-            guest.folds.lock().await.output(op, &buffer[..n]);
-        }
+        guest.folds.lock().await.output(&op, &buffer[..n]);
         total += n;
         let take = (EDGE - head.len()).min(n);
         head.extend_from_slice(&buffer[..take]);

@@ -18,15 +18,16 @@ pub enum Tree {
     Directory,
 }
 
-/// Paths never archived: caches and runtime state that can be rebuilt, and secrets that must
-/// not outlive the sandbox (`.env`, `.ssh`, `auth.json`). They are reported in the manifest so
-/// a restore can tell the user what to recreate.
+/// Files that must not outlive the sandbox. They are reported in the manifest so a restore can
+/// tell the user what to recreate.
+const SECRETS: [&str; 3] = [".env", ".ssh", "auth.json"];
+
+/// Paths never archived: secrets, and caches and runtime state that can be rebuilt.
 fn ignored(path: &Path, tree: Tree) -> bool {
     path.components().any(|p| {
-        matches!(
-            p.as_os_str().to_str(),
-            Some(".cache" | "auth.json" | ".env" | ".ssh")
-        )
+        p.as_os_str()
+            .to_str()
+            .is_some_and(|name| name == ".cache" || SECRETS.contains(&name))
     }) || (tree == Tree::Upper
         && matches!(
             path.components()
@@ -55,14 +56,9 @@ pub fn digest(path: &Path) -> anyhow::Result<(String, u64)> {
     Ok((format!("{:x}", hasher.finalize()), size))
 }
 
-/// Secret files left out of an archive (caches and runtime paths are not listed), at most 50.
-pub fn excluded(root: &Path) -> anyhow::Result<Vec<String>> {
-    excluded_in(root, Tree::Upper)
-}
-
-/// Like [`excluded`], for `tree`; a directory's paths are reported under `/workspace`.
-pub fn excluded_in(root: &Path, tree: Tree) -> anyhow::Result<Vec<String>> {
-    const SECRETS: [&str; 3] = [".env", ".ssh", "auth.json"];
+/// Secret files left out of an archive of `tree` (caches and runtime paths are not listed), at
+/// most 50. A directory's paths are reported under `/workspace`.
+pub fn excluded(root: &Path, tree: Tree) -> anyhow::Result<Vec<String>> {
     let mut found = vec![];
     let mut pending = vec![std::path::PathBuf::new()];
     while let Some(rel) = pending.pop() {
@@ -94,11 +90,7 @@ pub fn excluded_in(root: &Path, tree: Tree) -> anyhow::Result<Vec<String>> {
     Ok(found)
 }
 
-pub fn export(root: &Path, destination: &Path) -> anyhow::Result<()> {
-    export_tree(root, destination, Tree::Upper)
-}
-
-pub fn export_tree(root: &Path, destination: &Path, tree: Tree) -> anyhow::Result<()> {
+pub fn export(root: &Path, destination: &Path, tree: Tree) -> anyhow::Result<()> {
     let encoder = zstd::Encoder::new(fs::File::create(destination)?, 3)?;
     let mut tar = Builder::new(encoder);
     fn walk<W: std::io::Write>(
@@ -301,7 +293,6 @@ pub fn restore(source: &Path, root: &Path) -> anyhow::Result<()> {
                 .open(&target)?;
             std::io::copy(&mut entry, &mut f)?;
             f.sync_all()?;
-            fs::set_permissions(&target, fs::Permissions::from_mode(mode))?;
         } else if typ.is_symlink() {
             let link = entry.link_name()?.context("MISSING_LINK")?;
             symlink(link, &target)?;
@@ -352,7 +343,7 @@ mod tests {
         xattr::set(src.join("workspace/untracked"), "user.test", b"\0bytes").unwrap();
         symlink("/etc", src.join("link")).unwrap();
         let tar = d.path().join("a.tar");
-        export(&src, &tar).unwrap();
+        export(&src, &tar, Tree::Upper).unwrap();
         let out = d.path().join("out");
         restore(&tar, &out).unwrap();
         assert_eq!(fs::read(out.join("workspace/untracked")).unwrap(), b"hello");

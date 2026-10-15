@@ -308,53 +308,26 @@ pub fn reasoning_levels(harness: &str, protocol: &str) -> Vec<&'static str> {
 pub fn capabilities(harness: &str, protocol: &str) -> Value {
     let mut c = json!({
         "steer": "native",
-        "interrupt": "native",
-        "approval_granularity": "native",
-        "ask_user": "native",
-        "resume": "native",
         "fork": "native",
         "compact": "native",
         "plan_mode": "native",
-        "model_switch": "native",
         "thought_level": "native",
-        "commands_list": "native",
-        "todo": "unsupported",
-        "diff": "unsupported",
-        "terminal_stream": "unsupported",
-        "subagent": "unsupported",
-        "durable_pause": "emulated",
-        "side_query": "emulated",
         "terminal": "native",
     });
     if harness == "claude" {
         c["steer"] = json!("emulated");
-        c["todo"] = json!("native");
-        // Its agents' work nests under the call that started them.
-        c["subagent"] = json!("native");
-    }
-    if harness == "codex" {
-        c["todo"] = json!("native");
-        c["diff"] = json!("native");
-        c["terminal_stream"] = json!("native");
     }
     if !matches!(harness, "chat" | "codex" | "claude") {
-        // An agent over ACP: no steering (steers wait for the next turn), forks, questions or
-        // reasoning control; its plans and file diffs come as items.
+        // An agent over ACP: no steering (steers wait for the next turn), forks or reasoning
+        // control.
         c["steer"] = json!("emulated");
         c["fork"] = json!("unsupported");
-        c["ask_user"] = json!("unsupported");
         c["thought_level"] = json!("unsupported");
-        c["todo"] = json!("native");
-        c["diff"] = json!("native");
     }
     if harness == "chat" {
-        // A command's output streams while `exec` waits for it.
-        c["terminal_stream"] = json!("native");
         c["terminal"] = json!("unsupported");
         c["steer"] = json!("emulated");
         c["plan_mode"] = json!("unsupported");
-        c["commands_list"] = json!("unsupported");
-        c["durable_pause"] = json!("native");
         // Every Chat context compacts: by the provider where it can, else by a summary.
         if protocol != "responses" {
             c["thought_level"] = json!("unsupported");

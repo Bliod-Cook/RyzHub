@@ -1,6 +1,6 @@
 //! Work terminals: one WebSocket per terminal session, relayed to the sandbox's execution node.
 //!
-//! `GET /orgs/{org}/conversations/{conv}/terminal?session=&cols=&rows=&since=` upgrades to a
+//! `GET /orgs/{org}/conversations/{conv}/terminal?cols=&rows=&since=` upgrades to a
 //! WebSocket (authenticated like `/ws`). Binary messages carry terminal bytes both ways. Text
 //! messages carry control: from the client `{"resize":{"cols":c,"rows":r}}` and
 //! `{"close":true}` (end the session); from the server `{"attached":{"start":n}}` once
@@ -42,7 +42,6 @@ const MAX_INPUT: usize = 64 * 1024;
 #[derive(Deserialize)]
 pub struct TerminalQuery {
     ticket: Option<String>,
-    session: Option<String>,
     cols: Option<u16>,
     rows: Option<u16>,
     since: Option<u64>,
@@ -73,7 +72,6 @@ pub async fn upgrade(
     let command = HostCommand::TerminalAttach {
         sandbox_id: sandbox,
         exec_epoch: epoch as u64,
-        session: query.session.unwrap_or_else(|| "default".into()),
         cols: query.cols.unwrap_or(80).clamp(10, 500),
         rows: query.rows.unwrap_or(24).clamp(2, 300),
         since: query.since.unwrap_or(0),

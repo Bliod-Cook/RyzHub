@@ -85,7 +85,7 @@ async fn native_settings_reach_the_next_model_request() -> anyhow::Result<()> {
 
 #[tokio::test]
 #[ignore = "requires actual Claude SDK in the harness image"]
-async fn a_claude_session_that_dies_mid_turn_fails_the_run() -> anyhow::Result<()> {
+async fn a_claude_session_that_dies_mid_turn_fails_only_its_run() -> anyhow::Result<()> {
     let h = Harness::new().await?;
     let user = h.user().await?;
     let mut owner = h.owner()?;
@@ -119,6 +119,9 @@ async fn a_claude_session_that_dies_mid_turn_fails_the_run() -> anyhow::Result<(
             error.as_deref() == Some("NATIVE_OUTCOME_UNKNOWN"),
             "{error:?}"
         );
+        // The next run in the same sandbox gets a fresh harness.
+        h.submit(&user, conv, message("hello again")).await?;
+        h.wait_state(conv, "completed").await?;
         Ok::<_, anyhow::Error>(())
     }
     .await;

@@ -354,7 +354,12 @@ async fn project(
             runs::finish(tx, lease, run, state, error).await?;
             return Ok(true);
         }
-        HarnessEvent::Exited { .. } => anyhow::bail!(Code::NativeOutcomeUnknown),
+        // The turn ended with the harness, whose exit is acknowledged with it: the guest starts
+        // a fresh harness for the next run.
+        HarnessEvent::Exited { .. } => {
+            runs::finish(tx, lease, run, "failed", Some(Code::NativeOutcomeUnknown)).await?;
+            return Ok(true);
+        }
         HarnessEvent::TurnStarted { .. } => {}
     }
     Ok(false)

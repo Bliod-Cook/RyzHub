@@ -657,6 +657,8 @@ impl Guest {
             Incoming::Event(event) => {
                 let mut journal = self.journal.lock().await;
                 if matches!(event, HarnessEvent::Exited { .. }) {
+                    // The next NativeStart starts a fresh harness.
+                    *self.native.lock().await = None;
                     let pending: Vec<String> = journal
                         .state
                         .operations

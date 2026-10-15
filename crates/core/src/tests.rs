@@ -262,9 +262,16 @@ fn cache_from_an_older_schema_is_refetched_but_keeps_pending_commands() {
             })),
         },
     );
-    let mut old = serde_json::to_value(&e).unwrap();
+    let reopen = |e: &Engine, meta: String| {
+        let channels = e
+            .channels
+            .keys()
+            .map(|c| (c.clone(), e.channel_json(c).unwrap()));
+        Engine::from_records(Some(&meta), channels).unwrap()
+    };
+    let mut old: serde_json::Value = serde_json::from_str(&e.meta_json()).unwrap();
     old.as_object_mut().unwrap().remove("schema");
-    let mut restored = Engine::restore(&old.to_string()).unwrap();
+    let mut restored = reopen(&e, old.to_string());
     assert_eq!(content(&restored), "cached");
     let frames = restored.reconnect();
     assert!(frames.contains(&command));
@@ -273,7 +280,7 @@ fn cache_from_an_older_schema_is_refetched_but_keeps_pending_commands() {
         Some(Body::Subscribe(Subscribe { since_seq: None }))
     )));
 
-    let mut current = Engine::restore(&serde_json::to_string(&restored).unwrap()).unwrap();
+    let mut current = reopen(&restored, restored.meta_json());
     current.apply(frame(
         "conv:x",
         Body::Snapshot(Snapshot {
@@ -281,7 +288,7 @@ fn cache_from_an_older_schema_is_refetched_but_keeps_pending_commands() {
             ..Default::default()
         }),
     ));
-    let current = Engine::restore(&serde_json::to_string(&current).unwrap()).unwrap();
+    let current = reopen(&current, current.meta_json());
     assert_eq!(
         current.channels["conv:x"]
             .initialized

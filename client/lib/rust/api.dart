@@ -44,10 +44,6 @@ String? highlight({
 /// Whether code can be coloured; on the web, not until [`load_syntaxes`].
 bool syntaxesReady() => RustLib.instance.api.crateApiSyntaxesReady();
 
-/// Whether `language` names a language code can be coloured in.
-bool knownLanguage({required String language}) =>
-    RustLib.instance.api.crateApiKnownLanguage(language: language);
-
 /// Loads the grammars the web fetches on first use.
 void loadSyntaxes({required List<int> dump}) =>
     RustLib.instance.api.crateApiLoadSyntaxes(dump: dump);
@@ -59,10 +55,6 @@ String ansiSpans({required String text}) =>
 /// A unified diff as lines: `[{kind, text, old?, new?}]`.
 String diffLines({required String text}) =>
     RustLib.instance.api.crateApiDiffLines(text: text);
-
-/// What changed from `old` to `new`, as [`diff_lines`] gives it.
-String compareTexts({required String old, required String new_}) =>
-    RustLib.instance.api.crateApiCompareTexts(old: old, new_: new_);
 
 /// An id for a conversation this client creates.
 String newConversationId() => RustLib.instance.api.crateApiNewConversationId();
@@ -173,8 +165,7 @@ abstract class ClientCore implements RustOpaqueInterface {
   String viewJson();
 }
 
-/// A record of the client cache. The empty key is a whole engine cached before channels had
-/// records of their own.
+/// A record of the client cache.
 class CacheRecord {
   final String key;
   final String value;

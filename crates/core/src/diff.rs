@@ -1,9 +1,5 @@
-//! Diffs as lines the client shows: a unified diff read as written, or two texts compared.
+//! Unified diffs as lines the client shows.
 use serde::Serialize;
-use similar::{ChangeTag, TextDiff};
-
-/// Unchanged lines kept around each change of a comparison.
-const CONTEXT: usize = 3;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct DiffLine {
@@ -96,44 +92,6 @@ fn hunk_header(line: &str) -> Option<(u32, u32, u32, u32)> {
     Some((o, olen, n, nlen))
 }
 
-/// What changed from `old` to `new`, line by line, in hunks with a few unchanged lines around
-/// each change.
-pub fn compare(old: &str, new: &str) -> Vec<DiffLine> {
-    let diff = TextDiff::from_lines(old, new);
-    let mut out = Vec::new();
-    for group in diff.grouped_ops(CONTEXT) {
-        let (Some(first), Some(last)) = (group.first(), group.last()) else {
-            continue;
-        };
-        let (o, n) = (first.old_range().start, first.new_range().start);
-        let (olen, nlen) = (last.old_range().end - o, last.new_range().end - n);
-        out.push(DiffLine::new(
-            "hunk",
-            &format!("@@ -{},{olen} +{},{nlen} @@", o + 1, n + 1),
-            None,
-            None,
-        ));
-        for op in &group {
-            for change in diff.iter_changes(op) {
-                let text = change.value();
-                let text = text.strip_suffix('\n').unwrap_or(text);
-                let number = |i: Option<usize>| i.map(|i| i as u32 + 1);
-                let (kind, old, new) = match change.tag() {
-                    ChangeTag::Equal => (
-                        "ctx",
-                        number(change.old_index()),
-                        number(change.new_index()),
-                    ),
-                    ChangeTag::Delete => ("del", number(change.old_index()), None),
-                    ChangeTag::Insert => ("add", None, number(change.new_index())),
-                };
-                out.push(DiffLine::new(kind, text, old, new));
-            }
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -156,16 +114,5 @@ mod tests {
         // Changes written without a hunk header still read as changes.
         let bare: Vec<_> = parse("-a\n+b\n c").iter().map(|l| l.kind).collect();
         assert_eq!(bare, ["del", "add", "ctx"]);
-    }
-
-    #[test]
-    fn texts_compare_into_hunks() {
-        let old = (1..=20).map(|i| format!("{i}\n")).collect::<String>();
-        let new = old.replace("10\n", "ten\n");
-        let lines = compare(&old, &new);
-        assert_eq!(lines[0].text, "@@ -7,7 +7,7 @@");
-        assert!(lines.contains(&DiffLine::new("del", "10", Some(10), None)));
-        assert!(lines.contains(&DiffLine::new("add", "ten", None, Some(10))));
-        assert_eq!(lines.len(), 1 + 3 + 2 + 3);
     }
 }

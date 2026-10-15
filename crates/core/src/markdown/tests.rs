@@ -125,14 +125,26 @@ fn sandbox_files_and_bare_addresses_link() {
             text("see "),
             Inline::File {
                 label: "the chart".into(),
-                href: "sandbox:/workspace/out/chart%201.png".into()
+                path: "/workspace/out/chart 1.png".into()
             }
         ]
     );
     assert!(matches!(
-        &inlines("[a](/attachments/x.pdf)")[0],
-        Inline::File { href, .. } if href == "/attachments/x.pdf"
+        &inlines("[a](/attachments/100%)")[0],
+        Inline::File { path, .. } if path == "/attachments/100%"
     ));
+    // A page is not a file, though its address may look like one; a sandbox image is.
+    assert!(matches!(
+        &inlines("[a](https://example.com/workspace/a.txt)")[0],
+        Inline::Text { href: Some(_), .. }
+    ));
+    assert_eq!(
+        inlines("![plot](sandbox:/workspace/plot.png)"),
+        vec![Inline::File {
+            label: "plot".into(),
+            path: "/workspace/plot.png".into()
+        }]
+    );
     assert_eq!(
         inlines("go to https://example.com/a_(b). Or www.rust-lang.org!"),
         vec![

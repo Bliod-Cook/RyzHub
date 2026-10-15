@@ -102,10 +102,12 @@ pub enum Inline {
     Chip {
         index: usize,
     },
-    /// A link to a file of the sandbox: `sandbox:/workspace/…` or `/attachments/…`.
+    /// A link to a file of the sandbox: `sandbox:/workspace/…` or `/attachments/…`. `path`
+    /// is the link as the server records the files a reply links to: without `sandbox:` and
+    /// percent-decoded.
     File {
         label: String,
-        href: String,
+        path: String,
     },
     /// An image, shown as a link: a remote image loads only when the user opens it.
     Image {
@@ -831,11 +833,10 @@ fn complete(text: &mut String, from: usize) {
     text.push_str(&suffix);
 }
 
-/// Whether `href` names a file of the sandbox rather than a page.
-pub fn is_file_link(href: &str) -> bool {
-    let path = href.strip_prefix("sandbox:").unwrap_or(href);
-    let path = percent_decode(path);
-    path.starts_with("/workspace/") || path.starts_with("/attachments/")
+/// The path of the sandbox file `href` names, as [`Inline::File`] carries it; None for a page.
+fn file_path(href: &str) -> Option<String> {
+    let path = percent_decode(href.strip_prefix("sandbox:").unwrap_or(href));
+    (path.starts_with("/workspace/") || path.starts_with("/attachments/")).then_some(path)
 }
 
 fn percent_decode(s: &str) -> String {
@@ -855,7 +856,8 @@ fn percent_decode(s: &str) -> String {
         out.push(bytes[i]);
         i += 1;
     }
-    String::from_utf8_lossy(&out).into_owned()
+    // Unchanged unless decoded it is UTF-8, as the server reads it.
+    String::from_utf8(out).unwrap_or_else(|_| s.to_owned())
 }
 
 /// A container being built.
@@ -893,9 +895,9 @@ struct Builder<'a> {
     strong: u32,
     emphasis: u32,
     strike: u32,
-    /// Open links: the destination, whether it is a sandbox file, and where its text starts in
+    /// Open links: the destination, the sandbox file it names, and where its text starts in
     /// the inlines of the node holding it.
-    links: Vec<(String, bool, usize)>,
+    links: Vec<(String, Option<String>, usize)>,
     /// An image being read: its URL and alt text.
     image: Option<(String, String)>,
 }
@@ -1027,7 +1029,7 @@ impl Builder<'_> {
             Tag::Strong => return self.strong += 1,
             Tag::Strikethrough => return self.strike += 1,
             Tag::Link { dest_url, .. } => {
-                let file = is_file_link(&dest_url);
+                let file = file_path(&dest_url);
                 let at = self.inlines().map_or(0, |i| i.len());
                 self.links.push((dest_url.into_string(), file, at));
                 return;
@@ -1052,20 +1054,28 @@ impl Builder<'_> {
             TagEnd::Strong => self.strong = self.strong.saturating_sub(1),
             TagEnd::Strikethrough => self.strike = self.strike.saturating_sub(1),
             TagEnd::Link => {
-                let Some((href, file, at)) = self.links.pop() else {
+                let Some((_, file, at)) = self.links.pop() else {
                     return;
                 };
-                if file && let Some(inlines) = self.inlines() {
+                if let Some(path) = file
+                    && let Some(inlines) = self.inlines()
+                {
                     let label: String = inlines
                         .drain(at.min(inlines.len())..)
                         .map(text_of)
                         .collect();
-                    inlines.push(Inline::File { label, href });
+                    inlines.push(Inline::File { label, path });
                 }
             }
             TagEnd::Image => {
                 if let Some((url, alt)) = self.image.take() {
-                    self.inline(Inline::Image { alt, url });
+                    self.inline(match file_path(&url) {
+                        Some(path) => Inline::File {
+                            label: if alt.is_empty() { path.clone() } else { alt },
+                            path,
+                        },
+                        None => Inline::Image { alt, url },
+                    });
                 }
             }
             TagEnd::TableHead => {

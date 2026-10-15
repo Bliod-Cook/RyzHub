@@ -91,12 +91,6 @@ pub struct ViewDiff {
     pub removed: Vec<String>,
 }
 
-impl ViewDiff {
-    pub fn is_empty(&self) -> bool {
-        self.rows.is_empty() && self.items.is_empty() && self.removed.is_empty()
-    }
-}
-
 /// What the client has of an item.
 #[derive(Default)]
 struct Shown {
@@ -344,23 +338,23 @@ fn diff_rows(old: &[Row], new: &[Row]) -> Vec<RowDiff> {
     out
 }
 
-/// Applies `diffs` to `rows`, as the client does.
-pub fn apply_rows(rows: &mut Vec<Row>, diffs: &[RowDiff]) {
-    for diff in diffs {
-        match diff {
-            RowDiff::Insert { index, row } => rows.insert(*index, row.clone()),
-            RowDiff::Set { index, row } => rows[*index] = row.clone(),
-            RowDiff::Remove { index } => {
-                rows.remove(*index);
-            }
-            RowDiff::Reset { rows: all } => *rows = all.clone(),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Applies `diffs` to `rows`, as the client does.
+    fn apply_rows(rows: &mut Vec<Row>, diffs: &[RowDiff]) {
+        for diff in diffs {
+            match diff {
+                RowDiff::Insert { index, row } => rows.insert(*index, row.clone()),
+                RowDiff::Set { index, row } => rows[*index] = row.clone(),
+                RowDiff::Remove { index } => {
+                    rows.remove(*index);
+                }
+                RowDiff::Reset { rows: all } => *rows = all.clone(),
+            }
+        }
+    }
 
     fn item(id: &str, kind: &str, run: &str, seq: u64, text: &str) -> Item {
         Item {

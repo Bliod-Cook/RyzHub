@@ -27,8 +27,7 @@ pub struct ClientCore {
     inner: Mutex<State>,
 }
 
-/// A record of the client cache. The empty key is a whole engine cached before channels had
-/// records of their own.
+/// A record of the client cache.
 pub struct CacheRecord {
     pub key: String,
     pub value: String,
@@ -99,14 +98,11 @@ struct State {
     /// Channels changed since they were last stored, each with the change's number.
     dirty: BTreeMap<String, u64>,
     changes: u64,
-    /// What the writes being stored now hold: channel changes, commands, and whether they
-    /// replace a cache from before records.
-    saving: (BTreeMap<String, u64>, BTreeSet<String>, bool),
+    /// What the writes being stored now hold: channel changes and commands.
+    saving: (BTreeMap<String, u64>, BTreeSet<String>),
     /// Commands whose frames are stored. Only these are sent again: a command must survive a
     /// restart before the server may run it.
     stored: BTreeSet<String>,
-    /// The cache still holds a whole engine from before records.
-    legacy: bool,
     /// Timelines of the conversations the client shows, as it has them.
     views: BTreeMap<String, View>,
     pending: Pending,
@@ -120,8 +116,7 @@ impl State {
         self.dirty.insert(channel.to_owned(), self.changes);
     }
 
-    /// The writes that bring the cache up to date: the meta record, the changed channels and
-    /// the removal of a record from before.
+    /// The writes that bring the cache up to date: the meta record and the changed channels.
     fn writes(&mut self) -> Vec<CacheWrite> {
         let mut writes = vec![CacheWrite {
             key: META.into(),
@@ -133,20 +128,14 @@ impl State {
                 value: self.engine.channel_json(channel),
             });
         }
-        if self.legacy {
-            writes.push(CacheWrite {
-                key: String::new(),
-                value: None,
-            });
-        }
         let commands = self.engine.pending_commands.keys().cloned().collect();
-        self.saving = (self.dirty.clone(), commands, self.legacy);
+        self.saving = (self.dirty.clone(), commands);
         writes
     }
 
     /// The last writes are stored.
     fn committed(&mut self) {
-        let (channels, commands, legacy) = std::mem::take(&mut self.saving);
+        let (channels, commands) = std::mem::take(&mut self.saving);
         for (channel, change) in channels {
             // Changed again meanwhile: the next writes carry it.
             if self.dirty.get(&channel) == Some(&change) {
@@ -156,7 +145,6 @@ impl State {
         self.stored.extend(commands);
         let pending = &self.engine.pending_commands;
         self.stored.retain(|cid| pending.contains_key(cid));
-        self.legacy &= !legacy;
     }
 
     /// What changed in `channel`: its timeline when the client shows it, else its items (all of
@@ -227,41 +215,26 @@ impl State {
 impl ClientCore {
     #[frb(sync)]
     pub fn new(records: Vec<CacheRecord>) -> Result<Self, String> {
-        let (mut meta, mut legacy, mut channels) = (None, None, vec![]);
+        let (mut meta, mut channels) = (None, vec![]);
         for record in records {
             if record.key == META {
                 meta = Some(record.value);
-            } else if record.key.is_empty() {
-                legacy = Some(record.value);
             } else if let Some(name) = record.key.strip_prefix("channel:") {
                 channels.push((name.to_owned(), record.value));
             }
         }
-        let engine = match (&meta, &legacy) {
-            (None, Some(legacy)) => Engine::restore(legacy),
-            _ => Engine::from_records(meta.as_deref(), channels),
-        }
-        .map_err(|e| e.to_string())?;
-        let mut state = State {
-            stored: engine.pending_commands.keys().cloned().collect(),
-            legacy: legacy.is_some(),
-            dirty: BTreeMap::new(),
-            changes: 0,
-            saving: Default::default(),
-            engine,
-            views: BTreeMap::new(),
-            pending: Pending::default(),
-            flushed_at: f64::NEG_INFINITY,
-        };
-        // A cache from before records becomes records with the first save.
-        if meta.is_none() && state.legacy {
-            let names: Vec<String> = state.engine.channels.keys().cloned().collect();
-            for name in names {
-                state.dirty(&name);
-            }
-        }
+        let engine = Engine::from_records(meta.as_deref(), channels).map_err(|e| e.to_string())?;
         Ok(Self {
-            inner: Mutex::new(state),
+            inner: Mutex::new(State {
+                stored: engine.pending_commands.keys().cloned().collect(),
+                dirty: BTreeMap::new(),
+                changes: 0,
+                saving: Default::default(),
+                engine,
+                views: BTreeMap::new(),
+                pending: Pending::default(),
+                flushed_at: f64::NEG_INFINITY,
+            }),
         })
     }
     #[frb(sync)]
@@ -582,9 +555,9 @@ impl ClientCore {
             }
             pending.revoked.extend(effects.revoked);
             pending.results.extend(effects.results);
-            pending.expiring |= effects.auth_expiring.is_some();
-            if let Some(error) = state.engine.last_error.take() {
-                state.pending.error = Some(error);
+            pending.expiring |= effects.auth_expiring;
+            if effects.error.is_some() {
+                pending.error = effects.error;
             }
         }
         if !state.pending.is_empty() {
@@ -646,12 +619,6 @@ pub fn syntaxes_ready() -> bool {
     highlight::ready()
 }
 
-/// Whether `language` names a language code can be coloured in.
-#[frb(sync)]
-pub fn known_language(language: String) -> bool {
-    highlight::known(&language)
-}
-
 /// Loads the grammars the web fetches on first use.
 #[frb(sync)]
 pub fn load_syntaxes(dump: Vec<u8>) -> Result<(), String> {
@@ -668,12 +635,6 @@ pub fn ansi_spans(text: String) -> String {
 #[frb(sync)]
 pub fn diff_lines(text: String) -> String {
     serde_json::to_string(&diff::parse(&text)).unwrap()
-}
-
-/// What changed from `old` to `new`, as [`diff_lines`] gives it.
-#[frb(sync)]
-pub fn compare_texts(old: String, new: String) -> String {
-    serde_json::to_string(&diff::compare(&old, &new)).unwrap()
 }
 
 /// An id for a conversation this client creates.

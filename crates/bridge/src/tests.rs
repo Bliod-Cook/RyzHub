@@ -155,49 +155,35 @@ fn refusals_name_their_command_and_expiry_asks_for_a_refresh() {
 }
 
 #[test]
-fn a_cache_from_before_records_becomes_records_keeping_its_commands() {
-    let old = client(3);
-    old.send_text("conv:1".into(), "queued".into(), None, vec![]);
-    let legacy = old.view_json();
-    let core = ClientCore::new(vec![CacheRecord {
-        key: String::new(),
-        value: legacy,
-    }])
-    .unwrap();
-    // Read back from before, the command may go out again.
-    assert_eq!(core.retry_pending().len(), 1);
-    let update = core.subscribe("user:o:u".into());
-    let mut written = keys(&update.cache_writes);
-    written.sort();
-    assert_eq!(
-        written,
-        [
-            ("", false),
-            ("channel:conv:0", true),
-            ("channel:conv:1", true),
-            ("channel:conv:2", true),
-            ("channel:user:o:u", true),
-            ("engine", true)
-        ]
+fn a_cache_reopens_from_its_records_keeping_its_commands() {
+    let mut records = std::collections::BTreeMap::new();
+    let mut store = |writes: Vec<CacheWrite>| {
+        for write in writes {
+            match write.value {
+                Some(value) => records.insert(write.key, value),
+                None => records.remove(&write.key),
+            };
+        }
+    };
+    let core = ClientCore::new(vec![]).unwrap();
+    for n in 0..3 {
+        store(core.subscribe(format!("conv:{n}")).cache_writes);
+    }
+    store(
+        core.send_text("conv:1".into(), "queued".into(), None, vec![])
+            .cache_writes,
     );
-    core.committed();
-    let records: Vec<CacheRecord> = update
-        .cache_writes
-        .into_iter()
-        .filter_map(|write| {
-            Some(CacheRecord {
-                key: write.key,
-                value: write.value?,
-            })
-        })
-        .collect();
-    let reopened = ClientCore::new(records).unwrap();
+    let reopened = ClientCore::new(
+        records
+            .into_iter()
+            .map(|(key, value)| CacheRecord { key, value })
+            .collect(),
+    )
+    .unwrap();
+    // Read back from the cache, the command may go out again.
     assert_eq!(reopened.retry_pending().len(), 1);
     let view: serde_json::Value = serde_json::from_str(&reopened.view_json()).unwrap();
-    assert_eq!(view["channels"].as_object().unwrap().len(), 4);
-    // Once stored, the record from before is not removed again.
-    let next = core.subscribe("conv:0".into());
-    assert!(next.cache_writes.iter().all(|write| !write.key.is_empty()));
+    assert_eq!(view["channels"].as_object().unwrap().len(), 3);
 }
 
 #[test]

@@ -4496,9 +4496,7 @@ dependencies = [
  "ryzhub-proto",
  "serde",
  "serde_json",
- "similar",
  "syntect",
- "thiserror 2.0.21",
  "two-face",
  "vte",
 ]

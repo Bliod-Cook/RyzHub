@@ -12,8 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 const MAX_BUFFERED: usize = 256;
 const MAX_BUFFERED_BYTES: usize = 1024 * 1024;
 
-/// Bumped when cached projections may lack fields clients now read. 1: item `detail`; 2: the
-/// files user messages carry; 3: the files a reply links to; 4: whether a conversation is pinned.
+/// Bumped when cached projections may lack fields clients now read.
 pub const CACHE_SCHEMA: u32 = 4;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -44,23 +43,23 @@ pub struct Engine {
     pub channels: BTreeMap<String, Channel>,
     /// Persist this alongside projections and cursors, atomically, before sending.
     pub pending_commands: BTreeMap<String, Frame>,
-    pub last_error: Option<String>,
-    /// The `CACHE_SCHEMA` this state was cached under; absent in older caches.
+    /// The `CACHE_SCHEMA` this state was cached under.
     pub schema: u32,
 }
 
 #[derive(Debug, Default)]
 pub struct Effects {
     pub outbound: Vec<Frame>,
-    pub changed: bool,
     /// Channels whose projection changed, with what changed in each.
     pub touched: BTreeMap<String, Touched>,
     /// Channels taken away from this client.
     pub revoked: Vec<String>,
     /// Commands the server has finished with.
     pub results: Vec<CommandResult>,
-    /// When the session ends unless refreshed, in milliseconds since the epoch.
-    pub auth_expiring: Option<i64>,
+    /// The session ends soon unless refreshed.
+    pub auth_expiring: bool,
+    /// A protocol error the server reported.
+    pub error: Option<String>,
 }
 
 /// What changed in a channel.
@@ -106,18 +105,6 @@ struct Meta {
 }
 
 impl Engine {
-    /// The engine from its cache. Channels cached under an older schema keep showing their
-    /// items but resubscribe without a cursor, so a fresh snapshot replaces them; pending
-    /// commands survive.
-    pub fn restore(cache_json: &str) -> serde_json::Result<Self> {
-        let engine: Engine = if cache_json.is_empty() {
-            Engine::default()
-        } else {
-            serde_json::from_str(cache_json)?
-        };
-        Ok(engine.upgraded())
-    }
-
     /// The engine from its records: [`Engine::meta_json`] and each channel's
     /// [`Engine::channel_json`]. No meta is a fresh engine.
     pub fn from_records(
@@ -280,7 +267,6 @@ impl Engine {
                     code: String::new(),
                     retryable: false,
                 });
-                effects.changed = true;
             }
             Body::CommandRejected(r) => {
                 let channel = self
@@ -302,19 +288,14 @@ impl Engine {
                     code: r.code,
                     retryable: r.retryable,
                 });
-                effects.changed = true;
             }
-            Body::AuthExpiring(a) => effects.auth_expiring = Some(a.expires_at_ms),
-            Body::ProtocolError(e) => {
-                self.last_error = Some(e.code);
-                effects.changed = true;
-            }
+            Body::AuthExpiring(_) => effects.auth_expiring = true,
+            Body::ProtocolError(e) => effects.error = Some(e.code),
             Body::SubscriptionRevoked(_) => {
                 self.channels.remove(&input.channel);
                 self.pending_commands
                     .retain(|_, f| f.channel != input.channel);
                 effects.revoked.push(input.channel);
-                effects.changed = true;
             }
             Body::ChannelLagged(_) => {
                 if self
@@ -419,7 +400,6 @@ impl Engine {
                     let entry = effects.touch(&input.channel);
                     entry.items.extend(touched.items);
                     entry.reset |= touched.reset;
-                    effects.changed = true;
                 }
                 if resync {
                     effects.outbound.push(self.subscribe(input.channel));

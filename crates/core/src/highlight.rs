@@ -92,11 +92,6 @@ fn syntax(set: &'static SyntaxSet, name: &str) -> Option<&'static SyntaxReferenc
     set.find_syntax_by_token(word)
 }
 
-/// Whether `name` names a language code can be coloured in.
-pub fn known(name: &str) -> bool {
-    syntaxes().is_some_and(|set| syntax(set, name).is_some())
-}
-
 /// A run of code and its class; the empty class is plain text.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Span(pub String, pub &'static str);

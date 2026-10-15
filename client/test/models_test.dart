@@ -1,3 +1,4 @@
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:ryzhub/controller.dart';
@@ -198,5 +199,57 @@ void main() {
     await tester.tap(find.text('高'));
     await tester.pumpAndSettle();
     expect(levels, ['gpt-5.4:high']);
+  });
+
+  testWidgets('a click or an activation picks a model that has levels', (
+    tester,
+  ) async {
+    final semantics = tester.ensureSemantics();
+    final picked = <String>[];
+    await tester.pumpWidget(
+      MaterialApp(
+        theme: hubTheme,
+        home: Scaffold(
+          body: Center(
+            child: ModelPicker(
+              mode: 'chat',
+              chat: [
+                for (final e in _catalog['chat'] as List)
+                  Map<String, dynamic>.from(e),
+              ],
+              work: const [],
+              model: 'fixture-model',
+              onPick: (_, id, level) => picked.add('$id:$level'),
+              levelsFor: (_, id) =>
+                  id == 'gpt-5.4' ? const ['low', 'high'] : const [],
+            ),
+          ),
+        ),
+      ),
+    );
+    final row = find.text('gpt-5.4');
+    final mouse = await tester.createGesture(kind: PointerDeviceKind.mouse);
+    await mouse.addPointer(location: Offset.zero);
+    for (final activate in [false, true]) {
+      await tester.tap(find.bySemanticsLabel(RegExp('模型')));
+      await tester.pumpAndSettle();
+      // Hovering shows the levels; clicking the row still picks the model.
+      await mouse.moveTo(tester.getCenter(row));
+      await tester.pumpAndSettle();
+      expect(find.text('高'), findsOneWidget);
+      if (activate) {
+        // With semantics on, Web delivers a click as a semantics tap.
+        tester.semantics.tap(find.semantics.byLabel('gpt-5.4'));
+      } else {
+        await mouse.down(tester.getCenter(row));
+        await mouse.up();
+      }
+      await tester.pumpAndSettle();
+      expect(picked, ['gpt-5.4:null'], reason: 'activate: $activate');
+      expect(find.text('高'), findsNothing);
+      picked.clear();
+      await mouse.moveTo(Offset.zero);
+    }
+    semantics.dispose();
   });
 }

@@ -220,7 +220,9 @@ class EmptyHint extends StatelessWidget {
 
 /// A menu row with a flyout to its right, e.g. a model's reasoning levels or a
 /// harness's models. Hovering shows the flyout, so a mouse click runs
-/// [onPressed] instead of toggling it shut; a touch tap opens the flyout.
+/// [onPressed] instead of toggling it shut, as does an assistive activation
+/// (Web delivers clicks that way once semantics are on); a touch tap opens the
+/// flyout.
 class FlyoutButton extends StatefulWidget {
   final Widget child;
   final Widget? leadingIcon, trailingIcon;
@@ -241,6 +243,15 @@ class FlyoutButton extends StatefulWidget {
 class _FlyoutButtonState extends State<FlyoutButton> {
   final controller = MenuController();
   bool mouse = false;
+
+  void press() {
+    if (widget.onPressed != null) {
+      widget.onPressed!();
+    } else if (!controller.isOpen) {
+      controller.open();
+    }
+  }
+
   @override
   Widget build(BuildContext context) => Listener(
     onPointerDown: (event) => mouse = event.kind == PointerDeviceKind.mouse,
@@ -248,12 +259,7 @@ class _FlyoutButtonState extends State<FlyoutButton> {
       if (!mouse) return;
       // Runs after the button's own tap handler has toggled the flyout.
       Future.microtask(() {
-        if (!mounted) return;
-        if (widget.onPressed != null) {
-          widget.onPressed!();
-        } else if (!controller.isOpen) {
-          controller.open();
-        }
+        if (mounted) press();
       });
     },
     child: SubmenuButton(
@@ -269,7 +275,8 @@ class _FlyoutButtonState extends State<FlyoutButton> {
       leadingIcon: widget.leadingIcon,
       trailingIcon: widget.trailingIcon,
       menuChildren: widget.menuChildren,
-      child: widget.child,
+      // Merged into the row's node, this tap replaces the button's toggle.
+      child: Semantics(onTap: press, child: widget.child),
     ),
   );
 }

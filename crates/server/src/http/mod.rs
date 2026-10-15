@@ -349,7 +349,6 @@ async fn admin_settings(State(app): State<App>, headers: HeaderMap) -> ApiResult
             "resume": if config.llm.enabled { "loop_steps" } else { "emulated" },
             "chat": if config.llm.enabled { "anthropic" } else { "mock" },
             "work": if config.work.enabled { "codex" } else { "mock" },
-            "pty": false,
             "terminal": config.work.enabled && config.sandbox.enabled,
         },
     })))

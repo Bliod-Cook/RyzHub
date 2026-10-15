@@ -209,6 +209,15 @@ async fn stdin_is_idempotent_and_virtual_key_never_enters_journal() -> anyhow::R
         std::fs::read_to_string(workspace.path().join("marker"))?,
         "once\n"
     );
+    // Nothing can be written to a job that is not running: a definite failure, not unknown.
+    let stray = guest
+        .handle(call(GuestCommand::Write {
+            op_id: "missing".into(),
+            request_id: "stray".into(),
+            data: "lost\n".into(),
+        }))
+        .await?;
+    assert_eq!(stray, json!({"state":"failed","error":"JOB_NOT_RUNNING"}));
     assert!(
         !std::fs::read_to_string(directory.path().join("journal.json"))?
             .contains("test-secret-do-not-persist")

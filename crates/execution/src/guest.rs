@@ -492,15 +492,24 @@ impl Guest {
                     return Ok(result);
                 }
                 let mut jobs = self.jobs.lock().await;
-                let result = async {
-                    let job = jobs.get_mut(&op_id).context("JOB_NOT_RUNNING")?;
-                    let stdin = job.stdin.as_mut().context("STDIN_CLOSED")?;
-                    tokio::time::timeout(Duration::from_secs(2), stdin.write_all(data.as_bytes()))
-                        .await??;
-                    Ok::<_, anyhow::Error>(json!({"state":"completed","written":data.len()}))
-                }
-                .await
-                .unwrap_or_else(|_| json!({"state":"outcome_unknown","error":"stdin outcome unknown; do not automatically retry"}));
+                let write = match jobs.get_mut(&op_id).map(|job| job.stdin.as_mut()) {
+                    None => Err("JOB_NOT_RUNNING"),
+                    Some(None) => Err("STDIN_CLOSED"),
+                    Some(Some(stdin)) => Ok(tokio::time::timeout(
+                        Duration::from_secs(2),
+                        stdin.write_all(data.as_bytes()),
+                    )
+                    .await),
+                };
+                let result = match write {
+                    Ok(Ok(Ok(()))) => json!({"state":"completed","written":data.len()}),
+                    // Nothing was written.
+                    Err(error) => json!({"state":"failed","error":error}),
+                    // Some of it may have been.
+                    Ok(_) => {
+                        json!({"state":"outcome_unknown","error":"stdin outcome unknown; do not automatically retry"})
+                    }
+                };
                 journal.complete(&request_id, result.clone(), true)?;
                 self.changed.notify_waiters();
                 Ok(result)

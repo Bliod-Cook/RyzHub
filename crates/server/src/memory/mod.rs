@@ -508,15 +508,6 @@ pub struct MemoryContext {
     pub text: String,
     pub used: Vec<Value>,
 }
-pub async fn snapshot(
-    tx: &mut Tx<'_>,
-    config: &crate::config::Config,
-    org: Uuid,
-    conversation: Uuid,
-    user: Uuid,
-) -> anyhow::Result<String> {
-    Ok(context(tx, config, org, conversation, user).await?.text)
-}
 pub async fn context(
     tx: &mut Tx<'_>,
     config: &crate::config::Config,

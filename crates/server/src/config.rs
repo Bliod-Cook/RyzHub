@@ -30,9 +30,6 @@ pub struct Config {
     /// Program run as `<program> render-image` to decode uploaded images in a process of its
     /// own; empty runs this server binary.
     pub attachment_renderer: String,
-    /// Offers the `ryzhub.v1.json` WebSocket subprotocol, for debugging with text tools.
-    /// Development only.
-    pub json_protocol: bool,
 }
 
 impl Default for Config {
@@ -57,7 +54,6 @@ impl Default for Config {
             retention: RetentionConfig::default(),
             search: SearchConfig::default(),
             attachment_renderer: String::new(),
-            json_protocol: false,
         }
     }
 }

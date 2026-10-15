@@ -128,7 +128,6 @@ pub fn router(app: App) -> Router {
             patch(memory::set_preferences),
         )
         .route("/orgs/{org}/memories/{id}", delete(memory::remove))
-        .route("/orgs/{org}/memory-events/{id}/undo", post(memory::revert))
         .route(
             "/orgs/{org}/conversations/{conv}/memory-context/{item}",
             get(memory::timeline_context),
@@ -171,10 +170,7 @@ pub fn router(app: App) -> Router {
             "/orgs/{org}/credentials/{id}",
             delete(llm::credentials::revoke),
         )
-        .route(
-            "/orgs/{org}/conversations",
-            get(orgs::list_conversations).post(orgs::create_conversation),
-        )
+        .route("/orgs/{org}/conversations", get(orgs::list_conversations))
         .route("/orgs/{org}/conversations/{conv}/items", get(orgs::history))
         .route(
             "/orgs/{org}/conversations/{conv}/workspace",
@@ -294,19 +290,10 @@ async fn capabilities(State(app): State<App>) -> Json<Value> {
         "memory": config.search.enabled,
         "conversation_temporary": config.search.enabled,
         "conversation_delete": config.search.enabled,
-        "conversation_pin": true,
-        // Minor version 6: conversations created by CreateRun, unread state, synced drafts,
-        // memory undo by command.
-        "create_run": true,
-        "unread": true,
-        "drafts": true,
-        "memory_undo_command": true,
-        // `GET /stream` + `POST /stream/{connection}` where WebSockets do not get through.
-        "event_stream": true,
         // Sign-in with other accounts: `/auth/oauth/<id>/start?return_to=`.
         "auth_providers": sso::providers(&app),
-        // Minor version 8: plugins, their commands (InvokeMenuCommand) and questions
-        // (PendingAction.form_json), MCP Apps from `plugin_content_origin`.
+        // Plugins, their commands (InvokeMenuCommand) and questions (PendingAction.form_json),
+        // MCP Apps from `plugin_content_origin`.
         "plugins": config.plugins.enabled,
         // Android notifications: `POST /devices` with an FCM token.
         "push": config.push.enabled,

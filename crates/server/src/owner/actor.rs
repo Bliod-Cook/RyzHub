@@ -91,7 +91,8 @@ pub struct OwnerLink {
 }
 
 impl OwnerLink {
-    /// A link with no Owner behind it, for tools and tests: stream events are discarded.
+    /// A link with no Owner behind it, for tests: stream events are discarded.
+    #[cfg(feature = "test-support")]
     pub fn detached() -> Self {
         let (events, mut discard) = mpsc::channel(64);
         tokio::spawn(async move { while discard.recv().await.is_some() {} });
@@ -149,7 +150,6 @@ impl Live {
             Body::ItemFold(ItemFold {
                 item_id: self.item.id.clone(),
                 stream: self.stream.into(),
-                part_index: 0,
                 text: self.text.clone(),
                 base_seq: self.item.base_seq,
                 revision: self.item.revision,
@@ -463,7 +463,6 @@ impl Actor {
                     Body::Delta(Delta {
                         item_id: live.item.id.clone(),
                         stream: live.stream.into(),
-                        part_index: 0,
                         offset: live.published as u64,
                         text: live.text[live.published..].into(),
                         base_seq: live.item.base_seq,

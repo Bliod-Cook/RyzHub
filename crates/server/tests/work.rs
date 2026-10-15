@@ -22,12 +22,7 @@ impl Harness {
     }
     async fn conversation(&self, user: &Value) -> anyhow::Result<Uuid> {
         let ctx = self.context(user).await?;
-        Ok(self
-            .app
-            .store
-            .create_conversation(&ctx, "Work", "work")
-            .await?
-            .id)
+        Ok(self.create(&ctx, "Work", "work", json!({}), None).await?.id)
     }
     /// Install the fixture upstream's MCP server for `user` as the plugin `notes`.
     async fn install_notes(&self, user: &Value) -> anyhow::Result<()> {

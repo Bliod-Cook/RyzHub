@@ -52,9 +52,7 @@ impl Harness {
     async fn conversation(&self, user: &Value) -> anyhow::Result<Uuid> {
         let ctx = self.context(user).await?;
         Ok(self
-            .app
-            .store
-            .create_conversation(&ctx, "Platform", "chat")
+            .create(&ctx, "Platform", "chat", json!({}), None)
             .await?
             .id)
     }

@@ -9,8 +9,9 @@ use ryzhub_proto::{command_envelope::Command, event_envelope::Event, frame::Body
 use ryzhub_server::{
     app::App,
     config::Config,
+    error::{Code, code_of},
     owner::{self, OwnerLink},
-    store::append,
+    store::{append, create_in},
 };
 use serde_json::{Value, json};
 use sqlx::PgPool;
@@ -29,21 +30,23 @@ impl Harness {
         Self::start(|config| config.llm.enabled = true).await
     }
     async fn conversation(&self, user: &Value) -> anyhow::Result<Uuid> {
-        let response: Value = reqwest::Client::new()
-            .post(format!(
-                "{}/orgs/{}/conversations",
-                self.base,
-                user["org_id"].as_str().unwrap()
-            ))
-            .bearer_auth(user["token"].as_str().unwrap())
-            .json(&json!({"title":"一致性验收","mode":"chat"}))
-            .send()
+        let ctx = self.context(user).await?;
+        Ok(self
+            .create(&ctx, "一致性验收", "chat", json!({}), None)
             .await?
-            .error_for_status()?
-            .json()
-            .await?;
-        Ok(Uuid::parse_str(response["id"].as_str().unwrap())?)
+            .id)
     }
+}
+
+/// How many of the channel's committed events are not yet confirmed as published.
+async fn unpublished(db: &PgPool, channel: &str) -> anyhow::Result<i64> {
+    Ok(sqlx::query_scalar(
+        "SELECT count(*) FROM events e JOIN channels c ON c.org_id=e.org_id AND c.id=e.channel_id
+         WHERE e.channel_id=$1 AND e.seq>c.published_seq",
+    )
+    .bind(channel)
+    .fetch_one(db)
+    .await?)
 }
 fn message(cid: Uuid, text: &str) -> CommandEnvelope {
     CommandEnvelope {
@@ -236,7 +239,7 @@ async fn database_idempotency_fencing_rls_and_transaction_outbox() -> anyhow::Re
         .fetch_one(&mut *tx)
         .await?;
     assert_eq!(count, 0);
-    assert!(sqlx::query("INSERT INTO runs(id,org_id,conversation_id,exec_epoch,state,response_text,assistant_item_id,cause_cid) VALUES($1,$2,$3,1,'running','x',$4,$5)").bind(Uuid::now_v7()).bind(id(&other,"org_id")).bind(conv).bind(Uuid::now_v7()).bind(Uuid::now_v7()).execute(&mut *tx).await.is_err());
+    assert!(sqlx::query("INSERT INTO runs(id,org_id,conversation_id,harness,model,exec_epoch,state,response_text,assistant_item_id,cause_cid) VALUES($1,$2,$3,'chat','fixture-model',1,'running','x',$4,$5)").bind(Uuid::now_v7()).bind(id(&other,"org_id")).bind(conv).bind(Uuid::now_v7()).bind(Uuid::now_v7()).execute(&mut *tx).await.is_err());
     tx.rollback().await?;
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT count(*) FROM items")
@@ -251,8 +254,7 @@ async fn database_idempotency_fencing_rls_and_transaction_outbox() -> anyhow::Re
             .await
             .is_err()
     );
-    let pending = h.app.store.unpublished(ctx.org_id, &channel).await?;
-    assert_eq!(pending.len(), 3);
+    assert_eq!(unpublished(&h.db, &channel).await?, 3);
     // Process crashes after commit and before publishing: force only its lease to expire.
     sqlx::query("UPDATE channels SET lease_until=now()-interval '1 second' WHERE id=$1")
         .bind(&channel)
@@ -314,13 +316,7 @@ async fn database_idempotency_fencing_rls_and_transaction_outbox() -> anyhow::Re
         engine.apply(f);
     }
     assert_eq!(engine.channels[&channel].cursor, 4);
-    assert!(
-        h.app
-            .store
-            .unpublished(ctx.org_id, &channel)
-            .await?
-            .is_empty()
-    );
+    assert_eq!(unpublished(&h.db, &channel).await?, 0);
     h.close().await
 }
 
@@ -335,28 +331,43 @@ async fn disabled_engines_refuse_work_conversations_and_runs() -> anyhow::Result
     .await?;
     let user = h.user().await?;
     let org = id(&user, "org_id");
-    let created = reqwest::Client::new()
-        .post(format!("{}/orgs/{org}/conversations", h.base))
-        .bearer_auth(user["token"].as_str().unwrap())
-        .json(&json!({"title":"Work","mode":"work"}))
-        .send()
-        .await?;
-    assert_eq!(created.status(), 503);
-    assert_eq!(created.json::<Value>().await?["error"], "WORK_DISABLED");
-    // A Work conversation from before, and a Chat one where no model gateway runs.
     let ctx = h.context(&user).await?;
+    let mut create = create_run(Uuid::now_v7(), Uuid::now_v7(), "hello");
+    if let Some(Command::CreateRun(c)) = &mut create.command {
+        c.mode = "work".into();
+    }
+    let channel = format!("user:{org}:{}", ctx.user_id);
+    let refused =
+        ryzhub_server::user_commands::accept(&h.app, (org, ctx.user_id), &channel, "a", &create)
+            .await;
+    assert_eq!(
+        refused.err().and_then(|e| code_of(&e)),
+        Some(Code::WorkDisabled)
+    );
+    // A Work conversation from before, and a Chat one where no model gateway runs.
     let mut without_models = (*h.app.config).clone();
     without_models.llm.enabled = false;
+    let mut before = (*h.app.config).clone();
+    before.work.enabled = true;
     for (mode, config, code) in [
         ("work", &*h.app.config, "WORK_DISABLED"),
         ("chat", &without_models, "MODEL_GATEWAY_DISABLED"),
     ] {
-        let conv = h
-            .app
-            .store
-            .create_conversation(&ctx, "关闭", mode)
-            .await?
-            .id;
+        let mut tx = h.app.store.tx(org).await?;
+        let conv = create_in(
+            &mut tx,
+            &ctx,
+            Uuid::now_v7(),
+            "关闭",
+            mode,
+            json!({}),
+            None,
+            &before,
+        )
+        .await?
+        .unwrap()
+        .id;
+        tx.commit().await?;
         let cid = Uuid::now_v7();
         h.app
             .store
@@ -838,9 +849,7 @@ async fn member_removal_revokes_org_access_and_stops_waiting_run() -> anyhow::Re
         .await?;
     let ctx = h.app.store.context(user, org).await?;
     let conv = h
-        .app
-        .store
-        .create_conversation(&ctx, "待回答任务", "chat")
+        .create(&ctx, "待回答任务", "chat", json!({}), None)
         .await?
         .id;
     let channel = format!("conv:{conv}");
@@ -874,8 +883,6 @@ async fn member_removal_revokes_org_access_and_stops_waiting_run() -> anyhow::Re
     let base = format!("{}/orgs/{org}", h.base);
     for request in [
         http.get(format!("{base}/conversations")),
-        http.post(format!("{base}/conversations"))
-            .json(&json!({"title": "after removal"})),
         http.post(format!("{base}/memories"))
             .json(&json!({"content": "after removal"})),
         http.get(format!(
@@ -1241,7 +1248,9 @@ async fn legacy_upgrade_preserves_native_model_and_existing_settings() -> anyhow
         let org = id(&user,"org_id");
         let ctx = h.app.store.context(id(&user,"user_id"),org).await?;
         for mode in ["chat","work"] {
-            let conv = h.app.store.create_conversation(&ctx,"Legacy upgrade",mode).await?.id;
+            let conv = Uuid::now_v7();
+            sqlx::query("INSERT INTO conversations(id,org_id,creator_id,title,mode) VALUES($1,$2,$3,'Legacy upgrade',$4)")
+                .bind(conv).bind(org).bind(ctx.user_id).bind(mode).execute(&h.db).await?;
             let run=Uuid::now_v7();
             sqlx::query("INSERT INTO runs(id,org_id,conversation_id,harness,model,exec_epoch,state,response_text,assistant_item_id,cause_cid) VALUES($1,$2,$3,$4,'pinned-legacy-model',1,'running','',$5,$6)")
                 .bind(run).bind(org).bind(conv).bind(if mode=="work" {"codex"}else{"chat"}).bind(Uuid::now_v7()).bind(Uuid::now_v7()).execute(&h.db).await?;
@@ -1438,7 +1447,7 @@ async fn owner_discovery_applies_the_organization_idle_limit() -> anyhow::Result
         sqlx::query("UPDATE conversations SET mode='work' WHERE id=$1").bind(conv).execute(&h.db).await?;
         // Idle for ten minutes: past a 60-second organization limit, within the global 1800.
         let run = Uuid::now_v7();
-        sqlx::query("INSERT INTO runs(id,org_id,conversation_id,exec_epoch,state,response_text,assistant_item_id,cause_cid,ended_at) VALUES($1,$2,$3,1,'cancelled','',$4,$5,now()-interval '10 minutes')")
+        sqlx::query("INSERT INTO runs(id,org_id,conversation_id,harness,model,exec_epoch,state,response_text,assistant_item_id,cause_cid,ended_at) VALUES($1,$2,$3,'codex','gpt-5.4',1,'cancelled','',$4,$5,now()-interval '10 minutes')")
             .bind(run).bind(org).bind(conv).bind(Uuid::now_v7()).bind(Uuid::now_v7()).execute(&h.db).await?;
         sqlx::query("INSERT INTO sandboxes(id,org_id,conversation_id,run_id,lease_epoch,exec_epoch,state,handle,persistent,node_lease_until,created_at) VALUES($1,$2,$3,$4,1,1,'running','{}',true,now()+interval '1 hour',now()-interval '10 minutes')")
             .bind(Uuid::now_v7()).bind(org).bind(conv).bind(run).execute(&h.db).await?;
@@ -1907,20 +1916,15 @@ fn hello(device: &str) -> Frame {
 
 #[tokio::test]
 #[ignore = "requires PostgreSQL/NATS: scripts/test-integration.sh"]
-async fn connections_compress_speak_json_fall_back_to_events_and_ride_http2() -> anyhow::Result<()>
-{
-    let h = Harness::start(|config| config.json_protocol = true).await?;
+async fn connections_compress_fall_back_to_events_and_ride_http2() -> anyhow::Result<()> {
+    let h = Harness::start(|_| {}).await?;
     let user = h.user().await?;
     let org = id(&user, "org_id");
     let user_channel = format!("user:{org}:{}", id(&user, "user_id"));
     // A long title makes the user channel's snapshot worth compressing.
-    reqwest::Client::new()
-        .post(format!("{}/orgs/{org}/conversations", h.base))
-        .bearer_auth(user["token"].as_str().unwrap())
-        .json(&json!({"title": "压缩".repeat(40), "mode": "chat"}))
-        .send()
-        .await?
-        .error_for_status()?;
+    let ctx = h.context(&user).await?;
+    h.create(&ctx, &"压缩".repeat(40), "chat", json!({}), None)
+        .await?;
 
     // zstd: preferred when offered; large frames come compressed, small ones plain.
     let (mut socket, chosen) = connect_with(
@@ -1947,20 +1951,6 @@ async fn connections_compress_speak_json_fall_back_to_events_and_ride_http2() ->
     }
     assert!(saw_compressed, "the snapshot came compressed");
     assert!(snapshot.unwrap().items[0].text.starts_with("压缩"));
-
-    // JSON, where the server offers it: text frames both ways.
-    let (mut socket, chosen) = connect_with(&h.base, &user, SUBPROTOCOL_JSON).await?;
-    assert_eq!(chosen.as_deref(), Some(SUBPROTOCOL_JSON));
-    socket
-        .send(WsMessage::Text(
-            serde_json::to_string(&hello("json"))?.into(),
-        ))
-        .await?;
-    let WsMessage::Text(text) = socket.next().await.context("closed")?? else {
-        anyhow::bail!("a text Welcome")
-    };
-    let welcome: Frame = serde_json::from_str(&text)?;
-    assert!(matches!(welcome.body, Some(Body::Welcome(_))));
 
     // Server-sent events where WebSockets do not get through, frames posted back.
     let http = reqwest::Client::new();

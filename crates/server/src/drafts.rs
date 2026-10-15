@@ -25,8 +25,6 @@ const MAX_TEXT: usize = 65_536;
 pub struct DraftInput {
     #[serde(default)]
     text: String,
-    #[serde(default)]
-    attachment_ids: Vec<Uuid>,
     /// The device writing it, so it can tell its own writes from others'.
     #[serde(default)]
     device_id: String,
@@ -40,25 +38,22 @@ pub async fn put(
     Json(input): Json<DraftInput>,
 ) -> ApiResult<Json<Value>> {
     require!(
-        input.text.len() <= MAX_TEXT
-            && input.attachment_ids.len() <= crate::attachments::MAX_PER_MESSAGE
-            && input.device_id.len() <= 128,
+        input.text.len() <= MAX_TEXT && input.device_id.len() <= 128,
         Code::InvalidInput
     );
     let (ctx, mut tx) = crate::http::member_tx(&app, &headers, org).await?;
     conversation_in(&mut tx, &ctx, conv).await?;
     let updated_at_ms: i64 = sqlx::query_scalar(
-        "INSERT INTO drafts(org_id,user_id,conversation_id,text,attachment_ids,device_id)
-         VALUES($1,$2,$3,$4,$5,$6)
+        "INSERT INTO drafts(org_id,user_id,conversation_id,text,device_id)
+         VALUES($1,$2,$3,$4,$5)
          ON CONFLICT(user_id,conversation_id) DO UPDATE SET text=excluded.text,
-           attachment_ids=excluded.attachment_ids,device_id=excluded.device_id,updated_at=now()
+           device_id=excluded.device_id,updated_at=now()
          RETURNING (extract(epoch FROM updated_at)*1000)::bigint",
     )
     .bind(org)
     .bind(ctx.user_id)
     .bind(conv)
     .bind(&input.text)
-    .bind(&input.attachment_ids)
     .bind(&input.device_id)
     .fetch_one(&mut *tx)
     .await?;
@@ -71,7 +66,6 @@ pub async fn put(
         Event::DraftChanged(Draft {
             conversation_id: conv.to_string(),
             text: input.text,
-            attachment_ids: input.attachment_ids.iter().map(Uuid::to_string).collect(),
             updated_at_ms,
             device_id: input.device_id,
         }),
@@ -83,11 +77,10 @@ pub async fn put(
 
 /// The user's drafts not cleared, for their user channel's snapshot.
 pub async fn of_user(tx: &mut Tx<'_>, ctx: &OrgContext) -> anyhow::Result<Vec<Draft>> {
-    let rows: Vec<(Uuid, String, Vec<Uuid>, i64, String)> = sqlx::query_as(
-        "SELECT d.conversation_id,d.text,d.attachment_ids,(extract(epoch FROM d.updated_at)*1000)::bigint,d.device_id
+    let rows: Vec<(Uuid, String, i64, String)> = sqlx::query_as(
+        "SELECT d.conversation_id,d.text,(extract(epoch FROM d.updated_at)*1000)::bigint,d.device_id
          FROM drafts d JOIN conversations c ON c.org_id=d.org_id AND c.id=d.conversation_id
-         WHERE d.org_id=$1 AND d.user_id=$2 AND c.state IN ('active','archived')
-           AND (d.text<>'' OR cardinality(d.attachment_ids)>0)",
+         WHERE d.org_id=$1 AND d.user_id=$2 AND c.state IN ('active','archived') AND d.text<>''",
     )
     .bind(ctx.org_id)
     .bind(ctx.user_id)
@@ -95,10 +88,9 @@ pub async fn of_user(tx: &mut Tx<'_>, ctx: &OrgContext) -> anyhow::Result<Vec<Dr
     .await?;
     Ok(rows
         .into_iter()
-        .map(|(conv, text, files, updated_at_ms, device_id)| Draft {
+        .map(|(conv, text, updated_at_ms, device_id)| Draft {
             conversation_id: conv.to_string(),
             text,
-            attachment_ids: files.iter().map(Uuid::to_string).collect(),
             updated_at_ms,
             device_id,
         })

@@ -95,16 +95,7 @@ impl Harness {
     ) -> anyhow::Result<Uuid> {
         let ctx = self.context(user).await?;
         Ok(self
-            .app
-            .store
-            .create_configured(
-                &ctx,
-                "Harness",
-                mode,
-                settings,
-                project,
-                Some(&self.app.config),
-            )
+            .create(&ctx, "Harness", mode, settings, project)
             .await?
             .id)
     }
@@ -196,7 +187,7 @@ async fn responses_native_history_projects_and_commands() -> anyhow::Result<()> 
  let other=h.user().await?;let denied=reqwest::Client::new().get(format!("{}/orgs/{org}/projects/{project}/files",h.base)).bearer_auth(other["token"].as_str().unwrap()).send().await?;ensure!(!denied.status().is_success());
  let immutable=reqwest::Client::new().patch(format!("{}/orgs/{org}/projects/{project}",h.base)).bearer_auth(user["token"].as_str().unwrap()).json(&json!({"name":"bad","memory_mode":"default"})).send().await?;ensure!(immutable.status()==400);
  let defaults=h.json(&user,&format!("/orgs/{org}/projects"),reqwest::Method::POST,json!({"name":"Defaults","defaults":{"mode":"work","harness":"claude","model":"claude-sonnet-4-6"}})).await?;
- let inherited=h.json(&user,&format!("/orgs/{org}/conversations"),reqwest::Method::POST,json!({"title":"Inherit defaults","project_id":defaults["id"]})).await?;ensure!(inherited["mode"]=="work" && inherited["run_config"]["harness"]=="claude");
+ let inherited=h.create(&h.context(&user).await?,"Inherit defaults","",json!({}),Some(id(&defaults,"id"))).await?;ensure!(inherited.mode=="work" && inherited.run_config["harness"]=="claude");
  let conv=h.configured(&user,"chat",json!({}),Some(project)).await?;
  ensure!(h.configured(&user,"chat",json!({"approval":"full_auto"}),None).await.unwrap_err().to_string().contains("POLICY_DENIED"));
  // Chat sandbox tools run without asking.
@@ -270,18 +261,13 @@ async fn models_catalog_and_provider_inference() -> anyhow::Result<()> {
         }));
 
         // Clients send only the model; the server derives the wire protocol.
-        let conversations = format!("/orgs/{org}/conversations");
+        let ctx = h.context(&user).await?;
         let create = |run_config: Value, project: Option<Uuid>| {
-            h.json(
-                &user,
-                &conversations,
-                reqwest::Method::POST,
-                json!({"title":"Model first","mode":"chat","project_id":project,"run_config":run_config}),
-            )
+            h.create(&ctx, "Model first", "chat", run_config, project)
         };
         let openai = create(json!({"model":"gpt-5.4"}), None).await?;
-        ensure!(openai["run_config"]["protocol"] == "responses", "{openai}");
-        let conv = id(&openai, "id");
+        ensure!(openai.run_config["protocol"] == "responses", "{openai:?}");
+        let conv = openai.id;
         h.submit(&user, conv, message("hello by model")).await?;
         h.wait_state(conv, "completed").await?;
         let cross = h
@@ -302,8 +288,8 @@ async fn models_catalog_and_provider_inference() -> anyhow::Result<()> {
         );
 
         let anthropic = create(json!({"model":"claude-opus-4-6"}), None).await?;
-        ensure!(anthropic["run_config"]["protocol"] == "anthropic", "{anthropic}");
-        let conv = id(&anthropic, "id");
+        ensure!(anthropic.run_config["protocol"] == "anthropic", "{anthropic:?}");
+        let conv = anthropic.id;
         h.submit(&user, conv, message("hello anthropic")).await?;
         h.wait_state(conv, "completed").await?;
         h.submit(
@@ -331,7 +317,7 @@ async fn models_catalog_and_provider_inference() -> anyhow::Result<()> {
             .await?;
         let project = id(&project, "id");
         let chosen = create(json!({"model":"claude-opus-4-6"}), Some(project)).await?;
-        ensure!(chosen["run_config"]["protocol"] == "anthropic", "{chosen}");
+        ensure!(chosen.run_config["protocol"] == "anthropic", "{chosen:?}");
         Ok::<_, anyhow::Error>(())
     }
     .await;

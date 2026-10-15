@@ -818,8 +818,8 @@ async fn fork(
     let title = format!("{} · 分叉", source.title);
     sqlx::query(
         "INSERT INTO conversations(id,org_id,creator_id,title,mode,run_config,project_id,
-             context_seed,native_fork,owner_epoch,temporary,expires_at)
-         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,1,$10,CASE WHEN $10 THEN now()+interval '30 days' END)",
+             context_seed,native_fork,temporary,expires_at)
+         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,CASE WHEN $10 THEN now()+interval '30 days' END)",
     )
     .bind(id)
     .bind(lease.org_id)

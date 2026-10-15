@@ -4,9 +4,9 @@
 //! affect it, and on a slow periodic fallback. Frames on the hot path are forwarded from the
 //! process-wide [`Hub`] without database work.
 //!
-//! A connection is the same whatever carries it: a WebSocket speaking protobuf, protobuf
-//! with server frames through one zstd stream, or JSON on development servers; or, where
-//! WebSockets do not get through, server-sent events with frames posted back ([`sse`]).
+//! A connection is the same whatever carries it: a WebSocket speaking protobuf, or protobuf
+//! with server frames through one zstd stream; or, where WebSockets do not get through,
+//! server-sent events with frames posted back ([`sse`]).
 mod hub;
 pub mod sse;
 
@@ -99,12 +99,8 @@ pub async fn upgrade(
 ) -> Result<Response, ApiError> {
     let auth = upgrade_auth(&app, &headers, query.ticket.as_deref()).await?;
     // The first protocol the client offers that this server speaks.
-    let mut protocols = vec![SUBPROTOCOL_ZSTD, SUBPROTOCOL];
-    if app.config.json_protocol {
-        protocols.push(SUBPROTOCOL_JSON);
-    }
     Ok(ws
-        .protocols(protocols)
+        .protocols([SUBPROTOCOL_ZSTD, SUBPROTOCOL])
         .max_message_size(MAX_FRAME_BYTES)
         .max_frame_size(MAX_FRAME_BYTES)
         .on_upgrade(move |socket| async move {
@@ -123,7 +119,6 @@ enum Codec {
     /// Rust decoder clients run holds back a stream's last window until it ends); the large
     /// messages it shrinks (snapshots, history, long replies) carry nearly all the bytes.
     Zstd,
-    Json,
 }
 
 /// Frames smaller than this gain nothing from compression.
@@ -134,7 +129,6 @@ impl Codec {
     fn negotiated(protocol: Option<&str>) -> Self {
         match protocol {
             Some(SUBPROTOCOL_ZSTD) => Codec::Zstd,
-            Some(SUBPROTOCOL_JSON) => Codec::Json,
             _ => Codec::Protobuf,
         }
     }
@@ -142,7 +136,6 @@ impl Codec {
     fn encode(&mut self, frame: &Frame) -> anyhow::Result<Message> {
         Ok(match self {
             Codec::Protobuf => Message::Binary(frame.encode_to_vec().into()),
-            Codec::Json => Message::Text(serde_json::to_string(frame)?.into()),
             Codec::Zstd => {
                 let bytes = frame.encode_to_vec();
                 if bytes.len() < ZSTD_FROM {
@@ -159,11 +152,10 @@ impl Codec {
     }
 }
 
-/// A message from the client: frames come as protobuf, or as JSON text on the JSON protocol.
-fn decode(json: bool, message: Message) -> anyhow::Result<Inbound> {
+/// A message from the client: frames come as protobuf.
+fn decode(message: Message) -> anyhow::Result<Inbound> {
     Ok(match message {
         Message::Binary(bytes) => Inbound::Frame(Box::new(Frame::decode(bytes)?)),
-        Message::Text(text) if json => Inbound::Frame(Box::new(serde_json::from_str(&text)?)),
         Message::Close(_) => Inbound::Close,
         _ => Inbound::Activity,
     })
@@ -239,13 +231,12 @@ async fn connection(app: App, socket: WebSocket, auth: Auth) -> anyhow::Result<(
         .and_then(|p| p.to_str().ok())
         .map(str::to_owned);
     let codec = Codec::negotiated(protocol.as_deref());
-    let json = matches!(codec, Codec::Json);
     let (sink, mut source) = socket.split();
     let mut out = WebSocketOut { sink, codec };
     let message = tokio::time::timeout(Duration::from_secs(10), source.next())
         .await?
         .context("closed before Hello")??;
-    let Inbound::Frame(first) = decode(json, message)? else {
+    let Inbound::Frame(first) = decode(message)? else {
         anyhow::bail!("Hello required")
     };
     let Some(Body::Hello(hello)) = first.body else {
@@ -255,7 +246,7 @@ async fn connection(app: App, socket: WebSocket, auth: Auth) -> anyhow::Result<(
         Ok(hello) => hello,
         Err(refusal) => return out.send(&refusal).await,
     };
-    let inbound = source.map(move |message| decode(json, message?));
+    let inbound = source.map(|message| decode(message?));
     serve(app, hello, auth, inbound, out, Uuid::now_v7()).await
 }
 
@@ -272,8 +263,6 @@ pub async fn serve(
     // Clients resubscribe from their own persisted cursors, so no server-side resume exists.
     let welcome = Welcome {
         connection_id: connection_id.to_string(),
-        heartbeat_ms: HEARTBEAT.as_millis() as u32,
-        max_frame_bytes: MAX_FRAME_BYTES as u32,
         ..Default::default()
     };
     // Online before welcomed, so nothing notifies a device that is already told.

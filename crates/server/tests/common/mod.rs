@@ -13,7 +13,13 @@ use anyhow::Context;
 use axum::Router;
 use ryzhub_execution::{ExecSpec, GuestCommand, GuestRequest, HostCommand};
 use ryzhub_proto::{CommandEnvelope, SendMessage, command_envelope::Command};
-use ryzhub_server::{app::App, config::Config, http::router, llm::gateway, store::Store};
+use ryzhub_server::{
+    app::App,
+    config::Config,
+    http::router,
+    llm::gateway,
+    store::{Conversation, Store, create_in},
+};
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use tokio::{
@@ -171,6 +177,33 @@ impl Harness {
     pub async fn context(&self, user: &Value) -> anyhow::Result<ryzhub_domain::OrgContext> {
         let (user, org) = (id(user, "user_id"), id(user, "org_id"));
         self.app.store.context(user, org).await
+    }
+
+    /// A conversation with no message yet, created as CreateRun creates one.
+    pub async fn create(
+        &self,
+        ctx: &ryzhub_domain::OrgContext,
+        title: &str,
+        mode: &str,
+        settings: Value,
+        project: Option<Uuid>,
+    ) -> anyhow::Result<Conversation> {
+        let mut tx = self.app.store.tx(ctx.org_id).await?;
+        let config = &self.app.config;
+        let created = create_in(
+            &mut tx,
+            ctx,
+            Uuid::now_v7(),
+            title,
+            mode,
+            settings,
+            project,
+            config,
+        )
+        .await?
+        .context("conversation id taken")?;
+        tx.commit().await?;
+        Ok(created)
     }
 
     pub async fn send(&self, user: &Value, conv: Uuid, command: Command) -> anyhow::Result<Uuid> {

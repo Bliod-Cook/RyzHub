@@ -53,6 +53,9 @@ ryzhub-core.workspace = true
 tokio-tungstenite.workspace = true
 hyper = { version = "1", features = ["client", "http2"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
+# The integration suites' own helpers.
+ryzhub-server = { path = ".", features = ["test-support"] }
 
 [features]
 local-embedding = ["dep:fastembed", "dep:candle-core"]
+test-support = []

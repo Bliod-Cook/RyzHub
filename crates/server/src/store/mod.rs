@@ -146,13 +146,6 @@ impl Store {
         tx.commit().await?;
         Ok(ctx)
     }
-
-    pub async fn conversation(&self, ctx: &OrgContext, id: Uuid) -> anyhow::Result<Conversation> {
-        let mut tx = self.tx(ctx.org_id).await?;
-        let conversation = conversation_in(&mut tx, ctx, id).await?;
-        tx.commit().await?;
-        Ok(conversation)
-    }
 }
 
 /// Membership is read afresh on every entry point; roles are never cached.

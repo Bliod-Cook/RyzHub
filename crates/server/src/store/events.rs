@@ -335,12 +335,6 @@ impl Store {
             owner_id: owner,
             epoch,
         };
-        sqlx::query("UPDATE conversations SET owner_epoch=$3 WHERE org_id=$1 AND id=$2")
-            .bind(org)
-            .bind(conv)
-            .bind(epoch)
-            .execute(&mut *tx)
-            .await?;
         type RunRow = (Uuid, String, bool, Option<i64>, Option<i64>);
         let runs: Vec<RunRow> = sqlx::query_as(concat!(
             "UPDATE runs SET exec_epoch=$3 WHERE org_id=$1 AND conversation_id=$2
@@ -410,28 +404,6 @@ impl Store {
         ensure!(renewed == 1, Code::Fenced);
         tx.commit().await?;
         Ok(())
-    }
-
-    /// Committed events not yet confirmed as published, oldest first.
-    pub async fn unpublished(
-        &self,
-        org: Uuid,
-        channel: &str,
-    ) -> anyhow::Result<Vec<EventEnvelope>> {
-        let mut tx = self.tx(org).await?;
-        let payloads: Vec<Vec<u8>> = sqlx::query_scalar(
-            "SELECT e.payload FROM events e JOIN channels c ON c.org_id=e.org_id AND c.id=e.channel_id
-             WHERE e.org_id=$1 AND e.channel_id=$2 AND e.seq>c.published_seq ORDER BY e.seq LIMIT 256",
-        )
-        .bind(org)
-        .bind(channel)
-        .fetch_all(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        payloads
-            .into_iter()
-            .map(|bytes| EventEnvelope::decode(bytes.as_slice()).map_err(Into::into))
-            .collect()
     }
 
     /// Resolve a channel to its organization and check the user may subscribe to it.

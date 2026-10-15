@@ -103,16 +103,6 @@ pub async fn remove(
     tx.commit().await?;
     Ok(Json(result))
 }
-pub async fn revert(
-    State(app): State<App>,
-    headers: HeaderMap,
-    Path((org, id)): Path<(Uuid, Uuid)>,
-) -> ApiResult<Json<Value>> {
-    let (ctx, mut tx) = member_tx(&app, &headers, org).await?;
-    let result = undo(&mut tx, org, ctx.user_id, id).await?;
-    tx.commit().await?;
-    Ok(Json(result))
-}
 #[derive(Deserialize)]
 pub struct Preferences {
     pub enabled: bool,

@@ -2,54 +2,11 @@
 use anyhow::{Context, ensure};
 use ryzhub_domain::{Action, OrgContext, Principal, Resource, authorize};
 use ryzhub_proto::event_envelope::Event;
-use serde_json::{Map, Value, json};
+use serde_json::{Map, Value};
 use uuid::Uuid;
 
-use super::{
-    Conversation, Store, Tx, append, audit, context_in, conversation_item, effective_policy,
-};
+use super::{Conversation, Tx, append, audit, conversation_item, effective_policy};
 use crate::{config::Config, error::Code, run_config::RunConfig};
-
-impl Store {
-    pub async fn create_conversation(
-        &self,
-        ctx: &OrgContext,
-        title: &str,
-        mode: &str,
-    ) -> anyhow::Result<Conversation> {
-        self.create_configured(ctx, title, mode, json!({}), None, None)
-            .await
-    }
-
-    /// Create a conversation, optionally inside a project whose defaults fill in the settings.
-    /// With `config`, the run configuration is resolved and validated against policy now.
-    pub async fn create_configured(
-        &self,
-        ctx: &OrgContext,
-        title: &str,
-        mode: &str,
-        settings: Value,
-        project: Option<Uuid>,
-        config: Option<&Config>,
-    ) -> anyhow::Result<Conversation> {
-        let mut tx = self.tx(ctx.org_id).await?;
-        let ctx = context_in(&mut tx, ctx.user_id, ctx.org_id).await?;
-        let conversation = create_in(
-            &mut tx,
-            &ctx,
-            Uuid::now_v7(),
-            title,
-            mode,
-            settings,
-            project,
-            config,
-        )
-        .await?
-        .context(Code::ConversationIdTaken)?;
-        tx.commit().await?;
-        Ok(conversation)
-    }
-}
 
 /// The caller's visible conversations, newest first.
 pub async fn list_conversations(
@@ -72,8 +29,9 @@ pub async fn list_conversations(
     .await?)
 }
 
-/// Create conversation `id` in `tx` for `ctx`, a membership resolved in `tx`: None when a
-/// conversation already has that id. See [`Store::create_configured`].
+/// Create conversation `id` in `tx` for `ctx`, a membership resolved in `tx`, optionally inside
+/// a project whose defaults fill in the settings; the run configuration is resolved and
+/// validated against policy now. None when a conversation already has that id.
 #[allow(clippy::too_many_arguments)]
 pub async fn create_in(
     tx: &mut Tx<'_>,
@@ -83,7 +41,7 @@ pub async fn create_in(
     mode: &str,
     settings: Value,
     project: Option<Uuid>,
-    config: Option<&Config>,
+    config: &Config,
 ) -> anyhow::Result<Option<Conversation>> {
     ensure!(
         matches!(mode, "" | "chat" | "work") && !title.trim().is_empty() && title.len() <= 256,
@@ -102,10 +60,8 @@ pub async fn create_in(
     .map_err(|_| Code::Forbidden)?;
     let (mode, mut settings) = match project {
         Some(project) => {
-            if let Some(config) = config {
-                let policy = effective_policy(tx, &config.policy, ctx.org_id).await?;
-                ensure!(policy.allow_projects != Some(false), Code::PolicyDenied);
-            }
+            let policy = effective_policy(tx, &config.policy, ctx.org_id).await?;
+            ensure!(policy.allow_projects != Some(false), Code::PolicyDenied);
             apply_project_defaults(tx, ctx, project, mode, settings).await?
         }
         None => (mode.to_owned(), settings),
@@ -117,11 +73,9 @@ pub async fn create_in(
         .and_then(|s| s.remove("temporary"))
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    if let Some(config) = config {
-        let resolved = RunConfig::resolve(settings, &mode, config)?;
-        resolved.validate(tx, ctx.org_id, config).await?;
-        settings = serde_json::to_value(resolved)?;
-    }
+    let resolved = RunConfig::resolve(settings, &mode, config)?;
+    resolved.validate(tx, ctx.org_id, config).await?;
+    let settings = serde_json::to_value(resolved)?;
     // An id taken in any organization is taken.
     let conversation: Option<Conversation> = sqlx::query_as(concat!(
         "INSERT INTO conversations(id,org_id,creator_id,title,mode,run_config,project_id,temporary,expires_at)

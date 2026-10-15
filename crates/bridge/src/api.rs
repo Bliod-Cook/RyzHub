@@ -243,9 +243,7 @@ impl ClientCore {
             "",
             Body::Hello(Hello {
                 protocol_major: PROTOCOL_MAJOR,
-                protocol_minor: PROTOCOL_MINOR,
                 device_id,
-                capabilities: vec!["text/0".into()],
                 ..Default::default()
             }),
         )

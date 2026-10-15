@@ -67,7 +67,7 @@ pub async fn validate_key(
 ) -> anyhow::Result<()> {
     let ctx = context_in(tx, key.user_id, key.org_id).await?;
     let run = sqlx::query(
-        "SELECT r.exec_epoch,r.state,c.creator_id,c.owner_epoch,
+        "SELECT r.exec_epoch,r.state,c.creator_id,ch.writer_epoch,
                 ch.lease_until>clock_timestamp() AS live,
                 v.revoked_at IS NULL AS unrevoked,v.superseded_at IS NULL AS current,v.expires_at>now() AS unexpired
          FROM runs r
@@ -102,7 +102,7 @@ pub async fn validate_key(
             let epoch = key.exec_epoch;
             ensure!(
                 epoch == Some(run.get("exec_epoch"))
-                    && epoch == Some(run.get("owner_epoch"))
+                    && epoch == Some(run.get("writer_epoch"))
                     && run.get::<Option<bool>, _>("live") == Some(true),
                 Code::Fenced
             );

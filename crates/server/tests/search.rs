@@ -2,7 +2,11 @@
 mod common;
 use anyhow::{Context, ensure};
 use common::{Harness, id};
-use ryzhub_server::{memory, search};
+use ryzhub_proto::{CommandEnvelope, UndoMemoryUpdate, command_envelope::Command, frame::Body};
+use ryzhub_server::{
+    memory, search,
+    user_commands::{self, Intake},
+};
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -52,16 +56,33 @@ impl Harness {
         project: Option<Uuid>,
         temporary: bool,
     ) -> anyhow::Result<Uuid> {
-        let v = self
-            .request(
-                user,
-                reqwest::Method::POST,
-                &format!("/orgs/{}/conversations", user["org_id"].as_str().unwrap()),
-                Some(json!({"title":"搜索测试","project_id":project,"temporary":temporary})),
-            )
-            .await?;
-        ensure!(v["temporary"] == temporary, "temporary flag lost");
-        Ok(id(&v, "id"))
+        let ctx = self.context(user).await?;
+        let settings = json!({"temporary": temporary});
+        let created = self.create(&ctx, "搜索测试", "", settings, project).await?;
+        ensure!(created.temporary == temporary, "temporary flag lost");
+        Ok(created.id)
+    }
+    /// Undo a memory change as clients do: by command on the user channel.
+    async fn undo(&self, user: &Value, event: &Value) -> anyhow::Result<()> {
+        let (org, member) = (id(user, "org_id"), id(user, "user_id"));
+        let undo = UndoMemoryUpdate {
+            event_id: event.as_str().unwrap().into(),
+        };
+        let envelope = CommandEnvelope {
+            cid: Uuid::now_v7().to_string(),
+            command: Some(Command::UndoMemoryUpdate(undo)),
+        };
+        let channel = format!("user:{org}:{member}");
+        let intake =
+            user_commands::accept(&self.app, (org, member), &channel, "test", &envelope).await?;
+        let Intake::Done(result) = intake else {
+            anyhow::bail!("undo queued")
+        };
+        ensure!(
+            matches!(result.body, Some(Body::CommandAck(_))),
+            "undo refused: {result:?}"
+        );
+        Ok(())
     }
     async fn item(&self, org: Uuid, conv: Uuid, text: &str) -> anyhow::Result<Uuid> {
         let id = Uuid::now_v7();
@@ -309,8 +330,9 @@ async fn acceptance(h: &Harness) -> anyhow::Result<()> {
     );
     let mut tx = h.app.store.tx(org).await?;
     ensure!(
-        memory::snapshot(&mut tx, &h.app.config, org, temporary, owner)
+        memory::context(&mut tx, &h.app.config, org, temporary, owner)
             .await?
+            .text
             .is_empty(),
         "temporary context injected"
     );
@@ -341,12 +363,16 @@ async fn acceptance(h: &Harness) -> anyhow::Result<()> {
         "secret persisted"
     );
     let mut tx = h.app.store.tx(org).await?;
-    let inside_snapshot = memory::snapshot(&mut tx, &h.app.config, org, inside, owner).await?;
+    let inside_snapshot = memory::context(&mut tx, &h.app.config, org, inside, owner)
+        .await?
+        .text;
     ensure!(
         inside_snapshot.contains("Rust") && !inside_snapshot.contains("个人偏好"),
         "project memory escaped scope"
     );
-    let global = memory::snapshot(&mut tx, &h.app.config, org, conv, owner).await?;
+    let global = memory::context(&mut tx, &h.app.config, org, conv, owner)
+        .await?
+        .text;
     ensure!(
         global.contains("个人偏好") && !global.contains("Rust"),
         "global scope imported project memory"
@@ -439,8 +465,9 @@ async fn acceptance(h: &Harness) -> anyhow::Result<()> {
         .await?;
     let mut tx = h.app.store.tx(org).await?;
     ensure!(
-        !memory::snapshot(&mut tx, &h.app.config, org, conv, owner)
+        !memory::context(&mut tx, &h.app.config, org, conv, owner)
             .await?
+            .text
             .contains("后来加入"),
         "snapshot changed mid-conversation"
     );
@@ -453,16 +480,7 @@ async fn acceptance(h: &Harness) -> anyhow::Result<()> {
             Some(json!({"content":"个人偏好详细","replace":saved["id"]})),
         )
         .await?;
-    h.request(
-        &user,
-        reqwest::Method::POST,
-        &format!(
-            "/orgs/{org}/memory-events/{}/undo",
-            edited["event_id"].as_str().unwrap()
-        ),
-        Some(json!({})),
-    )
-    .await?;
+    h.undo(&user, &edited["event_id"]).await?;
     let deleted = h
         .request(
             &user,
@@ -471,16 +489,7 @@ async fn acceptance(h: &Harness) -> anyhow::Result<()> {
             None,
         )
         .await?;
-    h.request(
-        &user,
-        reqwest::Method::POST,
-        &format!(
-            "/orgs/{org}/memory-events/{}/undo",
-            deleted["event_id"].as_str().unwrap()
-        ),
-        Some(json!({})),
-    )
-    .await?;
+    h.undo(&user, &deleted["event_id"]).await?;
     let list = h
         .request(
             &user,
@@ -541,8 +550,9 @@ async fn acceptance(h: &Harness) -> anyhow::Result<()> {
     .await?;
     let mut tx = h.app.store.tx(org).await?;
     ensure!(
-        memory::snapshot(&mut tx, &h.app.config, org, conv, owner)
+        memory::context(&mut tx, &h.app.config, org, conv, owner)
             .await?
+            .text
             .is_empty(),
         "disabled memory still injected"
     );
@@ -668,7 +678,7 @@ async fn acceptance(h: &Harness) -> anyhow::Result<()> {
         .context("MCP lease")?;
     let mut tx = h.app.store.fenced(&lease).await?;
     let run = Uuid::now_v7();
-    sqlx::query("INSERT INTO runs(id,org_id,conversation_id,exec_epoch,state,response_text,assistant_item_id,cause_cid) VALUES($1,$2,$3,$4,'running','',$5,$6)")
+    sqlx::query("INSERT INTO runs(id,org_id,conversation_id,harness,model,exec_epoch,state,response_text,assistant_item_id,cause_cid) VALUES($1,$2,$3,'codex','fixture-model',$4,'running','',$5,$6)")
         .bind(run).bind(fresh_org).bind(work_conv).bind(lease.epoch).bind(Uuid::now_v7()).bind(Uuid::now_v7()).execute(&mut *tx).await?;
     let sandbox = Uuid::now_v7();
     sqlx::query("INSERT INTO sandboxes(id,org_id,conversation_id,run_id,lease_epoch,exec_epoch,state,handle,persistent,node_lease_until) VALUES($1,$2,$3,$4,1,$5,'running','{}',true,now()+interval '5 minutes')")

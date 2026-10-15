@@ -24,8 +24,7 @@ HubController _hub(ClientCore core, _Cache cache) =>
       )
       ..org = 'o'
       ..user = 'u'
-      ..token = 't'
-      ..capabilities = {'create_run': true, 'unread': true, 'drafts': true};
+      ..token = 't';
 
 void main() {
   test(

@@ -4580,6 +4580,7 @@ dependencies = [
  "ryzhub-domain",
  "ryzhub-execution",
  "ryzhub-proto",
+ "ryzhub-server",
  "serde",
  "serde_json",
  "sha2 0.10.9",

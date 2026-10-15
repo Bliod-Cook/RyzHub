@@ -482,25 +482,16 @@ enum StreamResult {
 }
 
 fn apply_stream(state: &mut Channel, body: &Body) -> StreamResult {
-    let (id, stream, part, base, revision, text, offset) = match body {
+    let (id, stream, base, revision, text, offset) = match body {
         Body::Delta(d) => (
             &d.item_id,
             &d.stream,
-            d.part_index,
             d.base_seq,
             d.revision,
             &d.text,
             Some(d.offset),
         ),
-        Body::ItemFold(f) => (
-            &f.item_id,
-            &f.stream,
-            f.part_index,
-            f.base_seq,
-            f.revision,
-            &f.text,
-            None,
-        ),
+        Body::ItemFold(f) => (&f.item_id, &f.stream, f.base_seq, f.revision, &f.text, None),
         _ => return StreamResult::Ignored,
     };
     // A reply's text, or a command's output; other streams do not corrupt either.
@@ -509,9 +500,6 @@ fn apply_stream(state: &mut Channel, body: &Body) -> StreamResult {
         "terminal_output" => true,
         _ => return StreamResult::Ignored,
     };
-    if part != 0 {
-        return StreamResult::Ignored;
-    }
     if base > state.cursor {
         return StreamResult::Future;
     }

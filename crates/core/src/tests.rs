@@ -71,7 +71,6 @@ fn delta(base: u64, offset: u64, text: &str) -> Frame {
         Body::Delta(Delta {
             item_id: "i".into(),
             stream: "text".into(),
-            part_index: 0,
             offset,
             text: text.into(),
             base_seq: base,
@@ -86,7 +85,6 @@ fn fold(text: &str) -> Frame {
         Body::ItemFold(ItemFold {
             item_id: "i".into(),
             stream: "text".into(),
-            part_index: 0,
             text: text.into(),
             base_seq: 1,
             revision: 1,
@@ -430,7 +428,6 @@ fn command_output_streams_apart_from_the_item_text() {
                 text: text.into(),
                 base_seq: 1,
                 revision: 2,
-                ..Default::default()
             }),
         )
     };

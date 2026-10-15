@@ -262,10 +262,6 @@ impl ClientCore {
         self.inner.lock().unwrap().committed();
     }
     #[frb(sync)]
-    pub fn view_json(&self) -> String {
-        serde_json::to_string(&self.inner.lock().unwrap().engine).unwrap()
-    }
-    #[frb(sync)]
     pub fn merge_history(&self, channel: String, items_json: String) -> Result<Update, String> {
         let items = serde_json::from_str(&items_json).map_err(|e| e.to_string())?;
         let mut state = self.inner.lock().unwrap();
@@ -375,10 +371,6 @@ impl ClientCore {
                 attachment_ids,
             }),
         )
-    }
-    #[frb(sync)]
-    pub fn side_query(&self, channel: String, text: String) -> Update {
-        self.command(channel, Command::SideQuery(SideQuery { text }))
     }
     #[frb(sync)]
     pub fn answer_question(

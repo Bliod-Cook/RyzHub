@@ -149,8 +149,6 @@ abstract class ClientCore implements RustOpaqueInterface {
     required List<String> attachmentIds,
   });
 
-  Update sideQuery({required String channel, required String text});
-
   Update steer({
     required String channel,
     required String text,
@@ -161,8 +159,6 @@ abstract class ClientCore implements RustOpaqueInterface {
 
   /// Undoes the memory change of `event_id`, on the user's channel `channel`.
   Update undoMemoryUpdate({required String channel, required String eventId});
-
-  String viewJson();
 }
 
 /// A record of the client cache.

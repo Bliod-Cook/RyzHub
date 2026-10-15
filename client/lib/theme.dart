@@ -86,12 +86,8 @@ class HubColors extends ThemeExtension<HubColors> {
   Color get userBubble =>
       Color.alphaBlend(accent.withValues(alpha: userTint), background);
 
-  /// Falls back for widgets pumped under a bare MaterialApp (widget tests).
-  static HubColors of(BuildContext context) {
-    final theme = Theme.of(context);
-    return theme.extension<HubColors>() ??
-        (theme.brightness == Brightness.dark ? dark : light);
-  }
+  static HubColors of(BuildContext context) =>
+      Theme.of(context).extension<HubColors>()!;
 
   @override
   HubColors copyWith({Color? accent}) => HubColors(

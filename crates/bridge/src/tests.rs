@@ -182,8 +182,11 @@ fn a_cache_reopens_from_its_records_keeping_its_commands() {
     .unwrap();
     // Read back from the cache, the command may go out again.
     assert_eq!(reopened.retry_pending().len(), 1);
-    let view: serde_json::Value = serde_json::from_str(&reopened.view_json()).unwrap();
-    assert_eq!(view["channels"].as_object().unwrap().len(), 3);
+    // Each channel reads back from its record.
+    for n in 0..3 {
+        let merged = reopened.merge_history(format!("conv:{n}"), "[]".into());
+        assert_ne!(merged.unwrap().changes_json, "[]", "conv:{n}");
+    }
 }
 
 #[test]

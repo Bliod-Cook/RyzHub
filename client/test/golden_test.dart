@@ -63,12 +63,12 @@ Widget _timeline() {
         Padding(
           padding: const EdgeInsets.only(bottom: Space.s12),
           child: row['kind'] == 'steps'
-              ? StepsGroup(
+              ? stepsGroup(
                   steps: row['steps'],
                   running: true,
                   latest: row['latest'] == true,
                 )
-              : MessageCard(item: row, agentLabel: 'Codex'),
+              : messageCard(item: row, agentLabel: 'Codex'),
         ),
     ],
   );

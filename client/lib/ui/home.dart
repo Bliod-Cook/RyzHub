@@ -63,7 +63,7 @@ class _HubPageState extends State<HubPage>
   Object? _timelineShows;
 
   /// Signing back in with the device's refresh cookie; the login page waits.
-  bool restoring = keepsSession;
+  bool restoring = true;
 
   /// The conversation whose draft the composer holds; empty for a new chat.
   String _draftFor = '';
@@ -146,7 +146,7 @@ class _HubPageState extends State<HubPage>
     HardwareKeyboard.instance.addHandler(_shortcut);
     _stopPaste = listenForPastedFiles((name, bytes) {
       // Nothing takes files while a preview covers the composer.
-      if (!hub.signedIn || !hub.canAttach || hub.previewFiles != null) return;
+      if (!hub.signedIn || hub.previewFiles != null) return;
       if (hub.libraryOpen) {
         libraryKey.currentState?.upload([
           (name: name, size: bytes.length, open: () => Stream.value(bytes)),
@@ -248,7 +248,12 @@ class _HubPageState extends State<HubPage>
         signInError = errorText(e);
       }
     }
-    final restored = await hub.restore(server);
+    var restored = false;
+    try {
+      restored = await hub.restore(server);
+    } catch (e) {
+      signInError = errorText(e);
+    }
     if (!mounted) return;
     setState(() => restoring = false);
     if (restored) _opened();
@@ -257,7 +262,7 @@ class _HubPageState extends State<HubPage>
     }
   }
 
-  /// Why signing in with another account did not finish, for the login page.
+  /// Why signing in did not finish, for the login page.
   String signInError = '';
 
   /// Sign in with another account at [server]; native builds wait here for the browser.
@@ -1119,8 +1124,8 @@ class _HubPageState extends State<HubPage>
 
     /// A file a reply links to opens in the preview once handed over; the
     /// reply holding the link is looked in first, then newer replies.
-    void openFile(String href, Iterable<dynamic> scope) {
-      final found = linkedFile(href, [...scope, ...hub.items.reversed]);
+    void openFile(String path, Iterable<dynamic> scope) {
+      final found = linkedFile(path, [...scope, ...hub.items.reversed]);
       if (found != null && found.error == null) {
         return hub.openPreview(
           found.files,
@@ -1145,9 +1150,6 @@ class _HubPageState extends State<HubPage>
         ),
       );
     }
-
-    void openLink(String href, Iterable<dynamic> scope) =>
-        isFileLink(href) ? openFile(href, scope) : openSource(href);
 
     Widget centered(Widget child, {Key? key}) => Center(
       key: key,
@@ -1175,7 +1177,8 @@ class _HubPageState extends State<HubPage>
             running: hub.runActive('${row['run_id'] ?? ''}'),
             latest: row['latest'] == true,
             worked: hub.workedFor('${row['run_id'] ?? ''}'),
-            onSource: (href) => openLink(href, steps),
+            onSource: openSource,
+            onFile: (path) => openFile(path, steps),
             rendered: rendered,
             children: hub.childrenOf,
           ),
@@ -1186,9 +1189,10 @@ class _HubPageState extends State<HubPage>
         key: ValueKey(row['id']),
         MessageCard(
           item: item,
-          rendered: rendered(id),
+          rendered: rendered(id) ?? const Rendered([], []),
           agentLabel: hub.agentLabel,
-          onSource: (href) => openLink(href, [item]),
+          onSource: openSource,
+          onFile: (path) => openFile(path, [item]),
           files: (files) => MessageFiles(
             hub: hub,
             files: files,
@@ -1291,7 +1295,7 @@ class _HubPageState extends State<HubPage>
                       onAnswer: (answer) =>
                           action(() => hub.answer(approval, answer)),
                     )
-                  : (approval['options'] as List).contains('__answer__')
+                  : approval['kind'] == 'question'
                   ? QuestionCard(
                       key: ValueKey(approval['id']),
                       summary: approval['summary'],
@@ -1380,7 +1384,7 @@ class _HubPageState extends State<HubPage>
                       Expanded(
                         // Files dropped anywhere on the conversation go with the next message.
                         child: DropTarget(
-                          enable: hub.canAttach && !previewing,
+                          enable: !previewing,
                           onDragEntered: (_) => setState(() => dragging = true),
                           onDragExited: (_) => setState(() => dragging = false),
                           onDragDone: (details) async {

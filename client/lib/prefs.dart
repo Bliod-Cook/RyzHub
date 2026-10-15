@@ -40,33 +40,49 @@ class AppPrefs extends ChangeNotifier {
 
   Future<void> load() async {
     _detected = detectLanguage(PlatformDispatcher.instance.locales);
+    final String raw;
     try {
       _store = await PrefsStore.open();
-      final raw = await _store!.read();
-      if (raw.isEmpty) return;
-      final v = jsonDecode(raw) as Map<String, dynamic>;
-      language = v['language'] ?? language;
-      theme = v['theme'] ?? theme;
-      accent = v['accent'] ?? accent;
-      // A new key: `enter_to_send` was false by default, not by choice.
-      enterToSend = v['enter_sends'] ?? enterToSend;
-      sidebarCollapsed = v['sidebar_collapsed'] ?? sidebarCollapsed;
-      libraryList = v['library_list'] ?? libraryList;
-      defaultMode = v['default_mode'] ?? defaultMode;
-      defaultChatModel = v['default_chat_model'];
-      defaultWorkModel = v['default_work_model'];
-      collapsedSections = {
-        for (final s in v['collapsed_sections'] as List? ?? []) '$s',
-      };
-      defaultHarness = v['default_harness'] ?? defaultHarness;
-      server = v['server'] ?? server;
-      lastConversations = {
-        for (final e in (v['last_conversations'] as Map? ?? {}).entries)
-          '${e.key}': '${e.value}',
-      };
+      raw = await _store!.read();
     } catch (_) {
-      // Unreadable preferences fall back to defaults; they are not critical.
+      // A store the platform cannot open keeps the defaults; preferences are
+      // not critical.
+      return;
     }
+    read(raw);
+  }
+
+  /// Takes the preferences stored as [raw]; each one missing or unreadable
+  /// keeps its default.
+  @visibleForTesting
+  void read(String raw) {
+    final Object? decoded;
+    try {
+      decoded = jsonDecode(raw);
+    } on FormatException {
+      return;
+    }
+    if (decoded is! Map) return;
+    final stored = decoded;
+    T? at<T>(String key) => stored[key] is T ? stored[key] as T : null;
+    language = at<String>('language') ?? language;
+    theme = at<String>('theme') ?? theme;
+    accent = at<String>('accent') ?? accent;
+    enterToSend = at<bool>('enter_sends') ?? enterToSend;
+    sidebarCollapsed = at<bool>('sidebar_collapsed') ?? sidebarCollapsed;
+    libraryList = at<bool>('library_list') ?? libraryList;
+    defaultMode = at<String>('default_mode') ?? defaultMode;
+    defaultChatModel = at<String>('default_chat_model');
+    defaultWorkModel = at<String>('default_work_model');
+    collapsedSections = {
+      for (final s in at<List>('collapsed_sections') ?? []) '$s',
+    };
+    defaultHarness = at<String>('default_harness') ?? defaultHarness;
+    server = at<String>('server') ?? server;
+    lastConversations = {
+      for (final e in (at<Map>('last_conversations') ?? {}).entries)
+        '${e.key}': '${e.value}',
+    };
   }
 
   void update(void Function(AppPrefs p) change) {

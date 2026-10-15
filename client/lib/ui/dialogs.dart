@@ -82,7 +82,6 @@ Future<bool> confirmDialog(
 }
 
 /// Pins or unpins a conversation, beside the header and sidebar row menus.
-/// Disabled on servers that do not advertise `conversation_pin`.
 class PinButton extends StatelessWidget {
   final HubController hub;
   final Map<String, dynamic> conv;
@@ -104,15 +103,9 @@ class PinButton extends StatelessWidget {
     final pinned = HubController.pinnedAt(conv) > 0;
     final size = compact ? 17.0 : 20.0;
     return IconButton(
-      tooltip: !hub.canPin
-          ? tr('置顶（即将支持）', 'Pin (coming soon)')
-          : pinned
-          ? tr('取消置顶', 'Unpin')
-          : tr('置顶', 'Pin'),
+      tooltip: pinned ? tr('取消置顶', 'Unpin') : tr('置顶', 'Pin'),
       isSelected: pinned,
-      onPressed: hub.canPin
-          ? () => run(() => hub.pin(conv['id'], !pinned))
-          : null,
+      onPressed: () => run(() => hub.pin(conv['id'], !pinned)),
       padding: compact ? EdgeInsets.zero : null,
       style: compact
           ? const ButtonStyle(
@@ -122,7 +115,7 @@ class PinButton extends StatelessWidget {
       icon: Icon(
         Icons.push_pin_outlined,
         size: size,
-        color: compact ? (hub.canPin ? c.muted : c.subtle) : null,
+        color: compact ? c.muted : null,
       ),
       selectedIcon: Icon(Icons.push_pin, size: size, color: c.accent),
     );
@@ -373,9 +366,7 @@ class _SearchDialogState extends State<SearchDialog> {
     if (!loading) return;
     debounce = Timer(const Duration(milliseconds: 300), () async {
       try {
-        final result = await widget.hub.request(
-          '/orgs/${widget.hub.org}/search?q=${Uri.encodeQueryComponent(value.trim())}',
-        );
+        final result = await widget.hub.search(value.trim());
         if (mounted && turn == generation) {
           setState(() {
             hits = result['matches'];
@@ -583,7 +574,7 @@ class _ProjectsDialogState extends State<ProjectsDialog> {
       files = [];
     });
     if (p != null && p['state'] == 'active') {
-      files = await hub.request('/orgs/${hub.org}/projects/${p['id']}/files');
+      files = await hub.projectFiles(p['id']);
       if (mounted) setState(() {});
     }
   }
@@ -692,17 +683,10 @@ class _ProjectsDialogState extends State<ProjectsDialog> {
                                     },
                               };
                               if (selected == null) {
-                                final p = await hub.request(
-                                  '/orgs/${hub.org}/projects',
-                                  body: data,
-                                );
+                                final p = await hub.createProject(data);
                                 await choose(Map<String, dynamic>.from(p));
                               } else {
-                                await hub.request(
-                                  '/orgs/${hub.org}/projects/${selected!['id']}',
-                                  body: data,
-                                  method: 'PATCH',
-                                );
+                                await hub.updateProject(selected!['id'], data);
                               }
                             }),
                       child: Text(tr('保存项目', 'Save project')),
@@ -714,11 +698,10 @@ class _ProjectsDialogState extends State<ProjectsDialog> {
                           : () => run(() async {
                               final deleted =
                                   selected!['state'] == 'deletion_pending';
-                              await hub.request(
-                                '/orgs/${hub.org}/projects/${selected!['id']}${deleted ? '/restore' : ''}',
-                                body: deleted ? {} : null,
-                                method: deleted ? 'POST' : 'DELETE',
-                              );
+                              final id = selected!['id'] as String;
+                              await (deleted
+                                  ? hub.restoreProject(id)
+                                  : hub.deleteProject(id));
                               await hub.refreshConversations();
                               await choose(null);
                             }),
@@ -779,9 +762,9 @@ class _ProjectsDialogState extends State<ProjectsDialog> {
                           tooltip: tr('删除文件', 'Delete file'),
                           icon: const Icon(Icons.delete_outline),
                           onPressed: () => run(() async {
-                            await hub.request(
-                              '/orgs/${hub.org}/projects/${selected!['id']}/files/${f['id']}',
-                              method: 'DELETE',
+                            await hub.deleteProjectFile(
+                              selected!['id'],
+                              f['id'],
                             );
                             await choose(selected);
                           }),
@@ -833,12 +816,10 @@ class _ProjectsDialogState extends State<ProjectsDialog> {
                     onPressed: busy
                         ? null
                         : () => run(() async {
-                            await hub.request(
-                              '/orgs/${hub.org}/projects/${selected!['id']}/files',
-                              body: {
-                                'name': fileName.text,
-                                'content': fileContent.text,
-                              },
+                            await hub.addProjectFile(
+                              selected!['id'],
+                              fileName.text,
+                              fileContent.text,
                             );
                             await choose(selected);
                           }),

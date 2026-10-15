@@ -66,7 +66,7 @@ class _PluginSettingsState extends State<PluginSettings> {
 
   Future<void> load() async {
     try {
-      final data = await hub.request('/orgs/${hub.org}/plugins');
+      final data = await hub.plugins();
       if (!mounted) return;
       setState(() {
         plugins = data['plugins'] as List;
@@ -158,7 +158,7 @@ class _PluginTile extends StatelessWidget {
     required this.act,
   });
 
-  String get path => '/orgs/${hub.org}/plugins/${plugin['id']}';
+  String get id => '${plugin['id']}';
 
   @override
   Widget build(BuildContext context) {
@@ -215,9 +215,7 @@ class _PluginTile extends StatelessWidget {
         ),
         trailing: Switch(
           value: plugin['enabled'] == true,
-          onChanged: (v) => act(
-            () => hub.request(path, method: 'PATCH', body: {'enabled': v}),
-          ),
+          onChanged: (v) => act(() => hub.updatePlugin(id, {'enabled': v})),
         ),
         children: [
           for (final warning in (plugin['warnings'] as List? ?? []))
@@ -256,7 +254,7 @@ class _PluginTile extends StatelessWidget {
                       builder: (_) => _ConfirmChanges(plugin: plugin),
                     );
                     if (ok == true) {
-                      await act(() => hub.request('$path/confirm', body: {}));
+                      await act(() => hub.confirmPlugin(id));
                     }
                   },
                   child: Text(tr('查看并确认变更', 'Review and confirm')),
@@ -264,17 +262,11 @@ class _PluginTile extends StatelessWidget {
               for (final server in servers.where((s) => s['enabled'] == true))
                 OutlinedButton(
                   onPressed: () => connected.contains(server['name'])
-                      ? act(
-                          () => hub.request(
-                            '$path/connections/${Uri.encodeComponent('${server['name']}')}',
-                            method: 'DELETE',
-                          ),
-                        )
+                      ? act(() => hub.disconnectPlugin(id, '${server['name']}'))
                       : act(() async {
-                          final started = await hub.request(
-                            '$path/connect',
-                            body: {'server': server['name']},
-                            timeout: const Duration(seconds: 60),
+                          final started = await hub.connectPlugin(
+                            id,
+                            '${server['name']}',
                           );
                           await launchUrl(
                             Uri.parse(started['url']),
@@ -302,38 +294,22 @@ class _PluginTile extends StatelessWidget {
                     );
                     if (values != null) {
                       await act(
-                        () => hub.request(
-                          path,
-                          method: 'PATCH',
-                          body: {
-                            'config': values.config,
-                            'secrets': values.secrets,
-                          },
-                        ),
+                        () => hub.updatePlugin(id, {
+                          'config': values.config,
+                          'secrets': values.secrets,
+                        }),
                       );
                     }
                   },
                   child: Text(tr('设置', 'Settings')),
                 ),
               OutlinedButton(
-                onPressed: () => act(
-                  () => hub.request(
-                    '$path/refresh',
-                    body: {},
-                    timeout: const Duration(seconds: 60),
-                  ),
-                ),
+                onPressed: () => act(() => hub.refreshPlugin(id)),
                 child: Text(tr('刷新工具', 'Refresh tools')),
               ),
               if ((plugin['source'] as Map?)?['kind'] != 'upload')
                 OutlinedButton(
-                  onPressed: () => act(
-                    () => hub.request(
-                      '$path/update',
-                      body: {},
-                      timeout: const Duration(seconds: 120),
-                    ),
-                  ),
+                  onPressed: () => act(() => hub.upgradePlugin(id)),
                   child: Text(tr('检查更新', 'Check for updates')),
                 ),
               TextButton(
@@ -349,7 +325,7 @@ class _PluginTile extends StatelessWidget {
                     confirm: tr('卸载', 'Uninstall'),
                     danger: true,
                   )) {
-                    await act(() => hub.request(path, method: 'DELETE'));
+                    await act(() => hub.uninstallPlugin(id));
                   }
                 },
                 child: Text(tr('卸载', 'Uninstall')),
@@ -758,10 +734,7 @@ class _InstallPluginDialogState extends State<InstallPluginDialog> {
   }
 
   Future<void> loadCatalog() => run(() async {
-    final data = await hub.request(
-      '/orgs/${hub.org}/plugins/catalog',
-      timeout: const Duration(seconds: 30),
-    );
+    final data = await hub.pluginCatalog();
     catalog = data['plugins'] as List;
   });
 
@@ -951,14 +924,11 @@ class _InstallPluginDialogState extends State<InstallPluginDialog> {
             onPressed: busy || source == null
                 ? null
                 : () => run(() async {
-                    final data = await hub.request(
-                      '/orgs/${hub.org}/plugins/preview',
-                      body: {
-                        'source': source,
-                        if (kind == 'upload' && uploadBytes != null)
-                          'archive': base64Encode(uploadBytes!),
-                      },
-                      timeout: const Duration(minutes: 2),
+                    final data = await hub.previewPlugin(
+                      source!,
+                      archive: kind == 'upload' && uploadBytes != null
+                          ? base64Encode(uploadBytes!)
+                          : null,
                     );
                     preview = Map<String, dynamic>.from(data);
                   }),
@@ -975,14 +945,10 @@ class _InstallPluginDialogState extends State<InstallPluginDialog> {
             onPressed: busy
                 ? null
                 : () => run(() async {
-                    await hub.request(
-                      '/orgs/${hub.org}/plugins',
-                      body: {
-                        'version_id': shown['version_id'],
-                        'config': config,
-                        'secrets': secrets,
-                      },
-                      timeout: const Duration(minutes: 2),
+                    await hub.installPlugin(
+                      shown['version_id'],
+                      config,
+                      secrets,
                     );
                     if (context.mounted) Navigator.pop(context, true);
                   }),
@@ -1011,12 +977,10 @@ class _ConversationPluginsState extends State<_ConversationPlugins> {
   List<dynamic>? plugins;
   String error = '';
   HubController get hub => widget.hub;
-  String get path => '/orgs/${hub.org}/conversations/${hub.selected}/plugins';
-
   @override
   void initState() {
     super.initState();
-    load(hub.request(path));
+    load(hub.conversationPlugins(hub.selected));
   }
 
   Future<void> load(Future<dynamic> request) async {
@@ -1065,10 +1029,10 @@ class _ConversationPluginsState extends State<_ConversationPlugins> {
                       onChanged: p['state'] == 'pending'
                           ? null
                           : (v) => load(
-                              hub.request(
-                                '$path/${p['id']}',
-                                method: 'PUT',
-                                body: {'enabled': v},
+                              hub.setConversationPlugin(
+                                hub.selected,
+                                '${p['id']}',
+                                v,
                               ),
                             ),
                     ),

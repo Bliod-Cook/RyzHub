@@ -1,7 +1,7 @@
 import 'package:idb_shim/idb_browser.dart';
 
 /// The client cache: records of one partition (server, user and organization), changed
-/// together in one transaction. The record with the empty key is a cache from before records.
+/// together in one transaction.
 class LocalCache {
   final Database _db;
   final String _partition;
@@ -17,15 +17,13 @@ class LocalCache {
     return LocalCache._(db, partition);
   }
 
-  /// A record's key in the store. The cache from before records sits under the partition.
-  String _key(String key) => key.isEmpty ? _partition : '$_partition\u0000$key';
+  /// A record's key in the store.
+  String _key(String key) => '$_partition\u0000$key';
 
   Future<Map<String, String>> load() async {
     final tx = _db.transaction('cache', idbModeReadOnly);
     final store = tx.objectStore('cache');
     final records = <String, String>{};
-    final legacy = await store.getObject(_partition);
-    if (legacy is String) records[''] = legacy;
     final prefix = '$_partition\u0000';
     await store
         .openCursor(

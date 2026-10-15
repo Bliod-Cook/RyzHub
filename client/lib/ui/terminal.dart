@@ -66,14 +66,14 @@ class _TerminalPanelState extends State<TerminalPanel> {
     setState(() => status = 'connecting');
     try {
       final hub = widget.hub;
-      final ticket = await hub.request('/auth/ticket', body: {});
+      final ticket = await hub.ticket();
       final uri =
           Uri.parse(
             '${hub.base}/orgs/${hub.org}/conversations/${widget.conversation}/terminal',
           ).replace(
             scheme: hub.base.startsWith('https:') ? 'wss' : 'ws',
             queryParameters: {
-              'ticket': ticket['ticket'],
+              'ticket': ticket,
               'cols': '${terminal.viewWidth}',
               'rows': '${terminal.viewHeight}',
               'since': '$offset',

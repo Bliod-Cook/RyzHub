@@ -5,6 +5,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:ryzhub/controller.dart';
 import 'package:ryzhub/l10n.dart';
 import 'package:ryzhub/main.dart';
+import 'package:ryzhub/prefs.dart';
 import 'package:ryzhub/ui/dialogs.dart';
 import 'package:ryzhub/ui/model_picker.dart';
 import 'package:ryzhub/ui/sidebar.dart';
@@ -18,6 +19,23 @@ void main() {
     expect(detectLanguage(const []), 'en');
     expect(detectLanguage(const [Locale('ja'), Locale('zh', 'CN')]), 'zh');
     expect(detectLanguage(const [Locale('en', 'US'), Locale('zh')]), 'en');
+  });
+
+  test('an unreadable preference keeps its default and spares the rest', () {
+    final read = AppPrefs()
+      ..read(
+        jsonEncode({
+          'theme': 3,
+          'accent': 'blue',
+          'collapsed_sections': 'pinned',
+          'last_conversations': {'s o': 'c'},
+        }),
+      );
+    expect(read.theme, 'system');
+    expect(read.accent, 'blue');
+    expect(read.collapsedSections, isEmpty);
+    expect(read.lastConversations, {'s o': 'c'});
+    expect((AppPrefs()..read('{')).accent, 'orange');
   });
 
   testWidgets('composer speaks English when the client language is English', (
@@ -111,7 +129,7 @@ void main() {
       {'id': 'a', 'title': 'A', 'state': 'active', 'project_id': null},
       {'id': 'b', 'title': 'B', 'state': 'active', 'project_id': null},
     ]);
-    String item(String id, int pinnedAt, {bool detail = true}) => jsonEncode([
+    String item(String id, int pinnedAt) => jsonEncode([
       {
         'channel': 'user:o:u',
         'items': [
@@ -120,12 +138,11 @@ void main() {
             'kind': 'conversation',
             'state': 'active',
             'text': id.toUpperCase(),
-            if (detail)
-              'detail': {
-                'kind': {
-                  'Conversation': {'pinned_at_ms': pinnedAt},
-                },
+            'detail': {
+              'kind': {
+                'Conversation': {'pinned_at_ms': pinnedAt},
               },
+            },
           },
         ],
         'actions': [],
@@ -134,9 +151,6 @@ void main() {
     await hub.debugChanges(item('b', 42));
     expect(hub.pinned.map((c) => c['id']), ['b']);
     expect(hub.recents.map((c) => c['id']), ['a']);
-    // An item cached before pins were carried leaves the pin alone.
-    await hub.debugChanges(item('b', 0, detail: false));
-    expect(hub.pinned.map((c) => c['id']), ['b']);
     await hub.debugChanges(item('b', 0));
     expect(hub.pinned, isEmpty);
     expect(hub.recents.map((c) => c['id']), ['a', 'b']);
@@ -215,11 +229,6 @@ void main() {
           'model': 'claude-opus-4-6',
         },
       },
-      {
-        'id': 'legacy',
-        'state': 'active',
-        'defaults': {'mode': 'chat', 'protocol': 'responses'},
-      },
     ];
     hub.selected = 'x';
     hub.startDraft(project: 'p');
@@ -231,9 +240,6 @@ void main() {
     hub.orgModels = catalog;
     hub.startDraft(project: 'p');
     expect((hub.harness, hub.draftModel), ('claude', 'claude-opus-4-6'));
-    // Older projects stored a wire protocol; the draft shows that provider's model.
-    hub.startDraft(project: 'legacy');
-    expect((hub.mode, hub.draftModel), ('chat', 'gpt-5.4'));
     hub.startDraft(mode: 'chat', model: 'retired-model');
     expect(hub.draftModel, 'fixture-model');
     // Without a catalog the draft sends no model and the server decides.
@@ -378,8 +384,7 @@ void main() {
     // Pin is a button beside the menu, never an entry; delete stays hidden.
     expect(values(), isNot(contains('pin')));
     expect(values(), isNot(contains('delete')));
-    expect(() => hub.pin('a', true), throwsException);
-    hub.capabilities = {'conversation_pin': true, 'conversation_delete': true};
+    hub.capabilities = {'conversation_delete': true};
     expect(values(), contains('delete'));
     expect(values(), isNot(contains('pin')));
   });

@@ -10,6 +10,8 @@ import 'package:ryzhub/controller.dart';
 import 'package:ryzhub/main.dart';
 import 'package:ryzhub/ui/attachments.dart';
 
+import 'kernel.dart';
+
 /// A hub whose server calls are recorded and answered in place.
 class _Hub extends HubController {
   final requests = <String>[];
@@ -290,7 +292,7 @@ void main() {
     await tester.pumpWidget(
       MaterialApp(
         home: Scaffold(
-          body: MessageCard(
+          body: messageCard(
             item: {
               'id': 'u',
               'kind': 'user',

@@ -26,6 +26,7 @@ List<Widget> _blocks(
   double size, {
   required String key,
   ValueChanged<String>? onSource,
+  ValueChanged<String>? onFile,
   Color? color,
   _Citations? citations,
   bool fill = true,
@@ -35,6 +36,7 @@ List<Widget> _blocks(
     size: size,
     color: color,
     onLink: onSource,
+    onFile: onFile,
     chip: citations?.chip(onSource),
     codeKey: key,
     fill: fill,
@@ -92,31 +94,20 @@ class _Citations {
   }
 }
 
-/// [href] as the server records the files replies link to: without
-/// `sandbox:` and percent-decoded.
-String fileLinkPath(String href) {
-  final path = href.startsWith('sandbox:') ? href.substring(8) : href;
-  try {
-    return Uri.decodeComponent(path);
-  } on ArgumentError {
-    return path;
-  }
-}
-
-/// What a file link resolves to in [replies], the first that recorded it:
-/// the files handed over with that reply and which one is linked, or [error]
-/// saying why it was not handed over. Null when none recorded it.
+/// What the file link to [path] (as the server records it) resolves to in
+/// [replies], the first that recorded it: the files handed over with that
+/// reply and which one is linked, or [error] saying why it was not handed
+/// over. Null when none recorded it.
 ({List<Map<String, dynamic>> files, int index, String? error})? linkedFile(
-  String href,
+  String path,
   Iterable<dynamic> replies,
 ) {
-  final link = fileLinkPath(href);
   for (final reply in replies) {
     if (reply is! Map) continue;
     final recorded = reply['detail']?['kind']?['Answer']?['files'];
     if (recorded is! List) continue;
     final shared = recorded.whereType<Map>().toList();
-    final found = shared.where((f) => f['link'] == link).firstOrNull;
+    final found = shared.where((f) => f['link'] == path).firstOrNull;
     if (found == null) continue;
     final files = [
       for (final f in shared)
@@ -133,12 +124,6 @@ String fileLinkPath(String href) {
     );
   }
   return null;
-}
-
-/// Whether [href] names a file of the sandbox rather than a page.
-bool isFileLink(String href) {
-  final path = fileLinkPath(href);
-  return path.startsWith('/workspace/') || path.startsWith('/attachments/');
 }
 
 /// A cited page's title, or its site when it has none.
@@ -377,21 +362,25 @@ class MessageCard extends StatelessWidget {
   final VoidCallback? onMemoryUndo;
   final ValueChanged<String>? onSource;
 
+  /// Opens a sandbox file the text links to, by its path.
+  final ValueChanged<String>? onFile;
+
   /// Shows the files a message carried.
   final Widget Function(List<dynamic> files)? files;
 
-  /// Its text as the timeline rendered it; rendered here when absent.
-  final Rendered? rendered;
+  /// Its text as the timeline rendered it.
+  final Rendered rendered;
   const MessageCard({
     super.key,
     required this.item,
+    required this.rendered,
     this.agentLabel,
     this.onFork,
     this.forkNote,
     this.onMemoryUndo,
     this.onSource,
+    this.onFile,
     this.files,
-    this.rendered,
   });
 
   @override
@@ -400,7 +389,6 @@ class MessageCard extends StatelessWidget {
     final text = item['text'] as String;
     final kind = item['kind'];
     final key = '${item['id']}';
-    Rendered render() => rendered ?? Rendered.item(item);
     if (kind == 'memory_notice') {
       Map<String, dynamic> notice;
       try {
@@ -480,10 +468,11 @@ class MessageCard extends StatelessWidget {
                               mainAxisSize: MainAxisSize.min,
                               // The bubble fits its text.
                               children: _blocks(
-                                render(),
+                                rendered,
                                 15,
                                 key: key,
                                 onSource: onSource,
+                                onFile: onFile,
                                 fill: false,
                               ),
                             ),
@@ -506,7 +495,6 @@ class MessageCard extends StatelessWidget {
       );
     }
     if (kind == 'assistant') {
-      final rendered = render();
       final citations = _Citations.of(item, rendered);
       return Padding(
         padding: const EdgeInsets.only(bottom: Space.s18),
@@ -522,6 +510,7 @@ class MessageCard extends StatelessWidget {
                   15,
                   key: key,
                   onSource: onSource,
+                  onFile: onFile,
                   citations: citations,
                 ),
               ),
@@ -624,10 +613,11 @@ class MessageCard extends StatelessWidget {
                         crossAxisAlignment: CrossAxisAlignment.stretch,
                         mainAxisSize: MainAxisSize.min,
                         children: _blocks(
-                          render(),
+                          rendered,
                           14,
                           key: key,
                           onSource: onSource,
+                          onFile: onFile,
                         ),
                       ),
                     ),
@@ -736,19 +726,23 @@ class StepsGroup extends StatefulWidget {
   final Duration? worked;
   final ValueChanged<String>? onSource;
 
-  /// A step's text as the timeline rendered it; rendered here when absent.
-  final Rendered? Function(String id)? rendered;
+  /// Opens a sandbox file a step's text links to, by its path.
+  final ValueChanged<String>? onFile;
+
+  /// A step's text as the timeline rendered it.
+  final Rendered? Function(String id) rendered;
 
   /// What a subagent did for a call, shown under it.
   final List<Map<String, dynamic>> Function(String id)? children;
   const StepsGroup({
     super.key,
     required this.steps,
+    required this.rendered,
     this.running = false,
     this.latest = false,
     this.worked,
     this.onSource,
-    this.rendered,
+    this.onFile,
     this.children,
   });
   @override
@@ -857,9 +851,7 @@ class _StepsGroupState extends State<StepsGroup> {
     );
     final muted = TextStyle(fontSize: 13.5, height: 1.65, color: c.muted);
     final key = '${item['id']}';
-    final rendered =
-        widget.rendered?.call(key) ??
-        (_folds(item) ? const Rendered([], []) : Rendered.item(item));
+    final rendered = widget.rendered(key) ?? const Rendered([], []);
     final citations = _Citations.of(item, rendered);
     List<Widget> selectable(List<Widget> blocks) => [
       SelectionArea(
@@ -886,6 +878,7 @@ class _StepsGroupState extends State<StepsGroup> {
             14,
             key: key,
             onSource: widget.onSource,
+            onFile: widget.onFile,
             color: c.muted,
           ),
         ),
@@ -898,6 +891,7 @@ class _StepsGroupState extends State<StepsGroup> {
             14,
             key: key,
             onSource: widget.onSource,
+            onFile: widget.onFile,
             color: c.muted,
           ),
         ),
@@ -919,6 +913,7 @@ class _StepsGroupState extends State<StepsGroup> {
                 15,
                 key: key,
                 onSource: widget.onSource,
+                onFile: widget.onFile,
                 citations: citations,
               ),
             ),

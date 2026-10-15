@@ -2,7 +2,6 @@ import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:ryzhub/prefs.dart';
-import 'package:ryzhub/ui/messages.dart';
 
 import 'kernel.dart';
 
@@ -50,12 +49,12 @@ Widget _render(List<Map<String, dynamic>> rows, {bool running = false}) =>
           children: [
             for (final row in rows)
               row['kind'] == 'steps'
-                  ? StepsGroup(
+                  ? stepsGroup(
                       steps: row['steps'],
                       running: running,
                       latest: row['latest'] == true,
                     )
-                  : MessageCard(item: row),
+                  : messageCard(item: row),
           ],
         ),
       ),
@@ -176,7 +175,7 @@ void main() {
     ];
     await tester.pumpWidget(
       MaterialApp(
-        home: Scaffold(body: StepsGroup(steps: steps, running: true)),
+        home: Scaffold(body: stepsGroup(steps: steps, running: true)),
       ),
     );
     expect(
@@ -215,7 +214,7 @@ void main() {
       await tester.pumpWidget(
         MaterialApp(
           home: Scaffold(
-            body: StepsGroup(steps: [web('a'), _run[3], image, web('b')]),
+            body: stepsGroup(steps: [web('a'), _run[3], image, web('b')]),
           ),
         ),
       );
@@ -253,7 +252,7 @@ void main() {
     }) => tester.pumpWidget(
       MaterialApp(
         home: Scaffold(
-          body: StepsGroup(
+          body: stepsGroup(
             steps: steps,
             running: running,
             latest: running,
@@ -310,7 +309,7 @@ void main() {
       await tester.pumpWidget(
         MaterialApp(
           home: Scaffold(
-            body: MessageCard(
+            body: messageCard(
               item: {
                 ..._item('answer', 'assistant', text: text, state: state),
                 'detail': {
@@ -356,7 +355,7 @@ void main() {
     await tester.pumpWidget(
       MaterialApp(
         home: Scaffold(
-          body: MessageCard(
+          body: messageCard(
             item: {
               ..._item(
                 'answer',
@@ -458,7 +457,7 @@ void main() {
         MaterialApp(
           home: Scaffold(
             body: SingleChildScrollView(
-              child: StepsGroup(
+              child: stepsGroup(
                 steps: [call, edit],
                 running: true,
                 latest: true,

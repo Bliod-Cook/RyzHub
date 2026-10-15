@@ -35,19 +35,6 @@ class Rendered {
     if (_cache.length > 64) _cache.remove(_cache.keys.first);
     return rendered;
   }
-
-  /// [item]'s text rendered as its message shows it.
-  factory Rendered.item(Map<String, dynamic> item) {
-    final citations = item['detail']?['kind']?['Answer']?['citations'];
-    return Rendered.of(
-      '${item['text'] ?? ''}',
-      cited: [
-        if (citations is List)
-          for (final c in citations.whereType<Map>()) '${c['url']}',
-      ],
-      streaming: item['state'] == 'streaming',
-    );
-  }
 }
 
 /// Space between blocks.
@@ -60,8 +47,12 @@ class MarkdownBlocks extends StatefulWidget {
   final double size;
   final Color? color;
 
-  /// Opens a link: a page, a sandbox file or a conversation.
+  /// Opens a link: a page or a conversation.
   final ValueChanged<String>? onLink;
+
+  /// Opens a file of the sandbox a reply links to, by its path as the server
+  /// records it.
+  final ValueChanged<String>? onFile;
 
   /// The chip for a run of cited sources, by its index.
   final Widget? Function(int index)? chip;
@@ -80,6 +71,7 @@ class MarkdownBlocks extends StatefulWidget {
     this.size = 15,
     this.color,
     this.onLink,
+    this.onFile,
     this.chip,
     this.codeKey = '',
     this.fill = true,
@@ -95,6 +87,7 @@ class _MarkdownBlocksState extends State<MarkdownBlocks> {
   Object? _builtFor;
 
   void _link(String href) => widget.onLink?.call(href);
+  void _file(String path) => widget.onFile?.call(path);
   Widget? _chip(int index) => widget.chip?.call(index);
 
   @override
@@ -129,6 +122,7 @@ class _MarkdownBlocksState extends State<MarkdownBlocks> {
         block: block as Map,
         style: style,
         link: _link,
+        file: _file,
         chip: _chip,
         codeKey: '${widget.codeKey}#$i',
       );
@@ -193,7 +187,7 @@ class _Block extends StatelessWidget {
   final bool first;
   final Map block;
   final _Style style;
-  final ValueChanged<String> link;
+  final ValueChanged<String> link, file;
   final Widget? Function(int) chip;
   final String codeKey;
   const _Block({
@@ -202,6 +196,7 @@ class _Block extends StatelessWidget {
     required this.block,
     required this.style,
     required this.link,
+    required this.file,
     required this.chip,
     required this.codeKey,
   });
@@ -229,6 +224,7 @@ class _Block extends StatelessWidget {
     style: text,
     code: style.code,
     link: link,
+    file: file,
     chip: chip,
   );
 
@@ -395,6 +391,7 @@ class _Block extends StatelessWidget {
               ),
               code: style.code,
               link: link,
+              file: file,
               chip: chip,
               align: alignOf(i),
             ),
@@ -416,7 +413,7 @@ class _Block extends StatelessWidget {
 class _Paragraph extends StatefulWidget {
   final List inlines;
   final TextStyle style, code;
-  final ValueChanged<String> link;
+  final ValueChanged<String> link, file;
   final Widget? Function(int) chip;
   final TextAlign align;
   const _Paragraph({
@@ -424,6 +421,7 @@ class _Paragraph extends StatefulWidget {
     required this.style,
     required this.code,
     required this.link,
+    required this.file,
     required this.chip,
     this.align = TextAlign.start,
   });
@@ -510,7 +508,7 @@ class _ParagraphState extends State<_Paragraph> {
             );
           }
         case 'file':
-          spans.add(_file(inline['label'] as String, inline['href'] as String));
+          spans.add(_file(inline['label'] as String, inline['path'] as String));
         case 'image':
           final alt = '${inline['alt']}'.trim();
           final url = inline['url'] as String;
@@ -573,7 +571,7 @@ class _ParagraphState extends State<_Paragraph> {
   }
 
   /// A link to a sandbox file: the file's glyph before the label, opened on tap.
-  InlineSpan _file(String label, String href) {
+  InlineSpan _file(String label, String path) {
     final c = HubColors.of(context);
     final style = widget.style.copyWith(color: c.accent);
     return WidgetSpan(
@@ -582,7 +580,7 @@ class _ParagraphState extends State<_Paragraph> {
         link: true,
         child: InkWell(
           borderRadius: BorderRadius.circular(4),
-          onTap: () => widget.link(href),
+          onTap: () => widget.file(path),
           child: Row(
             mainAxisSize: MainAxisSize.min,
             children: [

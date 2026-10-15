@@ -2,8 +2,9 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:ryzhub/prefs.dart';
 import 'package:ryzhub/theme.dart';
-import 'package:ryzhub/ui/messages.dart';
 import 'package:ryzhub/ui/unfold.dart';
+
+import 'kernel.dart';
 
 void main() {
   tearDown(() => prefs.language = 'zh');
@@ -37,7 +38,7 @@ void main() {
                     delegate: SliverChildBuilderDelegate(
                       (context, i) => i == below
                           ? fold ??
-                                StepsGroup(
+                                stepsGroup(
                                   steps: [
                                     {
                                       'id': 'r',
@@ -99,7 +100,7 @@ void main() {
     await timeline(
       tester,
       below: 2,
-      fold: MessageCard(
+      fold: messageCard(
         item: {
           'id': 'a',
           'kind': 'assistant',
@@ -330,8 +331,8 @@ void main() {
       await tester.pumpWidget(
         MaterialApp(
           theme: ThemeData(extensions: [HubColors.light(accentColor(accent))]),
-          home: const Scaffold(
-            body: MessageCard(
+          home: Scaffold(
+            body: messageCard(
               item: {
                 'id': 'u',
                 'kind': 'user',

@@ -5,7 +5,7 @@ import 'package:sqflite/sqflite.dart' as mobile;
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 
 /// The client cache: records of one partition (server, user and organization), changed
-/// together in one transaction. The record with the empty key is a cache from before records.
+/// together in one transaction.
 class LocalCache {
   final Database _db;
   final String _partition;
@@ -16,22 +16,13 @@ class LocalCache {
         ? mobile.databaseFactory
         : databaseFactoryFfi;
     if (!Platform.isAndroid && !Platform.isIOS) sqfliteFfiInit();
-    const records =
-        'CREATE TABLE cache_records(partition TEXT NOT NULL, key TEXT NOT NULL, '
-        'value TEXT NOT NULL, PRIMARY KEY(partition, key))';
     final db = await factory.openDatabase(
       '${folder.path}/ryzhub.db',
       options: OpenDatabaseOptions(
-        version: 2,
-        onCreate: (db, _) async {
-          await db.execute(
-            'CREATE TABLE cache(partition TEXT PRIMARY KEY, state TEXT NOT NULL)',
-          );
-          await db.execute(records);
-        },
-        onUpgrade: (db, from, _) async {
-          if (from < 2) await db.execute(records);
-        },
+        onOpen: (db) => db.execute(
+          'CREATE TABLE IF NOT EXISTS cache_records(partition TEXT NOT NULL, '
+          'key TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY(partition, key))',
+        ),
       ),
     );
     return LocalCache._(db, partition);
@@ -39,12 +30,6 @@ class LocalCache {
 
   Future<Map<String, String>> load() async {
     final records = <String, String>{};
-    final legacy = await _db.query(
-      'cache',
-      where: 'partition = ?',
-      whereArgs: [_partition],
-    );
-    if (legacy.isNotEmpty) records[''] = legacy.first['state'] as String;
     for (final row in await _db.query(
       'cache_records',
       where: 'partition = ?',
@@ -59,14 +44,7 @@ class LocalCache {
   Future<void> write(Map<String, String?> records) =>
       _db.transaction((txn) async {
         for (final MapEntry(:key, :value) in records.entries) {
-          if (key.isEmpty) {
-            // The cache from before records is only ever removed.
-            await txn.delete(
-              'cache',
-              where: 'partition = ?',
-              whereArgs: [_partition],
-            );
-          } else if (value == null) {
+          if (value == null) {
             await txn.delete(
               'cache_records',
               where: 'partition = ? AND key = ?',

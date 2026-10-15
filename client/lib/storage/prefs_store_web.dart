@@ -1,7 +1,6 @@
 import 'package:idb_shim/idb_browser.dart';
 
-/// Client preferences live apart from `ryzhub-core`, whose single cache record
-/// is read directly by the browser tests.
+/// Client preferences live apart from the `ryzhub-core` cache.
 class PrefsStore {
   final Database _db;
   PrefsStore._(this._db);

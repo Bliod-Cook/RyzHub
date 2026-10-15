@@ -5,10 +5,8 @@ import 'package:http/browser_client.dart';
 import 'package:http/http.dart' as http;
 import 'package:web/web.dart' as web;
 
-/// The browser holds the device's refresh token in an HttpOnly cookie.
-const keepsSession = true;
-
-/// Requests carry the cookie to the server, which is another origin.
+/// The browser holds the device's refresh token in an HttpOnly cookie; requests
+/// carry it to the server, which is another origin.
 http.Client sessionClient() => BrowserClient()..withCredentials = true;
 
 const _loopback = {'localhost', '127.0.0.1', '[::1]', '::1'};

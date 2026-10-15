@@ -4,7 +4,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:ryzhub/controller.dart';
 import 'package:ryzhub/ui/code.dart';
-import 'package:ryzhub/ui/messages.dart';
+
+import 'kernel.dart';
 
 void main() {
   test('timeline diffs keep the blocks they do not replace', () async {
@@ -138,7 +139,7 @@ void main() {
       MaterialApp(
         home: Scaffold(
           body: SingleChildScrollView(
-            child: MessageCard(
+            child: messageCard(
               item: {
                 'id': 'r',
                 'kind': 'assistant',

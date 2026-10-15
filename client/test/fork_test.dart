@@ -3,6 +3,8 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:ryzhub/controller.dart';
 import 'package:ryzhub/main.dart';
 
+import 'kernel.dart';
+
 void main() {
   setUpAll(() => prefs.language = 'zh');
   testWidgets('Codex exposes only server-confirmed fork boundaries', (
@@ -32,7 +34,7 @@ void main() {
           body: Column(
             children: [
               for (final reply in replies)
-                MessageCard(
+                messageCard(
                   item: reply,
                   onFork: hub.canFork(reply)
                       ? () => selected.add(reply['id']!)

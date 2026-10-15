@@ -7,7 +7,6 @@ import 'package:ryzhub/controller.dart';
 import 'package:ryzhub/prefs.dart';
 import 'package:ryzhub/ui/dialogs.dart';
 import 'package:ryzhub/ui/memories.dart';
-import 'package:ryzhub/ui/messages.dart';
 
 import 'kernel.dart';
 
@@ -144,7 +143,7 @@ void main() {
     await tester.pumpWidget(
       MaterialApp(
         home: Scaffold(
-          body: MessageCard(
+          body: messageCard(
             item: {
               'kind': 'memory_notice',
               'state': 'completed',

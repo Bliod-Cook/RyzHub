@@ -410,11 +410,7 @@ class _PluginAppPanelState extends State<PluginAppPanel> {
       error = '';
     });
     try {
-      final data = await widget.hub.request(
-        '/orgs/${widget.hub.org}/conversations/${widget.hub.selected}/apps',
-        body: {'item_id': widget.item},
-        timeout: const Duration(seconds: 60),
-      );
+      final data = await widget.hub.pluginApp(widget.item);
       opened = Map<String, dynamic>.from(data);
     } catch (e) {
       error = errorText(e);

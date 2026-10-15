@@ -2,6 +2,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
 import 'package:ryzhub/browser_native.dart';
+import 'package:ryzhub/controller.dart';
 
 class _Memory implements SecretStore {
   final values = <String, String>{};
@@ -14,6 +15,24 @@ class _Memory implements SecretStore {
 
   @override
   Future<void> delete(String key) async => values.remove(key);
+}
+
+/// A hub whose requests get their answer by path: a value, or an error thrown.
+class _Hub extends HubController {
+  _Hub(this.answers);
+  final Map<String, Object> answers;
+
+  @override
+  Future<dynamic> request(
+    String path, {
+    Map<String, dynamic>? body,
+    String? method,
+    Duration timeout = const Duration(seconds: 15),
+  }) async {
+    final answer = answers[path];
+    if (answer is Exception) throw answer;
+    return answer;
+  }
 }
 
 void main() {
@@ -72,5 +91,32 @@ void main() {
     expect(seen['/auth/refresh'], isNull, reason: 'another server gets none');
     await client.post(Uri.parse('https://hub.example/auth/logout'));
     expect(secrets.values.containsKey('refresh:https://hub.example'), isFalse);
+  });
+
+  test(
+    'a lapsed session signs out; a server out of reach is not one',
+    () async {
+      final lapsed = _Hub({
+        '/capabilities': <String, dynamic>{},
+        '/auth/refresh': Exception('UNAUTHORIZED'),
+      });
+      addTearDown(lapsed.dispose);
+      expect(await lapsed.restore('https://hub.example'), isFalse);
+      final offline = _Hub({'/capabilities': http.ClientException('offline')});
+      addTearDown(offline.dispose);
+      await expectLater(
+        offline.restore('https://hub.example'),
+        throwsA(isA<http.ClientException>()),
+      );
+    },
+  );
+
+  test('models that fail to load keep those shown', () async {
+    final hub = _Hub({'/orgs/o/models': Exception('UNAVAILABLE')})
+      ..org = 'o'
+      ..orgModels = {'chat': []};
+    addTearDown(hub.dispose);
+    await expectLater(hub.refreshModels(), throwsException);
+    expect(hub.orgModels, {'chat': []});
   });
 }

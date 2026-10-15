@@ -1,6 +1,7 @@
 import 'dart:io';
 import 'dart:typed_data';
 
+import 'package:flutter/services.dart' show PlatformException;
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
@@ -8,8 +9,6 @@ import 'package:url_launcher/url_launcher.dart';
 
 /// Native builds keep the device's refresh token in the platform's secure
 /// storage (Android Keystore, Windows Credential Manager) and stay signed in.
-const keepsSession = true;
-
 http.Client sessionClient() => RefreshCookieClient(http.Client());
 
 /// What the platform's secure storage holds for [RefreshCookieClient].
@@ -26,25 +25,28 @@ class _PlatformSecrets implements SecretStore {
   Future<String?> read(String key) async {
     try {
       return await _storage.read(key: key);
-    } catch (_) {
+    } on PlatformException {
       // Storage the platform cannot open (a reset keystore) holds nothing.
       return null;
     }
   }
 
-  // A device whose storage refuses only signs in again next start.
   @override
   Future<void> write(String key, String value) async {
     try {
       await _storage.write(key: key, value: value);
-    } catch (_) {}
+    } on PlatformException {
+      // A device whose storage refuses only signs in again next start.
+    }
   }
 
   @override
   Future<void> delete(String key) async {
     try {
       await _storage.delete(key: key);
-    } catch (_) {}
+    } on PlatformException {
+      // What it holds is refused with the next refresh.
+    }
   }
 }
 

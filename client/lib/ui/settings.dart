@@ -922,7 +922,7 @@ class _IdentitiesState extends State<_Identities> {
 
   Future<void> load() async {
     try {
-      final loaded = await hub.request('/me/identities');
+      final loaded = await hub.identities();
       if (mounted) setState(() => data = Map<String, dynamic>.from(loaded));
     } catch (e) {
       if (mounted) setState(() => error = errorText(e));
@@ -941,11 +941,11 @@ class _IdentitiesState extends State<_Identities> {
 
   /// Adds an account: the provider signs the member in and returns here.
   Future<void> connect(String provider) async {
-    final ticket = await hub.request('/auth/ticket', body: {});
+    final ticket = await hub.ticket();
     final returned = await signInElsewhere(
       (returnTo) =>
           '${hub.base}/auth/oauth/$provider/start?return_to=${Uri.encodeQueryComponent(returnTo)}'
-          '&link=${Uri.encodeQueryComponent('${ticket['ticket']}')}',
+          '&link=${Uri.encodeQueryComponent(ticket)}',
     );
     final failed = returned['login_error'];
     if (failed != null) throw Exception(failed);
@@ -972,9 +972,9 @@ class _IdentitiesState extends State<_Identities> {
             trailing: TextButton(
               style: TextButton.styleFrom(foregroundColor: c.danger),
               onPressed: () => act(
-                () => hub.request(
-                  '/me/identities/${Uri.encodeComponent('${identity['provider']}')}/${Uri.encodeComponent('${identity['subject']}')}',
-                  method: 'DELETE',
+                () => hub.removeIdentity(
+                  '${identity['provider']}',
+                  '${identity['subject']}',
                 ),
               ),
               child: Text(tr('移除', 'Remove')),
@@ -1006,7 +1006,7 @@ class _Usage extends StatelessWidget {
   Widget build(BuildContext context) {
     final c = HubColors.of(context);
     return _Loader<List<dynamic>>(
-      load: () async => await hub.request('/orgs/${hub.org}/usage') as List,
+      load: hub.usage,
       builder: (context, rows, reload) {
         num sum(String key) =>
             rows.fold<num>(0, (a, r) => a + ((r[key] as num?) ?? 0));
@@ -1187,8 +1187,7 @@ class _CredentialsState extends State<_Credentials> {
       children: [
         _Loader<List<dynamic>>(
           key: loader,
-          load: () async =>
-              await hub.request('/orgs/${hub.org}/credentials') as List,
+          load: hub.credentials,
           builder: (context, rows, _) => SettingsCard(
             children: [
               if (rows.isEmpty)
@@ -1219,12 +1218,7 @@ class _CredentialsState extends State<_Credentials> {
                               confirm: tr('吊销', 'Revoke'),
                               danger: true,
                             )) {
-                              await run(
-                                () => hub.request(
-                                  '/orgs/${hub.org}/credentials/${r['id']}',
-                                  method: 'DELETE',
-                                ),
-                              );
+                              await run(() => hub.revokeCredential(r['id']));
                             }
                           },
                     child: Text(tr('吊销', 'Revoke')),
@@ -1287,14 +1281,11 @@ class _CredentialsState extends State<_Credentials> {
                       onPressed: busy
                           ? null
                           : () => run(() async {
-                              await hub.request(
-                                '/orgs/${hub.org}/credentials',
-                                body: {
-                                  'name': name.text,
-                                  'api_key': key.text,
-                                  'provider': provider,
-                                  'organization': organization,
-                                },
+                              await hub.addCredential(
+                                name: name.text,
+                                apiKey: key.text,
+                                provider: provider,
+                                organization: organization,
                               );
                               name.clear();
                               key.clear();
@@ -1345,10 +1336,7 @@ class _Server extends StatelessWidget {
             ),
             SettingRow(
               title: tr('当前 Agent', 'Current agent'),
-              trailing: Text(
-                hub.agentLabel,
-                style: TextStyle(color: c.muted),
-              ),
+              trailing: Text(hub.agentLabel, style: TextStyle(color: c.muted)),
             ),
           ],
         ),
@@ -1398,7 +1386,7 @@ class _Server extends StatelessWidget {
           ],
         ),
         _Loader<dynamic>(
-          load: () => hub.request('/orgs/${hub.org}/policy'),
+          load: hub.policy,
           builder: (context, policy, _) => SettingsCard(
             title: tr('组织策略（只读）', 'Organization policy (read-only)'),
             children: [

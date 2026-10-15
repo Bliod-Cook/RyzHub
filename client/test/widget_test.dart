@@ -6,6 +6,8 @@ import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:ryzhub/main.dart';
 
+import 'kernel.dart';
+
 void main() {
   setUpAll(() => prefs.language = 'zh');
   testWidgets('Chinese composition is not submitted by Ctrl+Enter', (
@@ -105,9 +107,9 @@ void main() {
     'streaming Markdown supports a partial code block and independent copy',
     (tester) async {
       await tester.pumpWidget(
-        const MaterialApp(
+        MaterialApp(
           home: Scaffold(
-            body: MessageCard(
+            body: messageCard(
               item: {
                 'id': 'i',
                 'kind': 'assistant',
@@ -134,7 +136,7 @@ void main() {
         home: Scaffold(
           body: ListView(
             children: [
-              MessageCard(
+              messageCard(
                 item: {
                   'id': 'i',
                   'kind': 'assistant',
@@ -180,7 +182,7 @@ void main() {
       await tester.pumpWidget(
         MaterialApp(
           home: Scaffold(
-            body: MessageCard(
+            body: messageCard(
               item: {
                 'id': 'i',
                 'kind': 'assistant',
@@ -218,7 +220,7 @@ void main() {
         home: Scaffold(
           body: ListView.builder(
             itemCount: 10000,
-            itemBuilder: (_, i) => MessageCard(
+            itemBuilder: (_, i) => messageCard(
               item: {
                 'id': '$i',
                 'kind': 'assistant',

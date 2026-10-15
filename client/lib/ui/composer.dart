@@ -876,21 +876,19 @@ Widget? plusMenu(
       ),
     );
     final files = [
-      if (hub.canAttach) ...[
-        row(
-          Icons.attach_file,
-          tr('上传文件', 'Upload files'),
-          tr('图片、PDF、文本或任意文件', 'Images, PDFs, text or any file'),
-          () => pickFiles(page, hub),
-        ),
-        row(
-          Icons.folder_copy_outlined,
-          tr('从文件库添加', 'Add from library'),
-          tr('用过的文件可以再次附带', 'Reuse files you uploaded before'),
-          () => chooseFromLibrary(page, hub),
-        ),
-        const MenuDivider(),
-      ],
+      row(
+        Icons.attach_file,
+        tr('上传文件', 'Upload files'),
+        tr('图片、PDF、文本或任意文件', 'Images, PDFs, text or any file'),
+        () => pickFiles(page, hub),
+      ),
+      row(
+        Icons.folder_copy_outlined,
+        tr('从文件库添加', 'Add from library'),
+        tr('用过的文件可以再次附带', 'Reuse files you uploaded before'),
+        () => chooseFromLibrary(page, hub),
+      ),
+      const MenuDivider(),
     ];
     if (!hub.isDraft) {
       // The + stays in a conversation too, so the composer keeps one layout.

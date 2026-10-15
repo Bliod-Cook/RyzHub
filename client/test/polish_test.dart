@@ -2,8 +2,9 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:ryzhub/ui/common.dart';
 import 'package:ryzhub/ui/composer.dart';
-import 'package:ryzhub/ui/messages.dart';
 import 'package:ryzhub/ui/workspace_status.dart';
+
+import 'kernel.dart';
 
 Widget _page(Widget child) => MaterialApp(
   home: Scaffold(body: Center(child: child)),
@@ -66,7 +67,7 @@ void main() {
           home: Scaffold(
             body: SizedBox(
               width: 800,
-              child: MessageCard(
+              child: messageCard(
                 item: {
                   'id': 'u',
                   'kind': 'user',

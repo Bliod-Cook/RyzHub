@@ -40,15 +40,11 @@ class _MemorySettingsState extends State<MemorySettings> {
   Future<void> load() async {
     final turn = ++generation;
     try {
-      final uri = Uri(
-        path: '/orgs/${hub.org}/memories',
-        queryParameters: {
-          'project': ?project,
-          'sort': sort,
-          if (query.isNotEmpty) 'q': query,
-        },
+      final data = await hub.memories(
+        project: project,
+        sort: sort,
+        query: query,
       );
-      final data = await hub.request(uri.toString());
       if (!mounted || turn != generation) return;
       setState(() {
         items = data['items'];
@@ -95,24 +91,17 @@ class _MemorySettingsState extends State<MemorySettings> {
     );
     if (content == null || content.trim().isEmpty || !mounted) return;
     await run(() async {
-      await hub.request(
-        '/orgs/${hub.org}/memories',
-        body: {
-          'content': content,
-          'project_id': project,
-          if (memory != null) 'replace': memory['id'],
-          'priority': memory?['priority'] ?? 0,
-        },
+      await hub.saveMemory(
+        content: content,
+        project: project,
+        replace: memory?['id'],
+        priority: memory?['priority'] ?? 0,
       );
     });
   }
 
   Future<void> toggle(String key, bool value) => run(() async {
-    await hub.request(
-      '/orgs/${hub.org}/memories/preferences',
-      method: 'PATCH',
-      body: {...preferences, key: value},
-    );
+    await hub.setMemoryPreferences({...preferences, key: value});
   });
   @override
   Widget build(BuildContext context) => Column(
@@ -254,14 +243,11 @@ class _MemorySettingsState extends State<MemorySettings> {
                           return;
                         }
                         await run(() async {
-                          await hub.request(
-                            '/orgs/${hub.org}/memories',
-                            body: {
-                              'content': item['content'],
-                              'replace': item['id'],
-                              'project_id': project,
-                              'priority': priority,
-                            },
+                          await hub.saveMemory(
+                            content: item['content'],
+                            replace: item['id'],
+                            project: project,
+                            priority: priority,
                           );
                         });
                       },
@@ -272,10 +258,7 @@ class _MemorySettingsState extends State<MemorySettings> {
                 onPressed: busy
                     ? null
                     : () => run(() async {
-                        final result = await hub.request(
-                          '/orgs/${hub.org}/memories/${item['id']}',
-                          method: 'DELETE',
-                        );
+                        final result = await hub.deleteMemory('${item['id']}');
                         if (context.mounted) {
                           ScaffoldMessenger.of(context).showSnackBar(
                             SnackBar(

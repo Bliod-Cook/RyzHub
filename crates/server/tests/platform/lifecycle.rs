@@ -53,7 +53,8 @@ async fn idle_conversations_archive_and_expired_workspaces_are_deleted() -> anyh
     let mut settled = false;
     for _ in 0..400 {
         settled = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM workspace_heads h JOIN checkpoints c ON c.id=h.checkpoint_id
+            "SELECT EXISTS(SELECT 1 FROM workspace_heads h
+               JOIN checkpoints c ON c.id=h.checkpoint_id
                WHERE h.conversation_id=$1 AND c.state='committed')
              AND NOT EXISTS(SELECT 1 FROM sandboxes WHERE conversation_id=$1 AND state<>'deleted')",
         )
@@ -79,7 +80,8 @@ async fn idle_conversations_archive_and_expired_workspaces_are_deleted() -> anyh
 
     // Without a policy nothing happens, however old.
     let age = "UPDATE conversations SET created_at=now()-interval '2 hours' WHERE org_id=$1;
-               UPDATE runs SET started_at=now()-interval '2 hours',ended_at=now()-interval '2 hours' WHERE org_id=$1";
+               UPDATE runs SET started_at=now()-interval '2 hours',ended_at=now()-interval '2 hours'
+               WHERE org_id=$1";
     for statement in age.split(';') {
         sqlx::query(sqlx::AssertSqlSafe(statement.to_owned()))
             .bind(org)
@@ -90,7 +92,8 @@ async fn idle_conversations_archive_and_expired_workspaces_are_deleted() -> anyh
     assert_eq!(state(&h, conv).await?, ("active".into(), false));
 
     sqlx::query(
-        "UPDATE org_policies SET policy=policy||'{\"auto_archive_after_secs\":3600,\"archive_retention_secs\":3600}'
+        "UPDATE org_policies
+         SET policy=policy||'{\"auto_archive_after_secs\":3600,\"archive_retention_secs\":3600}'
          WHERE org_id=$1",
     )
     .bind(org)

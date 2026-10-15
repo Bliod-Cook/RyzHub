@@ -44,8 +44,9 @@ async fn send(
     }
     sent.lock().unwrap().push(body.clone());
     if body["message"]["token"] == "tok-dead" {
-        let error = json!({"error": {"code": 404, "status": "NOT_FOUND", "details": [
-            {"@type": "type.googleapis.com/google.firebase.fcm.v1.FcmError", "errorCode": "UNREGISTERED"}]}});
+        let detail = json!({"@type": "type.googleapis.com/google.firebase.fcm.v1.FcmError",
+            "errorCode": "UNREGISTERED"});
+        let error = json!({"error": {"code": 404, "status": "NOT_FOUND", "details": [detail]}});
         return (axum::http::StatusCode::NOT_FOUND, Json(error)).into_response();
     }
     Json(json!({"name": "projects/ryzhub-test/messages/1"})).into_response()

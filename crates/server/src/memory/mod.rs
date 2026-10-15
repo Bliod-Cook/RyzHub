@@ -1092,8 +1092,25 @@ pub async fn announce(
 }
 
 #[cfg(test)]
-mod category_tests {
+mod tests {
     use super::*;
+
+    #[test]
+    fn secret_shaped_values_are_redacted() {
+        for secret in [
+            "api_key=secret-value",
+            "token:secret-value",
+            "\"password\":\"secret-value\"",
+            "{\"access_token\":\"secret-value\"}",
+            "Authorization: Bearer secret-value",
+            "refresh_token = secret-value",
+            "key sk-secret-value",
+        ] {
+            assert!(!redact(secret).contains("secret-value"), "{secret}");
+        }
+        let plain = "偏好简洁的回答 and short replies";
+        assert_eq!(redact(plain), plain);
+    }
 
     #[test]
     fn policies_add_categories_kept_out_of_memory() {

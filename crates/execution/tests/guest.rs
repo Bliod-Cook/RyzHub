@@ -15,7 +15,8 @@ async fn durable_exec_deduplication_fencing_replay_and_restart() -> anyhow::Resu
     };
     guest.handle(request(1, GuestCommand::Fence)).await?;
     let spec: ExecSpec = serde_json::from_value(
-        json!({"cmd":"printf once >> marker; sleep 0.1; printf '你好'","cwd":workspace.path(),"timeout_ms":2000}),
+        json!({"cmd":"printf once >> marker; sleep 0.1; printf '你好'",
+            "cwd":workspace.path(),"timeout_ms":2000}),
     )?;
     let command = GuestCommand::Exec {
         op_id: "turn:call".into(),

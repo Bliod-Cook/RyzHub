@@ -2,8 +2,7 @@
 mod common;
 use anyhow::{Context, ensure};
 use common::{Harness, guest_exec, id, message};
-use ryzhub_proto::{command_envelope::Command, *};
-use ryzhub_server::{llm::keys, owner};
+use ryzhub_server::owner;
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use std::{io::Write, sync::Arc, time::Duration};
@@ -12,13 +11,7 @@ use uuid::Uuid;
 
 impl Harness {
     async fn new() -> anyhow::Result<Self> {
-        Self::start(|config| {
-            common::work(config);
-            // The fixture upstream's MCP server is a plugin some tests install.
-            config.plugins.insecure_hosts = vec!["127.0.0.1".into()];
-            config.policy.approval_required_tools = Some(["notes__write_note".to_owned()].into());
-        })
-        .await
+        Self::start(common::work).await
     }
     async fn conversation(&self, user: &Value) -> anyhow::Result<Uuid> {
         let ctx = self.context(user).await?;
@@ -93,12 +86,37 @@ async fn actual_codex_native_turn_and_checkpoint_restore() -> anyhow::Result<()>
     let conv = h.conversation(&user).await?;
     let org = id(&user, "org_id");
     let mut owner = h.owner()?;
-    reqwest::Client::new().post(format!("{}/orgs/{org}/credentials",h.base)).bearer_auth(user["token"].as_str().unwrap()).json(&json!({"name":"Anthropic isolation fixture","provider":"anthropic","api_key":"must-not-reach-openai"})).send().await?.error_for_status()?;
+    let credential = |name: &str, provider: &str, key: &str| {
+        reqwest::Client::new()
+            .post(format!("{}/orgs/{org}/credentials", h.base))
+            .bearer_auth(user["token"].as_str().unwrap())
+            .json(&json!({"name":name,"provider":provider,"api_key":key}))
+            .send()
+    };
+    credential(
+        "Anthropic isolation fixture",
+        "anthropic",
+        "must-not-reach-openai",
+    )
+    .await?
+    .error_for_status()?;
     h.send(&user, conv, message("hello codex")).await?;
     let run = h.wait_state(conv, "completed").await?;
-    let text:String=sqlx::query_scalar("SELECT text FROM items WHERE run_id=$1 AND kind='assistant' ORDER BY last_seq DESC LIMIT 1").bind(run).fetch_one(&h.db).await?;
+    let text: String = sqlx::query_scalar(
+        "SELECT text FROM items WHERE run_id=$1 AND kind='assistant'
+         ORDER BY last_seq DESC LIMIT 1",
+    )
+    .bind(run)
+    .fetch_one(&h.db)
+    .await?;
     assert!(text.contains("Codex"), "{text}");
-    let usage:(String,i64,i64,bool)=sqlx::query_as("SELECT provider,input_tokens,output_tokens,estimated FROM usage_records WHERE run_id=$1 ORDER BY created_at DESC LIMIT 1").bind(run).fetch_one(&h.db).await?;
+    let usage: (String, i64, i64, bool) = sqlx::query_as(
+        "SELECT provider,input_tokens,output_tokens,estimated
+         FROM usage_records WHERE run_id=$1 ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(run)
+    .fetch_one(&h.db)
+    .await?;
     assert_eq!(usage, ("openai".into(), 31, 9, false));
     let key = h
         .requests
@@ -139,7 +157,9 @@ async fn actual_codex_native_turn_and_checkpoint_restore() -> anyhow::Result<()>
             },
         },
     };
-    ryzhub_execution::call(host,&exec("printf checkpoint > /workspace/untracked; chmod 751 /workspace/untracked; mv /etc/periodic /etc/renamed-periodic; chmod 700 /etc/renamed-periodic", "prepare-checkpoint")).await?;
+    let prepare = "printf checkpoint > /workspace/untracked; chmod 751 /workspace/untracked; \
+                   mv /etc/periodic /etc/renamed-periodic; chmod 700 /etc/renamed-periodic";
+    ryzhub_execution::call(host, &exec(prepare, "prepare-checkpoint")).await?;
     tokio::time::sleep(Duration::from_millis(300)).await;
     async fn job(
         h: &Harness,
@@ -193,7 +213,14 @@ async fn actual_codex_native_turn_and_checkpoint_restore() -> anyhow::Result<()>
     )
     .await?;
     // Corrupt the primary object; restore must verify and repair it from secondary storage.
-    let manifest:Value=sqlx::query_scalar("SELECT c.manifest FROM checkpoints c JOIN workspace_heads w ON w.checkpoint_id=c.id WHERE w.conversation_id=$1").bind(conv).fetch_one(&h.db).await?;
+    let manifest: Value = sqlx::query_scalar(
+        "SELECT c.manifest FROM checkpoints c
+         JOIN workspace_heads w ON w.checkpoint_id=c.id
+         WHERE w.conversation_id=$1",
+    )
+    .bind(conv)
+    .fetch_one(&h.db)
+    .await?;
     let key = manifest["sha256"].as_str().unwrap();
     let blob_path = std::path::Path::new(&h.app.config.work.storage_root)
         .join(org.to_string())
@@ -232,7 +259,9 @@ async fn actual_codex_native_turn_and_checkpoint_restore() -> anyhow::Result<()>
         "stopped source task must release its shim"
     );
     assert_eq!(std::fs::read(&blob_path)?, archive);
-    reqwest::Client::new().post(format!("{}/orgs/{org}/credentials",h.base)).bearer_auth(user["token"].as_str().unwrap()).json(&json!({"name":"OpenAI BYOK fixture","provider":"openai","api_key":"openai-fixture-key"})).send().await?.error_for_status()?;
+    credential("OpenAI BYOK fixture", "openai", "openai-fixture-key")
+        .await?
+        .error_for_status()?;
     let restored: Uuid = sqlx::query_scalar(
         "SELECT id FROM sandboxes WHERE conversation_id=$1 AND persistent AND state='running'",
     )
@@ -245,13 +274,17 @@ async fn actual_codex_native_turn_and_checkpoint_restore() -> anyhow::Result<()>
         .await?;
     // The restored workspace runs with the limits the fresh one had.
     let specs: Vec<Value> = sqlx::query_scalar(
-        "SELECT handle-'{id,exec_epoch}'::text[] FROM sandboxes WHERE id=ANY($1) ORDER BY created_at",
+        "SELECT handle-'{id,exec_epoch}'::text[] FROM sandboxes
+         WHERE id=ANY($1) ORDER BY created_at",
     )
     .bind([sandbox, restored])
     .fetch_all(&h.db)
     .await?;
     assert_eq!(specs[0], specs[1]);
-    let result=guest_exec(host,restored,restored_epoch,"verify-restored","cat /workspace/untracked; stat -c %a /workspace/untracked; test ! -d /etc/periodic; test -d /etc/renamed-periodic; stat -c %a /etc/renamed-periodic").await?;
+    let verify = "cat /workspace/untracked; stat -c %a /workspace/untracked; \
+                  test ! -d /etc/periodic; test -d /etc/renamed-periodic; \
+                  stat -c %a /etc/renamed-periodic";
+    let result = guest_exec(host, restored, restored_epoch, "verify-restored", verify).await?;
     assert_eq!(result["exit_code"], 0);
     assert_eq!(result["stdout_head"], "checkpoint751\n700\n");
     h.send(&user, conv, message("hello again")).await?;
@@ -307,120 +340,20 @@ async fn actual_codex_native_turn_and_checkpoint_restore() -> anyhow::Result<()>
 }
 async fn wait_workspace_idle(h: &Harness, conv: Uuid) -> anyhow::Result<()> {
     for _ in 0..600 {
-        let ready:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM workspace_heads WHERE conversation_id=$1) AND NOT EXISTS(SELECT 1 FROM workspace_jobs WHERE conversation_id=$1 AND state IN ('queued','running'))").bind(conv).fetch_one(&h.db).await?;
+        let ready: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM workspace_heads
+             WHERE conversation_id=$1) AND NOT EXISTS(SELECT 1 FROM workspace_jobs
+             WHERE conversation_id=$1 AND state IN ('queued','running'))",
+        )
+        .bind(conv)
+        .fetch_one(&h.db)
+        .await?;
         if ready {
             return Ok(());
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     anyhow::bail!("automatic turn checkpoint did not complete")
-}
-#[tokio::test]
-#[ignore = "requires PostgreSQL/NATS/containerd and actual Codex"]
-async fn bypassing_harness_still_requires_one_use_mcp_approval() -> anyhow::Result<()> {
-    let h = Harness::new().await?;
-    let user = h.user().await?;
-    h.install_notes(&user).await?;
-    let conv = h.conversation(&user).await?;
-    let org = id(&user, "org_id");
-    h.send(&user, conv, message("manual gateway test")).await?;
-    let lease = h
-        .app
-        .store
-        .claim(org, conv, Uuid::now_v7(), 60_000)
-        .await?
-        .unwrap();
-    owner::process_with_config(&h.app.store, &lease, &h.app.config).await?;
-    let run: Uuid = sqlx::query_scalar("SELECT id FROM runs WHERE conversation_id=$1")
-        .bind(conv)
-        .fetch_one(&h.db)
-        .await?;
-    let sandbox = ryzhub_server::work::ensure_work(&h.app, &lease, run).await?;
-    // The same kind of key the guest holds, issued directly: the caller bypasses the harness.
-    let epoch: i64 = sqlx::query_scalar("SELECT lease_epoch FROM sandboxes WHERE id=$1")
-        .bind(sandbox)
-        .fetch_one(&h.db)
-        .await?;
-    let token = keys::issue_sandbox_key(
-        &h.app.store,
-        keys::SandboxKeyRequest {
-            org_id: org,
-            user_id: id(&user, "user_id"),
-            conversation_id: conv,
-            run_id: run,
-            sandbox_id: sandbox,
-            lease_epoch: epoch,
-            models: vec![h.app.config.work.model.clone()],
-        },
-    )
-    .await?
-    .token;
-    let request = json!({"jsonrpc":"2.0","id":"once","method":"tools/call","params":{"name":"notes__write_note","arguments":{"text":"approved parameters"}}});
-    let url = format!("{}/mcp", h.gateway);
-    let client = reqwest::Client::new();
-    let pending = tokio::spawn(client.post(&url).bearer_auth(&token).json(&request).send());
-    for _ in 0..100 {
-        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM mcp_calls WHERE run_id=$1")
-            .bind(run)
-            .fetch_one(&h.db)
-            .await?;
-        if count == 1 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    assert!(
-        h.requests
-            .lock()
-            .unwrap()
-            .iter()
-            .all(|(v, _)| v["method"] != "tools/call")
-    );
-    ryzhub_server::mcp::project(&h.app, &lease, run).await?;
-    let (action, epoch) = h.action(run).await?;
-    h.send(
-        &user,
-        conv,
-        Command::DecideApproval(DecideApproval {
-            action_id: action.to_string(),
-            run_epoch: epoch as u64,
-            decision: "allow".into(),
-        }),
-    )
-    .await?;
-    owner::process_with_config(&h.app.store, &lease, &h.app.config).await?;
-    let result: Value = pending.await??.json().await?;
-    assert!(result.get("error").is_none(), "{result}");
-    let again: Value = client
-        .post(&url)
-        .bearer_auth(&token)
-        .json(&request)
-        .send()
-        .await?
-        .json()
-        .await?;
-    assert_eq!(result, again);
-    let mut changed = request;
-    changed["params"]["arguments"]["text"] = json!("different");
-    let denied: Value = client
-        .post(&url)
-        .bearer_auth(&token)
-        .json(&changed)
-        .send()
-        .await?
-        .json()
-        .await?;
-    assert_eq!(denied["error"]["message"], "REQUEST_ID_REUSED");
-    assert_eq!(
-        h.requests
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|(v, _)| v["method"] == "tools/call")
-            .count(),
-        1
-    );
-    h.close().await
 }
 #[tokio::test]
 #[ignore = "requires PostgreSQL/NATS/containerd and actual Codex"]
@@ -469,8 +402,7 @@ async fn owner_restarts_do_not_restart_or_interrupt_native_model_stream() -> any
 }
 #[tokio::test]
 #[ignore = "requires PostgreSQL/NATS"]
-async fn restore_pin_blocks_expired_checkpoint_gc_and_secondary_repairs_primary()
--> anyhow::Result<()> {
+async fn checkpoint_gc_spares_pins_heads_grace_periods_and_other_tenants() -> anyhow::Result<()> {
     let h = Harness::new().await?;
     let user = h.user().await?;
     let conv = h.conversation(&user).await?;
@@ -489,7 +421,17 @@ async fn restore_pin_blocks_expired_checkpoint_gc_and_secondary_repairs_primary(
         .fetch_one(&h.db)
         .await?;
     let sandbox = Uuid::now_v7();
-    sqlx::query("INSERT INTO sandboxes(id,org_id,conversation_id,run_id,lease_epoch,exec_epoch,state,handle,persistent) VALUES($1,$2,$3,$4,1,1,'suspended','{}',true)").bind(sandbox).bind(org).bind(conv).bind(run).execute(&h.db).await?;
+    sqlx::query(
+        "INSERT INTO sandboxes(id,org_id,conversation_id,run_id,lease_epoch,exec_epoch,state,
+           handle,persistent)
+         VALUES($1,$2,$3,$4,1,1,'suspended','{}',true)",
+    )
+    .bind(sandbox)
+    .bind(org)
+    .bind(conv)
+    .bind(run)
+    .execute(&h.db)
+    .await?;
     use sha2::{Digest, Sha256};
     let bytes = b"immutable archive fixture";
     let key = format!("{:x}", Sha256::digest(bytes));
@@ -502,7 +444,18 @@ async fn restore_pin_blocks_expired_checkpoint_gc_and_secondary_repairs_primary(
     p.put(&key, bytes).await?;
     s.put(&key, bytes).await?;
     let checkpoint = Uuid::now_v7();
-    sqlx::query("INSERT INTO checkpoints(id,org_id,conversation_id,sandbox_id,manifest,channel_seq,gseq,state,delete_after) VALUES($1,$2,$3,$4,$5,0,0,'tombstoned',now()-interval '1 second')").bind(checkpoint).bind(org).bind(conv).bind(sandbox).bind(json!({"sha256":key})).execute(&h.db).await?;
+    sqlx::query(
+        "INSERT INTO checkpoints(id,org_id,conversation_id,sandbox_id,manifest,channel_seq,gseq,
+           state,delete_after)
+         VALUES($1,$2,$3,$4,$5,0,0,'tombstoned',now()-interval '1 second')",
+    )
+    .bind(checkpoint)
+    .bind(org)
+    .bind(conv)
+    .bind(sandbox)
+    .bind(json!({"sha256":key}))
+    .execute(&h.db)
+    .await?;
     let pin = Uuid::now_v7();
     let mut restoring = h.app.store.tx(org).await?;
     sqlx::query("SELECT id FROM checkpoints WHERE org_id=$1 AND id=$2 FOR UPDATE")
@@ -530,9 +483,6 @@ async fn restore_pin_blocks_expired_checkpoint_gc_and_secondary_repairs_primary(
         "GC must recheck a pin committed by its concurrent restore"
     );
     assert_eq!(p.get(&key).await?, bytes);
-    p.delete(&key).await?;
-    p.put(&key, &s.get(&key).await?).await?;
-    assert_eq!(p.get(&key).await?, bytes);
     sqlx::query("DELETE FROM restore_pins WHERE id=$1")
         .bind(pin)
         .execute(&h.db)
@@ -540,8 +490,18 @@ async fn restore_pin_blocks_expired_checkpoint_gc_and_secondary_repairs_primary(
     let head = Uuid::now_v7();
     let superseded = Uuid::now_v7();
     for id in [head, superseded] {
-        sqlx::query("INSERT INTO checkpoints(id,org_id,conversation_id,sandbox_id,manifest,channel_seq,gseq,created_at) VALUES($1,$2,$3,$4,$5,0,0,now()-interval '40 days')")
-            .bind(id).bind(org).bind(conv).bind(sandbox).bind(json!({"sha256":key})).execute(&h.db).await?;
+        sqlx::query(
+            "INSERT INTO checkpoints(id,org_id,conversation_id,sandbox_id,manifest,channel_seq,
+               gseq,created_at)
+             VALUES($1,$2,$3,$4,$5,0,0,now()-interval '40 days')",
+        )
+        .bind(id)
+        .bind(org)
+        .bind(conv)
+        .bind(sandbox)
+        .bind(json!({"sha256":key}))
+        .execute(&h.db)
+        .await?;
     }
     sqlx::query(
         "INSERT INTO workspace_heads(org_id,conversation_id,checkpoint_id) VALUES($1,$2,$3)",
@@ -661,7 +621,14 @@ async fn node_lease_expiry_restores_committed_rpo_and_invalidates_later_operatio
     h.send(&user, conv, message("slow uncommitted operation"))
         .await?;
     for _ in 0..200 {
-        let active:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM runs WHERE conversation_id=$1 AND id<>$2 AND native_turn_id IS NOT NULL)").bind(conv).bind(first).fetch_one(&h.db).await?;
+        let active: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM runs WHERE conversation_id=$1
+             AND id<>$2 AND native_turn_id IS NOT NULL)",
+        )
+        .bind(conv)
+        .bind(first)
+        .fetch_one(&h.db)
+        .await?;
         if active {
             break;
         }
@@ -677,7 +644,14 @@ async fn node_lease_expiry_restores_committed_rpo_and_invalidates_later_operatio
     .await?;
     let mut recovered = false;
     for _ in 0..500 {
-        let live:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM sandboxes WHERE conversation_id=$1 AND id<>$2 AND state='running')").bind(conv).bind(old).fetch_one(&h.db).await?;
+        let live: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM sandboxes
+             WHERE conversation_id=$1 AND id<>$2 AND state='running')",
+        )
+        .bind(conv)
+        .bind(old)
+        .fetch_one(&h.db)
+        .await?;
         if live {
             recovered = true;
             break;
@@ -692,7 +666,13 @@ async fn node_lease_expiry_restores_committed_rpo_and_invalidates_later_operatio
     .fetch_one(&h.db)
     .await?;
     assert!(invalid > 0);
-    let notice:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM items WHERE conversation_id=$1 AND kind='notice' AND text LIKE '%水位后的操作%')").bind(conv).fetch_one(&h.db).await?;
+    let notice: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM items WHERE conversation_id=$1
+         AND kind='notice' AND text LIKE '%水位后的操作%')",
+    )
+    .bind(conv)
+    .fetch_one(&h.db)
+    .await?;
     assert!(notice);
     let revoked: bool = sqlx::query_scalar(
         "SELECT bool_and(revoked_at IS NOT NULL) FROM virtual_keys WHERE sandbox_id=$1",
@@ -705,20 +685,9 @@ async fn node_lease_expiry_restores_committed_rpo_and_invalidates_later_operatio
     h.close().await
 }
 #[tokio::test]
-#[ignore = "requires local S3 wire fixture verified by AWS botocore"]
+#[ignore = "requires the MinIO service: scripts/test-work.sh"]
 async fn s3_sigv4_storage_roundtrip_and_authentication() -> anyhow::Result<()> {
-    let s3_url =
-        std::env::var("RYZHUB_TEST_S3_URL").unwrap_or_else(|_| "http://127.0.0.1:59000".into());
-    let mut config = tempfile::NamedTempFile::new()?;
-    write!(
-        config,
-        "endpoint = \"{s3_url}\"\nbucket = \"ryzhub-test\"\nregion = \"us-east-1\"\naccess_env = \"RYZHUB_TEST_S3_ACCESS\"\nsecret_env = \"RYZHUB_TEST_S3_SECRET\"\n"
-    )?;
-    let store = ryzhub_server::workspace::blob::BlobStore::configured(&format!(
-        "s3config:{}",
-        config.path().display()
-    ))?
-    .scoped(Uuid::now_v7());
+    let store = s3_store("RYZHUB_TEST_S3_SECRET")?.scoped(Uuid::now_v7());
     use sha2::{Digest, Sha256};
     let body = format!("archive {}", Uuid::now_v7());
     let key = format!("{:x}", Sha256::digest(body.as_bytes()));
@@ -768,70 +737,25 @@ async fn s3_sigv4_storage_roundtrip_and_authentication() -> anyhow::Result<()> {
     store.delete(&target).await?;
     let abandoned = store.start_direct(&target).await?;
     store.abort_direct(&target, &abandoned).await?;
-    config.as_file_mut().set_len(0)?;
-    use std::io::{Seek, SeekFrom};
-    config.as_file_mut().seek(SeekFrom::Start(0))?;
-    write!(
-        config,
-        "endpoint = \"{s3_url}\"\nbucket = \"ryzhub-test\"\nregion = \"us-east-1\"\naccess_env = \"RYZHUB_TEST_S3_ACCESS\"\nsecret_env = \"RYZHUB_TEST_UPSTREAM_KEY\"\n"
-    )?;
-    let bad = ryzhub_server::workspace::blob::BlobStore::configured(&format!(
-        "s3config:{}",
-        config.path().display()
-    ))?;
+    // Signed with the wrong secret, nothing is stored.
+    let bad = s3_store("RYZHUB_TEST_UPSTREAM_KEY")?;
     assert!(bad.put(&key, body.as_bytes()).await.is_err());
     Ok(())
 }
-#[tokio::test]
-#[ignore = "requires actual Codex, PostgreSQL/NATS/containerd"]
-async fn native_command_approval_is_durable_and_executes_once() -> anyhow::Result<()> {
-    let h = Harness::new().await?;
-    let user = h.user().await?;
-    let conv = h.conversation(&user).await?;
-    let mut owner = h.owner()?;
-    h.send(&user, conv, message("native-exec")).await?;
-    let run = h.wait_state(conv, "requires_action").await?;
-    let (action, epoch) = h.action(run).await?;
-    let (sandbox, exec_epoch): (Uuid, i64) =
-        sqlx::query_as("SELECT id,exec_epoch FROM sandboxes WHERE run_id=$1")
-            .bind(run)
-            .fetch_one(&h.db)
-            .await?;
-    let before = guest_exec(
-        std::path::Path::new(&h.app.config.sandbox.host_socket),
-        sandbox,
-        exec_epoch,
-        "before-approval",
-        "test ! -f /workspace/approval-marker",
-    )
-    .await?;
-    assert_eq!(before["exit_code"], 0);
-    h.send(
-        &user,
-        conv,
-        Command::DecideApproval(DecideApproval {
-            action_id: action.to_string(),
-            run_epoch: epoch as u64,
-            decision: "allow".into(),
-        }),
-    )
-    .await?;
-    h.wait_state(conv, "completed").await?;
-    let result = guest_exec(
-        std::path::Path::new(&h.app.config.sandbox.host_socket),
-        sandbox,
-        exec_epoch,
-        "after-approval",
-        "cat /workspace/approval-marker",
-    )
-    .await?;
-    assert_eq!(result["stdout_head"], "native-once");
-    let tool:String=sqlx::query_scalar("SELECT text FROM items WHERE run_id=$1 AND kind='tool' AND state='completed' ORDER BY last_seq DESC LIMIT 1").bind(run).fetch_one(&h.db).await?;
-    assert!(tool.contains("native-once"));
-    owner.kill().await?;
-    h.close().await
-}
 
+/// A store on the MinIO service's bucket (compose.yaml), signing with the secret in `secret_env`.
+fn s3_store(secret_env: &str) -> anyhow::Result<ryzhub_server::workspace::blob::BlobStore> {
+    let url =
+        std::env::var("RYZHUB_TEST_S3_URL").unwrap_or_else(|_| "http://127.0.0.1:59000".into());
+    let mut config = tempfile::NamedTempFile::new()?;
+    write!(
+        config,
+        "endpoint = \"{url}\"\nbucket = \"ryzhub-test\"\nregion = \"us-east-1\"\n\
+         access_env = \"RYZHUB_TEST_S3_ACCESS\"\nsecret_env = \"{secret_env}\"\n"
+    )?;
+    let path = format!("s3config:{}", config.path().display());
+    ryzhub_server::workspace::blob::BlobStore::configured(&path)
+}
 #[tokio::test]
 #[ignore = "requires PostgreSQL/NATS, containerd and Codex"]
 async fn a_work_terminal_runs_commands_resumes_detached_and_is_cut_by_fencing() -> anyhow::Result<()>
@@ -972,7 +896,8 @@ async fn idle_work_archives_through_its_job_and_a_purged_workspace_cannot_restor
     let mut head: Option<Uuid> = None;
     for _ in 0..600 {
         head = sqlx::query_scalar(
-            "SELECT checkpoint_id FROM workspace_heads WHERE conversation_id=$1 AND checkpoint_id IS NOT NULL",
+            "SELECT checkpoint_id FROM workspace_heads
+             WHERE conversation_id=$1 AND checkpoint_id IS NOT NULL",
         )
         .bind(conv)
         .fetch_optional(&h.db)
@@ -985,7 +910,8 @@ async fn idle_work_archives_through_its_job_and_a_purged_workspace_cannot_restor
     head.context("turn checkpoint")?;
     wait_workspace_idle(&h, conv).await?;
     sqlx::query(
-        "UPDATE org_policies SET policy=policy||'{\"auto_archive_after_secs\":3600,\"archive_retention_secs\":3600}'
+        "UPDATE org_policies
+         SET policy=policy||'{\"auto_archive_after_secs\":3600,\"archive_retention_secs\":3600}'
          WHERE org_id=$1",
     )
     .bind(org)
@@ -1041,21 +967,8 @@ async fn idle_work_archives_through_its_job_and_a_purged_workspace_cannot_restor
         .bind(conv)
         .execute(&h.db)
         .await?;
+    // Purged once the archive was kept long enough (the platform suite covers how).
     ryzhub_server::lifecycle::sweep(&h.app, &worker).await?;
-    let (stored, head): (String, Option<Uuid>) = sqlx::query_as(
-        "SELECT storage_state,checkpoint_id FROM workspace_heads WHERE conversation_id=$1",
-    )
-    .bind(conv)
-    .fetch_one(&h.db)
-    .await?;
-    assert_eq!((stored.as_str(), head), ("deleted", None));
-    let left: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM checkpoints WHERE conversation_id=$1 AND state<>'deleted'",
-    )
-    .bind(conv)
-    .fetch_one(&h.db)
-    .await?;
-    assert_eq!(left, 0);
     let refused = reqwest::Client::new()
         .post(format!(
             "{}/orgs/{org}/conversations/{conv}/workspace",

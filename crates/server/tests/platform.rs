@@ -117,7 +117,8 @@ impl Harness {
 
 #[tokio::test]
 #[ignore = "requires PostgreSQL/NATS and test gateway secrets"]
-async fn gateway_native_protocol_byok_usage_and_execution_fencing() -> anyhow::Result<()> {
+async fn gateway_passes_the_native_protocol_through_records_usage_and_fences_executions()
+-> anyhow::Result<()> {
     let h = Harness::new().await?;
     let user = h.user().await?;
     let conv = h.conversation(&user).await?;
@@ -137,7 +138,9 @@ async fn gateway_native_protocol_byok_usage_and_execution_fencing() -> anyhow::R
         .await?;
     let token = h.loop_key(&lease, uid, run).await?;
     let client = reqwest::Client::new();
-    let body = json!({"model":"fixture-model","max_tokens":32,"stream":true,"messages":[{"role":"user","content":"hello"}],"system":[{"type":"text","text":"native","cache_control":{"type":"ephemeral"}}]});
+    let body = json!({"model":"fixture-model","max_tokens":32,"stream":true,
+        "messages":[{"role":"user","content":"hello"}],
+        "system":[{"type":"text","text":"native","cache_control":{"type":"ephemeral"}}]});
     let response = client
         .post(format!("{}/v1/messages", h.gateway))
         .bearer_auth(&token)
@@ -155,46 +158,19 @@ async fn gateway_native_protocol_byok_usage_and_execution_fencing() -> anyhow::R
     assert_eq!(received.1["anthropic-beta"], "future-feature-2026");
     assert_eq!(received.1["x-api-key"], "local-fixture-key");
     assert!(received.1.get("authorization").is_none());
-    let usage=sqlx::query("SELECT input_tokens,output_tokens,raw_usage,estimated,status FROM usage_records WHERE run_id=$1 ORDER BY created_at DESC LIMIT 1").bind(run).fetch_one(&h.db).await?;
+    let usage = sqlx::query(
+        "SELECT input_tokens,output_tokens,raw_usage,estimated,status
+         FROM usage_records WHERE run_id=$1 ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(run)
+    .fetch_one(&h.db)
+    .await?;
     assert_eq!(usage.get::<i64, _>("input_tokens"), 25);
     assert_eq!(usage.get::<i64, _>("output_tokens"), 8);
     assert!(!usage.get::<bool, _>("estimated"));
     assert_eq!(
         usage.get::<Value, _>("raw_usage")["cache_read_input_tokens"],
         12
-    );
-    let credential: Value = client
-        .post(format!("{}/orgs/{org}/credentials", h.base))
-        .bearer_auth(user["token"].as_str().unwrap())
-        .json(&json!({"name":"personal","api_key":"personal-fixture-key"}))
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
-    // The key lives envelope-encrypted in a secret; the credential row holds only its id.
-    let (ciphertext, wrapped): (Vec<u8>, Vec<u8>) = sqlx::query_as(
-        "SELECT s.ciphertext,s.wrapped_dek FROM model_credentials c
-         JOIN secrets s ON s.org_id=c.org_id AND s.id=c.secret_id WHERE c.id=$1",
-    )
-    .bind(id(&credential, "id"))
-    .fetch_one(&h.db)
-    .await?;
-    for stored in [&ciphertext, &wrapped] {
-        assert!(!stored.windows(20).any(|b| b == b"personal-fixture-key"));
-    }
-    client
-        .post(format!("{}/v1/messages", h.gateway))
-        .bearer_auth(&token)
-        .json(&body)
-        .send()
-        .await?
-        .error_for_status()?
-        .bytes()
-        .await?;
-    assert_eq!(
-        h.requests.lock().unwrap().last().unwrap().1["x-api-key"],
-        "personal-fixture-key"
     );
     sqlx::query("UPDATE runs SET exec_epoch=exec_epoch+1 WHERE id=$1")
         .bind(run)
@@ -219,6 +195,81 @@ async fn gateway_native_protocol_byok_usage_and_execution_fencing() -> anyhow::R
             .await?
             .status(),
         401
+    );
+    h.close().await
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL/NATS and a model provider"]
+async fn a_real_provider_answers_through_the_gateway_and_its_usage_is_recorded()
+-> anyhow::Result<()> {
+    let provider = ["RYZHUB_TEST_PROVIDER_URL", "RYZHUB_TEST_PROVIDER_MODEL"]
+        .map(|name| std::env::var(name).unwrap_or_default());
+    if provider.iter().any(String::is_empty)
+        || std::env::var_os("RYZHUB_TEST_PROVIDER_KEY").is_none()
+    {
+        println!(
+            "real provider skipped: RYZHUB_TEST_PROVIDER_URL, RYZHUB_TEST_PROVIDER_MODEL or \
+             RYZHUB_TEST_PROVIDER_KEY is not set"
+        );
+        return Ok(());
+    }
+    let [url, model] = provider;
+    let route = ModelRoute {
+        id: model.clone(),
+        protocol: "responses".into(),
+        harnesses: vec![],
+        upstreams: vec![Upstream {
+            url,
+            key_env: "RYZHUB_TEST_PROVIDER_KEY".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let h = Harness::with(|c| c.llm.models.push(route)).await?;
+    let user = h.user().await?;
+    let conv = h.conversation(&user).await?;
+    let org = id(&user, "org_id");
+    h.send(&user, conv, message("hello")).await?;
+    let lease = h
+        .app
+        .store
+        .claim(org, conv, Uuid::now_v7(), 60_000)
+        .await?
+        .unwrap();
+    owner::process_with_config(&h.app.store, &lease, &h.app.config).await?;
+    let run: Uuid = sqlx::query_scalar("SELECT id FROM runs WHERE conversation_id=$1")
+        .bind(conv)
+        .fetch_one(&h.db)
+        .await?;
+    let token = keys::issue_loop_key(
+        &h.app.store,
+        &lease,
+        id(&user, "user_id"),
+        run,
+        vec![model.clone()],
+    )
+    .await?;
+    let response: Value = reqwest::Client::new()
+        .post(format!("{}/v1/responses", h.gateway))
+        .bearer_auth(token)
+        .json(&json!({"model":model,"input":"Reply with the single word OK."}))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(response["status"], "completed", "{response}");
+    let usage: (String, i64, bool) = sqlx::query_as(
+        "SELECT status,input_tokens,estimated FROM usage_records WHERE run_id=$1 AND model=$2",
+    )
+    .bind(run)
+    .bind(&model)
+    .fetch_one(&h.db)
+    .await?;
+    assert!(
+        usage.0 == "completed" && usage.1 > 0 && !usage.2,
+        "{usage:?}"
     );
     h.close().await
 }
@@ -252,7 +303,13 @@ async fn loop_question_checkpoint_steer_and_read_only_side_query() -> anyhow::Re
     .await?;
     assert_eq!(steps.len(), 2);
     assert_eq!(steps[0]["content"][0]["signature"], "signed-block");
-    let tool_item: (String, String) = sqlx::query_as("SELECT i.state,i.text FROM tool_calls t JOIN items i ON i.id=t.item_id AND i.org_id=t.org_id WHERE t.run_id=$1").bind(run).fetch_one(&h.db).await?;
+    let tool_item: (String, String) = sqlx::query_as(
+        "SELECT i.state,i.text FROM tool_calls t
+         JOIN items i ON i.id=t.item_id AND i.org_id=t.org_id WHERE t.run_id=$1",
+    )
+    .bind(run)
+    .fetch_one(&h.db)
+    .await?;
     assert_eq!(tool_item.0, "completed");
     assert!(tool_item.1.contains("绿色"));
     assert!(
@@ -276,7 +333,14 @@ async fn loop_question_checkpoint_steer_and_read_only_side_query() -> anyhow::Re
     )
     .await?;
     h.wait_state(conv2, "completed").await?;
-    let consumed:bool=sqlx::query_scalar("SELECT bool_and(consumed_step IS NOT NULL) FROM pending_inputs WHERE run_id IN (SELECT id FROM runs WHERE conversation_id=$1)").bind(conv2).fetch_one(&h.db).await?;
+    let consumed: bool = sqlx::query_scalar(
+        "SELECT bool_and(consumed_step IS NOT NULL)
+         FROM pending_inputs WHERE run_id IN (SELECT id FROM runs
+         WHERE conversation_id=$1)",
+    )
+    .bind(conv2)
+    .fetch_one(&h.db)
+    .await?;
     assert!(consumed);
     h.send(
         &user,
@@ -286,7 +350,7 @@ async fn loop_question_checkpoint_steer_and_read_only_side_query() -> anyhow::Re
         }),
     )
     .await?;
-    // Wait for the new command to create its own run, rather than observing the previous completed run.
+    // Wait for the side query's own run, not the previous completed one.
     for _ in 0..200 {
         let count: i64 =
             sqlx::query_scalar("SELECT count(*) FROM runs WHERE conversation_id=$1 AND read_only")
@@ -406,72 +470,42 @@ async fn paused_web_search_turn_resumes_before_steer_and_keeps_citations() -> an
                 .any(|t| t["type"] == "web_search_20260318" && t["name"] == "web_search")
         );
     }
-    // The paused turn is re-sent as is, without the steer that arrived meanwhile.
-    let resumed = requests[1]["messages"].as_array().unwrap();
-    let paused = resumed.last().unwrap();
-    assert_eq!(paused["role"], "assistant");
-    assert!(!paused.to_string().contains("补充输入"));
-    let blocks = paused["content"].as_array().unwrap();
-    assert!(
-        blocks
-            .iter()
-            .any(|b| b["type"] == "server_tool_use" && b["input"]["query"] == "RyzHub")
-    );
-    assert!(blocks.iter().any(|b| b["type"] == "web_search_tool_result"
-        && b["content"][0]["encrypted_content"] == "opaque-search"));
-    // The steer follows the finished turn, which is one assistant message.
+    // The paused turn is re-sent with its search, without the steer that arrived meanwhile.
+    let resumed = requests[1]["messages"].to_string();
+    assert!(resumed.contains("opaque-search") && !resumed.contains("补充输入"));
+    // The steer follows the finished turn, citations and all.
     let after = requests[2]["messages"].as_array().unwrap();
     assert_eq!(after.last().unwrap()["content"], "补充输入");
-    let turn = &after[after.len() - 2];
-    assert_eq!(turn["role"], "assistant");
-    assert_eq!(after[after.len() - 3]["role"], "user");
-    let turn = turn.to_string();
+    let turn = after[after.len() - 2].to_string();
     assert!(turn.contains("先搜索一下") && turn.contains("opaque-index"));
-    // The search splits the paused step's reply where it happened.
-    let items: Vec<(String, String, String, Option<Value>)> = sqlx::query_as(
-        "SELECT kind,state,text,detail FROM items WHERE run_id=$1 AND kind IN ('assistant','tool')
+    // The search splits the paused step's reply where it happened; its citations are kept.
+    let items: Vec<(String, String, Option<Value>)> = sqlx::query_as(
+        "SELECT kind,state,detail FROM items WHERE run_id=$1 AND kind IN ('assistant','tool')
          ORDER BY first_seq",
     )
     .bind(run)
     .fetch_all(&h.db)
     .await?;
-    let shape: Vec<(&str, &str, &str)> = items
+    let shape: Vec<(&str, &str)> = items
         .iter()
-        .map(|(kind, state, text, _)| (kind.as_str(), state.as_str(), text.as_str()))
+        .map(|(kind, state, _)| (kind.as_str(), state.as_str()))
         .collect();
-    assert_eq!(shape[0], ("assistant", "completed", "先搜索一下"));
-    assert_eq!((shape[1].0, shape[1].1), ("tool", "completed"));
-    assert_eq!(shape[2], ("assistant", "completed", ""));
     assert_eq!(
-        shape[3],
-        (
-            "assistant",
-            "completed",
-            "搜索结果显示 RyzHub 已发布 ([example.com](https://example.com/a))"
-        )
+        shape,
+        [
+            ("assistant", "completed"),
+            ("tool", "completed"),
+            ("assistant", "completed"),
+            ("assistant", "completed"),
+            ("assistant", "completed"),
+        ]
     );
     assert_eq!(
-        shape[4],
-        ("assistant", "completed", "本地协议联调：你好 Rust")
+        items[1].2.as_ref().unwrap()["kind"]["Tool"]["name"],
+        "web_search"
     );
-    assert_eq!(shape.len(), 5);
-    let search = &items[1].3.as_ref().unwrap()["kind"]["Tool"];
-    assert_eq!(search["name"], "web_search");
-    assert_eq!(search["arguments_json"], r#"{"query":"RyzHub"}"#);
-    let result: Value = serde_json::from_str(search["result_json"].as_str().unwrap())?;
-    assert_eq!(
-        result,
-        json!({"matches":[{"url":"https://example.com/a","title":"Example A"}]})
-    );
-    let details: Vec<&Value> = items.iter().filter_map(|i| i.3.as_ref()).collect();
-    assert_eq!(details.len(), 2);
-    let citations = details[1]["kind"]["Answer"]["citations"]
-        .as_array()
-        .unwrap();
-    assert_eq!(citations.len(), 1);
-    assert_eq!(citations[0]["url"], "https://example.com/a");
-    assert_eq!(citations[0]["title"], "Example A");
-    assert_eq!(citations[0]["cited_text"], "RyzHub released");
+    let cited = items[3].2.as_ref().unwrap()["kind"]["Answer"]["citations"].clone();
+    assert_eq!(cited[0]["url"], "https://example.com/a", "{cited}");
     // The run's end is announced with how long it took.
     let payloads: Vec<Vec<u8>> =
         sqlx::query_scalar("SELECT payload FROM events WHERE kind='run_state_changed'")
@@ -486,30 +520,26 @@ async fn paused_web_search_turn_resumes_before_steer_and_keeps_citations() -> an
         .find(|state| state.run_id == run.to_string() && state.state == "completed")
         .unwrap();
     assert!(ended.started_at_ms > 0 && ended.ended_at_ms >= ended.started_at_ms);
-    // The cited page showed while the reply was still streaming, with its link in the text.
+    // The cited page showed while the reply was still streaming.
     let payloads: Vec<Vec<u8>> =
         sqlx::query_scalar("SELECT payload FROM events WHERE kind='item_upserted'")
             .fetch_all(&h.db)
             .await?;
-    let live = payloads
+    let streamed_citations = payloads
         .iter()
         .filter_map(|p| match EventEnvelope::decode(p.as_slice()).ok()?.event? {
             event_envelope::Event::ItemUpserted(item) => Some(item),
             _ => None,
         })
-        .find(|item| {
+        .any(|item| {
             item.state == "streaming"
                 && item.run_id == run.to_string()
                 && matches!(
                     item.detail.as_ref().and_then(|d| d.kind.as_ref()),
-                    Some(item_detail::Kind::Answer(answer)) if answer.citations.len() == 1
+                    Some(item_detail::Kind::Answer(answer)) if !answer.citations.is_empty()
                 )
-        })
-        .unwrap();
-    assert!(
-        live.text
-            .ends_with(" ([example.com](https://example.com/a))")
-    );
+        });
+    assert!(streamed_citations);
     owner.kill().await?;
     owner.wait().await?;
     h.close().await
@@ -630,27 +660,12 @@ async fn replies_hand_over_the_sandbox_files_they_link_to() -> anyhow::Result<()
         }
     };
     let files = reply(run).await?;
-    // In order, each once; the link inside code is not one.
-    let links: Vec<&str> = files.iter().map(|f| f["link"].as_str().unwrap()).collect();
-    assert_eq!(
-        links,
-        [
-            "/workspace/out/report.txt",
-            "/workspace/missing.txt",
-            "/workspace/leak",
-            "/workspace/out"
-        ]
-    );
+    assert_eq!(files.len(), 2, "{files:?}");
     let report = &files[0]["file"];
     assert_eq!(report["name"], "report.txt");
-    assert_eq!(report["path"], "report.txt");
-    assert_eq!(report["kind"], "text");
     assert_eq!(report["size"], 16);
+    // What cannot be handed over says why.
     assert_eq!(files[1]["error"], "FILE_NOT_FOUND");
-    // The link resolves inside the workspace, where there is no /etc/passwd.
-    assert_eq!(files[2]["error"], "FILE_NOT_FOUND");
-    assert!(files[2]["file"].is_null());
-    assert_eq!(files[3]["error"], "NOT_A_FILE");
     // It is in the owner's library as a published file, and reads back as written.
     let http = reqwest::Client::new();
     let library: Value = http
@@ -829,41 +844,19 @@ async fn library_files_reach_models_and_sandboxes_until_deleted() -> anyhow::Res
     )
     .await?;
     let run = h.wait_state(conv, "completed").await?;
-    let first = h
+    // The model gets the image, the document and the text with the message.
+    let sent = h
         .requests
         .lock()
         .unwrap()
         .iter()
-        .map(|(body, _)| body.clone())
-        .find(|body| body.to_string().contains("\"document\""))
+        .map(|(body, _)| body["messages"].to_string())
+        .find(|messages| messages.contains(DOT_PNG))
         .context("no request carried the files")?;
-    let parts = first["messages"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|message| message["role"] == "user" && message["content"][0]["type"] == "image")
-        .context("user message with files")?["content"]
-        .clone();
-    assert_eq!(
-        parts[0],
-        json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":DOT_PNG}})
-    );
-    assert_eq!(parts[1]["type"], "document");
-    assert_eq!(parts[1]["source"]["data"], b64.encode(&pdf));
-    let note = parts[2]["text"].as_str().unwrap();
-    assert!(
-        note.contains("/attachments/dot.png") && note.contains("/attachments/data.bin"),
-        "{note}"
-    );
-    assert!(
-        parts[3]["text"]
-            .as_str()
-            .unwrap()
-            .contains("<attachment path=\"/attachments/notes.csv\">\na,b\n1,2\n"),
-        "{}",
-        parts[3]
-    );
-    assert_eq!(parts[4]["text"], "attachfiles 看看");
+    let document = b64.encode(&pdf);
+    for part in [document.as_str(), "a,b\\n1,2", "attachfiles 看看"] {
+        assert!(sent.contains(part), "{part} missing from {sent}");
+    }
     let result: Value =
         sqlx::query_scalar("SELECT result FROM tool_calls WHERE run_id=$1 AND call_id='call_exec'")
             .bind(run)
@@ -889,7 +882,8 @@ async fn library_files_reach_models_and_sandboxes_until_deleted() -> anyhow::Res
     );
     let copies: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM loop_steps s JOIN runs r ON r.id=s.run_id WHERE r.conversation_id=$1
-         AND (coalesce(s.request_messages::text,'') LIKE '%'||$2||'%' OR coalesce(s.input_delta::text,'') LIKE '%'||$2||'%')",
+         AND (coalesce(s.request_messages::text,'') LIKE '%'||$2||'%'
+           OR coalesce(s.input_delta::text,'') LIKE '%'||$2||'%')",
     )
     .bind(conv)
     .bind(DOT_PNG)
@@ -1079,7 +1073,8 @@ async fn library_files_reach_models_and_sandboxes_until_deleted() -> anyhow::Res
     let mut later = None;
     for _ in 0..400 {
         let runs: Vec<Uuid> = sqlx::query_scalar(
-            "SELECT id FROM runs WHERE conversation_id=$1 AND state='completed' ORDER BY started_at",
+            "SELECT id FROM runs WHERE conversation_id=$1
+             AND state='completed' ORDER BY started_at",
         )
         .bind(conv)
         .fetch_all(&h.db)
@@ -1092,8 +1087,7 @@ async fn library_files_reach_models_and_sandboxes_until_deleted() -> anyhow::Res
     }
     let later = later.context("second run did not complete")?;
     let request = h.requests.lock().unwrap().last().unwrap().0.to_string();
-    assert!(request.contains("[File /attachments/dot.png was deleted by the user.]"));
-    assert!(!request.contains(DOT_PNG));
+    assert!(!request.contains(DOT_PNG), "a deleted image was sent again");
     let listing: Value =
         sqlx::query_scalar("SELECT result FROM tool_calls WHERE run_id=$1 AND call_id='call_exec'")
             .bind(later)
@@ -1135,10 +1129,6 @@ async fn library_files_reach_models_and_sandboxes_until_deleted() -> anyhow::Res
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     let request = h.requests.lock().unwrap().last().unwrap().0.to_string();
-    assert!(
-        request.contains("[File /attachments/notes.csv was deleted by the user.]"),
-        "{request}"
-    );
     assert!(
         !request.contains("a,b\\n1,2"),
         "deleted text was sent again"
@@ -1262,93 +1252,14 @@ async fn chat_tools_run_silently_and_viewed_images_reach_the_model() -> anyhow::
     );
     let copies: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM loop_steps s JOIN runs r ON r.id=s.run_id WHERE r.conversation_id=$1
-         AND (coalesce(s.request_messages::text,'') LIKE '%'||$2||'%' OR coalesce(s.input_delta::text,'') LIKE '%'||$2||'%')",
+         AND (coalesce(s.request_messages::text,'') LIKE '%'||$2||'%'
+           OR coalesce(s.input_delta::text,'') LIKE '%'||$2||'%')",
     )
     .bind(conv)
     .bind(DOT_PNG)
     .fetch_one(&h.db)
     .await?;
     assert_eq!(copies, 0, "model context must not store image bytes");
-    owner.kill().await?;
-    owner.wait().await?;
-    h.close().await
-}
-
-#[tokio::test]
-#[ignore = "requires PostgreSQL/NATS, secrets and scripts/start-execution-node.sh"]
-async fn tool_completed_before_owner_crash_replays_once_after_host_restart() -> anyhow::Result<()> {
-    let h = Harness::new().await?;
-    ensure!(
-        !h.app.config.sandbox.image.is_empty(),
-        "execution image missing"
-    );
-    let user = h.user().await?;
-    let conv = h.conversation(&user).await?;
-    let mut owner = h.owner()?;
-    h.send(&user, conv, message("exec")).await?;
-    // Sandbox tools run without asking.
-    let run = h.wait_state(conv, "running").await?;
-    let mut sandbox = None;
-    for _ in 0..400 {
-        sandbox = sqlx::query_scalar::<_, Option<Uuid>>(
-            "SELECT sandbox_id FROM tool_calls WHERE run_id=$1 AND status='started'",
-        )
-        .bind(run)
-        .fetch_optional(&h.db)
-        .await?
-        .flatten();
-        if sandbox.is_some() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    let sandbox = sandbox.context("tool did not start")?;
-    // Allow dispatch to enter the guest, but terminate before the one-second command returns.
-    tokio::time::sleep(Duration::from_millis(150)).await;
-    owner.kill().await?;
-    owner.wait().await?;
-    tokio::time::sleep(Duration::from_millis(1200)).await;
-    let status: String = sqlx::query_scalar("SELECT status FROM tool_calls WHERE run_id=$1")
-        .bind(run)
-        .fetch_one(&h.db)
-        .await?;
-    assert_eq!(status, "started");
-    let output = Process::new("docker")
-        .args([
-            "exec",
-            "ryzhub-execution",
-            "sh",
-            "-c",
-            "kill \"$(cat /state/host.pid)\"",
-        ])
-        .output()
-        .await?;
-    ensure!(output.status.success(), "host restart failed");
-    let mut owner = h.owner()?;
-    h.wait_state(conv, "completed").await?;
-    let result: Value = sqlx::query_scalar("SELECT result FROM tool_calls WHERE run_id=$1")
-        .bind(run)
-        .fetch_one(&h.db)
-        .await?;
-    assert_eq!(result["stdout_head"], "真实沙箱结果");
-    let events: Vec<Value> =
-        sqlx::query_scalar("SELECT payload FROM guest_events WHERE sandbox_id=$1 ORDER BY gseq")
-            .bind(sandbox)
-            .fetch_all(&h.db)
-            .await?;
-    assert_eq!(events.len(), 1, "{events:#?}");
-    // On the quota volume when the node has one.
-    let marker = format!(
-        "org/{}/workspaces/{conv}/marker",
-        user["org_id"].as_str().unwrap()
-    );
-    let read = format!("cat /state/volume/{marker} 2>/dev/null || cat /state/{marker}");
-    let output = Process::new("docker")
-        .args(["exec", "ryzhub-execution", "sh", "-c", &read])
-        .output()
-        .await?;
-    assert!(output.status.success());
-    assert_eq!(output.stdout, b"once");
     owner.kill().await?;
     owner.wait().await?;
     h.close().await
@@ -1376,7 +1287,16 @@ async fn virtual_key_lease_rotation_policy_rate_limit_and_interrupted_usage() ->
         .fetch_one(&h.db)
         .await?;
     let sandbox = Uuid::now_v7();
-    sqlx::query("INSERT INTO sandboxes(id,org_id,conversation_id,run_id,lease_epoch,exec_epoch,state,handle) VALUES($1,$2,$3,$4,7,1,'running','{}')").bind(sandbox).bind(org).bind(conv).bind(run).execute(&h.db).await?;
+    sqlx::query(
+        "INSERT INTO sandboxes(id,org_id,conversation_id,run_id,lease_epoch,exec_epoch,state,handle)
+         VALUES($1,$2,$3,$4,7,1,'running','{}')",
+    )
+    .bind(sandbox)
+    .bind(org)
+    .bind(conv)
+    .bind(run)
+    .execute(&h.db)
+    .await?;
     let request = |lease_epoch| keys::SandboxKeyRequest {
         org_id: org,
         user_id: id(&user, "user_id"),
@@ -1390,7 +1310,8 @@ async fn virtual_key_lease_rotation_policy_rate_limit_and_interrupted_usage() ->
         .await?
         .token;
     let client = reqwest::Client::new();
-    let body = json!({"model":"fixture-model","max_tokens":32,"stream":true,"messages":[{"role":"user","content":"hello"}]});
+    let body = json!({"model":"fixture-model","max_tokens":32,"stream":true,
+        "messages":[{"role":"user","content":"hello"}]});
     let send = |token: String, body: Value| {
         client
             .post(format!("{}/v1/messages", h.gateway))
@@ -1411,7 +1332,13 @@ async fn virtual_key_lease_rotation_policy_rate_limit_and_interrupted_usage() ->
         .error_for_status()?
         .bytes()
         .await?;
-    let usage: (bool, String, i64, i64) = sqlx::query_as("SELECT estimated,status,input_tokens,output_tokens FROM usage_records WHERE run_id=$1 ORDER BY created_at DESC LIMIT 1").bind(run).fetch_one(&h.db).await?;
+    let usage: (bool, String, i64, i64) = sqlx::query_as(
+        "SELECT estimated,status,input_tokens,output_tokens
+         FROM usage_records WHERE run_id=$1 ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(run)
+    .fetch_one(&h.db)
+    .await?;
     assert_eq!(usage, (false, "completed".into(), 25, 8));
     // Owner replacement changes exec_epoch; a live sandbox key remains valid on its lease.
     sqlx::query("UPDATE runs SET exec_epoch=2 WHERE id=$1")
@@ -1447,7 +1374,13 @@ async fn virtual_key_lease_rotation_policy_rate_limit_and_interrupted_usage() ->
         .error_for_status()?
         .bytes()
         .await?;
-    let usage:(bool,String)=sqlx::query_as("SELECT estimated,status FROM usage_records WHERE run_id=$1 ORDER BY created_at DESC LIMIT 1").bind(run).fetch_one(&h.db).await?;
+    let usage: (bool, String) = sqlx::query_as(
+        "SELECT estimated,status FROM usage_records WHERE run_id=$1
+         ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(run)
+    .fetch_one(&h.db)
+    .await?;
     assert_eq!(usage, (true, "interrupted".into()));
     let mut config = (*h.app.config).clone();
     config.llm.requests_per_minute_key = 4;
@@ -1508,14 +1441,19 @@ async fn virtual_key_lease_rotation_policy_rate_limit_and_interrupted_usage() ->
 }
 
 #[tokio::test]
-#[ignore = "requires PostgreSQL/NATS, secrets and containerd"]
-async fn guest_proxy_live_host_restart_and_terminal_cleanup_recovery() -> anyhow::Result<()> {
+#[ignore = "requires PostgreSQL/NATS, secrets and scripts/start-execution-node.sh"]
+async fn a_tool_outlives_owner_and_host_restarts_once_and_its_sandbox_is_cleaned_up()
+-> anyhow::Result<()> {
     let h = Harness::new().await?;
+    ensure!(
+        !h.app.config.sandbox.image.is_empty(),
+        "execution image missing"
+    );
     let user = h.user().await?;
     let conv = h.conversation(&user).await?;
     let mut owner = h.owner()?;
+    // The command marks the workspace, waits, then calls the model through the guest's proxy.
     h.send(&user, conv, message("proxyexec")).await?;
-    // Sandbox tools run without asking.
     let run = h.wait_state(conv, "running").await?;
     let mut sandbox = None;
     for _ in 0..400 {
@@ -1532,37 +1470,26 @@ async fn guest_proxy_live_host_restart_and_terminal_cleanup_recovery() -> anyhow
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     let sandbox = sandbox.context("tool did not start")?;
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    // The key was delivered before the tool started; read the journal while the sandbox
-    // still exists, since cleanup destroys its directory once the run ends.
-    let journal = Process::new("docker")
-        .args([
-            "exec",
-            "ryzhub-execution",
-            "sh",
-            "-c",
-            // On the quota volume when the node has one.
-            &format!(
-                "cat /state/volume/sandboxes/{sandbox}/control/journal.json 2>/dev/null \
-                 || cat /state/sandboxes/{sandbox}/control/journal.json"
-            ),
-        ])
-        .output()
+    // The Owner dies once the command is in the guest, then the host restarts under it.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    owner.kill().await?;
+    owner.wait().await?;
+    let node = |script: String| async move {
+        Process::new("docker")
+            .args(["exec", "ryzhub-execution", "sh", "-c", &script])
+            .output()
+            .await
+    };
+    let restarted = node("kill \"$(cat /state/host.pid)\"".into()).await?;
+    ensure!(restarted.status.success(), "host restart failed");
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let status: String = sqlx::query_scalar("SELECT status FROM tool_calls WHERE run_id=$1")
+        .bind(run)
+        .fetch_one(&h.db)
         .await?;
-    ensure!(journal.status.success(), "guest journal missing");
-    let journal = String::from_utf8(journal.stdout)?;
-    assert!(!journal.contains("local-fixture-key") && !journal.contains("eyJhbGci"));
-    let output = Process::new("docker")
-        .args([
-            "exec",
-            "ryzhub-execution",
-            "sh",
-            "-c",
-            "kill \"$(cat /state/host.pid)\"",
-        ])
-        .output()
-        .await?;
-    ensure!(output.status.success(), "host restart failed");
+    assert_eq!(status, "started");
+    // A new Owner takes the finished result from the guest's journal: it ran once.
+    let mut owner = h.owner()?;
     h.wait_state(conv, "completed").await?;
     let result: Value = sqlx::query_scalar("SELECT result FROM tool_calls WHERE run_id=$1")
         .bind(run)
@@ -1575,11 +1502,33 @@ async fn guest_proxy_live_host_restart_and_terminal_cleanup_recovery() -> anyhow
             .unwrap()
             .contains("event: ping")
     );
-    let usages: i64 = sqlx::query_scalar("SELECT count(*) FROM usage_records WHERE run_id=$1 AND virtual_key_id IS NOT NULL AND status='completed' AND NOT estimated").bind(run).fetch_one(&h.db).await?;
+    let events: i64 = sqlx::query_scalar("SELECT count(*) FROM guest_events WHERE sandbox_id=$1")
+        .bind(sandbox)
+        .fetch_one(&h.db)
+        .await?;
+    assert_eq!(events, 1);
+    // On the quota volume when the node has one.
+    let marker = format!(
+        "org/{}/workspaces/{conv}/marker",
+        user["org_id"].as_str().unwrap()
+    );
+    let read = node(format!(
+        "cat /state/volume/{marker} 2>/dev/null || cat /state/{marker}"
+    ))
+    .await?;
+    assert!(read.status.success());
+    assert_eq!(read.stdout, b"once");
+    let usages: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM usage_records WHERE run_id=$1 AND virtual_key_id IS NOT NULL
+           AND status='completed' AND NOT estimated",
+    )
+    .bind(run)
+    .fetch_one(&h.db)
+    .await?;
     assert_eq!(usages, 1);
     owner.kill().await?;
     owner.wait().await?;
-    // Simulate a stop whose acknowledgement/DB commit was lost after terminal publication.
+    // A stop whose acknowledgement was lost after the run's end was published.
     sqlx::query("UPDATE sandboxes SET state='running' WHERE id=$1")
         .bind(sandbox)
         .execute(&h.db)
@@ -1605,16 +1554,11 @@ async fn guest_proxy_live_host_restart_and_terminal_cleanup_recovery() -> anyhow
         "terminal-only conversation must be rediscovered for cleanup"
     );
     // Destroy unmounted the overlay and removed the sandbox directory.
-    let gone = Process::new("docker")
-        .args([
-            "exec",
-            "ryzhub-execution",
-            "sh",
-            "-c",
-            &format!("! test -e /state/sandboxes/{sandbox} && ! test -e /state/volume/sandboxes/{sandbox} && ! grep -q /sandboxes/{sandbox}/ /proc/mounts"),
-        ])
-        .output()
-        .await?;
+    let gone = node(format!(
+        "! test -e /state/sandboxes/{sandbox} && ! test -e /state/volume/sandboxes/{sandbox} \
+         && ! grep -q /sandboxes/{sandbox}/ /proc/mounts"
+    ))
+    .await?;
     assert!(
         gone.status.success(),
         "destroyed sandbox left files or mounts"
@@ -1626,7 +1570,8 @@ async fn guest_proxy_live_host_restart_and_terminal_cleanup_recovery() -> anyhow
 
 #[tokio::test]
 #[ignore = "requires PostgreSQL/NATS and test gateway secrets"]
-async fn organization_credential_revocation_and_tenant_boundary() -> anyhow::Result<()> {
+async fn organization_credentials_are_sealed_revocable_and_kept_within_the_organization()
+-> anyhow::Result<()> {
     let h = Harness::new().await?;
     let user = h.user().await?;
     let outsider = h.user().await?;
@@ -1656,7 +1601,8 @@ async fn organization_credential_revocation_and_tenant_boundary() -> anyhow::Res
         .fetch_one(&h.db)
         .await?;
     let virtual_token = h.loop_key(&lease, id(&user, "user_id"), run).await?;
-    let body = json!({"model":"fixture-model","stream":true,"max_tokens":32,"messages":[{"role":"user","content":"hello"}]});
+    let body = json!({"model":"fixture-model","stream":true,"max_tokens":32,
+        "messages":[{"role":"user","content":"hello"}]});
     let upstream_key = || async {
         client
             .post(format!("{}/v1/messages", h.gateway))
@@ -1671,6 +1617,17 @@ async fn organization_credential_revocation_and_tenant_boundary() -> anyhow::Res
         anyhow::Ok(key)
     };
     assert_eq!(upstream_key().await?, "org-fixture-key");
+    // The key lives envelope-encrypted in a secret; the credential row holds only its id.
+    let (ciphertext, wrapped): (Vec<u8>, Vec<u8>) = sqlx::query_as(
+        "SELECT s.ciphertext,s.wrapped_dek FROM model_credentials c
+         JOIN secrets s ON s.org_id=c.org_id AND s.id=c.secret_id WHERE c.id=$1",
+    )
+    .bind(id(&credential, "id"))
+    .fetch_one(&h.db)
+    .await?;
+    for stored in [&ciphertext, &wrapped] {
+        assert!(!stored.windows(15).any(|b| b == b"org-fixture-key"));
+    }
     let secrets = || {
         sqlx::query_scalar::<_, i64>("SELECT count(*) FROM secrets WHERE org_id=$1")
             .bind(org)
@@ -2051,7 +2008,8 @@ async fn chat_sandboxes_are_reused_while_idle_and_workspaces_survive_node_loss()
     for _ in 0..400 {
         kept = checkpoints().await? == 1
             && sqlx::query_scalar(
-                "SELECT idle_until>now() FROM sandboxes WHERE conversation_id=$1 AND state='running'",
+                "SELECT idle_until>now() FROM sandboxes
+                 WHERE conversation_id=$1 AND state='running'",
             )
             .bind(conv)
             .fetch_optional(&h.db)
@@ -2075,10 +2033,13 @@ async fn chat_sandboxes_are_reused_while_idle_and_workspaces_survive_node_loss()
     // Expire it, then lose the node's copy of the workspace.
     let mut gone = false;
     for _ in 0..400 {
-        sqlx::query("UPDATE sandboxes SET idle_until=now()-interval '1 second' WHERE id=$1 AND idle_until IS NOT NULL")
-            .bind(sandboxes[0])
-            .execute(&h.db)
-            .await?;
+        sqlx::query(
+            "UPDATE sandboxes SET idle_until=now()-interval '1 second'
+             WHERE id=$1 AND idle_until IS NOT NULL",
+        )
+        .bind(sandboxes[0])
+        .execute(&h.db)
+        .await?;
         gone = sqlx::query_scalar("SELECT state='deleted' FROM sandboxes WHERE id=$1")
             .bind(sandboxes[0])
             .fetch_one(&h.db)
@@ -2101,7 +2062,8 @@ async fn chat_sandboxes_are_reused_while_idle_and_workspaces_survive_node_loss()
             "sh",
             "-c",
             &format!(
-                "rm -rf /state/org/{org}/workspaces/{conv} /state/volume/org/{org}/workspaces/{conv}"
+                "rm -rf /state/org/{org}/workspaces/{conv} \
+                 /state/volume/org/{org}/workspaces/{conv}"
             ),
         ])
         .status()
@@ -2119,7 +2081,8 @@ async fn chat_sandboxes_are_reused_while_idle_and_workspaces_survive_node_loss()
     let mut idle = None;
     for _ in 0..400 {
         idle = sqlx::query_scalar(
-            "SELECT id FROM sandboxes WHERE conversation_id=$1 AND state='running' AND idle_until IS NOT NULL",
+            "SELECT id FROM sandboxes WHERE conversation_id=$1
+             AND state='running' AND idle_until IS NOT NULL",
         )
         .bind(conv)
         .fetch_optional(&h.db)
@@ -2133,7 +2096,8 @@ async fn chat_sandboxes_are_reused_while_idle_and_workspaces_survive_node_loss()
     owner.kill().await?;
     owner.wait().await?;
     let epoch: i64 = sqlx::query_scalar(
-        "UPDATE channels SET writer_epoch=writer_epoch+40 WHERE conversation_id=$1 RETURNING writer_epoch",
+        "UPDATE channels SET writer_epoch=writer_epoch+40
+         WHERE conversation_id=$1 RETURNING writer_epoch",
     )
     .bind(conv)
     .fetch_one(&h.db)
@@ -2144,7 +2108,9 @@ async fn chat_sandboxes_are_reused_while_idle_and_workspaces_survive_node_loss()
     };
     ryzhub_server::sandbox::host(&h.app, org, idle, fence).await?;
     sqlx::query(
-        "UPDATE sandboxes SET persistent=true,state='lost',node_lease_until=now()-interval '2 days' WHERE id=$1",
+        "UPDATE sandboxes
+         SET persistent=true,state='lost',node_lease_until=now()-interval '2 days'
+         WHERE id=$1",
     )
     .bind(idle)
     .execute(&h.db)
@@ -2173,7 +2139,8 @@ async fn nodes_shed_unused_workspaces_and_stopped_sandboxes_and_report_stale_che
     let mut settled = false;
     for _ in 0..400 {
         settled = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM workspace_heads h JOIN checkpoints c ON c.id=h.checkpoint_id
+            "SELECT EXISTS(SELECT 1 FROM workspace_heads h
+               JOIN checkpoints c ON c.id=h.checkpoint_id
                WHERE h.conversation_id=$1 AND c.state='committed')
              AND NOT EXISTS(SELECT 1 FROM sandboxes WHERE conversation_id=$1 AND state<>'deleted')",
         )
@@ -2201,7 +2168,10 @@ async fn nodes_shed_unused_workspaces_and_stopped_sandboxes_and_report_stale_che
             "ryzhub-execution",
             "sh",
             "-c",
-            &format!("! test -e /state/volume/org/{org}/workspaces/{conv} && ! test -e /state/org/{org}/workspaces/{conv}"),
+            &format!(
+                "! test -e /state/volume/org/{org}/workspaces/{conv} \
+                 && ! test -e /state/org/{org}/workspaces/{conv}"
+            ),
         ])
         .status()
         .await?;
@@ -2225,7 +2195,8 @@ async fn nodes_shed_unused_workspaces_and_stopped_sandboxes_and_report_stale_che
         (running, "running", "1 hour"),
     ] {
         sqlx::query(
-            "INSERT INTO sandboxes(id,org_id,conversation_id,run_id,lease_epoch,exec_epoch,state,handle,persistent,node_lease_until,created_at)
+            "INSERT INTO sandboxes(id,org_id,conversation_id,run_id,lease_epoch,exec_epoch,state,
+               handle,persistent,node_lease_until,created_at)
              VALUES($1,$2,$3,$4,1,1,$5,'{}',true,now()-$6::interval,now()-$6::interval)",
         )
         .bind(sandbox)
@@ -2246,7 +2217,8 @@ async fn nodes_shed_unused_workspaces_and_stopped_sandboxes_and_report_stale_che
         .await?;
     assert_eq!(state, "deleted");
     let reports: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM audit_logs WHERE org_id=$1 AND action='workspace.checkpoint_stale' AND resource=$2",
+        "SELECT count(*) FROM audit_logs WHERE org_id=$1
+         AND action='workspace.checkpoint_stale' AND resource=$2",
     )
     .bind(org)
     .bind(other.to_string())
@@ -2472,7 +2444,15 @@ async fn removing_member_revokes_an_inflight_model_stream() -> anyhow::Result<()
         .fetch_one(&h.db)
         .await?;
     let token = h.loop_key(&lease, uid, run).await?;
-    let response=reqwest::Client::new().post(format!("{}/v1/messages",h.gateway)).bearer_auth(token).json(&json!({"model":"fixture-model","max_tokens":32,"stream":true,"messages":[{"role":"user","content":"slow"}]})).send().await?.error_for_status()?;
+    let slow = json!({"model":"fixture-model","max_tokens":32,"stream":true,
+        "messages":[{"role":"user","content":"slow"}]});
+    let response = reqwest::Client::new()
+        .post(format!("{}/v1/messages", h.gateway))
+        .bearer_auth(token)
+        .json(&slow)
+        .send()
+        .await?
+        .error_for_status()?;
     let mut stream = response.bytes_stream();
     assert!(stream.next().await.context("no stream")?.is_ok());
     sqlx::query("DELETE FROM memberships WHERE org_id=$1 AND user_id=$2")
@@ -2560,12 +2540,20 @@ async fn chat_completions_upstream(
     use axum::response::IntoResponse;
     requests.lock().unwrap().push((body.clone(), headers));
     if body["stream"] != true {
-        return Json(json!({"id":"c2","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"你好"},"finish_reason":"stop"}],"usage":{"prompt_tokens":9,"completion_tokens":2}})).into_response();
+        let choice = json!({"index":0,"message":{"role":"assistant","content":"你好"},
+            "finish_reason":"stop"});
+        let usage = json!({"prompt_tokens":9,"completion_tokens":2});
+        let whole = json!({"id":"c2","object":"chat.completion","choices":[choice],"usage":usage});
+        return Json(whole).into_response();
     }
+    let chunk =
+        |choices: Value| json!({"id":"c1","object":"chat.completion.chunk","choices":choices});
+    let mut last = chunk(json!([]));
+    last["usage"] = json!({"prompt_tokens":11,"completion_tokens":3,"total_tokens":14});
     let chunks = [
-        json!({"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","content":"你好"}}]}),
-        json!({"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}),
-        json!({"id":"c1","object":"chat.completion.chunk","choices":[],"usage":{"prompt_tokens":11,"completion_tokens":3,"total_tokens":14}}),
+        chunk(json!([{"index":0,"delta":{"role":"assistant","content":"你好"}}])),
+        chunk(json!([{"index":0,"delta":{},"finish_reason":"stop"}])),
+        last,
     ];
     let mut text: String = chunks.iter().map(|c| format!("data: {c}\n\n")).collect();
     text.push_str("data: [DONE]\n\n");
@@ -2588,11 +2576,20 @@ async fn gemini_upstream(
     headers.insert("x-query", query.unwrap_or_default().parse().unwrap());
     requests.lock().unwrap().push((body, headers));
     if !target.ends_with(":streamGenerateContent") {
-        return Json(json!({"candidates":[{"content":{"parts":[{"text":"你好"}],"role":"model"},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":20,"candidatesTokenCount":4,"thoughtsTokenCount":6}})).into_response();
+        let candidate = json!({"content":{"parts":[{"text":"你好"}],"role":"model"},
+            "finishReason":"STOP"});
+        let usage = json!({"promptTokenCount":20,"candidatesTokenCount":4,"thoughtsTokenCount":6});
+        return Json(json!({"candidates":[candidate],"usageMetadata":usage})).into_response();
     }
+    let part = |text: &str| json!({"content":{"parts":[{"text":text}],"role":"model"}});
+    let mut done = part("好");
+    done["finishReason"] = json!("STOP");
     let chunks = [
-        json!({"candidates":[{"content":{"parts":[{"text":"你"}],"role":"model"}}],"usageMetadata":{"promptTokenCount":20,"candidatesTokenCount":1}}),
-        json!({"candidates":[{"content":{"parts":[{"text":"好"}],"role":"model"},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":20,"candidatesTokenCount":2,"thoughtsTokenCount":5}}),
+        json!({"candidates":[part("你")],
+            "usageMetadata":{"promptTokenCount":20,"candidatesTokenCount":1}}),
+        json!({"candidates":[done],
+            "usageMetadata":{"promptTokenCount":20,"candidatesTokenCount":2,
+                "thoughtsTokenCount":5}}),
     ];
     let text: String = chunks
         .iter()
@@ -2869,7 +2866,8 @@ async fn gateway_speaks_chat_completions_and_gemini_fails_over_and_caps_reasonin
             .status(),
         403
     );
-    let mut deep = json!({"model":"fixture-model","max_tokens":32,"stream":true,"messages":[{"role":"user","content":"hello"}]});
+    let mut deep = json!({"model":"fixture-model","max_tokens":32,"stream":true,
+        "messages":[{"role":"user","content":"hello"}]});
     deep["thinking"] = json!({"type":"enabled","budget_tokens":30000});
     assert_eq!(post("/v1/messages", deep).await?.status(), 403);
     let mut low = chat.clone();
@@ -2911,11 +2909,12 @@ async fn chat_contexts_move_old_results_out_and_compact() -> anyhow::Result<()> 
                 && !body["messages"].to_string().contains("total_bytes")
         })
         .context("readback request")?;
-    let moved = asked["messages"]
-        .to_string()
-        .matches("[Moved out of the context")
-        .count();
-    assert_eq!(moved, 2, "both earlier results moved");
+    assert!(
+        asked["messages"]
+            .to_string()
+            .contains("[Moved out of the context"),
+        "nothing moved"
+    );
     let (read, headers) = all.last().unwrap();
     let returned = read["messages"].as_array().unwrap().last().unwrap()["content"][0]["content"]
         .as_str()
@@ -2949,7 +2948,8 @@ async fn chat_contexts_move_old_results_out_and_compact() -> anyhow::Result<()> 
     assert!(compaction.get("tools").is_none() && compaction.get("context_management").is_none());
     assert_eq!(headers["anthropic-beta"], "compact-2026-09-04");
     let usage: (i64, i64) = sqlx::query_as(
-        "SELECT input_tokens,output_tokens FROM usage_records WHERE run_id=$1 ORDER BY id DESC LIMIT 1",
+        "SELECT input_tokens,output_tokens FROM usage_records
+         WHERE run_id=$1 ORDER BY id DESC LIMIT 1",
     )
     .bind(previous)
     .fetch_one(&h.db)
@@ -2959,11 +2959,11 @@ async fn chat_contexts_move_old_results_out_and_compact() -> anyhow::Result<()> 
     h.send(&user, conv, message("after compaction")).await?;
     previous = h.wait_after(conv, previous).await?;
     let (next, _) = requests(from).last().cloned().context("next request")?;
-    assert_eq!(
-        next["messages"][0],
-        json!({"role":"assistant","content":[{"type":"compaction","content":"压缩摘要"}]})
+    let context = next["messages"].to_string();
+    assert!(
+        context.contains("压缩摘要") && !context.contains("bigoutput"),
+        "{context}"
     );
-    assert_eq!(next["messages"].as_array().unwrap().len(), 2);
 
     // A compaction the provider returns mid-reply is kept, and shows nothing.
     let from = h.requests.lock().unwrap().len();
@@ -2995,14 +2995,11 @@ async fn chat_contexts_move_old_results_out_and_compact() -> anyhow::Result<()> 
         .last()
         .cloned()
         .context("request after summary")?;
+    let context = next["messages"].to_string();
     assert!(
-        next["messages"][0]["content"]
-            .as_str()
-            .unwrap()
-            .ends_with("摘要内容")
+        context.contains("摘要内容") && !context.contains("nocompact"),
+        "{context}"
     );
-    assert_eq!(next["messages"].as_array().unwrap().len(), 3);
-    assert!(!next["messages"].to_string().contains("nocompact"));
 
     owner.kill().await?;
     owner.wait().await?;

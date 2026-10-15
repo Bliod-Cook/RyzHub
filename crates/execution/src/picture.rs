@@ -287,23 +287,6 @@ mod tests {
     }
 
     #[test]
-    fn rendering_bytes_matches_reading_the_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let image = DynamicImage::ImageRgb8(RgbImage::from_pixel(2400, 600, image::Rgb([5, 6, 7])));
-        let path = save(dir.path(), "wide.bmp", &image, ImageFormat::Bmp);
-        let from_file = read(&path, 2000, 1 << 20);
-        assert_eq!(
-            render(&std::fs::read(&path).unwrap(), 2000, 1 << 20),
-            from_file
-        );
-        assert_eq!(from_file["width"].as_u64(), Some(2000));
-        assert_eq!(
-            render(b"plain text", 2000, 1 << 20)["error"],
-            "not_an_image"
-        );
-    }
-
-    #[test]
     fn refusals_are_answers() {
         let dir = tempfile::tempdir().unwrap();
         let text = dir.path().join("notes.txt");

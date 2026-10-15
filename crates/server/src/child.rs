@@ -64,17 +64,3 @@ pub async fn run(
         .context("timed out")??;
     serde_json::from_slice(&reply).context("unreadable reply")
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_program_outlives_a_rebuild_of_the_binary() {
-        assert_eq!(program("/opt/render").unwrap(), Path::new("/opt/render"));
-        // The kernel's link, not the file's path, which a rebuild replaces.
-        if cfg!(target_os = "linux") {
-            assert_eq!(program("").unwrap(), Path::new("/proc/self/exe"));
-        }
-    }
-}

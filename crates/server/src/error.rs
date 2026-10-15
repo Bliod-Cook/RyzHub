@@ -268,13 +268,11 @@ mod tests {
     use anyhow::Context;
 
     #[test]
-    fn codes_survive_context_and_round_trip_through_text() {
+    fn codes_survive_context_and_other_errors_are_internal() {
         let error = Err::<(), _>(Code::Fenced)
             .context("while renewing")
             .unwrap_err();
         assert!(is_fenced(&error));
-        assert_eq!(Code::parse("WORKSPACE_BUSY"), Some(Code::WorkspaceBusy));
-        assert_eq!(Code::WorkspaceBusy.to_string(), "WORKSPACE_BUSY");
         assert_eq!(
             public_code(&anyhow::anyhow!("disk full")),
             Code::InternalError

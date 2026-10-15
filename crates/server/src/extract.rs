@@ -250,49 +250,6 @@ mod tests {
         assert!(docx_text(b"PK\x03\x04 not really").is_err());
     }
 
-    /// A one-page PDF showing `text` in a standard font.
-    pub(crate) fn pdf(text: &str) -> Vec<u8> {
-        let stream = format!("BT /F1 24 Tf 72 720 Td ({text}) Tj ET");
-        let objects = [
-            "<< /Type /Catalog /Pages 2 0 R >>".to_owned(),
-            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_owned(),
-            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R \
-             /Resources << /Font << /F1 5 0 R >> >> >>"
-                .to_owned(),
-            format!(
-                "<< /Length {} >>\nstream\n{stream}\nendstream",
-                stream.len()
-            ),
-            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>"
-                .to_owned(),
-        ];
-        let mut out = b"%PDF-1.4\n".to_vec();
-        let mut offsets = vec![];
-        for (n, object) in objects.iter().enumerate() {
-            offsets.push(out.len());
-            out.extend(format!("{} 0 obj\n{object}\nendobj\n", n + 1).bytes());
-        }
-        let xref = out.len();
-        out.extend(format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).bytes());
-        for offset in offsets {
-            out.extend(format!("{offset:010} 00000 n \n").bytes());
-        }
-        out.extend(
-            format!(
-                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
-                objects.len() + 1
-            )
-            .bytes(),
-        );
-        out
-    }
-
-    #[test]
-    fn pdf_text_is_read() {
-        let text = pdf_extract::extract_text_from_mem(&pdf("Quarterly plan")).unwrap();
-        assert_eq!(tidy(&text), "Quarterly plan");
-    }
-
     #[test]
     fn formats_come_from_content_and_text_is_bounded() {
         assert_eq!(Format::of(b"%PDF-1.7\n", "a.bin").unwrap().0, Format::Pdf);

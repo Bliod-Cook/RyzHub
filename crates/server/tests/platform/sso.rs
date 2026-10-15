@@ -68,6 +68,45 @@ fn verifier_matches(challenge: &str, form: &HashMap<String, String>) -> bool {
     )) == challenge
 }
 
+/// The form of a token request.
+fn form(body: &str) -> HashMap<String, String> {
+    url::form_urlencoded::parse(body.as_bytes())
+        .into_owned()
+        .collect()
+}
+
+/// An ID token for the code whose PKCE verifier matches, tampered with as the test asks.
+async fn oidc_token(State(s): State<Shared>, body: String) -> axum::response::Response {
+    let form = form(&body);
+    let provider = s.lock().unwrap();
+    if !verifier_matches(&provider.challenge, &form)
+        || form.get("code").map(String::as_str) != Some("code-1")
+    {
+        let refused = Json(json!({"error":"invalid_grant"}));
+        return (axum::http::StatusCode::BAD_REQUEST, refused).into_response();
+    }
+    let now = chrono::Utc::now().timestamp();
+    let tampered = |what: &str| provider.tamper == Some(what);
+    let claims = json!({
+        "iss": provider.base, "sub": provider.subject,
+        "aud": if tampered("audience") { "someone-else" } else { "ryzhub" },
+        "exp": now + 300, "iat": now,
+        "nonce": if tampered("nonce") { "replayed" } else { provider.nonce.as_str() },
+        "email": provider.email, "email_verified": provider.verified, "name": "SSO User",
+    });
+    let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
+    header.kid = Some("k1".into());
+    let key = jsonwebtoken::EncodingKey::from_rsa_pem(KEY.as_bytes()).unwrap();
+    let mut token = jsonwebtoken::encode(&header, &claims, &key).unwrap();
+    if tampered("signature") {
+        // The last character holds the signature's last bits: another one changes it.
+        let last = token.pop().unwrap();
+        token.push(if last == 'A' { 'Q' } else { 'A' });
+    }
+    Json(json!({"access_token":"oidc-access","token_type":"Bearer","id_token":token}))
+        .into_response()
+}
+
 async fn serve_provider() -> anyhow::Result<(Shared, String, JoinHandle<()>)> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let base = format!("http://{}", listener.local_addr()?);
@@ -94,54 +133,39 @@ async fn serve_provider() -> anyhow::Result<(Shared, String, JoinHandle<()>)> {
             "/.well-known/openid-configuration",
             get(|State(s): State<Shared>| async move {
                 let base = s.lock().unwrap().base.clone();
-                Json(json!({"issuer": base, "authorization_endpoint": format!("{base}/authorize"),
-                    "token_endpoint": format!("{base}/token"), "jwks_uri": format!("{base}/jwks")}))
+                Json(
+                    json!({"issuer": base, "authorization_endpoint": format!("{base}/authorize"),
+                    "token_endpoint": format!("{base}/token"), "jwks_uri": format!("{base}/jwks")}),
+                )
             }),
         )
         .route(
             "/jwks",
-            get(|| async { Json(json!({"keys":[{"kty":"RSA","kid":"k1","alg":"RS256","use":"sig","n":MODULUS,"e":"AQAB"}]})) }),
-        )
-        .route("/authorize", get(authorize))
-        .route(
-            "/token",
-            post(|State(s): State<Shared>, body: String| async move {
-                let form: HashMap<String, String> = url::form_urlencoded::parse(body.as_bytes()).into_owned().collect();
-                let provider = s.lock().unwrap();
-                if !verifier_matches(&provider.challenge, &form) || form.get("code").map(String::as_str) != Some("code-1") {
-                    return (axum::http::StatusCode::BAD_REQUEST, Json(json!({"error":"invalid_grant"}))).into_response();
-                }
-                let now = chrono::Utc::now().timestamp();
-                let claims = json!({
-                    "iss": provider.base, "sub": provider.subject,
-                    "aud": if provider.tamper == Some("audience") { "someone-else" } else { "ryzhub" },
-                    "exp": now + 300, "iat": now,
-                    "nonce": if provider.tamper == Some("nonce") { "replayed" } else { provider.nonce.as_str() },
-                    "email": provider.email, "email_verified": provider.verified, "name": "SSO User",
-                });
-                let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
-                header.kid = Some("k1".into());
-                let mut token = jsonwebtoken::encode(&header, &claims, &jsonwebtoken::EncodingKey::from_rsa_pem(KEY.as_bytes()).unwrap()).unwrap();
-                if provider.tamper == Some("signature") {
-                    token.pop();
-                    token.push(if token.ends_with('A') { 'B' } else { 'A' });
-                }
-                Json(json!({"access_token":"oidc-access","token_type":"Bearer","id_token":token})).into_response()
+            get(|| async {
+                let key = json!({"kty":"RSA","kid":"k1","alg":"RS256","use":"sig",
+                    "n":MODULUS,"e":"AQAB"});
+                Json(json!({"keys":[key]}))
             }),
         )
+        .route("/authorize", get(authorize))
+        .route("/token", post(oidc_token))
         .route("/gh/login/oauth/authorize", get(authorize))
         .route(
             "/gh/login/oauth/access_token",
             post(|State(s): State<Shared>, body: String| async move {
-                let form: HashMap<String, String> = url::form_urlencoded::parse(body.as_bytes()).into_owned().collect();
-                let ok = verifier_matches(&s.lock().unwrap().challenge, &form);
-                Json(if ok { json!({"access_token":"gh-token"}) } else { json!({"error":"bad_verification_code"}) })
+                let ok = verifier_matches(&s.lock().unwrap().challenge, &form(&body));
+                Json(if ok {
+                    json!({"access_token":"gh-token"})
+                } else {
+                    json!({"error":"bad_verification_code"})
+                })
             }),
         )
         .route(
             "/gh/api/user",
             get(|headers: HeaderMap| async move {
-                if headers.get("authorization").and_then(|h| h.to_str().ok()) != Some("Bearer gh-token") {
+                let authorization = headers.get("authorization").and_then(|h| h.to_str().ok());
+                if authorization != Some("Bearer gh-token") {
                     return axum::http::StatusCode::UNAUTHORIZED.into_response();
                 }
                 Json(json!({"id": 4242, "login": "octo", "name": "Octo"})).into_response()
@@ -151,8 +175,10 @@ async fn serve_provider() -> anyhow::Result<(Shared, String, JoinHandle<()>)> {
             "/gh/api/user/emails",
             get(|State(s): State<Shared>| async move {
                 let provider = s.lock().unwrap();
-                Json(json!([{"email":"other@example.test","primary":false,"verified":true},
-                            {"email":provider.email,"primary":true,"verified":provider.verified}]))
+                Json(
+                    json!([{"email":"other@example.test","primary":false,"verified":true},
+                            {"email":provider.email,"primary":true,"verified":provider.verified}]),
+                )
             }),
         )
         .with_state(shared.clone());

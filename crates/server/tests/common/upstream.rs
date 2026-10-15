@@ -1,6 +1,5 @@
 //! The model providers' side, scripted by keywords in the last prompt: Anthropic Messages for
-//! the Chat engine, Claude Code and OpenCode, OpenAI Responses for Codex, an MCP server and an
-//! embeddings endpoint.
+//! the Chat engine, Claude Code and OpenCode, OpenAI Responses for Codex, and an MCP server.
 use axum::{
     Json, Router,
     body::{Body, Bytes},
@@ -36,7 +35,6 @@ pub fn router(requests: Requests) -> Router {
         )
         .route("/v1/responses", post(responses))
         .route("/v1/responses/compact", post(compact))
-        .route("/v1/embeddings", post(embeddings))
         .route("/mcp", post(mcp))
         .with_state(requests)
 }
@@ -79,10 +77,16 @@ fn offers(body: &Value, tool: &str) -> bool {
         .is_some_and(|tools| tools.iter().any(|t| t["name"] == tool))
 }
 
-/// What an `exec` prompt runs: a call through the guest's model proxy for `proxyexec`.
+/// What an `exec` prompt runs: for `proxyexec`, a call through the guest's model proxy.
 fn command(prompt: &str) -> &'static str {
     if prompt.contains("proxyexec") {
-        r#"sleep 2; wget -Y off -qO- --header 'Content-Type: application/json' --post-data '{"model":"fixture-model","max_tokens":32,"stream":true,"messages":[{"role":"user","content":"guest local proxy"}]}' http://127.0.0.1:8090/v1/messages"#
+        concat!(
+            "printf once >> marker; sleep 2; wget -Y off -qO- ",
+            "--header 'Content-Type: application/json' --post-data ",
+            r#"'{"model":"fixture-model","max_tokens":32,"stream":true,"#,
+            r#""messages":[{"role":"user","content":"guest local proxy"}]}' "#,
+            "http://127.0.0.1:8090/v1/messages"
+        )
     } else {
         "printf once >> marker; sleep 1; printf '真实沙箱结果'"
     }
@@ -312,20 +316,23 @@ fn chat_reply(body: &Value, prompt: &str, result: bool) -> Vec<Value> {
             "content":[found]});
         vec![text("先搜索一下"), search, results]
     } else if asks("sharefiles") {
-        let cmd = "mkdir -p out && printf 'quarterly report' > out/report.txt && ln -sf /etc/passwd leak && echo made";
-        vec![exec(cmd, 10000)]
+        vec![exec(
+            "mkdir -p out && printf 'quarterly report' > out/report.txt",
+            10000,
+        )]
     } else if asks("sharecheck") {
         vec![exec("cat /attachments/report.txt", 10000)]
     } else if result && asked.contains("sharefiles") {
         vec![text(
-            "文件在这里：[报告](sandbox:/workspace/out/report.txt)、[缺失](sandbox:/workspace/missing.txt)、[泄露](sandbox:/workspace/leak)、[目录](sandbox:/workspace/out)，代码里的 `[不算](sandbox:/workspace/out/report.txt)` 不算。",
+            "文件在这里：[报告](sandbox:/workspace/out/report.txt)、[缺失](sandbox:/workspace/missing.txt)。",
         )]
     } else if result && asked.contains("sharecheck") {
         vec![text(
             "还是这份：[报告](sandbox:/workspace/out/report.txt)，也就是 [附件里的](/attachments/report.txt)。",
         )]
     } else if asks("attachfiles") {
-        let cmd = "cat /attachments/notes.csv; ls /attachments; touch /attachments/new 2>/dev/null || echo READONLY";
+        let cmd = "cat /attachments/notes.csv; ls /attachments; \
+                   touch /attachments/new 2>/dev/null || echo READONLY";
         vec![exec(cmd, 10000)]
     } else if asks("fscheck") {
         let cmd = "cat data/notes.csv; printf 'made here' > out.txt";
@@ -343,10 +350,17 @@ fn chat_reply(body: &Value, prompt: &str, result: bool) -> Vec<Value> {
     } else if asks("markercat") {
         vec![exec("printf once >> marker; cat marker", 10000)]
     } else if asks("quotacheck") {
-        let cmd = "for f in /workspace/big /root/big; do dd if=/dev/zero of=$f bs=1M count=300 2>&1 | grep -oE 'No space left on device|Disk quota exceeded' | head -1; done; rm -f /workspace/big /root/big; awk 'BEGIN{s=\"x\"; while(1) s=s s}'; echo HOG=$?; echo small > /workspace/ok && echo SMALL_OK";
+        let cmd = "for f in /workspace/big /root/big; do \
+                   dd if=/dev/zero of=$f bs=1M count=300 2>&1 \
+                   | grep -oE 'No space left on device|Disk quota exceeded' | head -1; done; \
+                   rm -f /workspace/big /root/big; awk 'BEGIN{s=\"x\"; while(1) s=s s}'; \
+                   echo HOG=$?; echo small > /workspace/ok && echo SMALL_OK";
         vec![exec(cmd, 60000)]
     } else if asks("egresscheck") {
-        let cmd = "apk update >/tmp/apk.log 2>&1 && echo APK_OK; wget -q -T 10 -O /dev/null http://example.com/; echo WGET=$?; wget -Y off -q -T 5 -O /dev/null http://1.1.1.1/; echo DIRECT=$?; printenv https_proxy";
+        let cmd = "apk update >/tmp/apk.log 2>&1 && echo APK_OK; \
+                   wget -q -T 10 -O /dev/null http://example.com/; echo WGET=$?; \
+                   wget -Y off -q -T 5 -O /dev/null http://1.1.1.1/; echo DIRECT=$?; \
+                   printenv https_proxy";
         vec![exec(cmd, 60000)]
     } else if asks("streamcheck") {
         vec![exec("for i in 1 2 3; do echo line$i; sleep 1; done", 20000)]
@@ -525,30 +539,6 @@ async fn compact(
     let reply = json!({"id":"cmp_local","object":"response.compaction","output":[compaction],
         "usage":{"input_tokens":20,"output_tokens":3}});
     Json(reply)
-}
-
-/// One dimension per meaning: texts about 苹果 point one way, all others another.
-async fn embeddings(
-    State(requests): State<Requests>,
-    headers: HeaderMap,
-    Json(body): Json<Value>,
-) -> Response {
-    requests.lock().unwrap().push((body.clone(), headers));
-    let input = body["input"].as_array().unwrap();
-    let texts = input.iter().map(|v| v.as_str().unwrap());
-    if texts.clone().any(|t| t.contains("embedding-unavailable")) {
-        let error = json!({"error":"fixture unavailable"});
-        return (StatusCode::SERVICE_UNAVAILABLE, Json(error)).into_response();
-    }
-    let data: Vec<Value> = texts
-        .enumerate()
-        .map(|(index, text)| {
-            let mut embedding = vec![0.0f32; 1024];
-            embedding[if text.contains("苹果") { 0 } else { 1 }] = 1.0;
-            json!({"index":index,"embedding":embedding})
-        })
-        .collect();
-    Json(json!({"data":data,"usage":{"prompt_tokens":7,"total_tokens":7}})).into_response()
 }
 
 async fn mcp(

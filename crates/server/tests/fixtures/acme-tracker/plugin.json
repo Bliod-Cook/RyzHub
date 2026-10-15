@@ -1,0 +1,41 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "acme-tracker",
+  "version": "1.2.0",
+  "description": "Acme tickets",
+  "extensions": {
+    "app.ryzhub": {
+      "permissions": {
+        "deny": [
+          "purge"
+        ]
+      },
+      "commands": [
+        {
+          "name": "triage",
+          "title": "Triage",
+          "prompt": "app.ryzhub/commands/triage.md",
+          "params": {
+            "project": {
+              "type": "string"
+            }
+          }
+        }
+      ],
+      "ui": {
+        "mcpApps": true
+      },
+      "userConfig": {
+        "apiToken": {
+          "type": "string",
+          "secret": true,
+          "header": "Authorization",
+          "prefix": "Bearer "
+        }
+      }
+    },
+    "com.other.vendor": {
+      "anything": true
+    }
+  }
+}

@@ -7,40 +7,19 @@ fn files(entries: &[(&str, &str)]) -> Files {
         .collect()
 }
 
+/// The package the platform suite installs too, read from its fixture.
 fn agent_plugin() -> Files {
-    let plugin = json!({
-        "$schema": PLUGIN_SCHEMA,
-        "name": "acme-tracker",
-        "version": "1.2.0",
-        "description": "Acme tickets",
-        "extensions": {
-            NAMESPACE: {
-                "permissions": {"deny": ["purge"]},
-                "commands": [{"name": "triage", "title": "Triage", "prompt": "app.ryzhub/commands/triage.md",
-                              "params": {"project": {"type": "string"}}}],
-                "ui": {"mcpApps": true},
-                "userConfig": {"apiToken": {"type": "string", "secret": true, "header": "Authorization", "prefix": "Bearer "}},
-            },
-            "com.other.vendor": {"anything": true},
-        },
-    });
-    let mcp = json!({"$schema": MCP_SCHEMA, "mcpServers": {
-        "acme": {"type": "streamable-http", "url": "https://mcp.acme.example/mcp"},
-        "local": {"type": "stdio", "command": "acme-mcp"},
-    }});
-    files(&[
-        ("plugin.json", &plugin.to_string()),
-        ("mcp.json", &mcp.to_string()),
-        (
-            "skills/triage/SKILL.md",
-            "---\nname: triage\ndescription: Sort new tickets\n---\nRead each ticket.",
-        ),
-        ("skills/triage/checklist.md", "1. priority"),
-        (
-            "app.ryzhub/commands/triage.md",
-            "Triage the tickets of {{project}}.",
-        ),
-    ])
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/acme-tracker");
+    [
+        "plugin.json",
+        "mcp.json",
+        "skills/triage/SKILL.md",
+        "skills/triage/checklist.md",
+        "app.ryzhub/commands/triage.md",
+    ]
+    .into_iter()
+    .map(|path| (path.to_owned(), std::fs::read(root.join(path)).unwrap()))
+    .collect()
 }
 
 fn zipped(files: &Files) -> Vec<u8> {

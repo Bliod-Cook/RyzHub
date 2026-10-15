@@ -8,9 +8,15 @@ fn pdf(text: &str) -> Vec<u8> {
     let objects = [
         "<< /Type /Catalog /Pages 2 0 R >>".to_owned(),
         "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_owned(),
-        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>".to_owned(),
-        format!("<< /Length {} >>\nstream\n{stream}\nendstream", stream.len()),
-        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>".to_owned(),
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R \
+         /Resources << /Font << /F1 5 0 R >> >> >>"
+            .to_owned(),
+        format!(
+            "<< /Length {} >>\nstream\n{stream}\nendstream",
+            stream.len()
+        ),
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>"
+            .to_owned(),
     ];
     let mut out = b"%PDF-1.4\n".to_vec();
     let mut offsets = vec![];
@@ -39,7 +45,12 @@ fn docx(paragraphs: &[&str]) -> Vec<u8> {
         .map(|p| format!("<w:p><w:r><w:t>{p}</w:t></w:r></w:p>"))
         .collect();
     let xml = format!(
-        r#"<?xml version="1.0"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>{body}</w:body></w:document>"#
+        concat!(
+            r#"<?xml version="1.0"?>"#,
+            r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">"#,
+            "<w:body>{body}</w:body></w:document>"
+        ),
+        body = body
     );
     let mut out = std::io::Cursor::new(vec![]);
     let mut zip = zip::ZipWriter::new(&mut out);

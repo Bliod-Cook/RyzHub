@@ -1,0 +1,13 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+  "mcpServers": {
+    "acme": {
+      "type": "streamable-http",
+      "url": "https://mcp.acme.example/mcp"
+    },
+    "local": {
+      "type": "stdio",
+      "command": "acme-mcp"
+    }
+  }
+}

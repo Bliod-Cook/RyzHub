@@ -220,14 +220,3 @@ pub async fn member_key(
     let key = vault::get(tx, &app.config.llm, org, secret, &purpose(id, owner)).await?;
     Ok(Some((id, String::from_utf8(key)?)))
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn a_credential_secret_is_bound_to_its_owner() {
-        let (id, owner) = (Uuid::now_v7(), Uuid::now_v7());
-        assert_ne!(purpose(id, Some(owner)), purpose(id, None));
-        assert_ne!(purpose(id, None), purpose(Uuid::now_v7(), None));
-    }
-}

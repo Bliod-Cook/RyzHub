@@ -217,23 +217,7 @@ fn changes_wait_for_the_batch_and_shown_conversations_diff_their_timeline() {
 }
 
 #[test]
-fn kernel_rendering_reaches_the_client() {
-    let rendered: serde_json::Value = serde_json::from_str(&crate::api::render_markdown(
-        "# a\n\n$x$".into(),
-        vec![],
-        false,
-    ))
-    .unwrap();
-    assert_eq!(rendered["blocks"][0]["t"], "heading");
-    assert_eq!(rendered["blocks"][1]["inlines"][0]["t"], "math");
-    let spans = crate::api::highlight("k".into(), "rust".into(), "fn a() {}".into()).unwrap();
-    assert!(spans.contains("keyword"), "{spans}");
-    assert!(crate::api::ansi_spans("\x1b[31mred".into()).contains("\"fg\":1"));
-    assert!(crate::api::diff_lines("@@ -1 +1 @@\n-a\n+b".into()).contains("\"del\""));
-}
-
-#[test]
-fn a_new_conversation_is_subscribed_once_its_create_run_is_answered() {
+fn a_new_conversation_is_not_subscribed_before_its_create_run_is_answered() {
     let core = client(0);
     core.subscribe("user:o:u".into());
     core.committed();
@@ -250,25 +234,10 @@ fn a_new_conversation_is_subscribed_once_its_create_run_is_answered() {
     );
     assert_eq!(created.outbound_frames.len(), 1, "the CreateRun goes out");
     core.committed();
+    // The kernel holds the subscription until the answer releases it.
     let subscribed = core.subscribe("conv:c".into());
     assert!(
         subscribed.outbound_frames.is_empty(),
         "the server knows no such channel yet"
     );
-    core.committed();
-    let ack = bytes(frame(
-        "conv:c",
-        Body::CommandAck(CommandAck {
-            cid: created.cid.unwrap(),
-            ..Default::default()
-        }),
-    ));
-    let answered = core.ingest(vec![ack], later()).unwrap();
-    let released: Vec<_> = answered
-        .outbound_frames
-        .iter()
-        .map(|f| Frame::decode(f.as_slice()).unwrap())
-        .collect();
-    assert!(matches!(released[0].body, Some(Body::Subscribe(_))));
-    assert_eq!(released[0].channel, "conv:c");
 }

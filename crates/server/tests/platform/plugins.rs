@@ -20,19 +20,25 @@ struct Fixture {
 }
 type Shared = Arc<Mutex<Fixture>>;
 
-const NS: &str = "app.ryzhub";
-
 fn tools(description: &str) -> Value {
+    let object = json!({"type":"object"});
     json!([
-        {"name":"lookup","description":description,"inputSchema":{"type":"object","properties":{"id":{"type":"string"}}},"annotations":{"readOnlyHint":true}},
-        {"name":"purge","description":"Delete every ticket","inputSchema":{"type":"object"}},
-        {"name":"ask","description":"Ask which project","inputSchema":{"type":"object"}},
-        {"name":"widget","description":"Show the ticket board","inputSchema":{"type":"object"},"_meta":{"ui":{"resourceUri":"ui://acme/board"}}},
+        {"name":"lookup","description":description,
+            "inputSchema":{"type":"object","properties":{"id":{"type":"string"}}},
+            "annotations":{"readOnlyHint":true}},
+        {"name":"purge","description":"Delete every ticket","inputSchema":object},
+        {"name":"ask","description":"Ask which project","inputSchema":object},
+        {"name":"widget","description":"Show the ticket board","inputSchema":object,
+            "_meta":{"ui":{"resourceUri":"ui://acme/board"}}},
     ])
 }
 
 fn rpc(id: &Value, result: Value) -> axum::response::Response {
     Json(json!({"jsonrpc":"2.0","id":id,"result":result})).into_response()
+}
+
+fn rpc_error(id: &Value, code: i64, message: &str) -> axum::response::Response {
+    Json(json!({"jsonrpc":"2.0","id":id,"error":{"code":code,"message":message}})).into_response()
 }
 
 /// A server on the stateless protocol; `secure` ones want the account token.
@@ -47,14 +53,9 @@ async fn modern(
         && headers.get("authorization").and_then(|h| h.to_str().ok())
             != Some("Bearer fixture-token")
     {
-        return (
-            StatusCode::UNAUTHORIZED,
-            [(
-                "www-authenticate",
-                format!(r#"Bearer resource_metadata="{base}/.well-known/oauth-protected-resource/secure/mcp""#),
-            )],
-        )
-            .into_response();
+        let metadata = format!("{base}/.well-known/oauth-protected-resource/secure/mcp");
+        let challenge = format!(r#"Bearer resource_metadata="{metadata}""#);
+        return (StatusCode::UNAUTHORIZED, [("www-authenticate", challenge)]).into_response();
     }
     let id = body["id"].clone();
     if id.is_null() {
@@ -81,19 +82,34 @@ async fn modern(
         "tools/call" => {
             let args = &params["arguments"];
             match params["name"].as_str() {
-                Some("lookup") => rpc(&id, text(format!("ticket {} is open", args["id"].as_str().unwrap_or("?")))),
+                Some("lookup") => {
+                    let ticket = args["id"].as_str().unwrap_or("?");
+                    rpc(&id, text(format!("ticket {ticket} is open")))
+                }
                 Some("purge") => rpc(&id, text("purged".into())),
                 Some("ask") => match params.get("inputResponses") {
-                    Some(answers) => rpc(&id, text(format!(
-                        "project {}",
-                        answers["q"]["content"]["project"].as_str().unwrap_or("none")
-                    ))),
-                    None => rpc(&id, json!({"resultType":"input_required","requestState":"state-1","inputRequests":{"q":{
-                        "method":"elicitation/create","params":{"message":"Which project?","requestedSchema":{
-                            "type":"object","properties":{"project":{"type":"string"}},"required":["project"]}}}}})),
+                    Some(answers) => {
+                        let project = answers["q"]["content"]["project"].as_str();
+                        rpc(&id, text(format!("project {}", project.unwrap_or("none"))))
+                    }
+                    None => {
+                        let schema = json!({"type":"object",
+                            "properties":{"project":{"type":"string"}},"required":["project"]});
+                        let question = json!({"method":"elicitation/create",
+                            "params":{"message":"Which project?","requestedSchema":schema}});
+                        rpc(
+                            &id,
+                            json!({"resultType":"input_required","requestState":"state-1",
+                                "inputRequests":{"q":question}}),
+                        )
+                    }
                 },
-                Some("widget") => rpc(&id, json!({"content":[{"type":"text","text":"board"}],"structuredContent":{"tickets":[1,2]}})),
-                _ => Json(json!({"jsonrpc":"2.0","id":id,"error":{"code":-32602,"message":"no such tool"}})).into_response(),
+                Some("widget") => rpc(
+                    &id,
+                    json!({"content":[{"type":"text","text":"board"}],
+                        "structuredContent":{"tickets":[1,2]}}),
+                ),
+                _ => rpc_error(&id, -32602, "no such tool"),
             }
         }
         "resources/read" => rpc(
@@ -102,10 +118,7 @@ async fn modern(
             "text":"<!doctype html><title>Board</title><p>tickets</p>",
             "_meta":{"ui":{"csp":{"connectDomains":["https://api.acme.example"]}}}}]}),
         ),
-        _ => Json(
-            json!({"jsonrpc":"2.0","id":id,"error":{"code":-32601,"message":"method not found"}}),
-        )
-        .into_response(),
+        _ => rpc_error(&id, -32601, "method not found"),
     }
 }
 
@@ -116,20 +129,24 @@ async fn legacy(
     Json(body): Json<Value>,
 ) -> axum::response::Response {
     let id = body["id"].clone();
+    let session = headers.get("mcp-session-id").and_then(|h| h.to_str().ok());
     match body["method"].as_str().unwrap_or_default() {
-        "server/discover" => Json(json!({"jsonrpc":"2.0","id":id,"error":{"code":-32601,"message":"method not found"}})).into_response(),
-        "initialize" => (
-            [("mcp-session-id", "session-1")],
-            Json(json!({"jsonrpc":"2.0","id":id,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"legacy","version":"1"}}})),
-        )
-            .into_response(),
-        _ if headers.get("mcp-session-id").and_then(|h| h.to_str().ok()) != Some("session-1") => {
-            StatusCode::BAD_REQUEST.into_response()
+        "server/discover" => rpc_error(&id, -32601, "method not found"),
+        "initialize" => {
+            let result = json!({"protocolVersion":"2025-06-18","capabilities":{"tools":{}},
+                "serverInfo":{"name":"legacy","version":"1"}});
+            ([("mcp-session-id", "session-1")], rpc(&id, result)).into_response()
         }
+        _ if session != Some("session-1") => StatusCode::BAD_REQUEST.into_response(),
         "notifications/initialized" => StatusCode::ACCEPTED.into_response(),
         "tools/list" => {
-            shared.lock().unwrap().calls.push((body.clone(), headers.clone()));
-            let event = json!({"jsonrpc":"2.0","id":id,"result":{"tools":[{"name":"echo","description":"Echo","inputSchema":{"type":"object"}}]}});
+            shared
+                .lock()
+                .unwrap()
+                .calls
+                .push((body.clone(), headers.clone()));
+            let tool = json!({"name":"echo","description":"Echo","inputSchema":{"type":"object"}});
+            let event = json!({"jsonrpc":"2.0","id":id,"result":{"tools":[tool]}});
             (
                 [("content-type", "text/event-stream")],
                 format!("event: message\ndata: {event}\n\n"),
@@ -140,40 +157,23 @@ async fn legacy(
     }
 }
 
+/// The acme-tracker package of `tests/fixtures`, its server at `base`.
 fn package(base: &str) -> Vec<u8> {
     use std::io::Write as _;
-    let plugin = json!({
-        "$schema": ryzhub_server::plugins::package::PLUGIN_SCHEMA,
-        "name": "acme-tracker",
-        "version": "1.0.0",
-        "description": "Acme tickets",
-        "extensions": {NS: {
-            "permissions": {"deny": ["purge"]},
-            "commands": [{"name": "triage", "title": "Triage", "prompt": format!("{NS}/commands/triage.md"),
-                          "params": {"project": {"type": "string"}}}],
-            "ui": {"mcpApps": true},
-            "userConfig": {"apiToken": {"type": "string", "secret": true, "header": "Authorization", "prefix": "Bearer "}},
-        }},
-    });
-    let mcp = json!({"$schema": ryzhub_server::plugins::package::MCP_SCHEMA,
-                     "mcpServers": {"acme": {"type": "streamable-http", "url": format!("{base}/mcp")}}});
-    let files = [
-        ("plugin.json".to_owned(), plugin.to_string()),
-        ("mcp.json".to_owned(), mcp.to_string()),
-        (
-            "skills/triage/SKILL.md".to_owned(),
-            "---\nname: triage\ndescription: Sort new tickets\n---\nRead each ticket.".to_owned(),
-        ),
-        (
-            format!("{NS}/commands/triage.md"),
-            "Triage the tickets of {{project}}.".to_owned(),
-        ),
-    ];
+    let root = common::workspace().join("crates/server/tests/fixtures/acme-tracker");
     let mut zip = zip::ZipWriter::new(std::io::Cursor::new(vec![]));
-    for (path, text) in files {
+    for path in [
+        "plugin.json",
+        "mcp.json",
+        "skills/triage/SKILL.md",
+        "skills/triage/checklist.md",
+        "app.ryzhub/commands/triage.md",
+    ] {
+        let text = std::fs::read_to_string(root.join(path)).unwrap();
         zip.start_file(path, zip::write::SimpleFileOptions::default())
             .unwrap();
-        zip.write_all(text.as_bytes()).unwrap();
+        zip.write_all(text.replace("https://mcp.acme.example", base).as_bytes())
+            .unwrap();
     }
     zip.finish().unwrap().into_inner()
 }
@@ -185,6 +185,52 @@ struct Authorize {
     code_challenge: String,
 }
 
+/// The authorization server's metadata.
+async fn authorization_server(State(s): State<Shared>) -> Json<Value> {
+    let fixture = s.lock().unwrap();
+    let base = &fixture.base;
+    let authorize = if fixture.private_authorize {
+        "https://10.0.0.1/authorize".to_owned()
+    } else {
+        format!("{base}/auth/authorize")
+    };
+    Json(
+        json!({"issuer":format!("{base}/auth"),"authorization_endpoint":authorize,
+        "token_endpoint":format!("{base}/auth/token"),
+        "registration_endpoint":format!("{base}/auth/register"),
+        "code_challenge_methods_supported":["S256"],
+        "authorization_response_iss_parameter_supported":true}),
+    )
+}
+
+/// Tokens for a code whose PKCE verifier matches, or for the refresh token.
+async fn token(State(s): State<Shared>, body: String) -> axum::response::Response {
+    let form: HashMap<String, String> = url::form_urlencoded::parse(body.as_bytes())
+        .into_owned()
+        .collect();
+    let field = |name: &str| form.get(name).map(String::as_str).unwrap_or_default();
+    let fixture = s.lock().unwrap();
+    let verifier = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(Sha256::digest(field("code_verifier").as_bytes()));
+    let granted = match field("grant_type") {
+        "authorization_code" => fixture.codes.get(field("code")) == Some(&verifier),
+        "refresh_token" => field("refresh_token") == "refresh-1",
+        _ => false,
+    };
+    if !granted || field("client_id") != "client-1" {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error":"invalid_grant"})),
+        )
+            .into_response();
+    }
+    Json(
+        json!({"access_token":"fixture-token","token_type":"Bearer","expires_in":3600,
+        "refresh_token":"refresh-1"}),
+    )
+    .into_response()
+}
+
 async fn serve_fixture() -> anyhow::Result<(Shared, String, JoinHandle<()>)> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let base = format!("http://{}", listener.local_addr()?);
@@ -194,15 +240,16 @@ async fn serve_fixture() -> anyhow::Result<(Shared, String, JoinHandle<()>)> {
         ..Default::default()
     }));
     let state = shared.clone();
+    let mcp = |secure: bool| {
+        post(
+            move |State(s): State<Shared>, h: HeaderMap, Json(b): Json<Value>| {
+                modern(s, h, b, secure)
+            },
+        )
+    };
     let app = Router::new()
-        .route(
-            "/mcp",
-            post(|State(s): State<Shared>, h: HeaderMap, Json(b): Json<Value>| modern(s, h, b, false)),
-        )
-        .route(
-            "/secure/mcp",
-            post(|State(s): State<Shared>, h: HeaderMap, Json(b): Json<Value>| modern(s, h, b, true)),
-        )
+        .route("/mcp", mcp(false))
+        .route("/secure/mcp", mcp(true))
         .route("/legacy", post(legacy))
         .route(
             "/catalog.json",
@@ -220,50 +267,39 @@ async fn serve_fixture() -> anyhow::Result<(Shared, String, JoinHandle<()>)> {
             "/.well-known/oauth-protected-resource/secure/mcp",
             get(|State(s): State<Shared>| async move {
                 let base = s.lock().unwrap().base.clone();
-                Json(json!({"resource":format!("{base}/secure/mcp"),"authorization_servers":[format!("{base}/auth")],"scopes_supported":["tickets"]}))
+                Json(json!({"resource":format!("{base}/secure/mcp"),
+                    "authorization_servers":[format!("{base}/auth")],
+                    "scopes_supported":["tickets"]}))
             }),
         )
         .route(
             "/.well-known/oauth-authorization-server/auth",
-            get(|State(s): State<Shared>| async move {
-                let fixture = s.lock().unwrap();
-                let base = &fixture.base;
-                let authorize = if fixture.private_authorize { "https://10.0.0.1/authorize".to_owned() } else { format!("{base}/auth/authorize") };
-                Json(json!({"issuer":format!("{base}/auth"),"authorization_endpoint":authorize,
-                    "token_endpoint":format!("{base}/auth/token"),"registration_endpoint":format!("{base}/auth/register"),
-                    "code_challenge_methods_supported":["S256"],"authorization_response_iss_parameter_supported":true}))
-            }),
+            get(authorization_server),
         )
-        .route("/auth/register", post(|| async { Json(json!({"client_id":"client-1"})) }))
+        .route(
+            "/auth/register",
+            post(|| async { Json(json!({"client_id":"client-1"})) }),
+        )
         .route(
             "/auth/authorize",
-            get(|State(s): State<Shared>, Query(q): Query<Authorize>| async move {
-                let mut fixture = s.lock().unwrap();
-                fixture.codes.insert("code-1".into(), q.code_challenge.clone());
-                let iss = format!("{}/auth", fixture.base);
-                let mut target = url::Url::parse(&q.redirect_uri).unwrap();
-                target.query_pairs_mut().append_pair("code", "code-1").append_pair("state", &q.state).append_pair("iss", &iss);
-                axum::response::Redirect::to(target.as_str())
-            }),
+            get(
+                |State(s): State<Shared>, Query(q): Query<Authorize>| async move {
+                    let mut fixture = s.lock().unwrap();
+                    fixture
+                        .codes
+                        .insert("code-1".into(), q.code_challenge.clone());
+                    let iss = format!("{}/auth", fixture.base);
+                    let mut target = url::Url::parse(&q.redirect_uri).unwrap();
+                    target
+                        .query_pairs_mut()
+                        .append_pair("code", "code-1")
+                        .append_pair("state", &q.state)
+                        .append_pair("iss", &iss);
+                    axum::response::Redirect::to(target.as_str())
+                },
+            ),
         )
-        .route(
-            "/auth/token",
-            post(|State(s): State<Shared>, body: String| async move {
-                let form: HashMap<String, String> = url::form_urlencoded::parse(body.as_bytes()).into_owned().collect();
-                let fixture = s.lock().unwrap();
-                let verified = match form.get("grant_type").map(String::as_str) {
-                    Some("authorization_code") => fixture.codes.get(form.get("code").map(String::as_str).unwrap_or_default())
-                        .is_some_and(|challenge| *challenge == base64::engine::general_purpose::URL_SAFE_NO_PAD
-                            .encode(Sha256::digest(form.get("code_verifier").cloned().unwrap_or_default().as_bytes()))),
-                    Some("refresh_token") => form.get("refresh_token").map(String::as_str) == Some("refresh-1"),
-                    _ => false,
-                } && form.get("client_id").map(String::as_str) == Some("client-1");
-                if !verified {
-                    return (StatusCode::BAD_REQUEST, Json(json!({"error":"invalid_grant"}))).into_response();
-                }
-                Json(json!({"access_token":"fixture-token","token_type":"Bearer","expires_in":3600,"refresh_token":"refresh-1"})).into_response()
-            }),
-        )
+        .route("/auth/token", post(token))
         .with_state(state);
     let task = tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
@@ -862,7 +898,7 @@ async fn plugin_requests_stay_public_and_accounts_connect_by_oauth() -> anyhow::
 #[tokio::test]
 #[ignore = "requires PostgreSQL/NATS and test gateway secrets"]
 async fn work_gateway_asks_once_for_tools_that_need_approval() -> anyhow::Result<()> {
-    let (_fixture, base, fixture_task) = serve_fixture().await?;
+    let (fixture, base, fixture_task) = serve_fixture().await?;
     let h = Harness::with(|c| {
         c.policy.approval_required_tools = Some(["acme-tracker__lookup".to_owned()].into());
     })
@@ -885,8 +921,16 @@ async fn work_gateway_asks_once_for_tools_that_need_approval() -> anyhow::Result
         .fetch_one(&h.db)
         .await?;
     let sandbox = Uuid::now_v7();
-    sqlx::query("INSERT INTO sandboxes(id,org_id,conversation_id,run_id,lease_epoch,exec_epoch,state,handle) VALUES($1,$2,$3,$4,7,1,'running','{}')")
-        .bind(sandbox).bind(org).bind(conv).bind(run).execute(&h.db).await?;
+    sqlx::query(
+        "INSERT INTO sandboxes(id,org_id,conversation_id,run_id,lease_epoch,exec_epoch,state,handle)
+         VALUES($1,$2,$3,$4,7,1,'running','{}')",
+    )
+    .bind(sandbox)
+    .bind(org)
+    .bind(conv)
+    .bind(run)
+    .execute(&h.db)
+    .await?;
     let token = keys::issue_sandbox_key(
         &h.app.store,
         keys::SandboxKeyRequest {
@@ -916,6 +960,10 @@ async fn work_gateway_asks_once_for_tools_that_need_approval() -> anyhow::Result
             anyhow::Ok(value)
         }
     };
+    let call = |id: u64, tool: &str, arguments: Value| {
+        json!({"jsonrpc":"2.0","id":id,"method":"tools/call",
+            "params":{"name":tool,"arguments":arguments}})
+    };
     let listed = mcp(json!({"jsonrpc":"2.0","id":1,"method":"tools/list"})).await?;
     let names: Vec<&str> = listed["result"]["tools"]
         .as_array()
@@ -928,45 +976,73 @@ async fn work_gateway_asks_once_for_tools_that_need_approval() -> anyhow::Result
         "{names:?}"
     );
     // Tools that need no approval run at once.
-    let widget = mcp(json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"acme-tracker__widget","arguments":{}}})).await?;
+    let widget = mcp(call(2, "acme-tracker__widget", json!({}))).await?;
     assert_eq!(
         widget["result"]["structuredContent"]["tickets"],
         json!([1, 2])
     );
-    // A marked tool called around the harness waits for the member.
-    let waiting = tokio::spawn(mcp(
-        json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"acme-tracker__lookup","arguments":{"id":"7"}}}),
-    ));
-    let action: Uuid = async {
-        for _ in 0..100 {
-            if let Some(action) = sqlx::query_scalar::<_, Uuid>("SELECT id FROM pending_actions WHERE run_id=$1 AND status='pending' AND kind='approval'")
-                .bind(run).fetch_optional(&h.db).await? {
-                return anyhow::Ok(action);
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+    // A marked tool called around the harness waits for the member, asked in the timeline.
+    let lookups = || {
+        let fixture = fixture.lock().unwrap();
+        let calls = fixture.calls.iter().map(|(body, _)| body);
+        calls
+            .filter(|b| b["method"] == "tools/call" && b["params"]["name"] == "lookup")
+            .count()
+    };
+    let lookup = call(3, "acme-tracker__lookup", json!({"id":"7"}));
+    let waiting = tokio::spawn(mcp(lookup.clone()));
+    for _ in 0..100 {
+        let calls: i64 = sqlx::query_scalar("SELECT count(*) FROM mcp_calls WHERE run_id=$1")
+            .bind(run)
+            .fetch_one(&h.db)
+            .await?;
+        if calls == 1 {
+            break;
         }
-        anyhow::bail!("no approval asked")
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    .await?;
-    sqlx::query("UPDATE pending_actions SET status='allow' WHERE id=$1")
-        .bind(action)
-        .execute(&h.db)
-        .await?;
+    assert_eq!(lookups(), 0, "ran before the member decided");
+    ryzhub_server::mcp::project(&h.app, &lease, run).await?;
+    let (action, epoch) = h.action(run).await?;
+    let decision = Command::DecideApproval(DecideApproval {
+        action_id: action.to_string(),
+        run_epoch: epoch as u64,
+        decision: "allow".into(),
+    });
+    h.send(&user, conv, decision).await?;
+    owner::process_with_config(&h.app.store, &lease, &h.app.config).await?;
     let answered = waiting.await??;
     assert!(
         answered["result"].to_string().contains("ticket 7 is open"),
         "{answered}"
     );
+    // The same request again is answered without running again; its id cannot be reused.
+    assert_eq!(mcp(lookup.clone()).await?, answered);
+    let mut reused = lookup;
+    reused["params"]["arguments"]["id"] = json!("9");
+    assert_eq!(mcp(reused).await?["error"]["message"], "REQUEST_ID_REUSED");
+    assert_eq!(lookups(), 1);
     // Approved in the harness already: the gateway takes that approval and does not ask again.
     let epoch: i64 = sqlx::query_scalar("SELECT exec_epoch FROM runs WHERE id=$1")
         .bind(run)
         .fetch_one(&h.db)
         .await?;
-    sqlx::query("INSERT INTO approval_grants(id,org_id,run_id,exec_epoch,tool,args_digest,expires_at) VALUES($1,$2,$3,$4,$5,$6,now()+interval '1 hour')")
-        .bind(Uuid::now_v7()).bind(org).bind(run).bind(epoch).bind("acme-tracker__lookup")
-        .bind(ryzhub_server::mcp::digest("acme-tracker__lookup", &json!({"id":"8"})))
-        .execute(&h.db).await?;
-    let granted = mcp(json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"acme-tracker__lookup","arguments":{"id":"8"}}})).await?;
+    sqlx::query(
+        "INSERT INTO approval_grants(id,org_id,run_id,exec_epoch,tool,args_digest,expires_at)
+         VALUES($1,$2,$3,$4,$5,$6,now()+interval '1 hour')",
+    )
+    .bind(Uuid::now_v7())
+    .bind(org)
+    .bind(run)
+    .bind(epoch)
+    .bind("acme-tracker__lookup")
+    .bind(ryzhub_server::mcp::digest(
+        "acme-tracker__lookup",
+        &json!({"id":"8"}),
+    ))
+    .execute(&h.db)
+    .await?;
+    let granted = mcp(call(4, "acme-tracker__lookup", json!({"id":"8"}))).await?;
     assert!(granted["result"].to_string().contains("ticket 8 is open"));
     let asked: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM pending_actions WHERE run_id=$1 AND kind='approval'",

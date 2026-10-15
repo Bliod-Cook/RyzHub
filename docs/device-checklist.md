@@ -7,8 +7,8 @@ Windows 与 Android 的原生行为只能在实际设备上确认。开发机（
 ## 准备
 
 - Windows：Visual Studio C++ 工具链，开启开发者模式（pdfrx 需要），运行 `scripts/build-windows.ps1`。
-- Android：SDK、NDK、`cargo-ndk` 与三个 Rust Android target，运行 `scripts/build-android.sh`。要测通知，先把 Firebase 项目的 `google-services.json` 放到 `client/android/app/`，服务端配置 `[push] enabled = true` 与服务账号密钥（README“Android 通知”）。
-- 服务端：dev 栈或任意可达的实例。Work 相关项目需要执行节点。
+- Android：SDK、NDK、`cargo-ndk` 与三个 Rust Android target，运行 `scripts/build-android.sh`。要测通知，先把 Firebase 项目的 `google-services.json` 放到 `client/android/app/`，服务端配置 `[push] enabled = true` 与 `fcm_credentials`（Firebase 服务账号密钥）。
+- 服务端：设备可达的任意实例。Work 相关项目需要执行节点。
 
 ## Windows
 
@@ -43,8 +43,3 @@ Windows 与 Android 的原生行为只能在实际设备上确认。开发机（
 - [ ] 帧率：长对话滚动与流式输出时记录帧率（`flutter run --profile` 的性能浮层）。
 
 记录：
-
-## Web（已做的与仍需做的）
-
-- 已做：`scripts/web-metrics.py` 测量首次绘制、资源体积与 `crossOriginIsolated`；`scripts/browser-*.py` 浏览器回归脚本覆盖主要交互。
-- 仍需：首次显示中文的时间与弱网下的分位数（需要可控的网络环境）。

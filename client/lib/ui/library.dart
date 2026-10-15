@@ -212,9 +212,7 @@ class LibraryViewState extends State<LibraryView> {
         : tr('上传', 'Upload');
     return FilledButton.icon(
       style: FilledButton.styleFrom(
-        padding: EdgeInsets.symmetric(
-          horizontal: compact ? Space.s14 : Space.s18,
-        ),
+        padding: EdgeInsets.symmetric(horizontal: compact ? Space.inset : 18),
         // As tall as the search box beside it, at any density.
         visualDensity: VisualDensity.standard,
         minimumSize: const Size(0, 40),
@@ -267,7 +265,7 @@ class LibraryViewState extends State<LibraryView> {
           for (final MapEntry(key: id, value: (label, _, _))
               in _filters.entries)
             Padding(
-              padding: const EdgeInsets.only(right: Space.s4),
+              padding: const EdgeInsets.only(right: 4),
               child: _FilterTab(
                 label: label(),
                 selected: filter == id,
@@ -291,7 +289,7 @@ class LibraryViewState extends State<LibraryView> {
           Row(
             children: [
               Expanded(child: search),
-              const SizedBox(width: 8),
+              const SizedBox(width: Space.gap),
               toggle,
             ],
           ),
@@ -324,7 +322,7 @@ class LibraryViewState extends State<LibraryView> {
     final narrowed = query.trim().isNotEmpty || filter != 'all';
     return Center(
       child: Padding(
-        padding: const EdgeInsets.all(Space.s24),
+        padding: const EdgeInsets.all(24),
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
@@ -335,25 +333,11 @@ class LibraryViewState extends State<LibraryView> {
                   ? tr('没有匹配的文件', 'No matching files')
                   : tr('还没有文件', 'No files yet'),
               style: TextStyle(
-                fontSize: 16,
+                fontSize: FontSizes.title,
                 fontWeight: FontWeight.w500,
                 color: c.text,
               ),
             ),
-            if (!narrowed) ...[
-              const SizedBox(height: 6),
-              ConstrainedBox(
-                constraints: const BoxConstraints(maxWidth: 420),
-                child: Text(
-                  tr(
-                    '上传的文件会保存在这里，可以在任意对话中再次使用。删除文件会把它从所有对话中移除；删除对话不会删除文件。',
-                    'Files you upload stay here and can be used in any conversation. Deleting a file removes it from every conversation; deleting a conversation keeps its files.',
-                  ),
-                  textAlign: TextAlign.center,
-                  style: TextStyle(fontSize: 13, color: c.subtle),
-                ),
-              ),
-            ],
           ],
         ),
       ),
@@ -370,7 +354,7 @@ class LibraryViewState extends State<LibraryView> {
             mainAxisSize: MainAxisSize.min,
             children: [
               Text(error, style: TextStyle(color: c.danger)),
-              const SizedBox(height: 8),
+              const SizedBox(height: Space.gap),
               TextButton(onPressed: load, child: Text(tr('重试', 'Retry'))),
             ],
           ),
@@ -385,9 +369,9 @@ class LibraryViewState extends State<LibraryView> {
         SliverPadding(
           padding: EdgeInsets.fromLTRB(
             side,
-            list ? Space.s8 : Space.s16,
+            list ? Space.gap : Space.edge,
             side,
-            Space.s16,
+            Space.edge,
           ),
           sliver: list
               ? SliverList.builder(
@@ -418,7 +402,7 @@ class LibraryViewState extends State<LibraryView> {
         ),
         SliverToBoxAdapter(
           child: Padding(
-            padding: const EdgeInsets.only(bottom: Space.s24),
+            padding: const EdgeInsets.only(bottom: 24),
             child: Center(
               child: busy && paging
                   ? SizedBox(
@@ -446,13 +430,13 @@ class LibraryViewState extends State<LibraryView> {
   Widget build(BuildContext context) {
     return LayoutBuilder(
       builder: (context, box) {
-        final narrow = box.maxWidth < 640;
+        final narrow = box.maxWidth < narrowWidth;
         final side = max(narrow ? 16.0 : 32.0, (box.maxWidth - _width) / 2);
         return Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
             Padding(
-              padding: EdgeInsets.fromLTRB(side, Space.s4, side, Space.s4),
+              padding: EdgeInsets.fromLTRB(side, 4, side, 4),
               child: header(narrow),
             ),
             // A refresh keeps the files on screen under a thin bar.
@@ -529,13 +513,13 @@ class _FilterTab extends StatelessWidget {
           onTap: onTap,
           child: Padding(
             padding: const EdgeInsets.symmetric(
-              horizontal: Space.s16,
-              vertical: Space.s8,
+              horizontal: 16,
+              vertical: Space.gap,
             ),
             child: Text(
               label,
               style: TextStyle(
-                fontSize: 14,
+                fontSize: FontSizes.body,
                 color: selected ? c.text : c.muted,
               ),
             ),
@@ -631,7 +615,7 @@ class _FileCard extends StatelessWidget {
         color: image ? c.hover : c.background,
         clipBehavior: Clip.antiAlias,
         shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(16),
+          borderRadius: BorderRadius.circular(Radii.card),
           side: BorderSide(color: c.border),
         ),
         child: Stack(
@@ -657,25 +641,23 @@ class _FileCard extends StatelessWidget {
                         )
                       : Padding(
                           padding: const EdgeInsets.fromLTRB(
-                            Space.s18,
-                            Space.s16,
-                            Space.s18,
-                            Space.s16,
+                            18,
+                            Space.edge,
+                            18,
+                            Space.edge,
                           ),
                           child: Column(
                             crossAxisAlignment: CrossAxisAlignment.start,
                             children: [
                               Padding(
                                 // Clear of the menu in the corner.
-                                padding: const EdgeInsets.only(
-                                  right: Space.s20,
-                                ),
+                                padding: const EdgeInsets.only(right: 20),
                                 child: Text(
                                   name,
                                   maxLines: 2,
                                   overflow: TextOverflow.ellipsis,
                                   style: TextStyle(
-                                    fontSize: 15,
+                                    fontSize: FontSizes.message,
                                     height: 1.35,
                                     color: c.text,
                                   ),
@@ -698,7 +680,7 @@ class _FileCard extends StatelessWidget {
                                 maxLines: 1,
                                 overflow: TextOverflow.ellipsis,
                                 style: TextStyle(
-                                  fontSize: 12.5,
+                                  fontSize: FontSizes.caption,
                                   color: c.subtle,
                                 ),
                               ),
@@ -721,12 +703,7 @@ class _FileCard extends StatelessWidget {
                     opacity: hovered || touchPlatform ? 1 : 0,
                     duration: const Duration(milliseconds: 120),
                     child: Container(
-                      padding: const EdgeInsets.fromLTRB(
-                        Space.s12,
-                        Space.s24,
-                        Space.s12,
-                        Space.s10,
-                      ),
+                      padding: const EdgeInsets.fromLTRB(12, 24, 12, 10),
                       decoration: BoxDecoration(
                         gradient: LinearGradient(
                           begin: Alignment.topCenter,
@@ -742,7 +719,7 @@ class _FileCard extends StatelessWidget {
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
                         style: const TextStyle(
-                          fontSize: 13,
+                          fontSize: FontSizes.label,
                           color: Colors.white,
                         ),
                       ),
@@ -791,7 +768,7 @@ class _FileRow extends StatelessWidget {
     return Hover(
       builder: (context, hovered) => Material(
         color: hovered ? c.hover : Colors.transparent,
-        borderRadius: BorderRadius.circular(12),
+        borderRadius: BorderRadius.circular(Radii.field),
         child: Row(
           children: [
             Expanded(
@@ -799,47 +776,19 @@ class _FileRow extends StatelessWidget {
                 container: true,
                 button: true,
                 child: InkWell(
-                  borderRadius: BorderRadius.circular(12),
+                  borderRadius: BorderRadius.circular(Radii.field),
                   onTap: onOpen,
                   child: Padding(
                     padding: const EdgeInsets.symmetric(
-                      horizontal: Space.s10,
-                      vertical: Space.s9,
+                      horizontal: 10,
+                      vertical: 9,
                     ),
-                    child: Row(
-                      children: [
-                        FileThumbnail(
-                          hub: hub,
-                          name: name,
-                          id: file['id'] as String,
-                          kind: file['kind'] as String?,
-                          size: 40,
-                        ),
-                        const SizedBox(width: 12),
-                        Expanded(
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Text(
-                                name,
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                                style: TextStyle(fontSize: 14, color: c.text),
-                              ),
-                              const SizedBox(height: 2),
-                              Text(
-                                details,
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                                style: TextStyle(
-                                  fontSize: 12.5,
-                                  color: c.subtle,
-                                ),
-                              ),
-                            ],
-                          ),
-                        ),
-                      ],
+                    child: FileTile(
+                      hub: hub,
+                      name: name,
+                      id: file['id'] as String,
+                      kind: file['kind'] as String?,
+                      details: details,
                     ),
                   ),
                 ),
@@ -849,7 +798,7 @@ class _FileRow extends StatelessWidget {
               visible: hovered,
               child: _FileMenu(onAction: onAction),
             ),
-            const SizedBox(width: 8),
+            const SizedBox(width: Space.gap),
           ],
         ),
       ),

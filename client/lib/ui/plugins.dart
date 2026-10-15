@@ -7,6 +7,7 @@ import 'package:url_launcher/url_launcher.dart';
 import '../controller.dart';
 import '../l10n.dart';
 import '../theme.dart';
+import 'common.dart';
 import 'dialogs.dart';
 import 'settings.dart';
 
@@ -28,10 +29,7 @@ class TrustBadge extends StatelessWidget {
       _ => c.warning,
     };
     return Container(
-      padding: const EdgeInsets.symmetric(
-        horizontal: Space.s6,
-        vertical: Space.s1,
-      ),
+      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
       decoration: BoxDecoration(
         border: Border.all(color: color),
         borderRadius: BorderRadius.circular(4),
@@ -53,36 +51,9 @@ class PluginSettings extends StatefulWidget {
 }
 
 class _PluginSettingsState extends State<PluginSettings> {
-  List<dynamic> plugins = [];
-  bool loading = true, enabled = true;
+  final loader = GlobalKey<LoaderState<dynamic>>();
   String error = '';
   HubController get hub => widget.hub;
-
-  @override
-  void initState() {
-    super.initState();
-    load();
-  }
-
-  Future<void> load() async {
-    try {
-      final data = await hub.plugins();
-      if (!mounted) return;
-      setState(() {
-        plugins = data['plugins'] as List;
-        enabled = data['enabled'] != false;
-        loading = false;
-        error = '';
-      });
-    } catch (e) {
-      if (mounted) {
-        setState(() {
-          loading = false;
-          error = errorText(e);
-        });
-      }
-    }
-  }
 
   Future<void> act(Future<dynamic> Function() task) async {
     setState(() => error = '');
@@ -91,59 +62,54 @@ class _PluginSettingsState extends State<PluginSettings> {
     } catch (e) {
       if (mounted) setState(() => error = errorText(e));
     }
-    await load();
+    loader.currentState?.reload();
   }
 
   @override
   Widget build(BuildContext context) {
     final c = HubColors.of(context);
-    if (loading) {
-      return const Center(child: CircularProgressIndicator());
-    }
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      children: [
-        if (error.isNotEmpty)
-          Padding(
-            padding: const EdgeInsets.only(bottom: Space.s12),
-            child: SelectableText(error, style: TextStyle(color: c.danger)),
-          ),
-        SettingsCard(
-          title: tr('已安装', 'Installed'),
-          children: [
-            if (plugins.isEmpty)
-              SettingRow(
-                title: tr('还没有插件', 'No plugins yet'),
-                subtitle: tr(
-                  '插件为对话带来外部工具、技能和命令',
-                  'Plugins bring outside tools, skills and commands to conversations',
+    return Loader<dynamic>(
+      key: loader,
+      load: hub.plugins,
+      builder: (context, data, reload) => Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          if (error.isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 12),
+              child: SelectableText(error, style: TextStyle(color: c.danger)),
+            ),
+          SettingsCard(
+            title: tr('已安装', 'Installed'),
+            children: [
+              if ((data['plugins'] as List).isEmpty)
+                SettingRow(title: tr('还没有插件', 'No plugins yet')),
+              for (final p in data['plugins'] as List)
+                _PluginTile(
+                  plugin: Map<String, dynamic>.from(p),
+                  hub: hub,
+                  act: act,
                 ),
-              ),
-            for (final p in plugins)
-              _PluginTile(
-                plugin: Map<String, dynamic>.from(p),
-                hub: hub,
-                act: act,
-              ),
-          ],
-        ),
-        Align(
-          alignment: Alignment.centerLeft,
-          child: FilledButton.icon(
-            icon: const Icon(Icons.add, size: 18),
-            label: Text(tr('安装插件', 'Install a plugin')),
-            onPressed: !enabled
-                ? null
-                : () async {
-                    final installed = await showDialog<bool>(
-                      context: context,
-                      builder: (_) => InstallPluginDialog(hub: hub),
-                    );
-                    if (installed == true) await load();
-                  },
+            ],
           ),
-        ),
-      ],
+          Align(
+            alignment: Alignment.centerLeft,
+            child: FilledButton.icon(
+              icon: const Icon(Icons.add, size: 18),
+              label: Text(tr('安装插件', 'Install a plugin')),
+              onPressed: data['enabled'] == false
+                  ? null
+                  : () async {
+                      final installed = await showDialog<bool>(
+                        context: context,
+                        builder: (_) => InstallPluginDialog(hub: hub),
+                      );
+                      if (installed == true) reload();
+                    },
+            ),
+          ),
+        ],
+      ),
     );
   }
 }
@@ -174,7 +140,7 @@ class _PluginTile extends StatelessWidget {
       data: Theme.of(context).copyWith(dividerColor: Colors.transparent),
       child: ExpansionTile(
         tilePadding: EdgeInsets.zero,
-        childrenPadding: const EdgeInsets.only(bottom: Space.s12),
+        childrenPadding: const EdgeInsets.only(bottom: 12),
         expandedCrossAxisAlignment: CrossAxisAlignment.start,
         title: Row(
           children: [
@@ -185,19 +151,19 @@ class _PluginTile extends StatelessWidget {
                 style: TextStyle(color: c.text),
               ),
             ),
-            const SizedBox(width: 8),
+            const SizedBox(width: Space.gap),
             TrustBadge(plugin['trust'] as String?),
             if (plugin['blocked'] == true) ...[
-              const SizedBox(width: 8),
+              const SizedBox(width: Space.gap),
               Text(
                 tr('已被停用', 'Stopped by admin'),
-                style: TextStyle(fontSize: 12, color: c.danger),
+                style: TextStyle(fontSize: FontSizes.caption, color: c.danger),
               ),
             ] else if (waiting) ...[
-              const SizedBox(width: 8),
+              const SizedBox(width: Space.gap),
               Text(
                 tr('有变更待确认', 'Changes to confirm'),
-                style: TextStyle(fontSize: 12, color: c.warning),
+                style: TextStyle(fontSize: FontSizes.caption, color: c.warning),
               ),
             ],
           ],
@@ -211,7 +177,7 @@ class _PluginTile extends StatelessWidget {
           ].join(' · '),
           maxLines: 2,
           overflow: TextOverflow.ellipsis,
-          style: TextStyle(fontSize: 12, color: c.muted),
+          style: TextStyle(fontSize: FontSizes.caption, color: c.muted),
         ),
         trailing: Switch(
           value: plugin['enabled'] == true,
@@ -221,11 +187,11 @@ class _PluginTile extends StatelessWidget {
           for (final warning in (plugin['warnings'] as List? ?? []))
             Text(
               '⚠ $warning',
-              style: TextStyle(fontSize: 12, color: c.warning),
+              style: TextStyle(fontSize: FontSizes.caption, color: c.warning),
             ),
           for (final tool in tools)
             Padding(
-              padding: const EdgeInsets.symmetric(vertical: Space.s2),
+              padding: const EdgeInsets.symmetric(vertical: 2),
               child: Text(
                 [
                   '${tool['tool']}',
@@ -236,15 +202,15 @@ class _PluginTile extends StatelessWidget {
                         : tr('描述已变更，待确认', 'description changed, to confirm'),
                 ].join(' · '),
                 style: TextStyle(
-                  fontSize: 13,
+                  fontSize: FontSizes.label,
                   color: tool['confirmed'] == true ? c.text : c.warning,
                 ),
               ),
             ),
-          const SizedBox(height: 8),
+          const SizedBox(height: Space.gap),
           Wrap(
-            spacing: 8,
-            runSpacing: 8,
+            spacing: Space.gap,
+            runSpacing: Space.gap,
             children: [
               if (waiting)
                 FilledButton(
@@ -367,7 +333,7 @@ class _ConfirmChanges extends StatelessWidget {
                 ),
                 for (final tool in changed)
                   Padding(
-                    padding: const EdgeInsets.only(top: Space.s6),
+                    padding: const EdgeInsets.only(top: 6),
                     child: SelectableText(
                       '${tool['tool']}: ${tool['description'] ?? ''}',
                     ),
@@ -405,15 +371,15 @@ class PluginDescription extends StatelessWidget {
     final ui = preview['ui'] as Map? ?? {};
     Widget block(String text) => Container(
       width: double.infinity,
-      margin: const EdgeInsets.only(top: Space.s6),
-      padding: const EdgeInsets.all(Space.s10),
+      margin: const EdgeInsets.only(top: 6),
+      padding: const EdgeInsets.all(10),
       decoration: BoxDecoration(
         color: c.code,
-        borderRadius: BorderRadius.circular(6),
+        borderRadius: BorderRadius.circular(Radii.small),
       ),
       child: SelectableText(
         text,
-        style: const TextStyle(fontFamily: '0xProto', fontSize: 12),
+        style: codeStyle.copyWith(fontSize: FontSizes.caption),
       ),
     );
     return Column(
@@ -424,16 +390,16 @@ class PluginDescription extends StatelessWidget {
             Flexible(
               child: Text(
                 '${preview['name']}',
-                style: heading.copyWith(fontSize: 16),
+                style: heading.copyWith(fontSize: FontSizes.title),
               ),
             ),
-            const SizedBox(width: 8),
+            const SizedBox(width: Space.gap),
             TrustBadge(preview['trust'] as String?),
           ],
         ),
         if ('${preview['description'] ?? ''}'.isNotEmpty)
           Padding(
-            padding: const EdgeInsets.only(top: Space.s4),
+            padding: const EdgeInsets.only(top: 4),
             child: Text(
               '${preview['description']}',
               style: TextStyle(color: c.muted),
@@ -441,33 +407,33 @@ class PluginDescription extends StatelessWidget {
           ),
         if (preview['trust'] == 'unverified')
           Padding(
-            padding: const EdgeInsets.only(top: Space.s6),
+            padding: const EdgeInsets.only(top: 6),
             child: Text(
-              tr(
-                '未经签名或官方审核。请确认你信任它的来源。',
-                'Neither signed nor reviewed. Make sure you trust where it comes from.',
-              ),
-              style: TextStyle(color: c.warning, fontSize: 12),
+              tr('请确认你信任它的来源', 'Make sure you trust its source'),
+              style: TextStyle(color: c.warning, fontSize: FontSizes.caption),
             ),
           ),
         for (final warning in (preview['warnings'] as List? ?? []))
-          Text('⚠ $warning', style: TextStyle(fontSize: 12, color: c.warning)),
+          Text(
+            '⚠ $warning',
+            style: TextStyle(fontSize: FontSizes.caption, color: c.warning),
+          ),
         const SizedBox(height: 12),
         Text(tr('连接的服务', 'Servers it connects to'), style: heading),
         for (final s in (preview['servers'] as List? ?? []))
           Padding(
-            padding: const EdgeInsets.only(top: Space.s4),
+            padding: const EdgeInsets.only(top: 4),
             child: SelectableText(
               s['enabled'] == true
                   ? '${s['name']}: ${s['url']}'
                   : '${s['name']}: ${tr('（本地，不启用）', '(local, not run)')}',
-              style: const TextStyle(fontSize: 13),
+              style: const TextStyle(fontSize: FontSizes.label),
             ),
           ),
         const SizedBox(height: 12),
         Text(tr('权限', 'Permissions'), style: heading),
         Padding(
-          padding: const EdgeInsets.only(top: Space.s4),
+          padding: const EdgeInsets.only(top: 4),
           child: Text(
             [
               '${tr('工具默认', 'Tools by default')}: ${rules['default'] ?? 'ask'}',
@@ -476,10 +442,8 @@ class PluginDescription extends StatelessWidget {
                 '${e.key}: ${e.value}',
               if (ui['mcpApps'] == true)
                 tr('可显示网页界面（MCP Apps）', 'May show web pages (MCP Apps)'),
-              if (ui['declarative'] == true)
-                tr('可显示卡片与表单', 'May show cards and forms'),
             ].join('\n'),
-            style: const TextStyle(fontSize: 13),
+            style: const TextStyle(fontSize: FontSizes.label),
           ),
         ),
         if ((preview['tools'] as List? ?? []).isNotEmpty) ...[
@@ -487,10 +451,10 @@ class PluginDescription extends StatelessWidget {
           Text(tr('工具', 'Tools'), style: heading),
           for (final t in (preview['tools'] as List))
             Padding(
-              padding: const EdgeInsets.only(top: Space.s4),
+              padding: const EdgeInsets.only(top: 4),
               child: SelectableText(
                 '${t['name']}: ${t['description'] ?? ''}',
-                style: const TextStyle(fontSize: 13),
+                style: const TextStyle(fontSize: FontSizes.label),
               ),
             ),
         ],
@@ -505,7 +469,7 @@ class PluginDescription extends StatelessWidget {
                     '${u['server']} 暂时无法访问',
                     '${u['server']} cannot be reached now',
                   ),
-            style: TextStyle(fontSize: 12, color: c.muted),
+            style: TextStyle(fontSize: FontSizes.caption, color: c.muted),
           ),
         for (final skill in (preview['skills'] as List? ?? [])) ...[
           const SizedBox(height: 12),
@@ -522,73 +486,99 @@ class PluginDescription extends StatelessWidget {
   }
 }
 
+/// A plugin's settings, the secret ones apart.
 class _Settings {
   final Map<String, dynamic> config, secrets;
   const _Settings(this.config, this.secrets);
+
+  /// [values] given for the settings [fields].
+  factory _Settings.of(Map fields, Map<String, dynamic> values) {
+    bool secret(String key) => (fields[key] as Map?)?['secret'] == true;
+    return _Settings(
+      {
+        for (final MapEntry(:key, :value) in values.entries)
+          if (!secret(key)) key: value,
+      },
+      {
+        for (final MapEntry(:key, :value) in values.entries)
+          if (secret(key)) key: value,
+      },
+    );
+  }
 }
 
-/// The plugin's settings as a form; secret ones are never shown back, only replaced.
-class SettingsForm extends StatefulWidget {
-  final Map<String, dynamic> fields;
+/// Fields for a JSON schema's [properties]: a switch for a boolean, a menu for
+/// a choice, else a text field. A required field's label ends in *, and a
+/// secret one is never shown back. [onChanged] gets what is given, from the
+/// start: numbers as numbers, empty text left out.
+class SchemaForm extends StatefulWidget {
+  final Map<String, dynamic> properties;
+  final List<String> required;
   final Map<String, dynamic> values;
+
+  /// Secret fields that already have a value.
   final List<String> secretsSet;
-  final void Function(Map<String, dynamic> config, Map<String, dynamic> secrets)
-  onChanged;
-  const SettingsForm({
+  final bool enabled;
+  final ValueChanged<Map<String, dynamic>> onChanged;
+  const SchemaForm({
     super.key,
-    required this.fields,
+    required this.properties,
+    required this.onChanged,
+    this.required = const [],
     this.values = const {},
     this.secretsSet = const [],
-    required this.onChanged,
+    this.enabled = true,
   });
   @override
-  State<SettingsForm> createState() => _SettingsFormState();
+  State<SchemaForm> createState() => _SchemaFormState();
 }
 
-class _SettingsFormState extends State<SettingsForm> {
-  final config = <String, dynamic>{}, secrets = <String, dynamic>{};
-  final controllers = <String, TextEditingController>{};
+class _SchemaFormState extends State<SchemaForm> {
+  /// Switches and menus by field.
+  final picked = <String, dynamic>{};
+  final texts = <String, TextEditingController>{};
+
+  Map<String, dynamic> get values => {
+    ...picked,
+    for (final MapEntry(:key, :value) in texts.entries)
+      if (value.text.trim().isNotEmpty)
+        key: switch ((widget.properties[key] as Map)['type']) {
+          'number' ||
+          'integer' => num.tryParse(value.text.trim()) ?? value.text.trim(),
+          _ => value.text.trim(),
+        },
+  };
 
   @override
   void initState() {
     super.initState();
-    for (final MapEntry(:key, :value) in widget.fields.entries) {
+    for (final MapEntry(:key, :value) in widget.properties.entries) {
       final field = value as Map;
+      final initial = field['secret'] == true
+          ? null
+          : widget.values[key] ?? field['default'];
       if (field['type'] == 'boolean') {
-        config[key] = widget.values[key] ?? field['default'] ?? false;
+        picked[key] = initial == true;
+      } else if (field['enum'] is List) {
+        if (initial != null) picked[key] = initial;
       } else {
-        controllers[key] = TextEditingController(
-          text: field['secret'] == true
-              ? ''
-              : '${widget.values[key] ?? field['default'] ?? ''}',
-        );
+        texts[key] = TextEditingController(text: '${initial ?? ''}');
       }
     }
+    widget.onChanged(values);
   }
 
   @override
   void dispose() {
-    for (final c in controllers.values) {
-      c.dispose();
+    for (final text in texts.values) {
+      text.dispose();
     }
     super.dispose();
   }
 
-  void changed() {
-    for (final MapEntry(:key, :value) in controllers.entries) {
-      final field = widget.fields[key] as Map;
-      final text = value.text;
-      if (field['secret'] == true) {
-        if (text.isNotEmpty) secrets[key] = text;
-      } else if (text.isEmpty) {
-        config.remove(key);
-      } else {
-        config[key] = field['type'] == 'number'
-            ? num.tryParse(text) ?? text
-            : text;
-      }
-    }
-    widget.onChanged(config, secrets);
+  void pick(String key, Object? value) {
+    setState(() => picked[key] = value);
+    widget.onChanged(values);
   }
 
   @override
@@ -597,52 +587,79 @@ class _SettingsFormState extends State<SettingsForm> {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        for (final MapEntry(:key, :value) in widget.fields.entries)
+        for (final MapEntry(:key, :value) in widget.properties.entries)
           Padding(
-            padding: const EdgeInsets.only(top: Space.s8),
-            child: (value as Map)['type'] == 'boolean'
-                ? SwitchListTile(
-                    contentPadding: EdgeInsets.zero,
-                    title: Text('${value['title'] ?? key}'),
-                    subtitle: '${value['description'] ?? ''}'.isEmpty
-                        ? null
-                        : Text('${value['description']}'),
-                    value: config[key] == true,
-                    onChanged: (v) {
-                      setState(() => config[key] = v);
-                      changed();
-                    },
-                  )
-                : TextField(
-                    controller: controllers[key],
-                    obscureText: value['secret'] == true,
-                    keyboardType: value['type'] == 'number'
-                        ? TextInputType.number
-                        : null,
-                    onChanged: (_) => changed(),
-                    decoration: InputDecoration(
-                      labelText:
-                          '${value['title'] ?? key}${value['required'] == true ? ' *' : ''}',
-                      helperText: [
-                        if ('${value['description'] ?? ''}'.isNotEmpty)
-                          '${value['description']}',
-                        if (value['secret'] == true)
-                          widget.secretsSet.contains(key)
-                              ? tr('已设置；留空则保持不变', 'Set; leave empty to keep it')
-                              : tr(
-                                  '保存在密钥库，只发给该插件的服务',
-                                  'Kept in the vault and sent only to this plugin',
-                                ),
-                      ].join('\n'),
-                      helperMaxLines: 3,
-                      helperStyle: TextStyle(color: c.muted),
-                    ),
-                  ),
+            padding: const EdgeInsets.only(top: Space.gap),
+            child: field(c, key, value as Map),
           ),
       ],
     );
   }
+
+  Widget field(HubColors c, String key, Map field) {
+    final label =
+        '${field['title'] ?? key}${widget.required.contains(key) ? ' *' : ''}';
+    final description = '${field['description'] ?? ''}';
+    final enabled = widget.enabled;
+    if (field['type'] == 'boolean') {
+      return SettingRow(
+        title: label,
+        subtitle: description.isEmpty ? null : description,
+        trailing: Switch(
+          value: picked[key] == true,
+          onChanged: enabled ? (v) => pick(key, v) : null,
+        ),
+      );
+    }
+    if (field['enum'] is List) {
+      return DropdownButtonFormField<Object>(
+        initialValue: picked[key],
+        decoration: InputDecoration(
+          labelText: label,
+          helperText: description.isEmpty ? null : description,
+        ),
+        items: [
+          for (final option in field['enum'] as List)
+            DropdownMenuItem(value: option, child: Text('$option')),
+        ],
+        onChanged: enabled ? (v) => pick(key, v) : null,
+      );
+    }
+    final secret = field['secret'] == true;
+    final helper = [
+      if (description.isNotEmpty) description,
+      if (secret)
+        widget.secretsSet.contains(key)
+            ? tr('已设置；留空则保持不变', 'Set; leave empty to keep it')
+            : tr(
+                '保存在密钥库，只发给该插件的服务',
+                'Kept in the vault, sent only to this plugin',
+              ),
+    ].join('\n');
+    return TextField(
+      controller: texts[key],
+      enabled: enabled,
+      obscureText: secret,
+      style: secret ? codeStyle : null,
+      keyboardType: field['type'] == 'number' || field['type'] == 'integer'
+          ? TextInputType.number
+          : null,
+      onChanged: (_) => widget.onChanged(values),
+      decoration: InputDecoration(
+        labelText: label,
+        helperText: helper.isEmpty ? null : helper,
+        helperMaxLines: 3,
+        helperStyle: TextStyle(color: c.muted),
+      ),
+    );
+  }
 }
+
+/// The required fields of a plugin's settings.
+List<String> _requiredSettings(Map fields) => [
+  for (final MapEntry(:key, :value) in fields.entries)
+    if ((value as Map)['required'] == true) '$key',
+];
 
 class _SettingsDialog extends StatefulWidget {
   final Map<String, dynamic> plugin;
@@ -652,7 +669,10 @@ class _SettingsDialog extends StatefulWidget {
 }
 
 class _SettingsDialogState extends State<_SettingsDialog> {
-  var config = <String, dynamic>{}, secrets = <String, dynamic>{};
+  late final fields = Map<String, dynamic>.from(
+    widget.plugin['user_config'] as Map,
+  );
+  var values = <String, dynamic>{};
   @override
   Widget build(BuildContext context) => AlertDialog(
     title: Text(
@@ -661,19 +681,15 @@ class _SettingsDialogState extends State<_SettingsDialog> {
     content: SizedBox(
       width: 460,
       child: SingleChildScrollView(
-        child: SettingsForm(
-          fields: Map<String, dynamic>.from(
-            widget.plugin['user_config'] as Map,
-          ),
+        child: SchemaForm(
+          properties: fields,
+          required: _requiredSettings(fields),
           values: Map<String, dynamic>.from(
             widget.plugin['config'] as Map? ?? {},
           ),
           secretsSet: (widget.plugin['secrets_set'] as List? ?? [])
               .cast<String>(),
-          onChanged: (c, s) {
-            config = Map.of(c);
-            secrets = Map.of(s);
-          },
+          onChanged: (v) => values = v,
         ),
       ),
     ),
@@ -683,7 +699,7 @@ class _SettingsDialogState extends State<_SettingsDialog> {
         child: Text(tr('取消', 'Cancel')),
       ),
       FilledButton(
-        onPressed: () => Navigator.pop(context, _Settings(config, secrets)),
+        onPressed: () => Navigator.pop(context, _Settings.of(fields, values)),
         child: Text(tr('保存', 'Save')),
       ),
     ],
@@ -708,7 +724,7 @@ class _InstallPluginDialogState extends State<InstallPluginDialog> {
   List<dynamic>? catalog;
   String? chosen;
   Map<String, dynamic>? preview;
-  var config = <String, dynamic>{}, secrets = <String, dynamic>{};
+  var settings = <String, dynamic>{};
   bool busy = false;
   HubController get hub => widget.hub;
 
@@ -779,19 +795,19 @@ class _InstallPluginDialogState extends State<InstallPluginDialog> {
                         tr('设置', 'Settings'),
                         style: const TextStyle(fontWeight: FontWeight.w600),
                       ),
-                      SettingsForm(
-                        fields: Map<String, dynamic>.from(
+                      SchemaForm(
+                        properties: Map<String, dynamic>.from(
                           shown['user_config'] as Map,
                         ),
-                        onChanged: (c, s) {
-                          config = Map.of(c);
-                          secrets = Map.of(s);
-                        },
+                        required: _requiredSettings(
+                          shown['user_config'] as Map,
+                        ),
+                        onChanged: (v) => settings = v,
                       ),
                     ],
                     if (error.isNotEmpty)
                       Padding(
-                        padding: const EdgeInsets.only(top: Space.s12),
+                        padding: const EdgeInsets.only(top: 12),
                         child: SelectableText(
                           error,
                           style: TextStyle(color: c.danger),
@@ -904,7 +920,7 @@ class _InstallPluginDialogState extends State<InstallPluginDialog> {
                             ),
                     if (error.isNotEmpty)
                       Padding(
-                        padding: const EdgeInsets.only(top: Space.s12),
+                        padding: const EdgeInsets.only(top: 12),
                         child: SelectableText(
                           error,
                           style: TextStyle(color: c.danger),
@@ -945,10 +961,14 @@ class _InstallPluginDialogState extends State<InstallPluginDialog> {
             onPressed: busy
                 ? null
                 : () => run(() async {
+                    final values = _Settings.of(
+                      shown['user_config'] as Map? ?? {},
+                      settings,
+                    );
                     await hub.installPlugin(
                       shown['version_id'],
-                      config,
-                      secrets,
+                      values.config,
+                      values.secrets,
                     );
                     if (context.mounted) Navigator.pop(context, true);
                   }),
@@ -974,22 +994,18 @@ class _ConversationPlugins extends StatefulWidget {
 }
 
 class _ConversationPluginsState extends State<_ConversationPlugins> {
-  List<dynamic>? plugins;
+  final loader = GlobalKey<LoaderState<dynamic>>();
   String error = '';
   HubController get hub => widget.hub;
-  @override
-  void initState() {
-    super.initState();
-    load(hub.conversationPlugins(hub.selected));
-  }
 
-  Future<void> load(Future<dynamic> request) async {
+  Future<void> toggle(String plugin, bool enabled) async {
+    setState(() => error = '');
     try {
-      final data = await request;
-      if (mounted) setState(() => plugins = data['plugins'] as List);
+      await hub.setConversationPlugin(hub.selected, plugin, enabled);
     } catch (e) {
       if (mounted) setState(() => error = errorText(e));
     }
+    loader.currentState?.reload();
   }
 
   @override
@@ -999,52 +1015,45 @@ class _ConversationPluginsState extends State<_ConversationPlugins> {
       title: Text(tr('本对话的插件', 'Plugins in this conversation')),
       content: SizedBox(
         width: 420,
-        child: plugins == null
-            ? (error.isEmpty
-                  ? const LinearProgressIndicator()
-                  : Text(error, style: TextStyle(color: c.danger)))
-            : plugins!.isEmpty
-            ? Text(
+        child: Loader<dynamic>(
+          key: loader,
+          load: () => hub.conversationPlugins(hub.selected),
+          builder: (context, data, _) {
+            final plugins = data['plugins'] as List;
+            if (plugins.isEmpty) {
+              return Text(
                 tr(
                   '还没有安装插件，可在设置中安装。',
                   'No plugins installed. Install them in Settings.',
                 ),
-              )
-            : Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  for (final p in plugins!)
-                    SwitchListTile(
-                      contentPadding: EdgeInsets.zero,
-                      title: Text('${p['name']}'),
-                      subtitle: p['state'] == 'pending'
-                          ? Text(tr('尚未确认', 'Not confirmed yet'))
-                          : p['conversation'] == null
-                          ? Text(
-                              tr('跟随默认', 'Following the default'),
-                              style: TextStyle(color: c.muted),
-                            )
-                          : null,
-                      value: p['enabled'] == true,
-                      onChanged: p['state'] == 'pending'
-                          ? null
-                          : (v) => load(
-                              hub.setConversationPlugin(
-                                hub.selected,
-                                '${p['id']}',
-                                v,
-                              ),
-                            ),
-                    ),
-                  Padding(
-                    padding: const EdgeInsets.only(top: Space.s8),
-                    child: Text(
-                      tr('改动从下一次回复起生效。', 'Changes apply from the next reply.'),
-                      style: TextStyle(fontSize: 12, color: c.muted),
-                    ),
+              );
+            }
+            return Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                for (final p in plugins)
+                  SwitchListTile(
+                    contentPadding: EdgeInsets.zero,
+                    title: Text('${p['name']}'),
+                    subtitle: p['state'] == 'pending'
+                        ? Text(tr('尚未确认', 'Not confirmed yet'))
+                        : p['conversation'] == null
+                        ? Text(
+                            tr('跟随默认', 'Following the default'),
+                            style: TextStyle(color: c.muted),
+                          )
+                        : null,
+                    value: p['enabled'] == true,
+                    onChanged: p['state'] == 'pending'
+                        ? null
+                        : (v) => toggle('${p['id']}', v),
                   ),
-                ],
-              ),
+                if (error.isNotEmpty)
+                  Text(error, style: TextStyle(color: c.danger)),
+              ],
+            );
+          },
+        ),
       ),
       actions: [
         TextButton(
@@ -1063,8 +1072,8 @@ Future<Map<String, dynamic>?> askCommandParams(
 ) async {
   final params = Map<String, dynamic>.from(command['params'] as Map? ?? {});
   if (params.isEmpty) return {};
-  final controllers = {for (final k in params.keys) k: TextEditingController()};
-  final result = await showDialog<Map<String, dynamic>>(
+  var values = <String, dynamic>{};
+  return showDialog<Map<String, dynamic>>(
     context: context,
     builder: (context) => AlertDialog(
       title: Text('/${command['plugin']}:${command['name']}'),
@@ -1072,23 +1081,11 @@ Future<Map<String, dynamic>?> askCommandParams(
         width: 420,
         child: Column(
           mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
             if ('${command['description'] ?? ''}'.isNotEmpty)
               Text('${command['description']}'),
-            for (final MapEntry(:key, :value) in params.entries)
-              TextField(
-                controller: controllers[key],
-                autofocus: key == params.keys.first,
-                keyboardType: (value as Map)['type'] == 'number'
-                    ? TextInputType.number
-                    : null,
-                decoration: InputDecoration(
-                  labelText: '${value['title'] ?? key}',
-                  helperText: '${value['description'] ?? ''}'.isEmpty
-                      ? null
-                      : '${value['description']}',
-                ),
-              ),
+            SchemaForm(properties: params, onChanged: (v) => values = v),
           ],
         ),
       ),
@@ -1098,25 +1095,12 @@ Future<Map<String, dynamic>?> askCommandParams(
           child: Text(tr('取消', 'Cancel')),
         ),
         FilledButton(
-          onPressed: () => Navigator.pop(context, {
-            for (final MapEntry(:key, :value) in params.entries)
-              if (controllers[key]!.text.isNotEmpty)
-                key: (value as Map)['type'] == 'number'
-                    ? num.tryParse(controllers[key]!.text) ??
-                          controllers[key]!.text
-                    : value['type'] == 'boolean'
-                    ? controllers[key]!.text == 'true'
-                    : controllers[key]!.text,
-          }),
+          onPressed: () => Navigator.pop(context, values),
           child: Text(tr('运行', 'Run')),
         ),
       ],
     ),
   );
-  for (final controller in controllers.values) {
-    controller.dispose();
-  }
-  return result;
 }
 
 /// A plugin server's question (MCP elicitation): a form built from its schema, or a page the
@@ -1136,41 +1120,11 @@ class ElicitationCard extends StatefulWidget {
 }
 
 class _ElicitationCardState extends State<ElicitationCard> {
-  final values = <String, dynamic>{};
-  final controllers = <String, TextEditingController>{};
+  var values = <String, dynamic>{};
   bool busy = false;
 
-  Map<String, dynamic> get properties => Map<String, dynamic>.from(
-    (widget.form['requestedSchema'] as Map?)?['properties'] as Map? ?? {},
-  );
-  List<String> get required =>
-      ((widget.form['requestedSchema'] as Map?)?['required'] as List? ?? [])
-          .cast<String>();
-
-  @override
-  void initState() {
-    super.initState();
-    for (final MapEntry(:key, :value) in properties.entries) {
-      final field = value as Map;
-      if (field['type'] == 'boolean') {
-        values[key] = field['default'] == true;
-      } else if (field['enum'] is! List) {
-        controllers[key] = TextEditingController(
-          text: field['default'] == null ? '' : '${field['default']}',
-        );
-      } else if (field['default'] != null) {
-        values[key] = field['default'];
-      }
-    }
-  }
-
-  @override
-  void dispose() {
-    for (final controller in controllers.values) {
-      controller.dispose();
-    }
-    super.dispose();
-  }
+  Map get schema => widget.form['requestedSchema'] as Map? ?? {};
+  List<String> get required => (schema['required'] as List? ?? []).cast();
 
   Future<void> answer(String text) async {
     setState(() => busy = true);
@@ -1181,33 +1135,13 @@ class _ElicitationCardState extends State<ElicitationCard> {
     }
   }
 
-  void submit() {
-    final content = <String, dynamic>{...values};
-    for (final MapEntry(:key, :value) in controllers.entries) {
-      final text = value.text.trim();
-      if (text.isEmpty) continue;
-      final type = (properties[key] as Map)['type'];
-      content[key] = type == 'number' || type == 'integer'
-          ? num.tryParse(text) ?? text
-          : text;
-    }
-    if (required.any((name) => !content.containsKey(name))) return;
-    answer(jsonEncode(content));
-  }
-
   @override
   Widget build(BuildContext context) {
     final c = HubColors.of(context);
     final url = widget.form['mode'] == 'url'
         ? '${widget.form['url'] ?? ''}'
         : null;
-    return Container(
-      padding: const EdgeInsets.all(Space.s16),
-      decoration: BoxDecoration(
-        color: c.composer,
-        borderRadius: BorderRadius.circular(18),
-        border: Border.all(color: c.border),
-      ),
+    return PendingCard(
       child: Column(
         mainAxisSize: MainAxisSize.min,
         crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -1224,63 +1158,25 @@ class _ElicitationCardState extends State<ElicitationCard> {
           ),
           if (url != null)
             Padding(
-              padding: const EdgeInsets.only(top: Space.s10),
+              padding: const EdgeInsets.only(top: 10),
               child: SelectableText(
                 url,
-                style: TextStyle(color: c.muted, fontSize: 12),
+                style: TextStyle(color: c.muted, fontSize: FontSizes.caption),
               ),
             ),
-          for (final MapEntry(:key, :value) in properties.entries)
-            Padding(
-              padding: const EdgeInsets.only(top: Space.s10),
-              child: switch ((value as Map)['type']) {
-                'boolean' => Row(
-                  children: [
-                    Expanded(child: Text('${value['title'] ?? key}')),
-                    Switch(
-                      value: values[key] == true,
-                      onChanged: busy
-                          ? null
-                          : (v) => setState(() => values[key] = v),
-                    ),
-                  ],
-                ),
-                _ when value['enum'] is List => DropdownButtonFormField<Object>(
-                  initialValue: values[key],
-                  decoration: InputDecoration(
-                    labelText:
-                        '${value['title'] ?? key}${required.contains(key) ? ' *' : ''}',
-                  ),
-                  items: [
-                    for (final option in value['enum'] as List)
-                      DropdownMenuItem(value: option, child: Text('$option')),
-                  ],
-                  onChanged: busy
-                      ? null
-                      : (v) => setState(() => values[key] = v),
-                ),
-                _ => TextField(
-                  controller: controllers[key],
-                  enabled: !busy,
-                  keyboardType:
-                      value['type'] == 'number' || value['type'] == 'integer'
-                      ? TextInputType.number
-                      : null,
-                  decoration: InputDecoration(
-                    labelText:
-                        '${value['title'] ?? key}${required.contains(key) ? ' *' : ''}',
-                    helperText: value['description'] is String
-                        ? value['description'] as String
-                        : null,
-                  ),
-                ),
-              },
+          SchemaForm(
+            properties: Map<String, dynamic>.from(
+              schema['properties'] as Map? ?? {},
             ),
+            required: required,
+            enabled: !busy,
+            onChanged: (v) => values = v,
+          ),
           const SizedBox(height: 12),
           Wrap(
             alignment: WrapAlignment.end,
-            spacing: 8,
-            runSpacing: 8,
+            spacing: Space.gap,
+            runSpacing: Space.gap,
             children: [
               OutlinedButton(
                 onPressed: busy ? null : () => answer('decline'),
@@ -1298,7 +1194,14 @@ class _ElicitationCardState extends State<ElicitationCard> {
                 ),
               ] else
                 FilledButton(
-                  onPressed: busy ? null : submit,
+                  // A required field must be filled first.
+                  onPressed: busy
+                      ? null
+                      : () {
+                          if (required.every(values.containsKey)) {
+                            answer(jsonEncode(values));
+                          }
+                        },
                   child: Text(tr('提交', 'Submit')),
                 ),
             ],

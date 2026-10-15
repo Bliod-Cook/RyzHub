@@ -31,7 +31,6 @@ class Composer extends StatefulWidget {
   final VoidCallback onCancel;
   final bool running;
   final bool steer;
-  final Future<void> Function(String)? onSideQuery;
   final Widget? leading;
   final List<Widget> tools;
 
@@ -71,7 +70,6 @@ class Composer extends StatefulWidget {
     required this.onCancel,
     required this.running,
     this.steer = false,
-    this.onSideQuery,
     this.leading,
     this.tools = const [],
     this.trailing,
@@ -119,7 +117,6 @@ class _ComposerState extends State<Composer> {
   }
 
   bool sending = false;
-  bool sideQuery = false;
   bool empty = true;
 
   /// The suggested command the keyboard is on.
@@ -184,10 +181,9 @@ class _ComposerState extends State<Composer> {
   }
 
   Future<void> send() async {
-    final sideQuery = this.sideQuery && widget.onSideQuery != null;
     if (sending ||
         widget.blocked ||
-        (input.text.trim().isEmpty && (sideQuery || !widget.canSendEmpty)) ||
+        (input.text.trim().isEmpty && !widget.canSendEmpty) ||
         !input.value.composing.isCollapsed) {
       return;
     }
@@ -197,7 +193,7 @@ class _ComposerState extends State<Composer> {
     // out is the next draft, which nothing clears.
     input.clear();
     try {
-      await (sideQuery ? widget.onSideQuery!(text) : widget.onSend(text));
+      await widget.onSend(text);
     } catch (_) {
       // The caller reports the failure; the text comes back for a retry, ahead
       // of anything typed since.
@@ -245,8 +241,7 @@ class _ComposerState extends State<Composer> {
   @override
   Widget build(BuildContext context) {
     final c = HubColors.of(context);
-    final canSend =
-        !widget.running || widget.steer || widget.onSideQuery != null;
+    final canSend = !widget.running || widget.steer;
     final stop = round(
       tooltip: tr('停止', 'Stop'),
       icon: Icons.stop_rounded,
@@ -255,7 +250,11 @@ class _ComposerState extends State<Composer> {
       foreground: canSend ? c.text : c.background,
       border: canSend ? c.border : null,
     );
-    final fieldStyle = TextStyle(fontSize: 15, height: 1.5, color: c.text);
+    final fieldStyle = TextStyle(
+      fontSize: FontSizes.message,
+      height: 1.5,
+      color: c.text,
+    );
     // Measured with the field's own resolved style, so the single row gives
     // way exactly when the text would reach the controls on the right.
     final painter = TextPainter(
@@ -328,10 +327,10 @@ class _ComposerState extends State<Composer> {
                   menuChildren: menuItems?.call(context) ?? const [],
                   child: Container(
                     padding: const EdgeInsets.fromLTRB(
-                      Space.s8,
-                      Space.s6,
-                      Space.s8,
-                      Space.s6,
+                      Space.gap,
+                      6,
+                      Space.gap,
+                      6,
                     ),
                     decoration: BoxDecoration(
                       color: c.composer,
@@ -357,12 +356,7 @@ class _ComposerState extends State<Composer> {
                         children: [
                           if (widget.attachments != null)
                             Padding(
-                              padding: const EdgeInsets.fromLTRB(
-                                Space.s6,
-                                Space.s4,
-                                Space.s6,
-                                Space.s4,
-                              ),
+                              padding: const EdgeInsets.fromLTRB(6, 4, 6, 4),
                               child: widget.attachments,
                             ),
                           _ComposerRow(
@@ -381,36 +375,10 @@ class _ComposerState extends State<Composer> {
                                         child: Row(
                                           mainAxisSize: MainAxisSize.min,
                                           children: [
-                                            if (widget.onSideQuery != null)
-                                              Padding(
-                                                padding: const EdgeInsets.only(
-                                                  left: Space.s4,
-                                                ),
-                                                child: FilterChip(
-                                                  label: Text(
-                                                    tr('只读旁问', 'Side question'),
-                                                  ),
-                                                  avatar: sideQuery
-                                                      ? null
-                                                      : Icon(
-                                                          Icons
-                                                              .visibility_outlined,
-                                                          size: 15,
-                                                          color: c.muted,
-                                                        ),
-                                                  selected: sideQuery,
-                                                  visualDensity:
-                                                      VisualDensity.compact,
-                                                  onSelected: (value) =>
-                                                      setState(
-                                                        () => sideQuery = value,
-                                                      ),
-                                                ),
-                                              ),
                                             for (final tool in widget.tools)
                                               Padding(
                                                 padding: const EdgeInsets.only(
-                                                  left: Space.s6,
+                                                  left: 6,
                                                 ),
                                                 child: tool,
                                               ),
@@ -443,9 +411,9 @@ class _ComposerState extends State<Composer> {
                                         contentPadding:
                                             const EdgeInsets.fromLTRB(
                                               _ComposerRow.fieldStart,
-                                              Space.s10,
+                                              10,
                                               _ComposerRow.fieldEnd,
-                                              Space.s10,
+                                              10,
                                             ),
                                       ),
                                     ),
@@ -494,9 +462,12 @@ class _ComposerState extends State<Composer> {
             ),
             if (widget.footer.isNotEmpty)
               Padding(
-                padding: const EdgeInsets.only(top: Space.s8),
+                padding: const EdgeInsets.only(top: Space.gap),
                 child: DefaultTextStyle.merge(
-                  style: TextStyle(fontSize: 11.5, color: c.subtle),
+                  style: TextStyle(
+                    fontSize: FontSizes.caption,
+                    color: c.subtle,
+                  ),
                   child: Wrap(
                     alignment: WrapAlignment.center,
                     spacing: 14,
@@ -679,67 +650,17 @@ class ApprovalMenu extends StatelessWidget {
   });
 
   @override
-  Widget build(BuildContext context) {
-    final c = HubColors.of(context);
-    return PopupMenuButton<String>(
-      tooltip: tr('审批模式', 'Approval mode'),
-      position: PopupMenuPosition.under,
-      offset: const Offset(0, 6),
-      onSelected: onSelected,
-      itemBuilder: (_) => [
-        for (final mode in modes)
-          HubMenuItem(
-            value: mode,
-            height: 52,
-            child: Row(
-              children: [
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Text(approvalLabel(mode)),
-                      Text(
-                        approvalDescription(mode),
-                        style: TextStyle(fontSize: 12, color: c.muted),
-                      ),
-                    ],
-                  ),
-                ),
-                if (mode == value) ...[
-                  const SizedBox(width: 12),
-                  Icon(Icons.check, size: 16, color: c.text),
-                ],
-              ],
-            ),
-          ),
-      ],
-      child: Container(
-        height: 32,
-        padding: const EdgeInsets.symmetric(horizontal: Space.s10),
-        decoration: BoxDecoration(
-          borderRadius: BorderRadius.circular(16),
-          border: Border.all(color: c.border),
-        ),
-        child: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Icon(
-              value == 'full_auto'
-                  ? Icons.bolt_outlined
-                  : Icons.verified_user_outlined,
-              size: 15,
-              color: value == 'full_auto' ? c.warning : c.muted,
-            ),
-            const SizedBox(width: 6),
-            Text(approvalLabel(value), style: const TextStyle(fontSize: 13)),
-            const SizedBox(width: 2),
-            Icon(Icons.expand_more, size: 16, color: c.subtle),
-          ],
-        ),
-      ),
-    );
-  }
+  Widget build(BuildContext context) => ChoicePill<String>(
+    tooltip: tr('审批模式', 'Approval mode'),
+    value: value,
+    options: [for (final mode in modes) (mode, approvalLabel(mode))],
+    detail: approvalDescription,
+    icon: value == 'full_auto'
+        ? Icons.bolt_outlined
+        : Icons.verified_user_outlined,
+    iconColor: value == 'full_auto' ? HubColors.of(context).warning : null,
+    onChanged: onSelected,
+  );
 }
 
 /// The model and its reasoning level, placed beside the send button.
@@ -879,13 +800,13 @@ Widget? plusMenu(
       row(
         Icons.attach_file,
         tr('上传文件', 'Upload files'),
-        tr('图片、PDF、文本或任意文件', 'Images, PDFs, text or any file'),
+        null,
         () => pickFiles(page, hub),
       ),
       row(
         Icons.folder_copy_outlined,
         tr('从文件库添加', 'Add from library'),
-        tr('用过的文件可以再次附带', 'Reuse files you uploaded before'),
+        null,
         () => chooseFromLibrary(page, hub),
       ),
       const MenuDivider(),
@@ -898,7 +819,7 @@ Widget? plusMenu(
           row(
             Icons.extension_outlined,
             tr('插件', 'Plugins'),
-            tr('本对话使用哪些插件', 'Which plugins this chat uses'),
+            null,
             () => showConversationPlugins(page, hub),
           ),
           const MenuDivider(),
@@ -925,20 +846,20 @@ Widget? plusMenu(
       ...files,
       Padding(
         padding: const EdgeInsets.fromLTRB(
-          Space.s14,
-          Space.s8,
-          Space.s14,
-          Space.s4,
+          Space.inset,
+          Space.gap,
+          Space.inset,
+          4,
         ),
         child: Text(
           tr('新对话放入项目', 'Start in a project'),
-          style: TextStyle(fontSize: 12, color: c.subtle),
+          style: TextStyle(fontSize: FontSizes.caption, color: c.subtle),
         ),
       ),
       row(
         Icons.chat_bubble_outline,
         tr('无项目', 'No project'),
-        tr('不关联任何项目', 'Not linked to a project'),
+        null,
         () => hub.startDraft(mode: hub.mode),
         checked: hub.project == null,
       ),
@@ -954,7 +875,7 @@ Widget? plusMenu(
       row(
         Icons.create_new_folder_outlined,
         tr('新建项目…', 'New project…'),
-        tr('设置指令和知识文件后在其中开始', 'Set instructions and files, then start in it'),
+        null,
         onNewProject,
       ),
     ];
@@ -995,14 +916,14 @@ class _Suggestions extends StatelessWidget {
         rows.add(
           Padding(
             padding: const EdgeInsets.fromLTRB(
-              Space.s14,
-              Space.s8,
-              Space.s14,
-              Space.s2,
+              Space.inset,
+              Space.gap,
+              Space.inset,
+              2,
             ),
             child: Text(
               command.group,
-              style: TextStyle(fontSize: 11.5, color: c.subtle),
+              style: TextStyle(fontSize: FontSizes.caption, color: c.subtle),
             ),
           ),
         );
@@ -1016,14 +937,14 @@ class _Suggestions extends StatelessWidget {
             child: Container(
               color: i == highlighted ? c.hover : null,
               padding: const EdgeInsets.symmetric(
-                horizontal: Space.s14,
-                vertical: Space.s7,
+                horizontal: Space.inset,
+                vertical: 7,
               ),
               child: Row(
                 children: [
                   Text(
                     '/${command.name}',
-                    style: TextStyle(fontSize: 14, color: c.text),
+                    style: TextStyle(fontSize: FontSizes.body, color: c.text),
                   ),
                   const SizedBox(width: 12),
                   Expanded(
@@ -1031,7 +952,10 @@ class _Suggestions extends StatelessWidget {
                       command.description,
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
-                      style: TextStyle(fontSize: 13, color: c.subtle),
+                      style: TextStyle(
+                        fontSize: FontSizes.label,
+                        color: c.subtle,
+                      ),
                     ),
                   ),
                 ],
@@ -1042,16 +966,16 @@ class _Suggestions extends StatelessWidget {
       );
     }
     return Container(
-      margin: const EdgeInsets.only(bottom: Space.s6),
+      margin: const EdgeInsets.only(bottom: 6),
       constraints: const BoxConstraints(maxHeight: 260),
       decoration: BoxDecoration(
         color: c.menu,
-        borderRadius: BorderRadius.circular(14),
+        borderRadius: BorderRadius.circular(Radii.block),
         border: Border.all(color: c.border),
       ),
       clipBehavior: Clip.antiAlias,
       child: SingleChildScrollView(
-        padding: const EdgeInsets.only(bottom: Space.s4),
+        padding: const EdgeInsets.only(bottom: 4),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: rows,
@@ -1143,11 +1067,5 @@ List<Widget> composerFooter(HubController hub) => [
   // A Work harness that cannot steer the turn in progress gets the
   // instructions as its next turn.
   if (!hub.isDraft && hub.realWork && hub.emulated('steer'))
-    Row(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        Text(tr('补充指令排入下一轮', 'Instructions queue for the next turn')),
-        const EmulatedNote('steer'),
-      ],
-    ),
+    const EmulatedNote('steer'),
 ];

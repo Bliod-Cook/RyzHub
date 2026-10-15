@@ -1,11 +1,13 @@
 import 'package:flutter/material.dart';
 
-import 'tokens.g.dart';
-
-export 'tokens.g.dart';
-
-/// Colors, spacing and radii come from `client/tokens/tokens.json`.
-const accents = accentTokens;
+/// Accent colors a member can pick, by name.
+const accents = <String, Color>{
+  'orange': Color(0xfff0692a),
+  'blue': Color(0xff2f6fed),
+  'green': Color(0xff10a37f),
+  'purple': Color(0xff8b5cf6),
+  'pink': Color(0xffe0457b),
+};
 
 Color accentColor(String name) => accents[name] ?? accents['orange']!;
 
@@ -15,8 +17,8 @@ class HubColors extends ThemeExtension<HubColors> {
   final Color bubble, composer, menu, code, accent, onAccent, danger, success;
   final Color warning;
 
-  /// The user's messages, tinted with the accent.
-  final Color userBubble;
+  /// How much of the accent tints the user's messages.
+  final double userTint;
   const HubColors({
     required this.background,
     required this.sidebar,
@@ -35,68 +37,83 @@ class HubColors extends ThemeExtension<HubColors> {
     required this.danger,
     required this.success,
     required this.warning,
-    required this.userBubble,
+    required this.userTint,
   });
 
-  factory HubColors.light(Color accent) => HubColors(
-    background: LightTokens.background,
-    sidebar: LightTokens.sidebar,
-    border: LightTokens.border,
-    hover: LightTokens.hover,
-    selected: LightTokens.selected,
-    text: LightTokens.text,
-    muted: LightTokens.muted,
-    subtle: LightTokens.subtle,
-    bubble: LightTokens.bubble,
-    composer: LightTokens.composer,
-    menu: LightTokens.menu,
-    code: LightTokens.code,
-    accent: accent,
-    onAccent: LightTokens.onAccent,
-    danger: LightTokens.danger,
-    success: LightTokens.success,
-    warning: LightTokens.warning,
-    userBubble: Color.alphaBlend(
-      accent.withValues(alpha: .12),
-      LightTokens.background,
-    ),
+  static const light = HubColors(
+    background: Color(0xffffffff),
+    sidebar: Color(0xfff9f9f9),
+    border: Color(0xffe5e5e5),
+    hover: Color(0xffefefef),
+    selected: Color(0xffe8e8e8),
+    text: Color(0xff0d0d0d),
+    muted: Color(0xff5d5d5d),
+    subtle: Color(0xff8f8f8f),
+    bubble: Color(0xfff4f4f4),
+    composer: Color(0xffffffff),
+    menu: Color(0xffffffff),
+    code: Color(0xfff7f7f7),
+    accent: Color(0xfff0692a),
+    onAccent: Color(0xffffffff),
+    danger: Color(0xffd93025),
+    success: Color(0xff10a37f),
+    warning: Color(0xffe8a317),
+    userTint: .12,
   );
 
-  factory HubColors.dark(Color accent) => HubColors(
-    background: DarkTokens.background,
-    sidebar: DarkTokens.sidebar,
-    border: DarkTokens.border,
-    hover: DarkTokens.hover,
-    selected: DarkTokens.selected,
-    text: DarkTokens.text,
-    muted: DarkTokens.muted,
-    subtle: DarkTokens.subtle,
-    bubble: DarkTokens.bubble,
-    composer: DarkTokens.composer,
-    menu: DarkTokens.menu,
-    code: DarkTokens.code,
-    accent: accent,
-    onAccent: DarkTokens.onAccent,
-    danger: DarkTokens.danger,
-    success: DarkTokens.success,
-    warning: DarkTokens.warning,
-    userBubble: Color.alphaBlend(
-      accent.withValues(alpha: .24),
-      DarkTokens.background,
-    ),
+  static const dark = HubColors(
+    background: Color(0xff212121),
+    sidebar: Color(0xff181818),
+    border: Color(0x1affffff),
+    hover: Color(0xff2a2a2a),
+    selected: Color(0xff303030),
+    text: Color(0xffececec),
+    muted: Color(0xffb4b4b4),
+    subtle: Color(0xff8f8f8f),
+    bubble: Color(0xff303030),
+    composer: Color(0xff303030),
+    menu: Color(0xff353535),
+    code: Color(0xff171717),
+    accent: Color(0xfff0692a),
+    onAccent: Color(0xffffffff),
+    danger: Color(0xffff6b5e),
+    success: Color(0xff3ecf9e),
+    warning: Color(0xfff2c14e),
+    userTint: .24,
   );
+
+  /// The user's messages, tinted with the accent.
+  Color get userBubble =>
+      Color.alphaBlend(accent.withValues(alpha: userTint), background);
 
   /// Falls back for widgets pumped under a bare MaterialApp (widget tests).
   static HubColors of(BuildContext context) {
     final theme = Theme.of(context);
     return theme.extension<HubColors>() ??
-        (theme.brightness == Brightness.dark
-            ? HubColors.dark(accentColor('orange'))
-            : HubColors.light(accentColor('orange')));
+        (theme.brightness == Brightness.dark ? dark : light);
   }
 
   @override
-  HubColors copyWith() => this;
+  HubColors copyWith({Color? accent}) => HubColors(
+    background: background,
+    sidebar: sidebar,
+    border: border,
+    hover: hover,
+    selected: selected,
+    text: text,
+    muted: muted,
+    subtle: subtle,
+    bubble: bubble,
+    composer: composer,
+    menu: menu,
+    code: code,
+    accent: accent ?? this.accent,
+    onAccent: onAccent,
+    danger: danger,
+    success: success,
+    warning: warning,
+    userTint: userTint,
+  );
 
   @override
   HubColors lerp(covariant HubColors? other, double t) {
@@ -120,24 +137,73 @@ class HubColors extends ThemeExtension<HubColors> {
       danger: l(danger, other.danger),
       success: l(success, other.success),
       warning: l(warning, other.warning),
-      userBubble: l(userBubble, other.userBubble),
+      userTint: userTint + (other.userTint - userTint) * t,
     );
   }
+}
+
+/// Spacing with a role; other gaps are set where they are used.
+abstract final class Space {
+  /// The usual space between neighbours, and around them in a row.
+  static const double gap = 8;
+
+  /// Text from the edge of the box it sits in: a menu, a field, a bar.
+  static const double inset = 14;
+
+  /// Content from the edge of the page, a panel or a card.
+  static const double edge = 16;
+}
+
+/// Corner radii, by the size of what they round.
+abstract final class Radii {
+  /// Thumbnails, tooltips and small buttons.
+  static const double small = 8;
+
+  /// Rows, icon buttons and code boxes.
+  static const double control = 10;
+
+  /// Fields, menu items, bars and chips.
+  static const double field = 12;
+
+  /// Blocks of the timeline: code, and items that are not messages.
+  static const double block = 14;
+
+  /// Menus, cards and panels.
+  static const double card = 16;
+  static const double dialog = 20;
+}
+
+/// Type sizes.
+abstract final class FontSizes {
+  /// Captions, hints and the detail under a line.
+  static const double caption = 12;
+
+  /// Labels, buttons and pills.
+  static const double label = 13;
+
+  /// A run's steps, between labels and body text.
+  static const double step = 13.5;
+  static const double body = 14;
+
+  /// Messages and the composer.
+  static const double message = 15;
+  static const double title = 16;
 }
 
 const fontFamily = 'RyzHub Sans';
 const fontFallback = ['Microsoft YaHei', 'Noto Sans CJK SC', 'PingFang SC'];
 
-/// Masked fields: the UI font's bullet is a full-width CJK dot, so masks set
-/// in 0xProto's Latin one.
-const obscuredStyle = TextStyle(fontFamily: '0xProto');
+/// Code, in the bundled even-width font; CJK falls back to the UI font.
+/// Masked fields use it too: the UI font's bullet is a full-width CJK dot.
+const codeStyle = TextStyle(
+  fontFamily: '0xProto',
+  fontFamilyFallback: [fontFamily, ...fontFallback],
+);
 
 /// Model identifiers and reasoning levels: even glyph widths keep the label
-/// steady as values change. CJK labels fall back to the UI font.
+/// steady as values change.
 TextStyle modelLabelStyle({required double size, required Color color}) =>
-    TextStyle(
-      fontFamily: '0xProto',
-      fontFamilyFallback: const [fontFamily, ...fontFallback],
+    codeStyle.copyWith(
       fontSize: size,
       color: color,
       height: 1.2,
@@ -179,9 +245,8 @@ TextTheme _evenLeading(TextTheme t) {
 }
 
 ThemeData buildTheme(Brightness brightness, Color accent) {
-  final c = brightness == Brightness.dark
-      ? HubColors.dark(accent)
-      : HubColors.light(accent);
+  final c = (brightness == Brightness.dark ? HubColors.dark : HubColors.light)
+      .copyWith(accent: accent);
   final scheme = ColorScheme.fromSeed(seedColor: accent, brightness: brightness)
       .copyWith(
         primary: accent,
@@ -220,8 +285,8 @@ ThemeData buildTheme(Brightness brightness, Color accent) {
     inputDecorationTheme: InputDecorationTheme(
       isDense: true,
       contentPadding: const EdgeInsets.symmetric(
-        horizontal: Space.s14,
-        vertical: Space.s14,
+        horizontal: Space.inset,
+        vertical: Space.inset,
       ),
       border: OutlineInputBorder(
         borderRadius: radius,
@@ -244,11 +309,11 @@ ThemeData buildTheme(Brightness brightness, Color accent) {
       elevation: 6,
       shadowColor: Colors.black.withValues(alpha: .18),
       shape: RoundedRectangleBorder(
-        borderRadius: BorderRadius.circular(Radii.menu),
+        borderRadius: BorderRadius.circular(Radii.card),
         side: BorderSide(color: c.border),
       ),
       textStyle: _font(fontSize: FontSizes.body, color: c.text),
-      menuPadding: const EdgeInsets.all(Space.s8),
+      menuPadding: const EdgeInsets.all(Space.gap),
     ),
     menuTheme: MenuThemeData(
       style: MenuStyle(
@@ -256,7 +321,7 @@ ThemeData buildTheme(Brightness brightness, Color accent) {
         surfaceTintColor: const WidgetStatePropertyAll(Colors.transparent),
         shape: WidgetStatePropertyAll(
           RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(Radii.menu),
+            borderRadius: BorderRadius.circular(Radii.card),
             side: BorderSide(color: c.border),
           ),
         ),
@@ -264,14 +329,14 @@ ThemeData buildTheme(Brightness brightness, Color accent) {
         shadowColor: WidgetStatePropertyAll(
           Colors.black.withValues(alpha: .18),
         ),
-        padding: const WidgetStatePropertyAll(EdgeInsets.all(Space.s8)),
+        padding: const WidgetStatePropertyAll(EdgeInsets.all(Space.gap)),
       ),
     ),
     // Items sit inset from the panel edge with a rounded highlight.
     menuButtonTheme: MenuButtonThemeData(
       style: ButtonStyle(
         padding: const WidgetStatePropertyAll(
-          EdgeInsets.symmetric(horizontal: Space.s14),
+          EdgeInsets.symmetric(horizontal: Space.inset),
         ),
         minimumSize: const WidgetStatePropertyAll(Size(0, 38)),
         shape: WidgetStatePropertyAll(
@@ -289,7 +354,7 @@ ThemeData buildTheme(Brightness brightness, Color accent) {
       waitDuration: const Duration(milliseconds: 500),
       decoration: BoxDecoration(
         color: brightness == Brightness.dark ? c.menu : c.text,
-        borderRadius: BorderRadius.circular(Radii.tooltip),
+        borderRadius: BorderRadius.circular(Radii.small),
       ),
       textStyle: _font(
         fontSize: FontSizes.caption,
@@ -331,10 +396,7 @@ ThemeData buildTheme(Brightness brightness, Color accent) {
         backgroundColor: c.text,
         foregroundColor: c.background,
         shape: const StadiumBorder(),
-        padding: const EdgeInsets.symmetric(
-          horizontal: Space.s18,
-          vertical: Space.s12,
-        ),
+        padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 12),
       ),
     ),
     outlinedButtonTheme: OutlinedButtonThemeData(
@@ -342,10 +404,7 @@ ThemeData buildTheme(Brightness brightness, Color accent) {
         foregroundColor: c.text,
         side: BorderSide(color: c.border),
         shape: const StadiumBorder(),
-        padding: const EdgeInsets.symmetric(
-          horizontal: Space.s16,
-          vertical: Space.s10,
-        ),
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
       ),
     ),
     textButtonTheme: TextButtonThemeData(
@@ -372,7 +431,7 @@ ThemeData buildTheme(Brightness brightness, Color accent) {
       side: BorderSide(color: c.border),
       shape: const StadiumBorder(),
       labelStyle: _font(fontSize: FontSizes.label, color: c.text),
-      padding: const EdgeInsets.symmetric(horizontal: Space.s4),
+      padding: const EdgeInsets.symmetric(horizontal: 4),
     ),
     segmentedButtonTheme: SegmentedButtonThemeData(
       style: SegmentedButton.styleFrom(

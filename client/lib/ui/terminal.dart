@@ -1,12 +1,15 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:math';
 
 import 'package:flutter/material.dart';
+import 'package:http/http.dart' as http;
 import 'package:web_socket_channel/web_socket_channel.dart';
 import 'package:xterm/xterm.dart';
 
 import '../controller.dart';
 import '../l10n.dart';
+import '../rust/api.dart' show reconnectDelay;
 import '../theme.dart';
 
 /// A shell in the Work conversation's sandbox, over its own WebSocket.
@@ -38,6 +41,9 @@ class _TerminalPanelState extends State<TerminalPanel> {
   /// Output bytes shown so far, by the session's offsets: where a reconnect resumes.
   int offset = 0;
   String status = 'connecting';
+
+  /// Why the server refused the terminal; it is not retried.
+  String refused = '';
   int? exitCode;
   int attempt = 0;
   bool disposed = false;
@@ -91,8 +97,14 @@ class _TerminalPanelState extends State<TerminalPanel> {
         onDone: _closed,
         onError: (_) => _closed(),
       );
-    } catch (_) {
+    } on http.ClientException {
       _closed();
+    } on TimeoutException {
+      _closed();
+    } on WebSocketChannelException {
+      _closed();
+    } catch (e) {
+      if (!disposed) setState(() => refused = errorText(e));
     }
   }
 
@@ -127,9 +139,11 @@ class _TerminalPanelState extends State<TerminalPanel> {
     }
     // Detached, not ended: resume after a pause that grows with failures.
     setState(() => status = 'reconnecting');
-    final delay = Duration(milliseconds: 500 * (1 << attempt.clamp(0, 5)));
-    attempt++;
-    retry = Timer(delay, _connect);
+    final delay = reconnectDelay(
+      attempt: attempt++,
+      random: Random().nextInt(1 << 30),
+    );
+    retry = Timer(Duration(milliseconds: delay), _connect);
   }
 
   void _restart() {
@@ -158,6 +172,7 @@ class _TerminalPanelState extends State<TerminalPanel> {
   Widget build(BuildContext context) {
     final c = HubColors.of(context);
     final label = switch (status) {
+      _ when refused.isNotEmpty => refused,
       'online' => null,
       'ended' => tr('会话已结束（退出码 $exitCode）', 'Session ended (exit $exitCode)'),
       'reconnecting' => tr('连接中断，正在重连…', 'Disconnected, reconnecting…'),
@@ -165,26 +180,25 @@ class _TerminalPanelState extends State<TerminalPanel> {
     };
     return Container(
       height: 320,
-      margin: const EdgeInsets.fromLTRB(Space.s16, 0, Space.s16, Space.s6),
+      margin: const EdgeInsets.fromLTRB(Space.edge, 0, Space.edge, 6),
       decoration: BoxDecoration(
-        color: const Color(0xff15161a),
-        borderRadius: BorderRadius.circular(12),
+        color: c.sidebar,
+        borderRadius: BorderRadius.circular(Radii.field),
         border: Border.all(color: c.border),
       ),
       clipBehavior: Clip.antiAlias,
       child: Column(
         children: [
-          Container(
+          SizedBox(
             height: 34,
-            padding: const EdgeInsets.symmetric(horizontal: Space.s8),
-            color: const Color(0xff1f2026),
             child: Row(
               children: [
-                const Icon(Icons.terminal, size: 16, color: Colors.white70),
+                const SizedBox(width: Space.gap),
+                Icon(Icons.terminal, size: 16, color: c.muted),
                 const SizedBox(width: 6),
                 Text(
                   tr('终端', 'Terminal'),
-                  style: const TextStyle(fontSize: 13, color: Colors.white70),
+                  style: TextStyle(fontSize: FontSizes.label, color: c.muted),
                 ),
                 if (label != null) ...[
                   const SizedBox(width: 10),
@@ -192,9 +206,9 @@ class _TerminalPanelState extends State<TerminalPanel> {
                     child: Text(
                       label,
                       overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(
-                        fontSize: 12,
-                        color: Colors.white54,
+                      style: TextStyle(
+                        fontSize: FontSizes.caption,
+                        color: refused.isEmpty ? c.subtle : c.danger,
                       ),
                     ),
                   ),
@@ -211,15 +225,12 @@ class _TerminalPanelState extends State<TerminalPanel> {
                     child: Text(tr('结束会话', 'End session')),
                   ),
                 IconButton(
-                  tooltip: tr(
-                    '收起终端（会话保持运行）',
-                    'Hide terminal (the session keeps running)',
-                  ),
+                  tooltip: tr('收起终端', 'Hide terminal'),
                   iconSize: 18,
-                  color: Colors.white70,
                   onPressed: widget.onClose,
                   icon: const Icon(Icons.close),
                 ),
+                const SizedBox(width: Space.gap),
               ],
             ),
           ),
@@ -227,11 +238,11 @@ class _TerminalPanelState extends State<TerminalPanel> {
             child: TerminalView(
               terminal,
               autofocus: true,
-              textStyle: const TerminalStyle(
-                fontSize: 13,
-                fontFamily: '0xProto',
+              textStyle: TerminalStyle(
+                fontFamily: codeStyle.fontFamily!,
+                fontSize: FontSizes.label,
               ),
-              padding: const EdgeInsets.all(Space.s6),
+              padding: const EdgeInsets.all(6),
             ),
           ),
         ],

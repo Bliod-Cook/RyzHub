@@ -276,19 +276,14 @@ void main() {
     await tester.pump();
   });
 
-  testWidgets('side query and active-run supplement route independently', (
-    tester,
-  ) async {
-    final mainline = <String>[], side = <String>[];
+  testWidgets('a message sent while the run goes steers it', (tester) async {
+    final mainline = <String>[];
     await tester.pumpWidget(
       MaterialApp(
         home: Scaffold(
           body: Composer(
             onSend: (text) async {
               mainline.add(text);
-            },
-            onSideQuery: (text) async {
-              side.add(text);
             },
             onCancel: () {},
             running: true,
@@ -297,13 +292,6 @@ void main() {
         ),
       ),
     );
-    await tester.tap(find.text('只读旁问'));
-    await tester.enterText(find.byType(TextField), '旁问');
-    await tester.tap(find.byTooltip('发送'));
-    await tester.pump();
-    expect(side, ['旁问']);
-    expect(mainline, isEmpty);
-    await tester.tap(find.text('只读旁问'));
     await tester.enterText(find.byType(TextField), '补充');
     await tester.tap(find.byTooltip('发送'));
     await tester.pump();

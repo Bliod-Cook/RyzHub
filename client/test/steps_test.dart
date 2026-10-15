@@ -99,7 +99,7 @@ void main() {
     await tester.pumpWidget(_render(timeline(_run)));
     expect(find.byTooltip('复制消息'), findsNWidgets(2));
     // The user's bubble has the other copy button.
-    expect(find.text('模拟 Agent'), findsOneWidget);
+    expect(find.text('Chat'), findsOneWidget);
     expect(find.text('已调用 1 个工具'), findsOneWidget);
     expect(find.textContaining('搜索记忆'), findsNothing);
 

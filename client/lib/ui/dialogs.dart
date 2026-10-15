@@ -183,7 +183,7 @@ List<PopupMenuEntry<String>> conversationMenu(
       item(
         'project:',
         Icons.folder_off_outlined,
-        tr('移出项目 · 记忆保留在原项目', 'Remove from project · memory stays there'),
+        tr('移出项目', 'Remove from project'),
         enabled: !running,
       ),
     for (final p in others)
@@ -196,10 +196,6 @@ List<PopupMenuEntry<String>> conversationMenu(
     if (hub.canDelete) ...[
       const PopupMenuDivider(),
       item('delete', Icons.delete_outline, tr('删除', 'Delete'), danger: true),
-    ],
-    if (header) ...[
-      const PopupMenuDivider(),
-      item('refresh', Icons.refresh, tr('刷新命令能力', 'Refresh capabilities')),
     ],
   ];
 }
@@ -273,8 +269,6 @@ Future<void> conversationAction(
       if (confirmed == true) {
         await hub.deleteConversation(id, deleteMemories: related);
       }
-    case 'refresh':
-      await hub.refreshCommands();
     default:
       if (value.startsWith('project:')) {
         final project = value.substring(8);
@@ -408,11 +402,14 @@ class _SearchDialogState extends State<SearchDialog> {
       onTap: () => Navigator.pop(context, result),
       trailing: badge == null
           ? null
-          : Text(badge, style: TextStyle(fontSize: 12, color: c.subtle)),
+          : Text(
+              badge,
+              style: TextStyle(fontSize: FontSizes.caption, color: c.subtle),
+            ),
     );
     return Dialog(
       alignment: const Alignment(0, -.5),
-      insetPadding: const EdgeInsets.all(Space.s24),
+      insetPadding: const EdgeInsets.all(24),
       child: ConstrainedBox(
         constraints: const BoxConstraints(maxWidth: 620, maxHeight: 520),
         child: Column(
@@ -420,12 +417,7 @@ class _SearchDialogState extends State<SearchDialog> {
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
             Padding(
-              padding: const EdgeInsets.fromLTRB(
-                Space.s18,
-                Space.s10,
-                Space.s8,
-                Space.s6,
-              ),
+              padding: const EdgeInsets.fromLTRB(18, 10, Space.gap, 6),
               child: Row(
                 children: [
                   Expanded(
@@ -452,7 +444,7 @@ class _SearchDialogState extends State<SearchDialog> {
             Flexible(
               child: ListView(
                 shrinkWrap: true,
-                padding: const EdgeInsets.symmetric(vertical: Space.s8),
+                padding: const EdgeInsets.symmetric(vertical: Space.gap),
                 children: [
                   row(
                     null,
@@ -592,8 +584,8 @@ class _ProjectsDialogState extends State<ProjectsDialog> {
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
               Wrap(
-                spacing: 8,
-                runSpacing: 8,
+                spacing: Space.gap,
+                runSpacing: Space.gap,
                 children: [
                   ActionChip(
                     avatar: const Icon(Icons.add, size: 16),
@@ -650,17 +642,9 @@ class _ProjectsDialogState extends State<ProjectsDialog> {
                     ? (v) => setState(() => memory = v!)
                     : null,
               ),
-              const SizedBox(height: 8),
-              Text(
-                tr(
-                  '私有项目。指令与文件在下一轮生效。',
-                  'Private project. Instructions and files apply from the next turn.',
-                ),
-                style: TextStyle(fontSize: 12, color: c.subtle),
-              ),
               const SizedBox(height: 12),
               Wrap(
-                spacing: 8,
+                spacing: Space.gap,
                 children: [
                   if (selected?['state'] != 'deletion_pending')
                     FilledButton(
@@ -772,7 +756,7 @@ class _ProjectsDialogState extends State<ProjectsDialog> {
                       ],
                     ),
                   ),
-                const SizedBox(height: 8),
+                const SizedBox(height: Space.gap),
                 Align(
                   alignment: Alignment.centerLeft,
                   child: OutlinedButton.icon(
@@ -793,14 +777,14 @@ class _ProjectsDialogState extends State<ProjectsDialog> {
                           }),
                   ),
                 ),
-                const SizedBox(height: 8),
+                const SizedBox(height: Space.gap),
                 TextField(
                   controller: fileName,
                   decoration: InputDecoration(
                     labelText: tr('文件名', 'File name'),
                   ),
                 ),
-                const SizedBox(height: 8),
+                const SizedBox(height: Space.gap),
                 TextField(
                   controller: fileContent,
                   minLines: 3,
@@ -809,7 +793,7 @@ class _ProjectsDialogState extends State<ProjectsDialog> {
                     labelText: tr('文件内容', 'File content'),
                   ),
                 ),
-                const SizedBox(height: 8),
+                const SizedBox(height: Space.gap),
                 Align(
                   alignment: Alignment.centerLeft,
                   child: OutlinedButton(
@@ -829,7 +813,7 @@ class _ProjectsDialogState extends State<ProjectsDialog> {
               ],
               if (error.isNotEmpty)
                 Padding(
-                  padding: const EdgeInsets.only(top: Space.s8),
+                  padding: const EdgeInsets.only(top: Space.gap),
                   child: Text(error, style: TextStyle(color: c.danger)),
                 ),
             ],

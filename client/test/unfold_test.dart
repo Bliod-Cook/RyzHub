@@ -330,7 +330,9 @@ void main() {
     Future<Color?> bubble(String accent) async {
       await tester.pumpWidget(
         MaterialApp(
-          theme: ThemeData(extensions: [HubColors.light(accentColor(accent))]),
+          theme: ThemeData(
+            extensions: [HubColors.light.copyWith(accent: accentColor(accent))],
+          ),
           home: Scaffold(
             body: messageCard(
               item: {
@@ -354,8 +356,14 @@ void main() {
     }
 
     final blue = await bubble('blue'), pink = await bubble('pink');
-    expect(blue, HubColors.light(accentColor('blue')).userBubble);
-    expect(pink, HubColors.light(accentColor('pink')).userBubble);
+    expect(
+      blue,
+      HubColors.light.copyWith(accent: accentColor('blue')).userBubble,
+    );
+    expect(
+      pink,
+      HubColors.light.copyWith(accent: accentColor('pink')).userBubble,
+    );
     expect(blue, isNot(pink));
   });
 }

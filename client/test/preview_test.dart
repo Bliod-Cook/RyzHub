@@ -89,22 +89,22 @@ Future<void> _show(
 void main() {
   setUpAll(() => prefs.language = 'en');
 
-  test('each file goes to the previewer that can show it', () {
-    String? which(Map<String, dynamic> file) =>
-        previewerFor(PreviewFile.of(file))?.runtimeType.toString();
-    expect(which(_file('a', 'shot.png', 'image')), 'ImagePreviewer');
-    expect(which(_file('b', 'brief.pdf', 'pdf')), 'PdfPreviewer');
-    expect(which(_file('c', 'notes.csv', 'text')), 'TextPreviewer');
+  test('each file previews as what it is', () {
+    Preview? which(Map<String, dynamic> file) =>
+        previewOf(PreviewFile.of(file));
+    expect(which(_file('a', 'shot.png', 'image')), Preview.image);
+    expect(which(_file('b', 'brief.pdf', 'pdf')), Preview.pdf);
+    expect(which(_file('c', 'notes.csv', 'text')), Preview.text);
     // Text the server did not inline still previews, up to a size.
-    expect(which(_file('d', 'main.py', 'file')), 'TextPreviewer');
+    expect(which(_file('d', 'main.py', 'file')), Preview.text);
     expect(
       which(_file('e', 'data', 'file', type: 'application/json')),
-      'TextPreviewer',
+      Preview.text,
     );
     // A picture the server could not render when it was uploaded.
     expect(
       which(_file('p', 'shot.png', 'file', type: 'image/png')),
-      'ImagePreviewer',
+      Preview.image,
     );
     expect(which(_file('h', 'shot.heic', 'file', type: 'image/heic')), isNull);
     expect(which(_file('f', 'big.log', 'file', size: 5 << 20)), isNull);

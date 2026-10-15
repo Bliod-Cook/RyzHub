@@ -11,7 +11,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:ryzhub/prefs.dart';
 import 'package:ryzhub/theme.dart';
 import 'package:ryzhub/ui/messages.dart';
-import 'package:ryzhub/ui/plugin_ui.dart';
+import 'package:ryzhub/ui/plugins.dart';
 
 import 'kernel.dart';
 
@@ -43,7 +43,7 @@ Widget _frame(Brightness brightness, Widget child) => MaterialApp(
     body: Center(
       child: SizedBox(
         width: 720,
-        child: Padding(padding: const EdgeInsets.all(Space.s16), child: child),
+        child: Padding(padding: const EdgeInsets.all(Space.edge), child: child),
       ),
     ),
   ),
@@ -61,7 +61,7 @@ Widget _timeline() {
     children: [
       for (final row in rows)
         Padding(
-          padding: const EdgeInsets.only(bottom: Space.s12),
+          padding: const EdgeInsets.only(bottom: 12),
           child: row['kind'] == 'steps'
               ? stepsGroup(
                   steps: row['steps'],
@@ -82,31 +82,21 @@ Widget _cards() => Column(
       onDeny: () {},
       onAllow: () {},
     ),
-    const SizedBox(height: Space.s16),
-    PluginComponent(
-      component: const {
-        'type': 'card',
-        'title': 'Open tickets',
-        'children': [
-          {
-            'type': 'table',
-            'columns': ['Id', 'Title', 'State'],
-            'rows': [
-              ['7', 'Login redirect loops', 'open'],
-              ['8', '登录页样式错位', 'closed'],
-            ],
+    const SizedBox(height: Space.edge),
+    ElicitationCard(
+      summary: 'acme: Which project?',
+      form: const {
+        'mode': 'form',
+        'requestedSchema': {
+          'type': 'object',
+          'properties': {
+            'project': {'type': 'string', 'title': 'Project'},
+            'urgent': {'type': 'boolean', 'title': 'Urgent'},
           },
-          {
-            'type': 'button',
-            'label': 'Close #7',
-            'action': {
-              'tool': 'close',
-              'arguments': {'id': '7'},
-            },
-          },
-        ],
+          'required': ['project'],
+        },
       },
-      call: (_, _) async => const {},
+      onAnswer: (_) async {},
     ),
   ],
 );
@@ -135,7 +125,7 @@ void main() {
     });
   }
 
-  testWidgets('approval and plugin cards', (tester) async {
+  testWidgets('approval and plugin question cards', (tester) async {
     tester.view.physicalSize = const Size(720, 520);
     tester.view.devicePixelRatio = 1;
     addTearDown(tester.view.reset);

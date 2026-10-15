@@ -64,28 +64,24 @@ class PreviewFile {
       name.contains('.') ? name.split('.').last.toLowerCase() : '';
 }
 
-/// Shows one kind of file. The preview asks each of [previewers] in turn,
-/// and the first that accepts a file shows it.
-abstract class FilePreviewer {
-  const FilePreviewer();
-  bool accepts(PreviewFile file);
-  Widget build(BuildContext context, HubController hub, PreviewFile file);
-}
+/// How a file is previewed.
+enum Preview { image, pdf, text }
 
-/// Renderers of HTML or SVG belong before [TextPreviewer], which shows their
-/// source until then.
-const previewers = <FilePreviewer>[
-  ImagePreviewer(),
-  PdfPreviewer(),
-  TextPreviewer(),
-];
-
-/// What shows [file], or null when nothing can.
-FilePreviewer? previewerFor(PreviewFile file) {
-  for (final previewer in previewers) {
-    if (previewer.accepts(file)) return previewer;
+/// How [file] is previewed, or null when nothing here can show it.
+Preview? previewOf(PreviewFile file) {
+  if (file.kind == 'image' ||
+      (file.kind == 'file' && _pictureTypes.contains(file.mediaType))) {
+    return Preview.image;
   }
-  return null;
+  if (file.kind == 'pdf') return Preview.pdf;
+  if (file.kind == 'text') return Preview.text;
+  if (file.kind != 'file' || file.size > previewTextBytes) return null;
+  final type = file.mediaType ?? '';
+  return type.startsWith('text/') ||
+          _textTypes.contains(type) ||
+          _textExtensions.contains(file.extension)
+      ? Preview.text
+      : null;
 }
 
 /// Around a preview floating over the conversation: a tap on the backdrop,
@@ -138,17 +134,6 @@ const _originalSide = 8192;
 
 /// A picture to zoom and pan: the server's rendition at once, then the file
 /// as uploaded, at full size and animated, when it is small enough to fetch.
-class ImagePreviewer extends FilePreviewer {
-  const ImagePreviewer();
-  @override
-  bool accepts(PreviewFile file) =>
-      file.kind == 'image' ||
-      (file.kind == 'file' && _pictureTypes.contains(file.mediaType));
-  @override
-  Widget build(BuildContext context, HubController hub, PreviewFile file) =>
-      _ImagePreview(hub: hub, file: file);
-}
-
 class _ImagePreview extends StatefulWidget {
   final HubController hub;
   final PreviewFile file;
@@ -234,7 +219,7 @@ class _ImagePreviewState extends State<_ImagePreview> {
       maxScale: 8,
       child: Center(
         child: Padding(
-          padding: const EdgeInsets.all(Space.s24),
+          padding: const EdgeInsets.all(24),
           child: PreviewContent(
             child: DecoratedBox(
               // Lifted off the blurred page, which may be as white.
@@ -273,20 +258,31 @@ class _ImagePreviewState extends State<_ImagePreview> {
   }
 }
 
-/// A PDF's pages, drawn by PDFium on every platform.
-class PdfPreviewer extends FilePreviewer {
-  const PdfPreviewer();
-  @override
-  bool accepts(PreviewFile file) => file.kind == 'pdf';
-  @override
-  Widget build(BuildContext context, HubController hub, PreviewFile file) {
-    final c = HubColors.of(context);
-    final backdrop = PreviewBackdrop.of(context);
-    return _Loaded<Uint8List>(
+/// What a preview shows when it cannot load the file.
+Widget Function(BuildContext, Object) _unavailable(
+  HubController hub,
+  PreviewFile file,
+) =>
+    (context, error) => UnavailablePreview(
       hub: hub,
       file: file,
+      deleted: '$error'.contains('ATTACHMENT_DELETED'),
+      reason: errorText(error),
+    );
+
+/// A PDF's pages, drawn by PDFium on every platform.
+class _PdfPreview extends StatelessWidget {
+  final HubController hub;
+  final PreviewFile file;
+  const _PdfPreview({required this.hub, required this.file});
+  @override
+  Widget build(BuildContext context) {
+    final c = HubColors.of(context);
+    final backdrop = PreviewBackdrop.of(context);
+    return Loader<Uint8List>(
       load: () => hub.original(file.id),
-      builder: (context, bytes) => PdfViewer.data(
+      failed: _unavailable(hub, file),
+      builder: (context, bytes, _) => PdfViewer.data(
         bytes,
         sourceName: 'attachment:${file.id}',
         params: PdfViewerParams(
@@ -316,49 +312,37 @@ class PdfPreviewer extends FilePreviewer {
 }
 
 /// Text as written, in an even-width font; Markdown as messages show it.
-class TextPreviewer extends FilePreviewer {
-  const TextPreviewer();
-  @override
-  bool accepts(PreviewFile file) {
-    if (file.kind == 'text') return true;
-    if (file.kind != 'file' || file.size > previewTextBytes) return false;
-    final type = file.mediaType ?? '';
-    return type.startsWith('text/') ||
-        _textTypes.contains(type) ||
-        _textExtensions.contains(file.extension);
-  }
+class _TextPreview extends StatelessWidget {
+  final HubController hub;
+  final PreviewFile file;
+  const _TextPreview({required this.hub, required this.file});
 
-  bool _markdown(PreviewFile file) =>
+  bool get _markdown =>
       file.mediaType == 'text/markdown' ||
       file.extension == 'md' ||
       file.extension == 'markdown';
 
   @override
-  Widget build(BuildContext context, HubController hub, PreviewFile file) =>
-      _Loaded<String?>(
-        hub: hub,
-        file: file,
-        load: () async {
-          final bytes = await hub.original(file.id);
-          try {
-            return utf8.decode(bytes);
-          } on FormatException {
-            return null;
-          }
-        },
-        builder: (context, text) => text == null
-            ? UnavailablePreview(
-                hub: hub,
-                file: file,
-                reason: tr(
-                  '无法预览：不是文本文件',
-                  'Preview not available: not a text file',
-                ),
-              )
-            : _markdown(file)
-            ? _Paper(maxWidth: contentWidth + 64, child: MarkdownText(text))
-            : _Paper(child: _Code(text, language: file.extension)),
-      );
+  Widget build(BuildContext context) => Loader<String?>(
+    failed: _unavailable(hub, file),
+    load: () async {
+      final bytes = await hub.original(file.id);
+      try {
+        return utf8.decode(bytes);
+      } on FormatException {
+        return null;
+      }
+    },
+    builder: (context, text, _) => text == null
+        ? UnavailablePreview(
+            hub: hub,
+            file: file,
+            reason: tr('无法预览：不是文本文件', 'Preview not available: not a text file'),
+          )
+        : _markdown
+        ? _Paper(maxWidth: contentWidth + 64, child: MarkdownText(text))
+        : _Paper(child: _Code(text, language: file.extension)),
+  );
 }
 
 /// Text on a page of its own, centred over the preview's background.
@@ -370,26 +354,16 @@ class _Paper extends StatelessWidget {
   Widget build(BuildContext context) {
     final c = HubColors.of(context);
     return SingleChildScrollView(
-      padding: const EdgeInsets.fromLTRB(
-        Space.s16,
-        Space.s8,
-        Space.s16,
-        Space.s24,
-      ),
+      padding: const EdgeInsets.fromLTRB(Space.edge, Space.gap, Space.edge, 24),
       child: Center(
         child: PreviewContent(
           child: Container(
             width: double.infinity,
             constraints: BoxConstraints(maxWidth: maxWidth),
-            padding: const EdgeInsets.fromLTRB(
-              Space.s32,
-              Space.s28,
-              Space.s32,
-              Space.s32,
-            ),
+            padding: const EdgeInsets.fromLTRB(32, 28, 32, 32),
             decoration: BoxDecoration(
               color: c.background,
-              borderRadius: BorderRadius.circular(16),
+              borderRadius: BorderRadius.circular(Radii.card),
               border: Border.all(color: c.border),
             ),
             child: child,
@@ -414,10 +388,8 @@ class _Code extends StatelessWidget {
       child: CodeText(
         text,
         language: language,
-        style: TextStyle(
-          fontFamily: '0xProto',
-          fontFamilyFallback: const [fontFamily, ...fontFallback],
-          fontSize: 13,
+        style: codeStyle.copyWith(
+          fontSize: FontSizes.label,
           height: 1.55,
           color: c.text,
         ),
@@ -446,7 +418,7 @@ class UnavailablePreview extends StatelessWidget {
     final c = HubColors.of(context);
     return Center(
       child: SingleChildScrollView(
-        padding: const EdgeInsets.all(Space.s24),
+        padding: const EdgeInsets.all(24),
         child: PreviewContent(
           child: Column(
             mainAxisSize: MainAxisSize.min,
@@ -456,7 +428,7 @@ class UnavailablePreview extends StatelessWidget {
                 height: 80,
                 decoration: BoxDecoration(
                   color: c.hover,
-                  borderRadius: BorderRadius.circular(20),
+                  borderRadius: BorderRadius.circular(Radii.dialog),
                 ),
                 child: Icon(
                   fileIcon(file.kind, file.name),
@@ -468,7 +440,7 @@ class UnavailablePreview extends StatelessWidget {
               Text(
                 file.name,
                 textAlign: TextAlign.center,
-                style: TextStyle(fontSize: 16, color: c.text),
+                style: TextStyle(fontSize: FontSizes.title, color: c.text),
               ),
               const SizedBox(height: 6),
               Text(
@@ -476,23 +448,16 @@ class UnavailablePreview extends StatelessWidget {
                     ? tr('文件已被删除', 'This file was deleted')
                     : reason ?? tr('无法预览', 'Preview not available'),
                 textAlign: TextAlign.center,
-                style: TextStyle(fontSize: 14, color: c.subtle),
+                style: TextStyle(fontSize: FontSizes.body, color: c.subtle),
               ),
               if (!deleted) ...[
-                const SizedBox(height: 4),
-                Text(
-                  tr(
-                    '此类文件可以下载，或附加到对话中。',
-                    'This file can be downloaded or attached to a chat.',
-                  ),
-                  textAlign: TextAlign.center,
-                  style: TextStyle(fontSize: 14, color: c.subtle),
-                ),
-                const SizedBox(height: 16),
+                const SizedBox(height: 20),
                 OutlinedButton(
                   style: OutlinedButton.styleFrom(
                     visualDensity: VisualDensity.compact,
-                    padding: const EdgeInsets.symmetric(horizontal: Space.s14),
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: Space.inset,
+                    ),
                     shape: const StadiumBorder(),
                     side: BorderSide(color: c.border),
                     backgroundColor: c.background,
@@ -508,48 +473,6 @@ class UnavailablePreview extends StatelessWidget {
       ),
     );
   }
-}
-
-/// Loads what a previewer shows once, with a spinner meanwhile; a failure
-/// falls back to [UnavailablePreview].
-class _Loaded<T> extends StatefulWidget {
-  final HubController hub;
-  final PreviewFile file;
-  final Future<T> Function() load;
-  final Widget Function(BuildContext context, T value) builder;
-  const _Loaded({
-    super.key,
-    required this.hub,
-    required this.file,
-    required this.load,
-    required this.builder,
-  });
-  @override
-  State<_Loaded<T>> createState() => _LoadedState<T>();
-}
-
-class _LoadedState<T> extends State<_Loaded<T>> {
-  late final Future<T> future = widget.load();
-  @override
-  Widget build(BuildContext context) => FutureBuilder<T>(
-    future: future,
-    builder: (context, snapshot) {
-      if (snapshot.hasError) {
-        final error = snapshot.error!;
-        final deleted = '$error'.contains('ATTACHMENT_DELETED');
-        return UnavailablePreview(
-          hub: widget.hub,
-          file: widget.file,
-          deleted: deleted,
-          reason: errorText(error),
-        );
-      }
-      if (snapshot.connectionState != ConnectionState.done) {
-        return const Center(child: CircularProgressIndicator());
-      }
-      return widget.builder(context, snapshot.data as T);
-    },
-  );
 }
 
 /// A file's preview: its name, download and close above it, a question
@@ -622,14 +545,16 @@ class _FilePreviewViewState extends State<FilePreviewView> {
   @override
   Widget build(BuildContext context) {
     final c = HubColors.of(context);
-    final files = hub.previewFiles ?? const [];
-    if (files.isEmpty) return const SizedBox.shrink();
-    final index = hub.previewIndex.clamp(0, files.length - 1);
+    final files = hub.previewFiles!;
+    final index = hub.previewIndex;
     final raw = files[index];
     final file = PreviewFile.of(raw);
-    final body =
-        previewerFor(file)?.build(context, hub, file) ??
-        UnavailablePreview(hub: hub, file: file);
+    final body = switch (previewOf(file)) {
+      Preview.image => _ImagePreview(hub: hub, file: file),
+      Preview.pdf => _PdfPreview(hub: hub, file: file),
+      Preview.text => _TextPreview(hub: hub, file: file),
+      null => UnavailablePreview(hub: hub, file: file),
+    };
     final close = hub.closePreview;
     Widget stage = Hover(
       builder: (context, hovered) => Stack(
@@ -670,12 +595,7 @@ class _FilePreviewViewState extends State<FilePreviewView> {
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           Padding(
-            padding: const EdgeInsets.fromLTRB(
-              Space.s12,
-              Space.s10,
-              Space.s12,
-              Space.s6,
-            ),
+            padding: const EdgeInsets.fromLTRB(12, 10, 12, 6),
             child: Row(
               children: [
                 Flexible(
@@ -684,9 +604,9 @@ class _FilePreviewViewState extends State<FilePreviewView> {
                     child: _Raised(
                       child: Padding(
                         padding: const EdgeInsets.fromLTRB(
-                          Space.s14,
+                          Space.inset,
                           0,
-                          Space.s18,
+                          18,
                           0,
                         ),
                         child: Row(
@@ -697,7 +617,7 @@ class _FilePreviewViewState extends State<FilePreviewView> {
                               size: 18,
                               color: c.text,
                             ),
-                            const SizedBox(width: 8),
+                            const SizedBox(width: Space.gap),
                             Flexible(
                               child: Semantics(
                                 header: true,
@@ -705,7 +625,10 @@ class _FilePreviewViewState extends State<FilePreviewView> {
                                   file.name,
                                   maxLines: 1,
                                   overflow: TextOverflow.ellipsis,
-                                  style: TextStyle(fontSize: 15, color: c.text),
+                                  style: TextStyle(
+                                    fontSize: FontSizes.message,
+                                    color: c.text,
+                                  ),
                                 ),
                               ),
                             ),
@@ -725,7 +648,7 @@ class _FilePreviewViewState extends State<FilePreviewView> {
                         downloadFile(context, hub, file.id, file.name),
                   ),
                 ),
-                const SizedBox(width: 8),
+                const SizedBox(width: Space.gap),
                 _Raised(
                   round: true,
                   child: IconButton(
@@ -740,10 +663,10 @@ class _FilePreviewViewState extends State<FilePreviewView> {
           Expanded(child: stage),
           Padding(
             padding: const EdgeInsets.fromLTRB(
-              Space.s16,
-              Space.s6,
-              Space.s16,
-              Space.s14,
+              Space.edge,
+              6,
+              Space.edge,
+              Space.inset,
             ),
             child: Center(
               child: ConstrainedBox(

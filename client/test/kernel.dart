@@ -80,7 +80,7 @@ Rendered rendered(Map<String, dynamic> item) =>
 MessageCard messageCard({
   Key? key,
   required Map<String, dynamic> item,
-  String? agentLabel,
+  String agentLabel = 'Chat',
   VoidCallback? onFork,
   VoidCallback? onMemoryUndo,
   ValueChanged<String>? onSource,

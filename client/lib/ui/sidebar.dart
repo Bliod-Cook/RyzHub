@@ -2,7 +2,6 @@ import 'package:flutter/material.dart';
 
 import '../controller.dart';
 import '../l10n.dart';
-import '../prefs.dart';
 import '../theme.dart';
 import 'common.dart';
 import 'dialogs.dart';
@@ -29,8 +28,6 @@ class Sidebar extends StatelessWidget {
         run: app.run,
       );
 
-  bool folded(String id) => prefs.collapsedSections.contains(id);
-
   @override
   Widget build(BuildContext context) {
     final c = HubColors.of(context);
@@ -44,21 +41,21 @@ class Sidebar extends StatelessWidget {
           children: [
             Padding(
               padding: const EdgeInsets.fromLTRB(
-                Space.s16,
-                Space.s8,
-                Space.s8,
-                Space.s6,
+                Space.edge,
+                Space.gap,
+                Space.gap,
+                6,
               ),
               child: SizedBox(
                 height: 40,
                 child: Row(
                   children: [
                     Icon(Icons.hub_outlined, size: 20, color: c.text),
-                    const SizedBox(width: 8),
+                    const SizedBox(width: Space.gap),
                     Text(
                       'RyzHub',
                       style: TextStyle(
-                        fontSize: 16,
+                        fontSize: FontSizes.title,
                         fontWeight: FontWeight.w600,
                         color: c.text,
                       ),
@@ -107,21 +104,24 @@ class Sidebar extends StatelessWidget {
                   ? null
                   : Text(
                       '${hub.archived.length}',
-                      style: TextStyle(fontSize: 12, color: c.subtle),
+                      style: TextStyle(
+                        fontSize: FontSizes.caption,
+                        color: c.subtle,
+                      ),
                     ),
             ),
             Expanded(
               child: ListView(
-                padding: const EdgeInsets.only(bottom: Space.s12),
+                padding: const EdgeInsets.only(bottom: 12),
                 children: [
                   if (pinned.isNotEmpty) ...[
-                    SectionHeader(id: 'pinned', title: tr('已置顶', 'Pinned')),
-                    if (!folded('pinned'))
+                    _section('pinned', tr('已置顶', 'Pinned')),
+                    if (!FoldHeader.folded('pinned'))
                       for (final x in pinned) conversationRow(x),
                   ],
-                  SectionHeader(
-                    id: 'projects',
-                    title: tr('项目', 'Projects'),
+                  _section(
+                    'projects',
+                    tr('项目', 'Projects'),
                     trailing: SizedBox(
                       width: 30,
                       height: 26,
@@ -142,7 +142,7 @@ class Sidebar extends StatelessWidget {
                       ),
                     ),
                   ),
-                  if (!folded('projects')) ...[
+                  if (!FoldHeader.folded('projects')) ...[
                     if (hub.activeProjects.isEmpty)
                       EmptyHint(tr('暂无项目', 'No projects')),
                     for (final p in hub.activeProjects) ...[
@@ -173,8 +173,8 @@ class Sidebar extends StatelessWidget {
                           conversationRow(x, indent: true),
                     ],
                   ],
-                  SectionHeader(id: 'recents', title: tr('最近', 'Recents')),
-                  if (!folded('recents')) ...[
+                  _section('recents', tr('最近', 'Recents')),
+                  if (!FoldHeader.folded('recents')) ...[
                     if (recents.isEmpty) EmptyHint(tr('暂无对话', 'No chats yet')),
                     for (final x in recents) conversationRow(x),
                   ],
@@ -237,7 +237,7 @@ class SidebarRail extends StatelessWidget {
             ),
             const Spacer(),
             AccountButton(hub: hub, app: app, compact: true),
-            const SizedBox(height: 8),
+            const SizedBox(height: Space.gap),
           ],
         ),
       ),
@@ -245,7 +245,7 @@ class SidebarRail extends StatelessWidget {
   }
 }
 
-class ConversationRow extends StatefulWidget {
+class ConversationRow extends StatelessWidget {
   final HubController hub;
   final Map<String, dynamic> conversation;
   final bool indent;
@@ -260,129 +260,54 @@ class ConversationRow extends StatefulWidget {
     this.indent = false,
   });
   @override
-  State<ConversationRow> createState() => _ConversationRowState();
-}
-
-class _ConversationRowState extends State<ConversationRow> {
-  final menuKey = GlobalKey<PopupMenuButtonState<String>>();
-  @override
   Widget build(BuildContext context) {
     final c = HubColors.of(context);
-    final ConversationRow(:hub, :conversation, :indent, :onTap, :run) = widget;
-    final selected = conversation['id'] == hub.selected;
     final unread = hub.unread(conversation);
-    return Hover(
-      builder: (context, hovered) => Padding(
-        padding: EdgeInsets.fromLTRB(
-          indent ? Space.s22 : Space.s6,
-          Space.s1,
-          Space.s6,
-          Space.s1,
-        ),
-        child: Container(
-          height: 36,
-          decoration: BoxDecoration(
-            color: selected
-                ? c.selected
-                : hovered
-                ? c.hover
-                : Colors.transparent,
-            borderRadius: BorderRadius.circular(10),
+    return HoverRow<String>(
+      selected: conversation['id'] == hub.selected,
+      indent: indent ? 22 : 6,
+      onTap: onTap,
+      menuTooltip: tr('对话选项', 'Chat options'),
+      menu: (_) => conversationMenu(hub, conversation, header: false),
+      onSelected: (v) =>
+          run(() => conversationAction(context, hub, conversation, v)),
+      trailing: SizedBox(
+        width: 30,
+        height: 32,
+        child: PinButton(hub: hub, conv: conversation, run: run, compact: true),
+      ),
+      child: Row(
+        children: [
+          if (conversation['mode'] == 'work') ...[
+            Icon(Icons.terminal, size: 15, color: c.subtle),
+            const SizedBox(width: Space.gap),
+          ],
+          Expanded(
+            child: Text(
+              conversation['title'] ?? '',
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(
+                fontSize: FontSizes.body,
+                color: c.text,
+                fontWeight: unread ? FontWeight.w600 : null,
+              ),
+            ),
           ),
-          child: Row(
-            children: [
-              Expanded(
-                child: Semantics(
-                  container: true,
-                  button: true,
-                  selected: selected,
-                  child: InkWell(
-                    borderRadius: BorderRadius.circular(10),
-                    onTap: onTap,
-                    onLongPress: () => menuKey.currentState?.showButtonMenu(),
-                    child: Padding(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: Space.s10,
-                      ),
-                      child: Row(
-                        children: [
-                          if (conversation['mode'] == 'work') ...[
-                            Icon(Icons.terminal, size: 15, color: c.subtle),
-                            const SizedBox(width: 8),
-                          ],
-                          Expanded(
-                            child: Text(
-                              conversation['title'] ?? '',
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                              style: TextStyle(
-                                fontSize: 14,
-                                color: c.text,
-                                fontWeight: unread ? FontWeight.w600 : null,
-                              ),
-                            ),
-                          ),
-                          if (unread)
-                            Semantics(
-                              label: tr('有新消息', 'New messages'),
-                              child: Container(
-                                width: 7,
-                                height: 7,
-                                margin: const EdgeInsets.only(left: Space.s6),
-                                decoration: BoxDecoration(
-                                  color: c.accent,
-                                  shape: BoxShape.circle,
-                                ),
-                              ),
-                            ),
-                        ],
-                      ),
-                    ),
-                  ),
+          if (unread)
+            Semantics(
+              label: tr('有新消息', 'New messages'),
+              child: Container(
+                width: 7,
+                height: 7,
+                margin: const EdgeInsets.only(left: 6),
+                decoration: BoxDecoration(
+                  color: c.accent,
+                  shape: BoxShape.circle,
                 ),
               ),
-              Reveal(
-                visible: hovered || selected,
-                child: SizedBox(
-                  width: 32,
-                  height: 32,
-                  child: PopupMenuButton<String>(
-                    key: menuKey,
-                    tooltip: tr('对话选项', 'Chat options'),
-                    padding: EdgeInsets.zero,
-                    // The row already highlights; no second one on the glyph.
-                    style: const ButtonStyle(
-                      overlayColor: WidgetStatePropertyAll(Colors.transparent),
-                    ),
-                    icon: Icon(Icons.more_horiz, size: 18, color: c.muted),
-                    position: PopupMenuPosition.under,
-                    // Clear of the button and its highlight.
-                    offset: const Offset(0, 6),
-                    onSelected: (v) => run(
-                      () => conversationAction(context, hub, conversation, v),
-                    ),
-                    itemBuilder: (_) =>
-                        conversationMenu(hub, conversation, header: false),
-                  ),
-                ),
-              ),
-              Reveal(
-                visible: hovered || selected,
-                child: SizedBox(
-                  width: 30,
-                  height: 32,
-                  child: PinButton(
-                    hub: hub,
-                    conv: conversation,
-                    run: run,
-                    compact: true,
-                  ),
-                ),
-              ),
-              const SizedBox(width: 2),
-            ],
-          ),
-        ),
+            ),
+        ],
       ),
     );
   }
@@ -404,116 +329,55 @@ class ProjectRow extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final c = HubColors.of(context);
-    return Hover(
-      builder: (context, hovered) => Padding(
-        padding: const EdgeInsets.symmetric(
-          horizontal: Space.s6,
-          vertical: Space.s1,
-        ),
-        child: Container(
-          height: 36,
-          decoration: BoxDecoration(
-            color: selected
-                ? c.selected
-                : hovered
-                ? c.hover
-                : Colors.transparent,
-            borderRadius: BorderRadius.circular(10),
-          ),
+    return HoverRow<String>(
+      selected: selected,
+      onTap: onTap,
+      menuTooltip: tr('项目选项', 'Project options'),
+      menu: (_) => [
+        HubMenuItem(
+          value: 'edit',
+          height: 38,
           child: Row(
             children: [
-              Expanded(
-                child: Semantics(
-                  container: true,
-                  button: true,
-                  selected: selected,
-                  child: InkWell(
-                    borderRadius: BorderRadius.circular(10),
-                    onTap: onTap,
-                    child: Padding(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: Space.s10,
-                      ),
-                      child: Row(
-                        children: [
-                          Icon(
-                            open
-                                ? Icons.folder_open_outlined
-                                : Icons.folder_outlined,
-                            size: 18,
-                            color: c.text,
-                          ),
-                          const SizedBox(width: 10),
-                          Expanded(
-                            child: Text(
-                              project['name'] ?? '',
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                              style: TextStyle(fontSize: 14, color: c.text),
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                  ),
-                ),
-              ),
-              Reveal(
-                visible: hovered || selected,
-                child: SizedBox(
-                  width: 32,
-                  height: 32,
-                  child: PopupMenuButton<String>(
-                    tooltip: tr('项目选项', 'Project options'),
-                    padding: EdgeInsets.zero,
-                    // The row already highlights; no second one on the glyph.
-                    style: const ButtonStyle(
-                      overlayColor: WidgetStatePropertyAll(Colors.transparent),
-                    ),
-                    icon: Icon(Icons.more_horiz, size: 18, color: c.muted),
-                    position: PopupMenuPosition.under,
-                    // Clear of the button and its highlight.
-                    offset: const Offset(0, 6),
-                    onSelected: (value) =>
-                        value == 'delete' ? onDelete() : onEdit(),
-                    itemBuilder: (_) => [
-                      HubMenuItem(
-                        value: 'edit',
-                        height: 38,
-                        child: Row(
-                          children: [
-                            const Icon(Icons.edit_outlined, size: 17),
-                            const SizedBox(width: 12),
-                            Text(tr('编辑项目', 'Edit project')),
-                          ],
-                        ),
-                      ),
-                      HubMenuItem(
-                        value: 'delete',
-                        height: 38,
-                        child: Row(
-                          children: [
-                            Icon(
-                              Icons.delete_outline,
-                              size: 17,
-                              color: c.danger,
-                            ),
-                            const SizedBox(width: 12),
-                            Text(
-                              tr('删除项目', 'Delete project'),
-                              style: TextStyle(color: c.danger),
-                            ),
-                          ],
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-              const SizedBox(width: 2),
+              const Icon(Icons.edit_outlined, size: 17),
+              const SizedBox(width: 12),
+              Text(tr('编辑项目', 'Edit project')),
             ],
           ),
         ),
+        HubMenuItem(
+          value: 'delete',
+          height: 38,
+          child: Row(
+            children: [
+              Icon(Icons.delete_outline, size: 17, color: c.danger),
+              const SizedBox(width: 12),
+              Text(
+                tr('删除项目', 'Delete project'),
+                style: TextStyle(color: c.danger),
+              ),
+            ],
+          ),
+        ),
+      ],
+      onSelected: (value) => value == 'delete' ? onDelete() : onEdit(),
+      child: Row(
+        children: [
+          Icon(
+            open ? Icons.folder_open_outlined : Icons.folder_outlined,
+            size: 18,
+            color: c.text,
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Text(
+              project['name'] ?? '',
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(fontSize: FontSizes.body, color: c.text),
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -561,10 +425,10 @@ class AccountButton extends StatelessWidget {
           menuChildren: [
             Padding(
               padding: const EdgeInsets.fromLTRB(
-                Space.s14,
-                Space.s8,
-                Space.s14,
-                Space.s8,
+                Space.inset,
+                Space.gap,
+                Space.inset,
+                Space.gap,
               ),
               child: Row(
                 children: [
@@ -578,7 +442,10 @@ class AccountButton extends StatelessWidget {
                     child: Text(
                       hub.email,
                       overflow: TextOverflow.ellipsis,
-                      style: TextStyle(fontSize: 13, color: c.subtle),
+                      style: TextStyle(
+                        fontSize: FontSizes.label,
+                        color: c.subtle,
+                      ),
                     ),
                   ),
                 ],
@@ -609,10 +476,10 @@ class AccountButton extends StatelessWidget {
             // Inset so the highlight keeps clear of the sidebar edges.
             child: Padding(
               padding: compact
-                  ? const EdgeInsets.all(Space.s8)
-                  : const EdgeInsets.all(Space.s6),
+                  ? const EdgeInsets.all(Space.gap)
+                  : const EdgeInsets.all(6),
               child: InkWell(
-                borderRadius: BorderRadius.circular(10),
+                borderRadius: BorderRadius.circular(Radii.control),
                 onTap: () =>
                     controller.isOpen ? controller.close() : controller.open(),
                 // Collapsed, the tile spans the rail so the menu can attach to
@@ -621,16 +488,16 @@ class AccountButton extends StatelessWidget {
                     ? SizedBox(
                         width: double.infinity,
                         child: Padding(
-                          padding: const EdgeInsets.all(Space.s6),
+                          padding: const EdgeInsets.all(6),
                           child: Center(child: Avatar(hub.email)),
                         ),
                       )
                     : Padding(
                         padding: const EdgeInsets.fromLTRB(
-                          Space.s8,
-                          Space.s8,
-                          Space.s8,
-                          Space.s8,
+                          Space.gap,
+                          Space.gap,
+                          Space.gap,
+                          Space.gap,
                         ),
                         child: Row(
                           children: [
@@ -641,7 +508,10 @@ class AccountButton extends StatelessWidget {
                                 name,
                                 maxLines: 1,
                                 overflow: TextOverflow.ellipsis,
-                                style: TextStyle(fontSize: 14, color: c.text),
+                                style: TextStyle(
+                                  fontSize: FontSizes.body,
+                                  color: c.text,
+                                ),
                               ),
                             ),
                             Icon(Icons.unfold_more, size: 16, color: c.subtle),
@@ -688,7 +558,7 @@ class ConnectionStatus extends StatelessWidget {
         excludeSemantics: true,
         child: Tooltip(
           message: label,
-          child: Padding(padding: const EdgeInsets.all(Space.s8), child: dot),
+          child: Padding(padding: const EdgeInsets.all(Space.gap), child: dot),
         ),
       );
     }
@@ -699,80 +569,23 @@ class ConnectionStatus extends StatelessWidget {
       onTap: onReconnect,
       excludeSemantics: true,
       child: Tooltip(
-        message: '$label · ${tr('点击重新连接', 'click to reconnect')}',
+        message: label,
         // Only the dot: its colour carries the state, the tooltip names it.
         child: InkWell(
           customBorder: const CircleBorder(),
           onTap: onReconnect,
-          child: Padding(padding: const EdgeInsets.all(Space.s8), child: dot),
+          child: Padding(padding: const EdgeInsets.all(Space.gap), child: dot),
         ),
       ),
     );
   }
 }
 
-/// A sidebar section title. Hovering shows a chevron and the whole row folds
-/// or unfolds the section; a folded section keeps its chevron visible. The
-/// trailing action stays a separate target.
-class SectionHeader extends StatelessWidget {
-  final String id, title;
-  final Widget? trailing;
-  const SectionHeader({
-    super.key,
-    required this.id,
-    required this.title,
-    this.trailing,
-  });
-  @override
-  Widget build(BuildContext context) {
-    final c = HubColors.of(context);
-    final folded = prefs.collapsedSections.contains(id);
-    void toggle() => prefs.update((p) {
-      if (!p.collapsedSections.remove(id)) p.collapsedSections.add(id);
-    });
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(
-        Space.s6,
-        Space.s14,
-        Space.s8,
-        Space.s2,
-      ),
-      child: Hover(
-        builder: (context, hovered) => Row(
-          children: [
-            Expanded(
-              child: Semantics(
-                container: true,
-                button: true,
-                expanded: !folded,
-                child: Clickable(
-                  onTap: toggle,
-                  child: SizedBox(
-                    height: 30,
-                    child: Row(
-                      children: [
-                        const SizedBox(width: 10),
-                        Text(
-                          title,
-                          style: TextStyle(fontSize: 12.5, color: c.subtle),
-                        ),
-                        const SizedBox(width: 2),
-                        if (hovered || folded || touchPlatform)
-                          Icon(
-                            folded ? Icons.chevron_right : Icons.expand_more,
-                            size: 16,
-                            color: c.subtle,
-                          ),
-                      ],
-                    ),
-                  ),
-                ),
-              ),
-            ),
-            ?trailing,
-          ],
-        ),
-      ),
-    );
-  }
-}
+/// A sidebar section title that folds the section.
+Widget _section(String id, String title, {Widget? trailing}) => FoldHeader(
+  id: id,
+  title: title,
+  padding: const EdgeInsets.fromLTRB(Space.edge, Space.inset, Space.gap, 2),
+  height: 30,
+  trailing: trailing,
+);

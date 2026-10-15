@@ -71,15 +71,13 @@ class _ModelPickerState extends State<ModelPicker> {
       Icon(Icons.check, size: 16, color: HubColors.of(context).text);
 
   Widget header(BuildContext context, String text) => Padding(
-    padding: const EdgeInsets.fromLTRB(
-      Space.s14,
-      Space.s8,
-      Space.s14,
-      Space.s4,
-    ),
+    padding: const EdgeInsets.fromLTRB(Space.inset, Space.gap, Space.inset, 4),
     child: Text(
       text,
-      style: TextStyle(fontSize: 12, color: HubColors.of(context).subtle),
+      style: TextStyle(
+        fontSize: FontSizes.caption,
+        color: HubColors.of(context).subtle,
+      ),
     ),
   );
 
@@ -202,7 +200,7 @@ class _ModelPickerState extends State<ModelPicker> {
 
   Widget label(BuildContext context, VoidCallback onTap) {
     final c = HubColors.of(context);
-    final compact = MediaQuery.sizeOf(context).width < 560;
+    final compact = MediaQuery.sizeOf(context).width < narrowWidth;
     final level = shown(levels(widget.harness, widget.model));
     // No hover tooltip: it would cover the footer or the open menu. The
     // label still names the control for assistive tech.
@@ -215,12 +213,12 @@ class _ModelPickerState extends State<ModelPicker> {
       child: Material(
         type: MaterialType.transparency,
         child: InkWell(
-          borderRadius: BorderRadius.circular(10),
+          borderRadius: BorderRadius.circular(Radii.control),
           hoverColor: HubColors.of(context).hover,
           onTap: onTap,
           child: Container(
             height: 36,
-            padding: const EdgeInsets.symmetric(horizontal: Space.s12),
+            padding: const EdgeInsets.symmetric(horizontal: 12),
             child: Row(
               mainAxisSize: MainAxisSize.min,
               children: [
@@ -230,14 +228,17 @@ class _ModelPickerState extends State<ModelPicker> {
                     widget.model ?? '',
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
-                    style: modelLabelStyle(size: 14, color: c.text),
+                    style: modelLabelStyle(size: FontSizes.body, color: c.text),
                   ),
                 ),
                 if (level != null) ...[
                   const SizedBox(width: 6),
                   Text(
                     reasoningLabel(level),
-                    style: modelLabelStyle(size: 12, color: c.subtle),
+                    style: modelLabelStyle(
+                      size: FontSizes.caption,
+                      color: c.subtle,
+                    ),
                   ),
                 ],
                 const SizedBox(width: 2),

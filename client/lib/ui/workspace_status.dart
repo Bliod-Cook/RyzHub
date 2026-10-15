@@ -21,14 +21,11 @@ String checkpointSaved(Object? createdAt, {DateTime? now}) {
 /// checkpoint store) or deleted after the archive retention.
 String? storageNote(Object? state) => switch (state) {
   'archiving' => tr('正在归档工作区…', 'Archiving the workspace…'),
-  'cold' => tr(
-    '工作区已归档，只保存在检查点存储中；恢复后继续。',
-    'The workspace is archived in checkpoint storage; restore it to continue.',
-  ),
+  'cold' => tr('工作区已归档', 'Workspace archived'),
   'restoring' => tr('正在恢复工作区…', 'Restoring the workspace…'),
   'purging' || 'deleted' => tr(
-    '归档超过保留期，工作区文件已删除；对话记录仍可查看。',
-    'The archive outlived its retention; the workspace files were deleted. The conversation stays readable.',
+    '归档已过保留期，工作区文件已删除',
+    'Workspace files deleted after retention',
   ),
   _ => null,
 };

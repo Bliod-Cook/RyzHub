@@ -400,7 +400,7 @@ class _HubPageState extends State<HubPage>
     return true;
   }
 
-  bool get wide => MediaQuery.sizeOf(context).width >= 840;
+  bool get wide => MediaQuery.sizeOf(context).width >= wideWidth;
 
   void closeDrawer() {
     final scaffold = scaffoldKey.currentState;
@@ -536,10 +536,7 @@ class _HubPageState extends State<HubPage>
     if (!await confirmDialog(
       context,
       title: tr('退出登录？', 'Log out?'),
-      message: tr(
-        '将退出 ${hub.email}。本机缓存会保留，下次登录可继续使用。',
-        'You will be logged out of ${hub.email}. This device keeps its cache for your next sign-in.',
-      ),
+      message: hub.email,
       confirm: tr('退出登录', 'Log out'),
     )) {
       return;
@@ -581,7 +578,7 @@ class _HubPageState extends State<HubPage>
     height: wide ? 28 : 56,
     child: Row(
       children: [
-        const SizedBox(width: 8),
+        const SizedBox(width: Space.gap),
         if (!wide)
           IconButton(
             tooltip: tr('打开侧边栏', 'Open sidebar'),
@@ -610,7 +607,7 @@ class _HubPageState extends State<HubPage>
           Positioned.fill(
             child: Row(
               children: [
-                const SizedBox(width: 8),
+                const SizedBox(width: Space.gap),
                 if (!wide)
                   IconButton(
                     tooltip: tr('打开侧边栏', 'Open sidebar'),
@@ -627,7 +624,9 @@ class _HubPageState extends State<HubPage>
                 if (title != null)
                   Expanded(
                     child: Padding(
-                      padding: const EdgeInsets.symmetric(horizontal: Space.s8),
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: Space.gap,
+                      ),
                       // The mode trails the title the way a reasoning level
                       // trails its model; it is set when the chat starts.
                       child: Row(
@@ -641,7 +640,7 @@ class _HubPageState extends State<HubPage>
                                 maxLines: 1,
                                 overflow: TextOverflow.ellipsis,
                                 style: TextStyle(
-                                  fontSize: 15.5,
+                                  fontSize: FontSizes.title,
                                   fontWeight: FontWeight.w500,
                                   color: c.text,
                                 ),
@@ -651,7 +650,10 @@ class _HubPageState extends State<HubPage>
                           const SizedBox(width: 6),
                           Text(
                             conv['mode'] == 'work' ? 'Work' : 'Chat',
-                            style: modelLabelStyle(size: 12, color: c.subtle),
+                            style: modelLabelStyle(
+                              size: FontSizes.caption,
+                              color: c.subtle,
+                            ),
                           ),
                         ],
                       ),
@@ -659,21 +661,14 @@ class _HubPageState extends State<HubPage>
                   )
                 else
                   const Spacer(),
-                // Reserved like pin/delete: enabled once the server
-                // advertises `conversation_temporary`.
-                if (hub.isDraft)
+                if (hub.isDraft && hub.canTemporary)
                   IconButton(
-                    tooltip: !hub.canTemporary
-                        ? tr('临时对话（即将支持）', 'Temporary chat (coming soon)')
-                        : hub.temporary
+                    tooltip: hub.temporary
                         ? tr('关闭临时对话', 'Turn off temporary chat')
                         : tr('开启临时对话', 'Turn on temporary chat'),
                     isSelected: hub.temporary,
-                    onPressed: hub.canTemporary
-                        ? () => hub.updateDraft(
-                            () => hub.temporary = !hub.temporary,
-                          )
-                        : null,
+                    onPressed: () =>
+                        hub.updateDraft(() => hub.temporary = !hub.temporary),
                     icon: const HubIcon(HubIcons.temporaryChat),
                     selectedIcon: HubIcon(
                       HubIcons.temporaryChat,
@@ -693,7 +688,7 @@ class _HubPageState extends State<HubPage>
                     itemBuilder: (_) =>
                         conversationMenu(hub, conv, header: true),
                   ),
-                const SizedBox(width: 8),
+                const SizedBox(width: Space.gap),
               ],
             ),
           ),
@@ -703,22 +698,18 @@ class _HubPageState extends State<HubPage>
     );
   }
 
-  /// A refused message: why, and a way back to editing it.
-  Widget failedBar(SentInput failed) {
+  /// A failure above the composer: what went wrong, an [action] for it, and
+  /// a dismiss.
+  Widget errorBar(String message, VoidCallback onDismiss, {Widget? action}) {
     final c = HubColors.of(context);
     return Center(
       child: Container(
         constraints: const BoxConstraints(maxWidth: contentWidth),
-        margin: const EdgeInsets.fromLTRB(Space.s16, 0, Space.s16, Space.s8),
-        padding: const EdgeInsets.fromLTRB(
-          Space.s14,
-          Space.s6,
-          Space.s6,
-          Space.s6,
-        ),
+        margin: const EdgeInsets.fromLTRB(Space.edge, 0, Space.edge, Space.gap),
+        padding: const EdgeInsets.fromLTRB(Space.inset, 6, 6, 6),
         decoration: BoxDecoration(
           color: c.danger.withValues(alpha: .08),
-          borderRadius: BorderRadius.circular(12),
+          borderRadius: BorderRadius.circular(Radii.field),
         ),
         child: Row(
           children: [
@@ -726,57 +717,12 @@ class _HubPageState extends State<HubPage>
             const SizedBox(width: 10),
             Expanded(
               child: Text(
-                tr(
-                  '消息未发送：${errorText(failed.code)}',
-                  'Message not sent: ${errorText(failed.code)}',
-                ),
-                style: TextStyle(fontSize: 13, color: c.text),
+                message,
+                style: TextStyle(fontSize: FontSizes.label, color: c.text),
               ),
             ),
-            TextButton(
-              onPressed: restoreFailed,
-              child: Text(tr('恢复编辑', 'Edit again')),
-            ),
-            TextButton(
-              onPressed: hub.takeFailedSend,
-              child: Text(tr('关闭', 'Dismiss')),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Widget errorBar() {
-    final c = HubColors.of(context);
-    return Center(
-      child: Container(
-        constraints: const BoxConstraints(maxWidth: contentWidth),
-        margin: const EdgeInsets.fromLTRB(Space.s16, 0, Space.s16, Space.s8),
-        padding: const EdgeInsets.fromLTRB(
-          Space.s14,
-          Space.s6,
-          Space.s6,
-          Space.s6,
-        ),
-        decoration: BoxDecoration(
-          color: c.danger.withValues(alpha: .08),
-          borderRadius: BorderRadius.circular(12),
-        ),
-        child: Row(
-          children: [
-            Icon(Icons.error_outline, size: 18, color: c.danger),
-            const SizedBox(width: 10),
-            Expanded(
-              child: Text(
-                errorText(hub.error),
-                style: TextStyle(fontSize: 13, color: c.text),
-              ),
-            ),
-            TextButton(
-              onPressed: () => setState(() => hub.error = ''),
-              child: Text(tr('关闭', 'Dismiss')),
-            ),
+            ?action,
+            TextButton(onPressed: onDismiss, child: Text(tr('关闭', 'Dismiss'))),
           ],
         ),
       ),
@@ -798,8 +744,6 @@ class _HubPageState extends State<HubPage>
       onSend: (text) => action(() => hub.send(text), rethrowError: true),
       running: running,
       onCancel: () => action(hub.cancel),
-      // Side questions are off the composer for now; they are meant to come
-      // back as a command. Work's approval mode is among the run tools.
       steer: steerable,
       enterToSend: prefs.enterToSend,
       focusNode: composerFocus,
@@ -832,7 +776,7 @@ class _HubPageState extends State<HubPage>
     if (project == null) {
       return LayoutBuilder(
         builder: (context, box) => SingleChildScrollView(
-          padding: const EdgeInsets.symmetric(horizontal: Space.s16),
+          padding: const EdgeInsets.symmetric(horizontal: Space.edge),
           child: ConstrainedBox(
             constraints: BoxConstraints(minHeight: box.maxHeight),
             child: Center(
@@ -857,17 +801,6 @@ class _HubPageState extends State<HubPage>
                           ),
                         ),
                       ),
-                      if (hub.temporary) ...[
-                        const SizedBox(height: 10),
-                        Text(
-                          tr(
-                            '临时对话不会出现在历史记录中，也不会写入项目记忆。',
-                            'Temporary chats stay out of your history and project memory.',
-                          ),
-                          textAlign: TextAlign.center,
-                          style: TextStyle(fontSize: 13, color: c.muted),
-                        ),
-                      ],
                       const SizedBox(height: 30),
                       composer(),
                     ],
@@ -881,12 +814,7 @@ class _HubPageState extends State<HubPage>
     }
     final chats = hub.projectConversations(project['id']);
     return SingleChildScrollView(
-      padding: const EdgeInsets.fromLTRB(
-        Space.s16,
-        Space.s40,
-        Space.s16,
-        Space.s32,
-      ),
+      padding: const EdgeInsets.fromLTRB(Space.edge, 40, Space.edge, 32),
       child: Center(
         child: ConstrainedBox(
           constraints: const BoxConstraints(maxWidth: contentWidth),
@@ -921,15 +849,12 @@ class _HubPageState extends State<HubPage>
               ),
               if ((project['instructions'] ?? '').toString().isNotEmpty)
                 Padding(
-                  padding: const EdgeInsets.only(
-                    top: Space.s10,
-                    left: Space.s38,
-                  ),
+                  padding: const EdgeInsets.only(top: 10, left: 38),
                   child: Text(
                     project['instructions'],
                     maxLines: 2,
                     overflow: TextOverflow.ellipsis,
-                    style: TextStyle(fontSize: 13, color: c.muted),
+                    style: TextStyle(fontSize: FontSizes.label, color: c.muted),
                   ),
                 ),
               const SizedBox(height: 24),
@@ -937,28 +862,25 @@ class _HubPageState extends State<HubPage>
               const SizedBox(height: 28),
               Text(
                 tr('项目中的对话', 'Chats in this project'),
-                style: TextStyle(fontSize: 13, color: c.subtle),
+                style: TextStyle(fontSize: FontSizes.label, color: c.subtle),
               ),
-              const SizedBox(height: 8),
+              const SizedBox(height: Space.gap),
               if (chats.isEmpty)
                 Container(
-                  padding: const EdgeInsets.all(Space.s20),
+                  padding: const EdgeInsets.all(20),
                   decoration: BoxDecoration(
-                    borderRadius: BorderRadius.circular(16),
+                    borderRadius: BorderRadius.circular(Radii.card),
                     border: Border.all(color: c.border),
                   ),
                   child: Text(
-                    tr(
-                      '还没有对话。发送第一条消息即可在此项目中开始。',
-                      'No chats yet. Send a message to start one in this project.',
-                    ),
+                    tr('还没有对话', 'No chats yet'),
                     style: TextStyle(color: c.muted),
                   ),
                 )
               else
                 Container(
                   decoration: BoxDecoration(
-                    borderRadius: BorderRadius.circular(16),
+                    borderRadius: BorderRadius.circular(Radii.card),
                     border: Border.all(color: c.border),
                   ),
                   child: Column(
@@ -967,7 +889,7 @@ class _HubPageState extends State<HubPage>
                         if (i > 0) Divider(color: c.border),
                         ListTile(
                           shape: RoundedRectangleBorder(
-                            borderRadius: BorderRadius.circular(16),
+                            borderRadius: BorderRadius.circular(Radii.card),
                           ),
                           leading: Icon(
                             x['mode'] == 'work'
@@ -995,29 +917,21 @@ class _HubPageState extends State<HubPage>
 
   Widget workspaceBar() {
     final c = HubColors.of(context);
-    final small = TextStyle(fontSize: 12, color: c.muted);
+    final small = TextStyle(fontSize: FontSizes.caption, color: c.muted);
     return Center(
       child: ConstrainedBox(
         constraints: const BoxConstraints(maxWidth: contentWidth),
         child: Padding(
-          padding: const EdgeInsets.fromLTRB(
-            Space.s16,
-            Space.s4,
-            Space.s16,
-            Space.s6,
-          ),
+          padding: const EdgeInsets.fromLTRB(Space.edge, 4, Space.edge, 6),
           child: Wrap(
-            spacing: 8,
+            spacing: Space.gap,
             runSpacing: 6,
             crossAxisAlignment: WrapCrossAlignment.center,
             children: [
               Icon(Icons.inventory_2_outlined, size: 16, color: c.subtle),
               if (hub.workspace['recovery_required'] == true)
                 Text(
-                  tr(
-                    '工作区恢复未完成，请重试恢复后继续。',
-                    'Workspace recovery is incomplete. Retry the restore to continue.',
-                  ),
+                  tr('工作区恢复未完成', 'Workspace recovery incomplete'),
                   style: small.copyWith(color: c.danger),
                 ),
               if (hub.workspace['checkpoint'] != null)
@@ -1032,10 +946,7 @@ class _HubPageState extends State<HubPage>
               // point objective.
               if (hub.workspace['stale'] == true)
                 Text(
-                  tr(
-                    '超过 20 分钟没有新的检查点：执行节点故障时，之后的改动可能丢失。',
-                    'No checkpoint for over 20 minutes: a node failure could lose the changes since.',
-                  ),
+                  tr('超过 20 分钟没有检查点', 'No checkpoint for over 20 minutes'),
                   style: small.copyWith(color: c.warning),
                 ),
               if (storageNote(hub.workspace['storage_state']) case final note?)
@@ -1050,7 +961,7 @@ class _HubPageState extends State<HubPage>
                 OutlinedButton(
                   style: OutlinedButton.styleFrom(
                     textStyle: const TextStyle(
-                      fontSize: 13,
+                      fontSize: FontSizes.label,
                       fontFamily: fontFamily,
                       fontFamilyFallback: fontFallback,
                     ),
@@ -1065,7 +976,7 @@ class _HubPageState extends State<HubPage>
                 OutlinedButton.icon(
                   style: OutlinedButton.styleFrom(
                     textStyle: const TextStyle(
-                      fontSize: 13,
+                      fontSize: FontSizes.label,
                       fontFamily: fontFamily,
                       fontFamilyFallback: fontFallback,
                     ),
@@ -1228,7 +1139,10 @@ class _HubPageState extends State<HubPage>
               ? Center(
                   child: Text(
                     tr('还没有消息', 'No messages yet'),
-                    style: TextStyle(fontSize: 13, color: c.subtle),
+                    style: TextStyle(
+                      fontSize: FontSizes.label,
+                      color: c.subtle,
+                    ),
                   ),
                 )
               // Reversed so the newest message stays anchored above the
@@ -1246,10 +1160,10 @@ class _HubPageState extends State<HubPage>
                       slivers: [
                         SliverPadding(
                           padding: const EdgeInsets.fromLTRB(
-                            Space.s24,
-                            Space.s16,
-                            Space.s24,
-                            Space.s8,
+                            24,
+                            Space.edge,
+                            24,
+                            Space.gap,
                           ),
                           sliver: TimelineRows(
                             loader: true,
@@ -1278,12 +1192,7 @@ class _HubPageState extends State<HubPage>
           ),
         for (final approval in hub.actions)
           Padding(
-            padding: const EdgeInsets.fromLTRB(
-              Space.s16,
-              Space.s4,
-              Space.s16,
-              Space.s4,
-            ),
+            padding: const EdgeInsets.fromLTRB(Space.edge, 4, Space.edge, 4),
             child: centered(
               '${approval['form_json'] ?? ''}'.isNotEmpty
                   ? ElicitationCard(
@@ -1323,10 +1232,10 @@ class _HubPageState extends State<HubPage>
           top: false,
           child: Padding(
             padding: const EdgeInsets.fromLTRB(
-              Space.s16,
-              Space.s4,
-              Space.s16,
-              Space.s14,
+              Space.edge,
+              4,
+              Space.edge,
+              Space.inset,
             ),
             child: centered(composer()),
           ),
@@ -1414,9 +1323,29 @@ class _HubPageState extends State<HubPage>
                                           hub.libraryOpen
                                               ? libraryHeader()
                                               : header(),
+                                          // A refused message comes back to
+                                          // edit.
                                           if (hub.failedSend case final failed?)
-                                            failedBar(failed),
-                                          if (hub.error.isNotEmpty) errorBar(),
+                                            errorBar(
+                                              tr(
+                                                '消息未发送：${errorText(failed.code)}',
+                                                'Message not sent: ${errorText(failed.code)}',
+                                              ),
+                                              hub.takeFailedSend,
+                                              action: TextButton(
+                                                onPressed: restoreFailed,
+                                                child: Text(
+                                                  tr('恢复编辑', 'Edit again'),
+                                                ),
+                                              ),
+                                            ),
+                                          if (hub.error.isNotEmpty)
+                                            errorBar(
+                                              errorText(hub.error),
+                                              () => setState(
+                                                () => hub.error = '',
+                                              ),
+                                            ),
                                           Expanded(
                                             child: hub.libraryOpen
                                                 ? LibraryView(
@@ -1447,12 +1376,14 @@ class _HubPageState extends State<HubPage>
                                 Positioned.fill(
                                   child: IgnorePointer(
                                     child: Container(
-                                      margin: const EdgeInsets.all(Space.s12),
+                                      margin: const EdgeInsets.all(12),
                                       decoration: BoxDecoration(
                                         color: c.background.withValues(
                                           alpha: .85,
                                         ),
-                                        borderRadius: BorderRadius.circular(16),
+                                        borderRadius: BorderRadius.circular(
+                                          Radii.card,
+                                        ),
                                         border: Border.all(
                                           color: c.accent,
                                           width: 2,
@@ -1470,7 +1401,7 @@ class _HubPageState extends State<HubPage>
                                                 'Drop to add files',
                                               ),
                                         style: TextStyle(
-                                          fontSize: 16,
+                                          fontSize: FontSizes.title,
                                           color: c.text,
                                         ),
                                       ),
@@ -1526,10 +1457,7 @@ class ModePill extends StatelessWidget {
             // Stays tappable when selected so tests never see it disabled.
             onTap: () => onChanged(value),
             child: Padding(
-              padding: const EdgeInsets.symmetric(
-                horizontal: Space.s18,
-                vertical: Space.s6,
-              ),
+              padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 6),
               child: Row(
                 mainAxisSize: MainAxisSize.min,
                 children: [
@@ -1540,7 +1468,7 @@ class ModePill extends StatelessWidget {
                   Text(
                     label,
                     style: TextStyle(
-                      fontSize: 13.5,
+                      fontSize: FontSizes.label,
                       color: selected ? c.text : c.subtle,
                     ),
                   ),
@@ -1553,7 +1481,7 @@ class ModePill extends StatelessWidget {
     }
 
     return Container(
-      padding: const EdgeInsets.all(Space.s3),
+      padding: const EdgeInsets.all(3),
       decoration: BoxDecoration(
         color: c.bubble,
         borderRadius: BorderRadius.circular(999),
@@ -1615,11 +1543,11 @@ class _OlderLoaderState extends State<OlderLoader> {
     final hub = widget.hub;
     final c = HubColors.of(context);
     if (!hub.hasOlder || (!scrollable && !hub.historyFailed)) {
-      return const SizedBox(height: 8);
+      return const SizedBox(height: Space.gap);
     }
     return Center(
       child: Padding(
-        padding: const EdgeInsets.symmetric(vertical: Space.s12),
+        padding: const EdgeInsets.symmetric(vertical: 12),
         child: hub.historyFailed
             ? TextButton.icon(
                 onPressed: () => hub.loadOlder().catchError((_) {}),

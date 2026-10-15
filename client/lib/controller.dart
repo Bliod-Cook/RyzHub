@@ -529,11 +529,8 @@ class HubController extends ChangeNotifier with HubApi {
       capabilities['work'] != 'mock' &&
       conversations.where((c) => c['id'] == selected).firstOrNull?['mode'] ==
           'work';
-  String get agentLabel => realWork
-      ? pathLabel(settings['harness'] as String? ?? 'codex')
-      : realChat
-      ? 'Chat'
-      : tr('模拟 Agent', 'Mock agent');
+  String get agentLabel =>
+      realWork ? pathLabel(settings['harness'] as String? ?? 'codex') : 'Chat';
   Future<void> refreshModels() async {
     orgModels = Map<String, dynamic>.from(await request('/orgs/$org/models'));
     for (final g in workGroups) {
@@ -1347,7 +1344,7 @@ class HubController extends ChangeNotifier with HubApi {
     );
   }
 
-  /// Calls a plugin tool for an MCP App or a declarative component of tool item `item`.
+  /// Calls a plugin tool for the MCP App of tool item `item`.
   Future<dynamic> pluginToolCall(
     String item,
     String tool,
@@ -1365,12 +1362,6 @@ class HubController extends ChangeNotifier with HubApi {
     body: {'item_id': item},
     timeout: const Duration(seconds: 60),
   );
-
-  Future<void> sideQuery(String text) async {
-    if (isDraft) return;
-    final ch = channel;
-    await _schedule(() => _core!.sideQuery(channel: ch, text: text));
-  }
 
   Future<void> answer(Map<String, dynamic> action, String text) async {
     if (isDraft) return;

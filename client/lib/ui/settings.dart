@@ -51,7 +51,7 @@ final _sections = [
     'personal',
     Icons.tune,
     () => tr('个性化', 'Personalization'),
-    ['默认', 'default', '模式', 'mode', '执行路径', 'path', 'harness', 'protocol'],
+    ['默认', 'default', '模式', 'mode', '执行路径', 'path', 'harness'],
   ),
   _Section(
     'keyboard',
@@ -111,18 +111,8 @@ final _sections = [
     'server',
     'integrations',
     Icons.dns_outlined,
-    () => tr('服务器与策略', 'Server and policy'),
-    [
-      '服务器',
-      'server',
-      '连接',
-      'connection',
-      '策略',
-      'policy',
-      '能力',
-      'capabilities',
-      'agent',
-    ],
+    () => tr('服务器', 'Server'),
+    ['服务器', 'server', '连接', 'connection', '重连', 'reconnect'],
   ),
 ];
 
@@ -165,7 +155,7 @@ class _SettingsPageState extends State<SettingsPage> {
               .views
               .first
               .devicePixelRatio <
-      840;
+      wideWidth;
 
   List<_Section> get matches {
     final q = query.trim().toLowerCase();
@@ -191,10 +181,10 @@ class _SettingsPageState extends State<SettingsPage> {
           children: [
             Padding(
               padding: const EdgeInsets.fromLTRB(
-                Space.s8,
-                Space.s8,
-                Space.s8,
-                Space.s4,
+                Space.gap,
+                Space.gap,
+                Space.gap,
+                4,
               ),
               child: Row(
                 children: [
@@ -214,16 +204,16 @@ class _SettingsPageState extends State<SettingsPage> {
             ),
             Padding(
               padding: const EdgeInsets.fromLTRB(
-                Space.s8,
-                Space.s8,
-                Space.s8,
-                Space.s4,
+                Space.gap,
+                Space.gap,
+                Space.gap,
+                4,
               ),
               child: SizedBox(
                 height: 38,
                 child: TextField(
                   onChanged: (v) => setState(() => query = v),
-                  style: const TextStyle(fontSize: 14),
+                  style: const TextStyle(fontSize: FontSizes.body),
                   decoration: InputDecoration(
                     hintText: tr('搜索', 'Search'),
                     prefixIcon: const Icon(Icons.search, size: 18),
@@ -231,18 +221,18 @@ class _SettingsPageState extends State<SettingsPage> {
                     filled: true,
                     fillColor: c.hover,
                     contentPadding: const EdgeInsets.symmetric(
-                      vertical: Space.s8,
+                      vertical: Space.gap,
                     ),
                     border: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(10),
+                      borderRadius: BorderRadius.circular(Radii.control),
                       borderSide: BorderSide.none,
                     ),
                     enabledBorder: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(10),
+                      borderRadius: BorderRadius.circular(Radii.control),
                       borderSide: BorderSide.none,
                     ),
                     focusedBorder: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(10),
+                      borderRadius: BorderRadius.circular(Radii.control),
                       borderSide: BorderSide(color: c.border),
                     ),
                   ),
@@ -251,7 +241,7 @@ class _SettingsPageState extends State<SettingsPage> {
             ),
             Expanded(
               child: ListView(
-                padding: const EdgeInsets.only(bottom: Space.s16),
+                padding: const EdgeInsets.only(bottom: Space.edge),
                 children: [
                   for (final group in ['personal', 'account', 'integrations'])
                     if (list.any((s) => s.group == group)) ...[
@@ -289,7 +279,7 @@ class _SettingsPageState extends State<SettingsPage> {
             height: 52,
             child: Row(
               children: [
-                const SizedBox(width: 8),
+                const SizedBox(width: Space.gap),
                 if (narrow)
                   IconButton(
                     tooltip: tr('返回', 'Back'),
@@ -307,12 +297,7 @@ class _SettingsPageState extends State<SettingsPage> {
           ),
           Expanded(
             child: SingleChildScrollView(
-              padding: const EdgeInsets.fromLTRB(
-                Space.s20,
-                0,
-                Space.s20,
-                Space.s40,
-              ),
+              padding: const EdgeInsets.fromLTRB(20, 0, 20, 40),
               child: Center(
                 child: ConstrainedBox(
                   constraints: const BoxConstraints(maxWidth: 600),
@@ -369,7 +354,7 @@ class _SettingsPageState extends State<SettingsPage> {
     listenable: Listenable.merge([widget.hub, prefs]),
     builder: (context, _) {
       final c = HubColors.of(context);
-      final narrow = MediaQuery.sizeOf(context).width < 840;
+      final narrow = MediaQuery.sizeOf(context).width < wideWidth;
       return Scaffold(
         body: narrow
             ? section == null
@@ -401,27 +386,22 @@ class SettingsCard extends StatelessWidget {
   Widget build(BuildContext context) {
     final c = HubColors.of(context);
     return Padding(
-      padding: const EdgeInsets.only(bottom: Space.s20),
+      padding: const EdgeInsets.only(bottom: 20),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           if (title != null)
             Padding(
-              padding: const EdgeInsets.fromLTRB(
-                Space.s4,
-                0,
-                Space.s4,
-                Space.s8,
-              ),
+              padding: const EdgeInsets.fromLTRB(4, 0, 4, Space.gap),
               child: Text(
                 title!,
-                style: TextStyle(fontSize: 13, color: c.subtle),
+                style: TextStyle(fontSize: FontSizes.label, color: c.subtle),
               ),
             ),
           Container(
-            padding: const EdgeInsets.symmetric(horizontal: Space.s16),
+            padding: const EdgeInsets.symmetric(horizontal: Space.edge),
             decoration: BoxDecoration(
-              borderRadius: BorderRadius.circular(16),
+              borderRadius: BorderRadius.circular(Radii.card),
               border: Border.all(color: c.border),
             ),
             child: Column(
@@ -454,19 +434,25 @@ class SettingRow extends StatelessWidget {
   Widget build(BuildContext context) {
     final c = HubColors.of(context);
     return Padding(
-      padding: const EdgeInsets.symmetric(vertical: Space.s12),
+      padding: const EdgeInsets.symmetric(vertical: 12),
       child: Row(
         children: [
           Expanded(
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text(title, style: TextStyle(fontSize: 14, color: c.text)),
+                Text(
+                  title,
+                  style: TextStyle(fontSize: FontSizes.body, color: c.text),
+                ),
                 if (subtitle != null) ...[
                   const SizedBox(height: 2),
                   Text(
                     subtitle!,
-                    style: TextStyle(fontSize: 12, color: c.subtle),
+                    style: TextStyle(
+                      fontSize: FontSizes.caption,
+                      color: c.subtle,
+                    ),
                   ),
                 ],
               ],
@@ -479,114 +465,6 @@ class SettingRow extends StatelessWidget {
   }
 }
 
-/// A pill dropdown like the web settings' select.
-class ChoicePill<T> extends StatelessWidget {
-  final String tooltip;
-  final T value;
-  final List<(T, String)> options;
-  final ValueChanged<T> onChanged;
-  const ChoicePill({
-    super.key,
-    required this.tooltip,
-    required this.value,
-    required this.options,
-    required this.onChanged,
-  });
-  @override
-  Widget build(BuildContext context) {
-    final c = HubColors.of(context);
-    final label =
-        options.where((o) => o.$1 == value).firstOrNull?.$2 ?? '$value';
-    return PopupMenuButton<T>(
-      tooltip: tooltip,
-      position: PopupMenuPosition.under,
-      // Clear of the button and its highlight.
-      offset: const Offset(0, 6),
-      onSelected: onChanged,
-      itemBuilder: (_) => [
-        for (final (v, text) in options)
-          HubMenuItem(
-            value: v,
-            height: 38,
-            child: Row(
-              children: [
-                Expanded(child: Text(text)),
-                if (v == value) ...[
-                  const SizedBox(width: 12),
-                  Icon(Icons.check, size: 16, color: c.text),
-                ],
-              ],
-            ),
-          ),
-      ],
-      child: Container(
-        height: 34,
-        padding: const EdgeInsets.only(left: Space.s14, right: Space.s8),
-        decoration: BoxDecoration(
-          borderRadius: BorderRadius.circular(17),
-          border: Border.all(color: c.border),
-        ),
-        child: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Text(label, style: TextStyle(fontSize: 13, color: c.text)),
-            const SizedBox(width: 4),
-            Icon(Icons.expand_more, size: 16, color: c.subtle),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-class _Loader<T> extends StatefulWidget {
-  final Future<T> Function() load;
-  final Widget Function(BuildContext context, T value, VoidCallback reload)
-  builder;
-  const _Loader({super.key, required this.load, required this.builder});
-  @override
-  State<_Loader<T>> createState() => _LoaderState<T>();
-}
-
-class _LoaderState<T> extends State<_Loader<T>> {
-  late Future<T> future = widget.load();
-  void reload() => setState(() => future = widget.load());
-  @override
-  Widget build(BuildContext context) => FutureBuilder<T>(
-    future: future,
-    builder: (context, snap) {
-      final c = HubColors.of(context);
-      if (snap.hasError) {
-        return SettingsCard(
-          children: [
-            SettingRow(
-              title: tr('加载失败', 'Failed to load'),
-              subtitle: errorText(snap.error!),
-              trailing: OutlinedButton(
-                onPressed: reload,
-                child: Text(tr('重试', 'Retry')),
-              ),
-            ),
-          ],
-        );
-      }
-      if (!snap.hasData) {
-        return Padding(
-          padding: const EdgeInsets.all(Space.s24),
-          child: Center(
-            child: SizedBox(
-              width: 18,
-              height: 18,
-              child: CircularProgressIndicator(strokeWidth: 2, color: c.subtle),
-            ),
-          ),
-        );
-      }
-      return widget.builder(context, snap.data as T, reload);
-    },
-  );
-}
-
 class _General extends StatelessWidget {
   const _General();
   @override
@@ -594,10 +472,6 @@ class _General extends StatelessWidget {
     children: [
       SettingRow(
         title: tr('语言', 'Language'),
-        subtitle: tr(
-          '界面显示语言，仅保存在此设备',
-          'Language for the app UI, saved on this device',
-        ),
         trailing: ChoicePill<String>(
           tooltip: tr('语言', 'Language'),
           value: prefs.language,
@@ -635,10 +509,6 @@ class _Appearance extends StatelessWidget {
       children: [
         SettingRow(
           title: tr('主题', 'Theme'),
-          subtitle: tr(
-            '跟随系统或固定为浅色、深色',
-            'Follow the system, or always light or dark',
-          ),
           trailing: ChoicePill<String>(
             tooltip: tr('主题', 'Theme'),
             value: prefs.theme,
@@ -652,9 +522,8 @@ class _Appearance extends StatelessWidget {
         ),
         SettingRow(
           title: tr('强调色', 'Accent color'),
-          subtitle: names[prefs.accent],
           trailing: Wrap(
-            spacing: 8,
+            spacing: Space.gap,
             children: [
               for (final MapEntry(:key, :value) in accents.entries)
                 Semantics(
@@ -669,7 +538,7 @@ class _Appearance extends StatelessWidget {
                       child: Container(
                         width: 26,
                         height: 26,
-                        padding: const EdgeInsets.all(Space.s3),
+                        padding: const EdgeInsets.all(3),
                         decoration: BoxDecoration(
                           shape: BoxShape.circle,
                           border: Border.all(
@@ -746,7 +615,6 @@ class _Personalization extends StatelessWidget {
     children: [
       SettingRow(
         title: tr('默认模式', 'Default mode'),
-        subtitle: tr('点击“新建对话”时使用', 'Used when you start a new chat'),
         trailing: ChoicePill<String>(
           tooltip: tr('默认模式', 'Default mode'),
           value: prefs.defaultMode,
@@ -756,15 +624,10 @@ class _Personalization extends StatelessWidget {
       ),
       SettingRow(
         title: tr('默认 Chat 模型', 'Default Chat model'),
-        subtitle: tr(
-          '上游格式由服务端按模型决定',
-          'The server picks the wire format for the model',
-        ),
         trailing: chatModel(),
       ),
       SettingRow(
         title: tr('默认 Work 模型', 'Default Work model'),
-        subtitle: tr('先选执行器，再选模型', 'Choose a harness, then its model'),
         trailing: workModel(),
       ),
     ],
@@ -782,15 +645,18 @@ class _Keyboard extends StatelessWidget {
         for (final k in list)
           Container(
             padding: const EdgeInsets.symmetric(
-              horizontal: Space.s8,
-              vertical: Space.s3,
+              horizontal: Space.gap,
+              vertical: 3,
             ),
             decoration: BoxDecoration(
               color: c.bubble,
-              borderRadius: BorderRadius.circular(6),
+              borderRadius: BorderRadius.circular(Radii.small),
               border: Border.all(color: c.border),
             ),
-            child: Text(k, style: TextStyle(fontSize: 12, color: c.muted)),
+            child: Text(
+              k,
+              style: TextStyle(fontSize: FontSizes.caption, color: c.muted),
+            ),
           ),
       ],
     );
@@ -833,7 +699,7 @@ class _Account extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final c = HubColors.of(context);
-    return _Loader<Map<String, dynamic>>(
+    return Loader<Map<String, dynamic>>(
       load: hub.me,
       builder: (context, me, _) => Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -848,7 +714,7 @@ class _Account extends StatelessWidget {
                 title: tr('用户 ID', 'User ID'),
                 trailing: SelectableText(
                   '${me['user_id']}',
-                  style: TextStyle(fontSize: 12, color: c.muted),
+                  style: TextStyle(fontSize: FontSizes.caption, color: c.muted),
                 ),
               ),
               SettingRow(
@@ -874,10 +740,6 @@ class _Account extends StatelessWidget {
               ),
               SettingRow(
                 title: tr('会话到期时间', 'Session expires'),
-                subtitle: tr(
-                  '令牌只保存在内存中，不写入磁盘',
-                  'The token is kept in memory and never written to disk',
-                ),
                 trailing: Text(
                   hub.expiresAtMs == 0 ? '—' : _time(hub.expiresAtMs),
                   style: TextStyle(color: c.muted),
@@ -885,7 +747,6 @@ class _Account extends StatelessWidget {
               ),
               SettingRow(
                 title: tr('退出登录', 'Log out'),
-                subtitle: tr('结束此设备上的会话', 'End the session on this device'),
                 trailing: OutlinedButton(
                   style: OutlinedButton.styleFrom(foregroundColor: c.danger),
                   onPressed: app.logout,
@@ -910,24 +771,9 @@ class _Identities extends StatefulWidget {
 }
 
 class _IdentitiesState extends State<_Identities> {
-  Map<String, dynamic>? data;
+  final loader = GlobalKey<LoaderState<dynamic>>();
   String error = '';
   HubController get hub => widget.hub;
-
-  @override
-  void initState() {
-    super.initState();
-    load();
-  }
-
-  Future<void> load() async {
-    try {
-      final loaded = await hub.identities();
-      if (mounted) setState(() => data = Map<String, dynamic>.from(loaded));
-    } catch (e) {
-      if (mounted) setState(() => error = errorText(e));
-    }
-  }
 
   Future<void> act(Future<void> Function() task) async {
     setState(() => error = '');
@@ -936,7 +782,7 @@ class _IdentitiesState extends State<_Identities> {
     } catch (e) {
       if (mounted) setState(() => error = errorText(e));
     }
-    await load();
+    loader.currentState?.reload();
   }
 
   /// Adds an account: the provider signs the member in and returns here.
@@ -952,12 +798,17 @@ class _IdentitiesState extends State<_Identities> {
   }
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context) => Loader<dynamic>(
+    key: loader,
+    load: hub.identities,
+    builder: (context, data, _) => _identities(context, data as Map),
+  );
+
+  Widget _identities(BuildContext context, Map data) {
     final c = HubColors.of(context);
-    final shown = data;
-    final providers = (shown?['providers'] as List? ?? []).cast<Map>();
-    final identities = (shown?['identities'] as List? ?? []).cast<Map>();
-    if (shown == null || (providers.isEmpty && identities.isEmpty)) {
+    final providers = (data['providers'] as List? ?? []).cast<Map>();
+    final identities = (data['identities'] as List? ?? []).cast<Map>();
+    if (providers.isEmpty && identities.isEmpty) {
       return const SizedBox.shrink();
     }
     String label(String id) =>
@@ -991,7 +842,7 @@ class _IdentitiesState extends State<_Identities> {
             ),
         if (error.isNotEmpty)
           Padding(
-            padding: const EdgeInsets.only(bottom: Space.s8),
+            padding: const EdgeInsets.only(bottom: Space.gap),
             child: Text(error, style: TextStyle(color: c.danger)),
           ),
       ],
@@ -1005,7 +856,7 @@ class _Usage extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final c = HubColors.of(context);
-    return _Loader<List<dynamic>>(
+    return Loader<List<dynamic>>(
       load: hub.usage,
       builder: (context, rows, reload) {
         num sum(String key) =>
@@ -1042,7 +893,10 @@ class _Usage extends StatelessWidget {
                         '${_time(r['created_at'])} · ${r['status']}${r['estimated'] == true ? tr(' · 估算', ' · estimated') : ''}',
                     trailing: Text(
                       '${r['input_tokens']} / ${r['output_tokens']}',
-                      style: TextStyle(fontSize: 13, color: c.muted),
+                      style: TextStyle(
+                        fontSize: FontSizes.label,
+                        color: c.muted,
+                      ),
                     ),
                   ),
               ],
@@ -1068,7 +922,6 @@ class _Data extends StatelessWidget {
   const _Data({required this.hub, required this.app});
   @override
   Widget build(BuildContext context) {
-    final c = HubColors.of(context);
     final archived = hub.archived;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -1129,14 +982,6 @@ class _Data extends StatelessWidget {
                 child: Text(tr('导出', 'Export')),
               ),
             ),
-            SettingRow(
-              title: tr('本机缓存', 'Local cache'),
-              subtitle: tr(
-                '消息历史与离线队列按服务器、用户和组织分区缓存在此设备',
-                'History and the offline queue are cached on this device per server, user and organization',
-              ),
-              trailing: Icon(Icons.offline_pin_outlined, color: c.subtle),
-            ),
           ],
         ),
       ],
@@ -1153,7 +998,7 @@ class _Credentials extends StatefulWidget {
 
 class _CredentialsState extends State<_Credentials> {
   final name = TextEditingController(), key = TextEditingController();
-  final loader = GlobalKey<_LoaderState<List<dynamic>>>();
+  final loader = GlobalKey<LoaderState<List<dynamic>>>();
   String provider = 'anthropic', error = '';
   bool organization = false, busy = false;
   HubController get hub => widget.hub;
@@ -1185,19 +1030,13 @@ class _CredentialsState extends State<_Credentials> {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        _Loader<List<dynamic>>(
+        Loader<List<dynamic>>(
           key: loader,
           load: hub.credentials,
           builder: (context, rows, _) => SettingsCard(
             children: [
               if (rows.isEmpty)
-                SettingRow(
-                  title: tr('还没有自带的模型凭据', 'No model credentials yet'),
-                  subtitle: tr(
-                    '未配置时使用平台凭据',
-                    'Platform credentials are used by default',
-                  ),
-                ),
+                SettingRow(title: tr('还没有自带的模型凭据', 'No model credentials yet')),
               for (final r in rows)
                 SettingRow(
                   title: '${r['name']}',
@@ -1231,7 +1070,7 @@ class _CredentialsState extends State<_Credentials> {
           title: tr('添加凭据', 'Add a credential'),
           children: [
             Padding(
-              padding: const EdgeInsets.symmetric(vertical: Space.s14),
+              padding: const EdgeInsets.symmetric(vertical: Space.inset),
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
@@ -1243,7 +1082,7 @@ class _CredentialsState extends State<_Credentials> {
                   TextField(
                     controller: key,
                     obscureText: true,
-                    style: obscuredStyle,
+                    style: codeStyle,
                     decoration: InputDecoration(
                       labelText: tr('API 密钥', 'API key'),
                     ),
@@ -1272,7 +1111,7 @@ class _CredentialsState extends State<_Credentials> {
                   ),
                   if (error.isNotEmpty)
                     Padding(
-                      padding: const EdgeInsets.only(bottom: Space.s8),
+                      padding: const EdgeInsets.only(bottom: Space.gap),
                       child: Text(error, style: TextStyle(color: c.danger)),
                     ),
                   Align(
@@ -1309,102 +1148,19 @@ class _Server extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final c = HubColors.of(context);
-    final caps = hub.capabilities;
-    String show(Object? v) => switch (v) {
-      null => '—',
-      List l => l.isEmpty ? '—' : l.join(', '),
-      Map m => jsonEncode(m),
-      _ => '$v',
-    };
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
+    return SettingsCard(
       children: [
-        SettingsCard(
-          children: [
-            SettingRow(
-              title: tr('连接状态', 'Connection'),
-              subtitle: connectionLabel(hub.connection),
-              trailing: OutlinedButton.icon(
-                onPressed: hub.reconnect,
-                icon: const Icon(Icons.sync, size: 16),
-                label: Text(tr('重连', 'Reconnect now')),
-              ),
-            ),
-            SettingRow(
-              title: tr('服务器地址', 'Server URL'),
-              trailing: Text(hub.base, style: TextStyle(color: c.muted)),
-            ),
-            SettingRow(
-              title: tr('当前 Agent', 'Current agent'),
-              trailing: Text(hub.agentLabel, style: TextStyle(color: c.muted)),
-            ),
-          ],
+        SettingRow(
+          title: tr('服务器地址', 'Server URL'),
+          trailing: Text(hub.base, style: TextStyle(color: c.muted)),
         ),
-        SettingsCard(
-          title: tr('能力', 'Capabilities'),
-          children: [
-            for (final key in ['chat', 'work'])
-              SettingRow(
-                title: key == 'chat' ? 'Chat' : 'Work',
-                trailing: Text(
-                  caps[key] == 'mock' ? tr('模拟', 'Mock') : tr('已启用', 'Enabled'),
-                  style: TextStyle(fontSize: 13, color: c.muted),
-                ),
-              ),
-          ],
-        ),
-        SettingsCard(
-          title: tr(
-            '可用模型（上游格式由服务端按模型决定）',
-            'Models (the server picks each wire format)',
-          ),
-          children: [
-            if (hub.chatModels.isEmpty && hub.workGroups.isEmpty)
-              SettingRow(title: tr('服务器未提供模型目录', 'The server lists no models')),
-            for (final (path, models) in [
-              ('Chat', hub.chatModels),
-              for (final g in hub.workGroups)
-                (
-                  pathLabel(g['harness']),
-                  [
-                    for (final m in g['models'] as List)
-                      Map<String, dynamic>.from(m),
-                  ],
-                ),
-            ])
-              for (final m in models)
-                SettingRow(
-                  title: m['id'],
-                  subtitle: '$path · ${providerLabel(m['provider'] ?? '')}',
-                  trailing: m['default'] == true
-                      ? Text(
-                          tr('默认', 'Default'),
-                          style: TextStyle(fontSize: 12, color: c.subtle),
-                        )
-                      : null,
-                ),
-          ],
-        ),
-        _Loader<dynamic>(
-          load: hub.policy,
-          builder: (context, policy, _) => SettingsCard(
-            title: tr('组织策略（只读）', 'Organization policy (read-only)'),
-            children: [
-              if (policy is! Map || policy.isEmpty)
-                SettingRow(title: tr('没有额外限制', 'No extra restrictions')),
-              if (policy is Map)
-                for (final MapEntry(:key, :value) in policy.entries)
-                  SettingRow(
-                    title: '$key',
-                    trailing: Flexible(
-                      child: Text(
-                        show(value),
-                        textAlign: TextAlign.right,
-                        style: TextStyle(fontSize: 13, color: c.muted),
-                      ),
-                    ),
-                  ),
-            ],
+        SettingRow(
+          title: tr('连接状态', 'Connection'),
+          subtitle: connectionLabel(hub.connection),
+          trailing: OutlinedButton.icon(
+            onPressed: hub.reconnect,
+            icon: const Icon(Icons.sync, size: 16),
+            label: Text(tr('重连', 'Reconnect')),
           ),
         ),
       ],

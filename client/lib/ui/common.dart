@@ -29,6 +29,13 @@ bool get touchPlatform =>
 
 const contentWidth = 768.0;
 
+/// From this window width the sidebar docks beside the page and settings
+/// show both panes.
+const wideWidth = 840.0;
+
+/// Below this width boxes take less room: narrower margins and labels.
+const narrowWidth = 640.0;
+
 class Hover extends StatefulWidget {
   final Widget Function(BuildContext context, bool hovered) builder;
   const Hover({super.key, required this.builder});
@@ -62,30 +69,20 @@ class Reveal extends StatelessWidget {
 
 class SectionLabel extends StatelessWidget {
   final String text;
-  final Widget? trailing;
-  const SectionLabel(this.text, {super.key, this.trailing});
+  const SectionLabel(this.text, {super.key});
   @override
   Widget build(BuildContext context) {
     final c = HubColors.of(context);
     return Padding(
-      padding: const EdgeInsets.fromLTRB(
-        Space.s16,
-        Space.s18,
-        Space.s8,
-        Space.s4,
-      ),
+      padding: const EdgeInsets.fromLTRB(Space.edge, 18, Space.gap, 4),
       child: SizedBox(
         height: 26,
-        child: Row(
-          children: [
-            Expanded(
-              child: Text(
-                text,
-                style: TextStyle(fontSize: 12.5, color: c.subtle),
-              ),
-            ),
-            ?trailing,
-          ],
+        child: Align(
+          alignment: Alignment.centerLeft,
+          child: Text(
+            text,
+            style: TextStyle(fontSize: FontSizes.caption, color: c.subtle),
+          ),
         ),
       ),
     );
@@ -94,22 +91,21 @@ class SectionLabel extends StatelessWidget {
 
 class Avatar extends StatelessWidget {
   final String name;
-  final double size;
-  const Avatar(this.name, {super.key, this.size = 28});
+  const Avatar(this.name, {super.key});
   @override
   Widget build(BuildContext context) {
     final c = HubColors.of(context);
     final letter = name.isEmpty ? '?' : name.characters.first.toUpperCase();
     return Container(
-      width: size,
-      height: size,
+      width: 28,
+      height: 28,
       alignment: Alignment.center,
       decoration: BoxDecoration(color: c.accent, shape: BoxShape.circle),
       child: Text(
         letter,
         style: TextStyle(
           color: c.onAccent,
-          fontSize: size * .45,
+          fontSize: FontSizes.label,
           fontWeight: FontWeight.w600,
         ),
       ),
@@ -140,19 +136,16 @@ class NavRow extends StatelessWidget {
   Widget build(BuildContext context) {
     final c = HubColors.of(context);
     return Padding(
-      padding: const EdgeInsets.symmetric(
-        horizontal: Space.s8,
-        vertical: Space.s2,
-      ),
+      padding: const EdgeInsets.symmetric(horizontal: Space.gap, vertical: 2),
       child: Semantics(
         container: true,
         button: true,
         selected: selected,
         child: Material(
           color: selected ? c.selected : Colors.transparent,
-          borderRadius: BorderRadius.circular(10),
+          borderRadius: BorderRadius.circular(Radii.control),
           child: InkWell(
-            borderRadius: BorderRadius.circular(10),
+            borderRadius: BorderRadius.circular(Radii.control),
             hoverColor: c.hover,
             onTap: onTap,
             child: SizedBox(
@@ -167,7 +160,7 @@ class NavRow extends StatelessWidget {
                       label,
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
-                      style: TextStyle(fontSize: 14, color: c.text),
+                      style: TextStyle(fontSize: FontSizes.body, color: c.text),
                     ),
                   ),
                   ?trailing,
@@ -176,89 +169,6 @@ class NavRow extends StatelessWidget {
               ),
             ),
           ),
-        ),
-      ),
-    );
-  }
-}
-
-/// A pill-shaped popup picker. The tooltip is its accessible name.
-class PillMenu<T> extends StatelessWidget {
-  final String tooltip;
-  final IconData icon;
-  final String? label;
-  final T? value;
-  final List<(T, String)> items;
-  final ValueChanged<T> onSelected;
-  final bool enabled;
-  const PillMenu({
-    super.key,
-    required this.tooltip,
-    required this.icon,
-    required this.items,
-    required this.onSelected,
-    this.label,
-    this.value,
-    this.enabled = true,
-  });
-  @override
-  Widget build(BuildContext context) {
-    final c = HubColors.of(context);
-    final compact = MediaQuery.sizeOf(context).width < 560;
-    return PopupMenuButton<T>(
-      tooltip: tooltip,
-      enabled: enabled,
-      position: PopupMenuPosition.under,
-      // Clear of the button and its highlight.
-      offset: const Offset(0, 6),
-      onSelected: onSelected,
-      itemBuilder: (_) => [
-        for (final (v, text) in items)
-          HubMenuItem(
-            value: v,
-            height: 38,
-            child: Row(
-              children: [
-                Expanded(child: Text(text)),
-                if (v == value) ...[
-                  const SizedBox(width: 12),
-                  Icon(Icons.check, size: 16, color: c.text),
-                ],
-              ],
-            ),
-          ),
-      ],
-      child: Container(
-        height: 34,
-        padding: EdgeInsets.symmetric(
-          horizontal: compact ? Space.s8 : Space.s10,
-        ),
-        decoration: BoxDecoration(
-          borderRadius: BorderRadius.circular(17),
-          border: Border.all(color: c.border),
-        ),
-        child: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Icon(icon, size: 16, color: enabled ? c.muted : c.subtle),
-            if (label != null && !compact) ...[
-              const SizedBox(width: 6),
-              ConstrainedBox(
-                constraints: const BoxConstraints(maxWidth: 170),
-                child: Text(
-                  label!,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: TextStyle(
-                    fontSize: 13,
-                    color: enabled ? c.text : c.subtle,
-                  ),
-                ),
-              ),
-            ],
-            const SizedBox(width: 2),
-            Icon(Icons.expand_more, size: 16, color: c.subtle),
-          ],
         ),
       ),
     );
@@ -280,7 +190,7 @@ class EmulatedNote extends StatelessWidget {
       child: Semantics(
         label: text,
         child: Padding(
-          padding: const EdgeInsets.all(Space.s4),
+          padding: const EdgeInsets.all(4),
           child: Icon(
             Icons.info_outline,
             size: 15,
@@ -297,15 +207,13 @@ class EmptyHint extends StatelessWidget {
   const EmptyHint(this.text, {super.key});
   @override
   Widget build(BuildContext context) => Padding(
-    padding: const EdgeInsets.fromLTRB(
-      Space.s16,
-      Space.s4,
-      Space.s16,
-      Space.s6,
-    ),
+    padding: const EdgeInsets.fromLTRB(Space.edge, 4, Space.edge, 6),
     child: Text(
       text,
-      style: TextStyle(fontSize: 13, color: HubColors.of(context).subtle),
+      style: TextStyle(
+        fontSize: FontSizes.label,
+        color: HubColors.of(context).subtle,
+      ),
     ),
   );
 }
@@ -394,10 +302,8 @@ class HubMenuItem<T> extends PopupMenuItem<T> {
   const HubMenuItem({
     super.key,
     super.value,
-    super.onTap,
     super.enabled,
     super.height,
-    super.padding,
     required super.child,
   });
   @override
@@ -411,16 +317,90 @@ class _HubMenuItemState<T> extends PopupMenuItemState<T, HubMenuItem<T>> {
   Widget buildSemantics({required Widget child}) => super.buildSemantics(
     child: Material(
       type: MaterialType.transparency,
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(Radii.field),
+      ),
       clipBehavior: Clip.antiAlias,
       child: child,
     ),
   );
 }
 
-/// A foldable group inside a menu, like the sidebar sections: hovering shows a
-/// chevron and clicking the header row folds or unfolds it without closing
-/// the menu. The state lives in this device's preferences.
+/// A section title that folds its section: hovering shows a chevron, a folded
+/// section keeps it, and the whole row toggles without closing a menu around
+/// it. The state lives in this device's preferences; [trailing] stays a
+/// separate target.
+class FoldHeader extends StatelessWidget {
+  final String id, title;
+  final EdgeInsetsGeometry padding;
+
+  /// The row's height, when it is a larger target than its text.
+  final double? height;
+  final Widget? trailing;
+  const FoldHeader({
+    super.key,
+    required this.id,
+    required this.title,
+    required this.padding,
+    this.height,
+    this.trailing,
+  });
+
+  static bool folded(String id) => prefs.collapsedSections.contains(id);
+
+  @override
+  Widget build(BuildContext context) {
+    final c = HubColors.of(context);
+    final folded = FoldHeader.folded(id);
+    return Padding(
+      padding: padding,
+      child: Hover(
+        builder: (context, hovered) => Row(
+          children: [
+            Expanded(
+              child: Semantics(
+                container: true,
+                button: true,
+                expanded: !folded,
+                child: Clickable(
+                  onTap: () => prefs.update((p) {
+                    if (!p.collapsedSections.remove(id)) {
+                      p.collapsedSections.add(id);
+                    }
+                  }),
+                  child: SizedBox(
+                    height: height,
+                    child: Row(
+                      children: [
+                        Text(
+                          title,
+                          style: TextStyle(
+                            fontSize: FontSizes.caption,
+                            color: c.subtle,
+                          ),
+                        ),
+                        const SizedBox(width: 2),
+                        if (hovered || folded || touchPlatform)
+                          Icon(
+                            folded ? Icons.chevron_right : Icons.expand_more,
+                            size: 14,
+                            color: c.subtle,
+                          ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            ),
+            ?trailing,
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// A foldable group inside a menu, like the sidebar sections.
 class MenuGroup extends StatelessWidget {
   final String id, title;
   final List<Widget> children;
@@ -431,54 +411,23 @@ class MenuGroup extends StatelessWidget {
     required this.children,
   });
   @override
-  Widget build(BuildContext context) {
-    final c = HubColors.of(context);
-    final folded = prefs.collapsedSections.contains(id);
-    return Column(
-      mainAxisSize: MainAxisSize.min,
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      children: [
-        Hover(
-          builder: (context, hovered) => Semantics(
-            container: true,
-            button: true,
-            expanded: !folded,
-            child: Clickable(
-              onTap: () => prefs.update((p) {
-                if (!p.collapsedSections.remove(id)) {
-                  p.collapsedSections.add(id);
-                }
-              }),
-              child: Padding(
-                padding: const EdgeInsets.fromLTRB(
-                  Space.s14,
-                  Space.s8,
-                  Space.s14,
-                  Space.s4,
-                ),
-                child: Row(
-                  children: [
-                    Text(
-                      title,
-                      style: TextStyle(fontSize: 12, color: c.subtle),
-                    ),
-                    const SizedBox(width: 2),
-                    if (hovered || folded || touchPlatform)
-                      Icon(
-                        folded ? Icons.chevron_right : Icons.expand_more,
-                        size: 14,
-                        color: c.subtle,
-                      ),
-                  ],
-                ),
-              ),
-            ),
-          ),
+  Widget build(BuildContext context) => Column(
+    mainAxisSize: MainAxisSize.min,
+    crossAxisAlignment: CrossAxisAlignment.stretch,
+    children: [
+      FoldHeader(
+        id: id,
+        title: title,
+        padding: const EdgeInsets.fromLTRB(
+          Space.inset,
+          Space.gap,
+          Space.inset,
+          4,
         ),
-        if (!folded) ...children,
-      ],
-    );
-  }
+      ),
+      if (!FoldHeader.folded(id)) ...children,
+    ],
+  );
 }
 
 /// A tap target whose only feedback is the pointer; for headers that fold a
@@ -503,7 +452,286 @@ class MenuDivider extends StatelessWidget {
   const MenuDivider({super.key});
   @override
   Widget build(BuildContext context) => const Padding(
-    padding: EdgeInsets.symmetric(vertical: Space.s4),
+    padding: EdgeInsets.symmetric(vertical: 4),
     child: Divider(),
+  );
+}
+
+/// A pill that picks one of [options], showing the chosen one's label after
+/// [icon]. [detail] adds a line under each option in the menu. The tooltip is
+/// its accessible name.
+class ChoicePill<T> extends StatelessWidget {
+  final String tooltip;
+  final T value;
+  final List<(T, String)> options;
+  final ValueChanged<T> onChanged;
+  final IconData? icon;
+  final Color? iconColor;
+  final String Function(T value)? detail;
+  const ChoicePill({
+    super.key,
+    required this.tooltip,
+    required this.value,
+    required this.options,
+    required this.onChanged,
+    this.icon,
+    this.iconColor,
+    this.detail,
+  });
+  @override
+  Widget build(BuildContext context) {
+    final c = HubColors.of(context);
+    final label =
+        options.where((o) => o.$1 == value).firstOrNull?.$2 ?? '$value';
+    return PopupMenuButton<T>(
+      tooltip: tooltip,
+      position: PopupMenuPosition.under,
+      // Clear of the button and its highlight.
+      offset: const Offset(0, 6),
+      onSelected: onChanged,
+      itemBuilder: (_) => [
+        for (final (v, text) in options)
+          HubMenuItem(
+            value: v,
+            height: detail == null ? 38 : 52,
+            child: Row(
+              children: [
+                Expanded(
+                  child: detail == null
+                      ? Text(text)
+                      : Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Text(text),
+                            Text(
+                              detail!(v),
+                              style: TextStyle(
+                                fontSize: FontSizes.caption,
+                                color: c.muted,
+                              ),
+                            ),
+                          ],
+                        ),
+                ),
+                if (v == value) ...[
+                  const SizedBox(width: 12),
+                  Icon(Icons.check, size: 16, color: c.text),
+                ],
+              ],
+            ),
+          ),
+      ],
+      child: Container(
+        height: 34,
+        padding: EdgeInsets.only(
+          left: icon == null ? Space.inset : 10,
+          right: Space.gap,
+        ),
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(17),
+          border: Border.all(color: c.border),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            if (icon != null) ...[
+              Icon(icon, size: 15, color: iconColor ?? c.muted),
+              const SizedBox(width: 6),
+            ],
+            Text(
+              label,
+              style: TextStyle(fontSize: FontSizes.label, color: c.text),
+            ),
+            const SizedBox(width: 4),
+            Icon(Icons.expand_more, size: 16, color: c.subtle),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// A sidebar row: shaded on hover and when [selected], with its [menu]
+/// revealed at the end, which a long press also opens.
+class HoverRow<T> extends StatefulWidget {
+  final bool selected;
+
+  /// Space before the row, deeper for a row under another.
+  final double indent;
+  final VoidCallback onTap;
+  final Widget child;
+  final String menuTooltip;
+  final PopupMenuItemBuilder<T> menu;
+  final PopupMenuItemSelected<T> onSelected;
+
+  /// Revealed after the menu.
+  final Widget? trailing;
+  const HoverRow({
+    super.key,
+    required this.selected,
+    required this.onTap,
+    required this.child,
+    required this.menuTooltip,
+    required this.menu,
+    required this.onSelected,
+    this.indent = 6,
+    this.trailing,
+  });
+  @override
+  State<HoverRow<T>> createState() => _HoverRowState<T>();
+}
+
+class _HoverRowState<T> extends State<HoverRow<T>> {
+  final menuKey = GlobalKey<PopupMenuButtonState<T>>();
+  @override
+  Widget build(BuildContext context) {
+    final c = HubColors.of(context);
+    final selected = widget.selected;
+    return Hover(
+      builder: (context, hovered) => Padding(
+        padding: EdgeInsets.fromLTRB(widget.indent, 1, 6, 1),
+        child: Container(
+          height: 36,
+          decoration: BoxDecoration(
+            color: selected
+                ? c.selected
+                : hovered
+                ? c.hover
+                : Colors.transparent,
+            borderRadius: BorderRadius.circular(Radii.control),
+          ),
+          child: Row(
+            children: [
+              Expanded(
+                child: Semantics(
+                  container: true,
+                  button: true,
+                  selected: selected,
+                  child: InkWell(
+                    borderRadius: BorderRadius.circular(Radii.control),
+                    onTap: widget.onTap,
+                    onLongPress: () => menuKey.currentState?.showButtonMenu(),
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 10),
+                      child: widget.child,
+                    ),
+                  ),
+                ),
+              ),
+              Reveal(
+                visible: hovered || selected,
+                child: SizedBox(
+                  width: 32,
+                  height: 32,
+                  child: PopupMenuButton<T>(
+                    key: menuKey,
+                    tooltip: widget.menuTooltip,
+                    padding: EdgeInsets.zero,
+                    // The row already highlights; no second one on the glyph.
+                    style: const ButtonStyle(
+                      overlayColor: WidgetStatePropertyAll(Colors.transparent),
+                    ),
+                    icon: Icon(Icons.more_horiz, size: 18, color: c.muted),
+                    position: PopupMenuPosition.under,
+                    // Clear of the button and its highlight.
+                    offset: const Offset(0, 6),
+                    onSelected: widget.onSelected,
+                    itemBuilder: widget.menu,
+                  ),
+                ),
+              ),
+              if (widget.trailing case final trailing?)
+                Reveal(visible: hovered || selected, child: trailing),
+              const SizedBox(width: 2),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// The box around what waits on the member: an approval, a question, a
+/// plugin's form.
+class PendingCard extends StatelessWidget {
+  final Widget child;
+  const PendingCard({super.key, required this.child});
+  @override
+  Widget build(BuildContext context) {
+    final c = HubColors.of(context);
+    return Container(
+      padding: const EdgeInsets.all(Space.edge),
+      decoration: BoxDecoration(
+        color: c.composer,
+        borderRadius: BorderRadius.circular(Radii.card),
+        border: Border.all(color: c.border),
+      ),
+      child: child,
+    );
+  }
+}
+
+/// What [load] returns, built once it arrives, with a spinner meanwhile. A
+/// reload keeps the last value on screen until the next arrives.
+class Loader<T> extends StatefulWidget {
+  final Future<T> Function() load;
+  final Widget Function(BuildContext context, T value, VoidCallback reload)
+  builder;
+
+  /// What a failure shows; by default why, and a retry.
+  final Widget Function(BuildContext context, Object error)? failed;
+  const Loader({
+    super.key,
+    required this.load,
+    required this.builder,
+    this.failed,
+  });
+  @override
+  State<Loader<T>> createState() => LoaderState<T>();
+}
+
+class LoaderState<T> extends State<Loader<T>> {
+  late Future<T> future = widget.load();
+  void reload() => setState(() {
+    future = widget.load();
+  });
+  @override
+  Widget build(BuildContext context) => FutureBuilder<T>(
+    future: future,
+    builder: (context, snap) {
+      final c = HubColors.of(context);
+      final done = snap.connectionState == ConnectionState.done;
+      if (done && snap.hasError) {
+        return widget.failed?.call(context, snap.error!) ??
+            Padding(
+              padding: const EdgeInsets.all(Space.edge),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  SelectableText(
+                    errorText(snap.error!),
+                    textAlign: TextAlign.center,
+                    style: TextStyle(color: c.danger),
+                  ),
+                  TextButton(onPressed: reload, child: Text(tr('重试', 'Retry'))),
+                ],
+              ),
+            );
+      }
+      if (done || snap.hasData) {
+        return widget.builder(context, snap.data as T, reload);
+      }
+      return Padding(
+        padding: const EdgeInsets.all(24),
+        child: Center(
+          child: SizedBox(
+            width: 18,
+            height: 18,
+            child: CircularProgressIndicator(strokeWidth: 2, color: c.subtle),
+          ),
+        ),
+      );
+    },
   );
 }

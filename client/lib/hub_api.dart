@@ -613,7 +613,4 @@ mixin HubApi {
 
   Future<void> revokeCredential(String id) =>
       request('/orgs/$org/credentials/$id', method: 'DELETE');
-
-  /// The organization's policy.
-  Future<dynamic> policy() => request('/orgs/$org/policy');
 }

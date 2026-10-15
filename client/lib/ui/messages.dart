@@ -7,9 +7,9 @@ import 'package:flutter/services.dart';
 import '../l10n.dart';
 import '../theme.dart';
 import 'code.dart';
-import 'plugin_ui.dart';
 import 'common.dart';
 import 'markdown.dart';
+import 'plugin_ui.dart';
 import 'unfold.dart';
 
 export 'markdown.dart' show Rendered;
@@ -20,8 +20,8 @@ const _actionSize = 28.0;
 /// Space between an action button's edge and its 16px glyph.
 const _actionInset = (_actionSize - 16) / 2;
 
-/// [rendered] as a message shows it.
-List<Widget> _blocks(
+/// [rendered] as a message shows it, selectable.
+Widget _text(
   Rendered rendered,
   double size, {
   required String key,
@@ -30,8 +30,8 @@ List<Widget> _blocks(
   Color? color,
   _Citations? citations,
   bool fill = true,
-}) => [
-  MarkdownBlocks(
+}) => SelectionArea(
+  child: MarkdownBlocks(
     blocks: rendered.blocks,
     size: size,
     color: color,
@@ -41,7 +41,46 @@ List<Widget> _blocks(
     codeKey: key,
     fill: fill,
   ),
-];
+);
+
+/// Code and output as the timeline shows them.
+TextStyle _mono(HubColors c) =>
+    codeStyle.copyWith(fontSize: 12.5, height: 1.45, color: c.text);
+
+/// Text in a box of its own: a diff, a command's output, a call's details.
+class _CodeBox extends StatelessWidget {
+  final double maxHeight;
+
+  /// Kept scrolled to the end, where output arrives.
+  final bool reverse;
+  final Widget child;
+  const _CodeBox({
+    required this.maxHeight,
+    required this.child,
+    this.reverse = false,
+  });
+  @override
+  Widget build(BuildContext context) {
+    final c = HubColors.of(context);
+    return Container(
+      // Full width: a fold loosens its constraints, and a short diff would
+      // sit narrow and centred.
+      width: double.infinity,
+      margin: const EdgeInsets.fromLTRB(0, 4, 0, 6),
+      constraints: BoxConstraints(maxHeight: maxHeight),
+      decoration: BoxDecoration(
+        color: c.code,
+        borderRadius: BorderRadius.circular(Radii.control),
+        border: Border.all(color: c.border),
+      ),
+      child: SingleChildScrollView(
+        reverse: reverse,
+        padding: const EdgeInsets.fromLTRB(12, Space.gap, 12, 10),
+        child: child,
+      ),
+    );
+  }
+}
 
 /// The web pages a reply cites, and the chips the kernel folded runs of their source links
 /// into. Models write a passage's sources after it as `([site](url))`; the server sends each
@@ -176,7 +215,7 @@ class _CitationChip extends StatelessWidget {
     final site = label.trim().isEmpty ? _sourceTitle(first) : label.trim();
     final more = sources.length - 1;
     return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: Space.s3),
+      padding: const EdgeInsets.symmetric(horizontal: 3),
       child: Tooltip(
         message: sources.map((s) => _sourceTitle(s.$2)).join('\n'),
         child: Material(
@@ -186,10 +225,14 @@ class _CitationChip extends StatelessWidget {
             customBorder: const StadiumBorder(),
             onTap: () => _open(context),
             child: Padding(
-              padding: const EdgeInsets.symmetric(horizontal: Space.s8),
+              padding: const EdgeInsets.symmetric(horizontal: Space.gap),
               child: Text(
                 more > 0 ? '$site +$more' : site,
-                style: TextStyle(fontSize: 12, height: 1.6, color: c.muted),
+                style: TextStyle(
+                  fontSize: FontSizes.caption,
+                  height: 1.6,
+                  color: c.muted,
+                ),
               ),
             ),
           ),
@@ -211,10 +254,10 @@ List<Widget> _sources(
   final c = HubColors.of(context);
   return [
     Padding(
-      padding: const EdgeInsets.only(top: Space.s10, bottom: Space.s2),
+      padding: const EdgeInsets.only(top: 10, bottom: 2),
       child: Text(
         tr('来源', 'Sources'),
-        style: TextStyle(fontSize: 12, color: c.subtle),
+        style: TextStyle(fontSize: FontSizes.caption, color: c.subtle),
       ),
     ),
     for (final (i, source) in unshown.indexed)
@@ -237,10 +280,10 @@ class _Source extends StatelessWidget {
     final title = '${source['title'] ?? ''}'.trim();
     final cited = '${source['cited_text'] ?? ''}'.trim();
     final row = InkWell(
-      borderRadius: BorderRadius.circular(6),
+      borderRadius: BorderRadius.circular(Radii.small),
       onTap: onTap == null ? null : () => onTap!(url),
       child: Padding(
-        padding: const EdgeInsets.symmetric(vertical: Space.s3),
+        padding: const EdgeInsets.symmetric(vertical: 3),
         child: Text.rich(
           TextSpan(
             children: [
@@ -252,13 +295,16 @@ class _Source extends StatelessWidget {
               if (title.isNotEmpty)
                 TextSpan(
                   text: '  $site',
-                  style: TextStyle(fontSize: 12, color: c.subtle),
+                  style: TextStyle(
+                    fontSize: FontSizes.caption,
+                    color: c.subtle,
+                  ),
                 ),
             ],
           ),
           maxLines: 1,
           overflow: TextOverflow.ellipsis,
-          style: TextStyle(fontSize: 13, color: c.muted),
+          style: TextStyle(fontSize: FontSizes.label, color: c.muted),
         ),
       ),
     );
@@ -268,22 +314,15 @@ class _Source extends StatelessWidget {
 
 List<Widget> _states(BuildContext context, Map<String, dynamic> item) {
   final c = HubColors.of(context);
-  final small = TextStyle(fontSize: 12, color: c.subtle);
+  final small = TextStyle(fontSize: FontSizes.caption, color: c.subtle);
   return [
     if (item['state'] == 'streaming')
       Padding(
-        padding: const EdgeInsets.only(top: Space.s6),
+        padding: const EdgeInsets.only(top: 6),
         child: Row(
           children: [
-            SizedBox(
-              width: 10,
-              height: 10,
-              child: CircularProgressIndicator(
-                strokeWidth: 1.6,
-                color: c.subtle,
-              ),
-            ),
-            const SizedBox(width: 8),
+            const _Spinner(),
+            const SizedBox(width: Space.gap),
             Text(tr('生成中…', 'Generating…'), style: small),
           ],
         ),
@@ -294,23 +333,15 @@ List<Widget> _states(BuildContext context, Map<String, dynamic> item) {
           '已失效 · 此操作晚于恢复的检查点',
           'Invalidated · newer than the restored checkpoint',
         ),
-        style: TextStyle(fontSize: 12, color: c.danger),
+        style: TextStyle(fontSize: FontSizes.caption, color: c.danger),
       ),
     if (item['state'] == 'cancelled') Text(tr('已停止', 'Stopped'), style: small),
     if (item['kind'] == 'steer')
       Text(switch (item['state']) {
-        'injected' ||
-        'handed' ||
-        'consumed' => tr('已转交执行器', 'Handed to the agent'),
-        'waiting' => tr('等待注入点', 'Waiting for an injection point'),
-        'cancelled' => tr(
-          '任务已结束，此补充指令未采用',
-          'The run ended; this instruction was not used',
-        ),
-        _ => tr(
-          '已接收，等待下一次模型请求',
-          'Received; waiting for the next model request',
-        ),
+        'injected' || 'handed' || 'consumed' => tr('已送达', 'Delivered'),
+        'waiting' => tr('等待中', 'Waiting'),
+        'cancelled' => tr('未采用', 'Not used'),
+        _ => tr('已排队', 'Queued'),
       }, style: small),
   ];
 }
@@ -336,7 +367,9 @@ class _Action extends StatelessWidget {
       minimumSize: const Size.square(_actionSize),
       maximumSize: const Size.square(_actionSize),
       tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(Radii.small),
+      ),
     ),
   );
 }
@@ -344,17 +377,17 @@ class _Action extends StatelessWidget {
 /// Markdown as messages show it, e.g. for a previewed file.
 class MarkdownText extends StatelessWidget {
   final String text;
-  final double size;
-  const MarkdownText(this.text, {super.key, this.size = 15});
+  const MarkdownText(this.text, {super.key});
   @override
-  Widget build(BuildContext context) => SelectionArea(
-    child: MarkdownBlocks(blocks: Rendered.of(text).blocks, size: size),
-  );
+  Widget build(BuildContext context) =>
+      SelectionArea(child: MarkdownBlocks(blocks: Rendered.of(text).blocks));
 }
 
 class MessageCard extends StatelessWidget {
   final Map<String, dynamic> item;
-  final String? agentLabel;
+
+  /// Who replies: Chat, or the Work harness.
+  final String agentLabel;
   final VoidCallback? onFork;
 
   /// How the platform forks when the harness cannot, for the fork button.
@@ -374,7 +407,7 @@ class MessageCard extends StatelessWidget {
     super.key,
     required this.item,
     required this.rendered,
-    this.agentLabel,
+    required this.agentLabel,
     this.onFork,
     this.forkNote,
     this.onMemoryUndo,
@@ -390,24 +423,19 @@ class MessageCard extends StatelessWidget {
     final kind = item['kind'];
     final key = '${item['id']}';
     if (kind == 'memory_notice') {
-      Map<String, dynamic> notice;
-      try {
-        notice = jsonDecode(text) as Map<String, dynamic>;
-      } catch (_) {
-        notice = {};
-      }
+      final notice = jsonDecode(text) as Map;
       return Padding(
-        padding: const EdgeInsets.symmetric(vertical: Space.s6),
+        padding: const EdgeInsets.symmetric(vertical: 6),
         child: Row(
           children: [
             const Icon(Icons.psychology_outlined, size: 16),
-            const SizedBox(width: 8),
+            const SizedBox(width: Space.gap),
             Expanded(
               child: Text(
                 notice['action'] == 'delete'
                     ? tr('记忆已删除', 'Memory deleted')
                     : tr('记忆已更新', 'Memory updated'),
-                style: TextStyle(fontSize: 12, color: c.subtle),
+                style: TextStyle(fontSize: FontSizes.caption, color: c.subtle),
               ),
             ),
             TextButton(onPressed: onMemoryUndo, child: Text(tr('撤销', 'Undo'))),
@@ -429,13 +457,13 @@ class MessageCard extends StatelessWidget {
         // parent would otherwise shrink the column to the bubble and centre it.
         builder: (context, hovered) => Container(
           width: double.infinity,
-          padding: const EdgeInsets.only(bottom: Space.s8),
+          padding: const EdgeInsets.only(bottom: Space.gap),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.end,
             children: [
               if (carried != null)
                 Padding(
-                  padding: EdgeInsets.only(bottom: text.isEmpty ? 0 : Space.s6),
+                  padding: EdgeInsets.only(bottom: text.isEmpty ? 0 : 6),
                   child: LayoutBuilder(
                     builder: (context, box) => ConstrainedBox(
                       constraints: BoxConstraints(maxWidth: box.maxWidth * .78),
@@ -448,12 +476,7 @@ class MessageCard extends StatelessWidget {
                   builder: (context, box) => ConstrainedBox(
                     constraints: BoxConstraints(maxWidth: box.maxWidth * .78),
                     child: Container(
-                      padding: const EdgeInsets.fromLTRB(
-                        Space.s18,
-                        Space.s10,
-                        Space.s18,
-                        Space.s10,
-                      ),
+                      padding: const EdgeInsets.fromLTRB(18, 10, 18, 10),
                       decoration: BoxDecoration(
                         color: c.userBubble,
                         borderRadius: BorderRadius.circular(22),
@@ -462,20 +485,14 @@ class MessageCard extends StatelessWidget {
                         crossAxisAlignment: CrossAxisAlignment.start,
                         mainAxisSize: MainAxisSize.min,
                         children: [
-                          SelectionArea(
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              mainAxisSize: MainAxisSize.min,
-                              // The bubble fits its text.
-                              children: _blocks(
-                                rendered,
-                                15,
-                                key: key,
-                                onSource: onSource,
-                                onFile: onFile,
-                                fill: false,
-                              ),
-                            ),
+                          // The bubble fits its text.
+                          _text(
+                            rendered,
+                            FontSizes.message,
+                            key: key,
+                            onSource: onSource,
+                            onFile: onFile,
+                            fill: false,
                           ),
                           ..._states(context, item),
                         ],
@@ -497,29 +514,23 @@ class MessageCard extends StatelessWidget {
     if (kind == 'assistant') {
       final citations = _Citations.of(item, rendered);
       return Padding(
-        padding: const EdgeInsets.only(bottom: Space.s18),
+        padding: const EdgeInsets.only(bottom: 18),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            SelectionArea(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                mainAxisSize: MainAxisSize.min,
-                children: _blocks(
-                  rendered,
-                  15,
-                  key: key,
-                  onSource: onSource,
-                  onFile: onFile,
-                  citations: citations,
-                ),
-              ),
+            _text(
+              rendered,
+              FontSizes.message,
+              key: key,
+              onSource: onSource,
+              onFile: onFile,
+              citations: citations,
             ),
             ..._sources(context, citations, onSource),
             ..._states(context, item),
             // The actions mark the end of a reply, so they wait for it.
             if (item['state'] != 'streaming') ...[
-              const SizedBox(height: 8),
+              const SizedBox(height: Space.gap),
               // Shifted by the button's inner margin so the first glyph lines
               // up with the reply's left edge; the highlight keeps its size.
               Transform.translate(
@@ -540,9 +551,12 @@ class MessageCard extends StatelessWidget {
                     const SizedBox(width: 6),
                     Flexible(
                       child: Text(
-                        agentLabel ?? tr('模拟 Agent', 'Mock agent'),
+                        agentLabel,
                         overflow: TextOverflow.ellipsis,
-                        style: TextStyle(fontSize: 12, color: c.subtle),
+                        style: TextStyle(
+                          fontSize: FontSizes.caption,
+                          color: c.subtle,
+                        ),
                       ),
                     ),
                   ],
@@ -561,22 +575,14 @@ class MessageCard extends StatelessWidget {
       'steer' => (Icons.subdirectory_arrow_right, tr('补充指令', 'Instruction')),
       'side_query' => (Icons.visibility_outlined, tr('只读旁问', 'Side question')),
       'notice' => (Icons.info_outline, tr('系统通知', 'Notice')),
-      _ => (
-        Icons.auto_awesome_outlined,
-        agentLabel ?? tr('模拟 Agent', 'Mock agent'),
-      ),
+      _ => (Icons.auto_awesome_outlined, agentLabel),
     };
     return Padding(
-      padding: const EdgeInsets.only(bottom: Space.s14),
+      padding: const EdgeInsets.only(bottom: Space.inset),
       child: Container(
-        padding: const EdgeInsets.fromLTRB(
-          Space.s14,
-          Space.s10,
-          Space.s8,
-          Space.s12,
-        ),
+        padding: const EdgeInsets.fromLTRB(Space.inset, 10, Space.gap, 12),
         decoration: BoxDecoration(
-          borderRadius: BorderRadius.circular(14),
+          borderRadius: BorderRadius.circular(Radii.block),
           border: Border.all(color: c.border),
         ),
         child: Column(
@@ -585,41 +591,35 @@ class MessageCard extends StatelessWidget {
             Row(
               children: [
                 Icon(icon, size: 15, color: c.subtle),
-                const SizedBox(width: 8),
-                Text(label, style: TextStyle(fontSize: 13, color: c.muted)),
+                const SizedBox(width: Space.gap),
+                Text(
+                  label,
+                  style: TextStyle(fontSize: FontSizes.label, color: c.muted),
+                ),
                 const Spacer(),
                 copy,
               ],
             ),
             Padding(
-              padding: const EdgeInsets.only(right: Space.s6),
+              padding: const EdgeInsets.only(right: 6),
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
                   if (carried != null)
                     Padding(
-                      padding: const EdgeInsets.only(
-                        top: Space.s6,
-                        bottom: Space.s4,
-                      ),
+                      padding: const EdgeInsets.only(top: 6, bottom: 4),
                       child: Align(
                         alignment: Alignment.centerLeft,
                         child: carried,
                       ),
                     ),
                   if (text.isNotEmpty)
-                    SelectionArea(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.stretch,
-                        mainAxisSize: MainAxisSize.min,
-                        children: _blocks(
-                          rendered,
-                          14,
-                          key: key,
-                          onSource: onSource,
-                          onFile: onFile,
-                        ),
-                      ),
+                    _text(
+                      rendered,
+                      FontSizes.body,
+                      key: key,
+                      onSource: onSource,
+                      onFile: onFile,
                     ),
                   ..._states(context, item),
                 ],
@@ -669,7 +669,7 @@ class _DisclosureState extends State<_Disclosure> {
         overlayColor: const WidgetStatePropertyAll(Colors.transparent),
         splashFactory: NoSplash.splashFactory,
         child: Padding(
-          padding: const EdgeInsets.symmetric(vertical: Space.s4),
+          padding: const EdgeInsets.symmetric(vertical: 4),
           child: Row(
             mainAxisSize: MainAxisSize.min,
             children: [
@@ -776,7 +776,7 @@ class _StepsGroupState extends State<StepsGroup> {
       }
     }
     return Padding(
-      padding: const EdgeInsets.only(bottom: Space.s14),
+      padding: const EdgeInsets.only(bottom: Space.inset),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
@@ -794,7 +794,7 @@ class _StepsGroupState extends State<StepsGroup> {
                   // Folds name the calls once the model has spoken.
                   : _worked(widget.worked!, spoke ? [] : _done(widget.steps)),
               style: TextStyle(
-                fontSize: 13.5,
+                fontSize: FontSizes.step,
                 color: active ? c.text : c.subtle,
               ),
             ),
@@ -805,7 +805,7 @@ class _StepsGroupState extends State<StepsGroup> {
             // Following the run, it opens and folds in place of the newest.
             anchored: open != null,
             builder: (context) => Padding(
-              padding: const EdgeInsets.only(top: Space.s6),
+              padding: const EdgeInsets.only(top: 6),
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
@@ -831,12 +831,12 @@ class _StepsGroupState extends State<StepsGroup> {
     final c = HubColors.of(context);
     final text = '${item['text'] ?? ''}';
     Widget note(IconData icon, List<Widget> body) => Padding(
-      padding: const EdgeInsets.symmetric(vertical: Space.s4),
+      padding: const EdgeInsets.symmetric(vertical: 4),
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Padding(
-            padding: const EdgeInsets.only(top: Space.s4),
+            padding: const EdgeInsets.only(top: 4),
             child: Icon(icon, size: 15, color: c.subtle),
           ),
           const SizedBox(width: 10),
@@ -849,19 +849,14 @@ class _StepsGroupState extends State<StepsGroup> {
         ],
       ),
     );
-    final muted = TextStyle(fontSize: 13.5, height: 1.65, color: c.muted);
+    final muted = TextStyle(
+      fontSize: FontSizes.step,
+      height: 1.65,
+      color: c.muted,
+    );
     final key = '${item['id']}';
     final rendered = widget.rendered(key) ?? const Rendered([], []);
     final citations = _Citations.of(item, rendered);
-    List<Widget> selectable(List<Widget> blocks) => [
-      SelectionArea(
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          mainAxisSize: MainAxisSize.min,
-          children: blocks,
-        ),
-      ),
-    ];
     return switch (item['kind']) {
       'tool' => _ToolStep(
         key: ValueKey(item['id']),
@@ -870,52 +865,37 @@ class _StepsGroupState extends State<StepsGroup> {
         children: widget.children?.call(key) ?? const [],
         step: (child) => step(context, child),
       ),
-      'reasoning' => note(
-        Icons.lightbulb_outline,
-        selectable(
-          _blocks(
+      'reasoning' || 'plan' => note(
+        item['kind'] == 'plan' ? Icons.checklist : Icons.lightbulb_outline,
+        [
+          _text(
             rendered,
-            14,
+            FontSizes.body,
             key: key,
             onSource: widget.onSource,
             onFile: widget.onFile,
             color: c.muted,
           ),
-        ),
-      ),
-      'plan' => note(
-        Icons.checklist,
-        selectable(
-          _blocks(
-            rendered,
-            14,
-            key: key,
-            onSource: widget.onSource,
-            onFile: widget.onFile,
-            color: c.muted,
-          ),
-        ),
+        ],
       ),
       'file_change' => note(Icons.difference_outlined, [
         for (final change in _fileChanges(item))
           _FileChangeLine(change: change, style: muted),
-        if (_changes(item).isEmpty) Text(text, style: muted),
+        if (_fileChanges(item).isEmpty) Text(text, style: muted),
       ]),
       // An interim reply reads like the answer it leads to.
       _ => Padding(
-        padding: const EdgeInsets.symmetric(vertical: Space.s4),
+        padding: const EdgeInsets.symmetric(vertical: 4),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            ...selectable(
-              _blocks(
-                rendered,
-                15,
-                key: key,
-                onSource: widget.onSource,
-                onFile: widget.onFile,
-                citations: citations,
-              ),
+            _text(
+              rendered,
+              FontSizes.message,
+              key: key,
+              onSource: widget.onSource,
+              onFile: widget.onFile,
+              citations: citations,
             ),
             ..._sources(context, citations, widget.onSource),
             ..._states(context, item),
@@ -959,9 +939,9 @@ List<(String, String)> _done(Iterable<Map<String, dynamic>> steps) {
   final tools = calls.length - searches - commands - images;
   final files = {
     for (final step in steps.where((s) => s['kind'] == 'file_change'))
-      ...switch (_changes(step)) {
+      ...switch (_fileChanges(step)) {
         [] => ['${step['id']}'],
-        final changes => changes.map((c) => c.$2),
+        final changes => changes.map((c) => '${c['path']}'),
       },
   }.length;
   String count(int n, String noun) => n == 1 ? '1 $noun' : '$n ${noun}s';
@@ -1062,7 +1042,10 @@ class _StepFoldState extends State<_StepFold> {
             _did(widget.steps) ?? tr('已处理', 'Worked'),
             maxLines: 1,
             overflow: TextOverflow.ellipsis,
-            style: TextStyle(fontSize: 13.5, color: active ? c.text : c.muted),
+            style: TextStyle(
+              fontSize: FontSizes.step,
+              color: active ? c.text : c.muted,
+            ),
           ),
         ),
         Unfold(
@@ -1070,7 +1053,7 @@ class _StepFoldState extends State<_StepFold> {
           anchored: open != null,
           // Indented so the calls' icons line up under the fold's text.
           builder: (context) => Padding(
-            padding: const EdgeInsets.only(left: Space.s25),
+            padding: const EdgeInsets.only(left: 25),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [for (final s in widget.steps) widget.step(s)],
@@ -1132,53 +1115,17 @@ class _FileChangeLineState extends State<_FileChangeLine> {
         ),
         Unfold(
           open: open,
-          // The fold loosens its constraints: full width, or a short diff
-          // would sit narrow and centred.
-          builder: (context) => Container(
-            width: double.infinity,
-            margin: const EdgeInsets.fromLTRB(0, Space.s4, 0, Space.s6),
-            constraints: const BoxConstraints(maxHeight: 320),
-            decoration: BoxDecoration(
-              color: c.code,
-              borderRadius: BorderRadius.circular(10),
-              border: Border.all(color: c.border),
-            ),
+          builder: (context) => _CodeBox(
+            maxHeight: 320,
             child: SingleChildScrollView(
-              padding: const EdgeInsets.fromLTRB(
-                Space.s12,
-                Space.s8,
-                Space.s12,
-                Space.s10,
-              ),
-              child: SingleChildScrollView(
-                scrollDirection: Axis.horizontal,
-                child: DiffText(
-                  diff,
-                  style: TextStyle(
-                    fontFamily: 'monospace',
-                    fontFamilyFallback: const ['RyzHub Sans'],
-                    fontSize: 12.5,
-                    height: 1.45,
-                    color: c.text,
-                  ),
-                ),
-              ),
+              scrollDirection: Axis.horizontal,
+              child: DiffText(diff, style: _mono(c)),
             ),
           ),
         ),
       ],
     );
   }
-}
-
-/// A file-change item's (change, path) pairs.
-List<(String, String)> _changes(Map<String, dynamic> item) {
-  final changes = item['detail']?['kind']?['FileChange']?['changes'];
-  return [
-    if (changes is List)
-      for (final change in changes)
-        if (change is Map) ('${change['change']}', '${change['path']}'),
-  ];
 }
 
 Object? _decode(Object? text) {
@@ -1401,13 +1348,13 @@ class _ToolStep extends StatefulWidget {
 
   /// What the agent this call started did, shown under it.
   final List<Map<String, dynamic>> children;
-  final Widget Function(Map<String, dynamic> item)? step;
+  final Widget Function(Map<String, dynamic> item) step;
   const _ToolStep({
     super.key,
     required this.item,
     required this.running,
-    this.children = const [],
-    this.step,
+    required this.children,
+    required this.step,
   });
   @override
   State<_ToolStep> createState() => _ToolStepState();
@@ -1433,13 +1380,7 @@ class _ToolStepState extends State<_ToolStep> {
     final subject = call.subject;
     final details = call.details;
     final live = done ? '' : '${widget.item['live_output'] ?? ''}';
-    final mono = TextStyle(
-      fontFamily: 'monospace',
-      fontFamilyFallback: const ['RyzHub Sans'],
-      fontSize: 12.5,
-      height: 1.45,
-      color: c.text,
-    );
+    final mono = _mono(c);
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
@@ -1471,90 +1412,59 @@ class _ToolStepState extends State<_ToolStep> {
             ),
             maxLines: 1,
             overflow: TextOverflow.ellipsis,
-            style: TextStyle(fontSize: 13.5, color: active ? c.text : c.muted),
+            style: TextStyle(
+              fontSize: FontSizes.step,
+              color: active ? c.text : c.muted,
+            ),
           ),
         ),
         // A subagent's work, under the call that started it.
-        if (widget.children.isNotEmpty && widget.step != null)
+        if (widget.children.isNotEmpty)
           Container(
-            margin: const EdgeInsets.only(
-              left: Space.s7,
-              top: Space.s2,
-              bottom: Space.s4,
-            ),
-            padding: const EdgeInsets.only(left: Space.s14),
+            margin: const EdgeInsets.only(left: 7, top: 2, bottom: 4),
+            padding: const EdgeInsets.only(left: Space.inset),
             decoration: BoxDecoration(
               border: Border(left: BorderSide(color: c.border, width: 2)),
             ),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
-                for (final child in widget.children) widget.step!(child),
+                for (final child in widget.children) widget.step(child),
               ],
             ),
           ),
         // What the command writes, as it writes it.
         if (live.isNotEmpty)
-          Padding(
-            padding: const EdgeInsets.fromLTRB(0, Space.s2, 0, Space.s6),
-            child: Container(
-              constraints: const BoxConstraints(maxHeight: 200),
-              decoration: BoxDecoration(
-                color: c.code,
-                borderRadius: BorderRadius.circular(10),
-                border: Border.all(color: c.border),
-              ),
-              child: SingleChildScrollView(
-                reverse: true,
-                padding: const EdgeInsets.fromLTRB(
-                  Space.s12,
-                  Space.s8,
-                  Space.s12,
-                  Space.s10,
-                ),
-                child: AnsiText(live, style: mono),
-              ),
-            ),
+          _CodeBox(
+            maxHeight: 200,
+            reverse: true,
+            child: AnsiText(live, style: mono),
           ),
-        // A plugin's cards and forms, and its page, beside the call's own result.
+        // A plugin's page, beside the call's own result.
         if (done) PluginResult(item: widget.item),
         Unfold(
           open: open,
-          builder: (context) => Padding(
-            padding: const EdgeInsets.fromLTRB(0, Space.s2, 0, Space.s6),
-            child: Container(
-              constraints: const BoxConstraints(maxHeight: 280),
-              decoration: BoxDecoration(
-                color: c.code,
-                borderRadius: BorderRadius.circular(10),
-                border: Border.all(color: c.border),
-              ),
-              child: SingleChildScrollView(
-                padding: const EdgeInsets.fromLTRB(
-                  Space.s12,
-                  Space.s8,
-                  Space.s12,
-                  Space.s10,
-                ),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.stretch,
-                  children: [
-                    for (final (i, (title, body, language))
-                        in details.indexed) ...[
-                      if (i > 0) const SizedBox(height: 10),
-                      Text(
-                        title,
-                        style: TextStyle(fontSize: 12, color: c.subtle),
-                      ),
-                      const SizedBox(height: 2),
-                      if (language == null && AnsiText.styled(body))
-                        AnsiText(body, style: mono)
-                      else
-                        CodeText(body, language: language, style: mono),
-                    ],
-                  ],
-                ),
-              ),
+          builder: (context) => _CodeBox(
+            maxHeight: 280,
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                for (final (i, (title, body, language)) in details.indexed) ...[
+                  if (i > 0) const SizedBox(height: 10),
+                  Text(
+                    title,
+                    style: TextStyle(
+                      fontSize: FontSizes.caption,
+                      color: c.subtle,
+                    ),
+                  ),
+                  const SizedBox(height: 2),
+                  if (language == null && AnsiText.styled(body))
+                    AnsiText(body, style: mono)
+                  else
+                    CodeText(body, language: language, style: mono),
+                ],
+              ],
             ),
           ),
         ),
@@ -1575,18 +1485,7 @@ class ApprovalCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final c = HubColors.of(context);
-    return Container(
-      padding: const EdgeInsets.fromLTRB(
-        Space.s16,
-        Space.s12,
-        Space.s12,
-        Space.s12,
-      ),
-      decoration: BoxDecoration(
-        color: c.composer,
-        borderRadius: BorderRadius.circular(18),
-        border: Border.all(color: c.border),
-      ),
+    return PendingCard(
       child: Row(
         children: [
           Icon(Icons.shield_outlined, color: c.accent),
@@ -1594,9 +1493,9 @@ class ApprovalCard extends StatelessWidget {
           Expanded(
             child: Text(summary, style: TextStyle(color: c.text)),
           ),
-          const SizedBox(width: 8),
+          const SizedBox(width: Space.gap),
           OutlinedButton(onPressed: onDeny, child: Text(tr('拒绝', 'Deny'))),
-          const SizedBox(width: 8),
+          const SizedBox(width: Space.gap),
           FilledButton(onPressed: onAllow, child: Text(tr('允许', 'Allow'))),
         ],
       ),
@@ -1692,13 +1591,8 @@ class _QuestionCardState extends State<QuestionCard> {
   @override
   Widget build(BuildContext context) {
     final c = HubColors.of(context);
-    return Container(
-      padding: const EdgeInsets.all(Space.s16),
-      decoration: BoxDecoration(
-        color: c.composer,
-        borderRadius: BorderRadius.circular(18),
-        border: Border.all(color: c.border),
-      ),
+    final screen = MediaQuery.sizeOf(context);
+    return PendingCard(
       child: Column(
         mainAxisSize: MainAxisSize.min,
         crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -1706,8 +1600,7 @@ class _QuestionCardState extends State<QuestionCard> {
           ConstrainedBox(
             constraints: BoxConstraints(
               maxHeight:
-                  MediaQuery.sizeOf(context).height *
-                  (MediaQuery.sizeOf(context).width < 600 ? .22 : .32),
+                  screen.height * (screen.width < narrowWidth ? .22 : .32),
             ),
             child: SingleChildScrollView(
               child: Column(
@@ -1733,10 +1626,10 @@ class _QuestionCardState extends State<QuestionCard> {
                     ),
                     if (questions[i]['options'] is List)
                       Padding(
-                        padding: const EdgeInsets.only(top: Space.s10),
+                        padding: const EdgeInsets.only(top: 10),
                         child: Wrap(
-                          spacing: 8,
-                          runSpacing: 8,
+                          spacing: Space.gap,
+                          runSpacing: Space.gap,
                           children: [
                             for (final option
                                 in questions[i]['options'] as List)

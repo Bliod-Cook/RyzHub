@@ -168,9 +168,7 @@ class _Style {
     final ink = color ?? c.text;
     return _Style(
       TextStyle(fontSize: size, height: 1.65, color: ink),
-      TextStyle(
-        fontFamily: 'monospace',
-        fontFamilyFallback: const ['RyzHub Sans'],
+      codeStyle.copyWith(
         fontSize: size - 1.5,
         backgroundColor: c.code,
         color: ink,
@@ -243,9 +241,7 @@ class _Block extends StatelessWidget {
           _ => 1.0,
         };
         return Padding(
-          padding: EdgeInsets.only(
-            top: level <= Space.s2 ? Space.s6 : Space.s2,
-          ),
+          padding: EdgeInsets.only(top: level <= 2 ? 6 : 2),
           child: _paragraph(
             block['inlines'] as List,
             text.copyWith(
@@ -271,7 +267,7 @@ class _Block extends StatelessWidget {
         );
       case 'quote':
         return Container(
-          padding: const EdgeInsets.only(left: Space.s12),
+          padding: const EdgeInsets.only(left: 12),
           decoration: BoxDecoration(
             border: Border(left: BorderSide(color: c.border, width: 3)),
           ),
@@ -318,9 +314,7 @@ class _Block extends StatelessWidget {
       children: [
         for (final (i, item) in items.indexed)
           Padding(
-            padding: EdgeInsets.only(
-              top: i == 0 ? 0 : (tight ? Space.s2 : _gap),
-            ),
+            padding: EdgeInsets.only(top: i == 0 ? 0 : (tight ? 2 : _gap)),
             child: Row(
               crossAxisAlignment: CrossAxisAlignment.start,
               mainAxisSize: style.fill ? MainAxisSize.max : MainAxisSize.min,
@@ -350,7 +344,7 @@ class _Block extends StatelessWidget {
                       for (final (j, b) in (item['blocks'] as List).indexed)
                         Padding(
                           padding: EdgeInsets.only(
-                            top: j == 0 ? 0 : (tight ? Space.s2 : _gap),
+                            top: j == 0 ? 0 : (tight ? 2 : _gap),
                           ),
                           child: _content(context, b as Map, key: '$key.$i.$j'),
                         ),
@@ -379,10 +373,7 @@ class _Block extends StatelessWidget {
       children: [
         for (var i = 0; i < head.length; i++)
           Padding(
-            padding: const EdgeInsets.symmetric(
-              horizontal: Space.s10,
-              vertical: Space.s6,
-            ),
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
             child: _Paragraph(
               inlines: (cells.elementAtOrNull(i) as List?) ?? const [],
               style: style.text.copyWith(
@@ -547,7 +538,7 @@ class _ParagraphState extends State<_Paragraph> {
           child: SizedBox(
             width: double.infinity,
             child: Padding(
-              padding: const EdgeInsets.symmetric(vertical: Space.s6),
+              padding: const EdgeInsets.symmetric(vertical: 6),
               child: Center(
                 child: SingleChildScrollView(
                   scrollDirection: Axis.horizontal,
@@ -612,7 +603,7 @@ class _DisplayedMath extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) => Padding(
-    padding: const EdgeInsets.symmetric(vertical: Space.s6),
+    padding: const EdgeInsets.symmetric(vertical: 6),
     child: Center(
       child: SingleChildScrollView(
         scrollDirection: Axis.horizontal,

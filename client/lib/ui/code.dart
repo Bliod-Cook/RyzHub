@@ -334,9 +334,7 @@ class _CodeBlockState extends State<CodeBlock> {
   @override
   Widget build(BuildContext context) {
     final c = HubColors.of(context);
-    final style = TextStyle(
-      fontFamily: 'monospace',
-      fontFamilyFallback: const ['RyzHub Sans'],
+    final style = codeStyle.copyWith(
       fontSize: 13.5,
       height: 1.5,
       color: widget.color,
@@ -346,28 +344,26 @@ class _CodeBlockState extends State<CodeBlock> {
     final lines = this.lines;
     final foldable = lines > _foldLines;
     return Container(
-      margin: const EdgeInsets.symmetric(vertical: Space.s10),
+      margin: const EdgeInsets.symmetric(vertical: 10),
       decoration: BoxDecoration(
         color: c.code,
-        borderRadius: BorderRadius.circular(14),
+        borderRadius: BorderRadius.circular(Radii.block),
         border: Border.all(color: c.border),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           Padding(
-            padding: const EdgeInsets.fromLTRB(
-              Space.s14,
-              Space.s2,
-              Space.s4,
-              0,
-            ),
+            padding: const EdgeInsets.fromLTRB(Space.inset, 2, 4, 0),
             child: Row(
               children: [
                 Expanded(
                   child: Text(
                     widget.info,
-                    style: TextStyle(fontSize: 12, color: c.subtle),
+                    style: TextStyle(
+                      fontSize: FontSizes.caption,
+                      color: c.subtle,
+                    ),
                   ),
                 ),
                 if (foldable)
@@ -396,7 +392,7 @@ class _CodeBlockState extends State<CodeBlock> {
                 open: !folded,
                 peek: foldable ? _peekLines * lineHeight : 0,
                 builder: (context) => Padding(
-                  padding: const EdgeInsets.only(left: Space.s14),
+                  padding: const EdgeInsets.only(left: Space.inset),
                   child: Row(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
@@ -416,8 +412,8 @@ class _CodeBlockState extends State<CodeBlock> {
                           padding: const EdgeInsets.fromLTRB(
                             0,
                             0,
-                            Space.s14,
-                            Space.s14,
+                            Space.inset,
+                            Space.inset,
                           ),
                           child: CodeText(
                             text,
@@ -464,10 +460,10 @@ class _CodeBlockState extends State<CodeBlock> {
                 style: TextButton.styleFrom(
                   foregroundColor: c.muted,
                   minimumSize: const Size.fromHeight(38),
-                  textStyle: const TextStyle(fontSize: 12.5),
+                  textStyle: const TextStyle(fontSize: FontSizes.caption),
                   shape: const RoundedRectangleBorder(
                     borderRadius: BorderRadius.vertical(
-                      bottom: Radius.circular(13),
+                      bottom: Radius.circular(Radii.block - 1),
                     ),
                   ),
                 ),

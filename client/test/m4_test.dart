@@ -131,7 +131,7 @@ void main() {
       ),
     );
     await tester.pumpAndSettle();
-    await tester.tap(find.text('引用历史对话'));
+    await tester.tap(find.byType(Switch).last);
     await tester.pumpAndSettle();
     final update = hub.requests.firstWhere((r) => r['method'] == 'PATCH');
     expect(update['body'], {'enabled': true, 'reference_history': false});

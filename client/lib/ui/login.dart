@@ -9,30 +9,6 @@ import '../prefs.dart';
 import '../theme.dart';
 import 'common.dart';
 
-class LanguageMenu extends StatelessWidget {
-  const LanguageMenu({super.key});
-  @override
-  Widget build(BuildContext context) => PopupMenuButton<String>(
-    tooltip: tr('语言', 'Language'),
-    icon: const Icon(Icons.translate, size: 20),
-    initialValue: prefs.language,
-    onSelected: (v) => prefs.update((p) => p.language = v),
-    itemBuilder: (_) => [
-      for (final (v, label) in languageOptions())
-        HubMenuItem(
-          value: v,
-          height: 38,
-          child: Row(
-            children: [
-              Expanded(child: Text(label)),
-              if (prefs.language == v) const Icon(Icons.check, size: 16),
-            ],
-          ),
-        ),
-    ],
-  );
-}
-
 List<(String, String)> languageOptions() => [
   ('auto', tr('自动检测', 'Auto detect')),
   ('zh', '中文'),
@@ -141,7 +117,7 @@ class _LoginPageState extends State<LoginPage> {
           children: [
             Center(
               child: SingleChildScrollView(
-                padding: const EdgeInsets.all(Space.s28),
+                padding: const EdgeInsets.all(28),
                 child: SizedBox(
                   width: 380,
                   child: Column(
@@ -157,15 +133,6 @@ class _LoginPageState extends State<LoginPage> {
                           fontWeight: FontWeight.w600,
                           color: c.text,
                         ),
-                      ),
-                      const SizedBox(height: 10),
-                      Text(
-                        tr(
-                          '一个空间，连接你的想法与行动。',
-                          'One space for your ideas and actions.',
-                        ),
-                        textAlign: TextAlign.center,
-                        style: TextStyle(color: c.muted),
                       ),
                       const SizedBox(height: 34),
                       Focus(
@@ -192,7 +159,7 @@ class _LoginPageState extends State<LoginPage> {
                       TextField(
                         controller: password,
                         obscureText: true,
-                        style: obscuredStyle,
+                        style: codeStyle,
                         decoration: InputDecoration(
                           labelText: tr(
                             '密码（至少 8 位）',
@@ -204,15 +171,13 @@ class _LoginPageState extends State<LoginPage> {
                       const SizedBox(height: 20),
                       if (error.isNotEmpty)
                         Padding(
-                          padding: const EdgeInsets.only(bottom: Space.s16),
+                          padding: const EdgeInsets.only(bottom: 16),
                           child: Text(error, style: TextStyle(color: c.danger)),
                         ),
                       FilledButton(
                         onPressed: busy ? null : submit,
                         child: Padding(
-                          padding: const EdgeInsets.symmetric(
-                            vertical: Space.s4,
-                          ),
+                          padding: const EdgeInsets.symmetric(vertical: 4),
                           child: Text(
                             busy
                                 ? tr('连接中…', 'Connecting…')
@@ -230,7 +195,7 @@ class _LoginPageState extends State<LoginPage> {
                             const Expanded(child: Divider()),
                             Padding(
                               padding: const EdgeInsets.symmetric(
-                                horizontal: Space.s10,
+                                horizontal: 10,
                               ),
                               child: Text(
                                 tr('或', 'or'),
@@ -243,7 +208,7 @@ class _LoginPageState extends State<LoginPage> {
                         const SizedBox(height: 12),
                         for (final provider in providers)
                           Padding(
-                            padding: const EdgeInsets.only(bottom: Space.s8),
+                            padding: const EdgeInsets.only(bottom: Space.gap),
                             child: OutlinedButton.icon(
                               icon: Icon(
                                 provider['kind'] == 'github'
@@ -279,7 +244,17 @@ class _LoginPageState extends State<LoginPage> {
                 ),
               ),
             ),
-            const Positioned(top: 8, right: 8, child: LanguageMenu()),
+            Positioned(
+              top: Space.gap,
+              right: Space.gap,
+              child: ChoicePill<String>(
+                tooltip: tr('语言', 'Language'),
+                icon: Icons.translate,
+                value: prefs.language,
+                options: languageOptions(),
+                onChanged: (v) => prefs.update((p) => p.language = v),
+              ),
+            ),
           ],
         ),
       ),

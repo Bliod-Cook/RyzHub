@@ -250,7 +250,6 @@ class DuplicatePrompt {
       context: context,
       builder: (context) => StatefulBuilder(
         builder: (context, setState) {
-          final c = HubColors.of(context);
           final known = existing['name'] as String;
           final details = [
             uploadedOn(
@@ -265,44 +264,19 @@ class DuplicatePrompt {
               mainAxisSize: MainAxisSize.min,
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Row(
-                  children: [
-                    FileThumbnail(
-                      hub: hub,
-                      name: known,
-                      id: existing['id'] as String,
-                      kind: existing['kind'] as String?,
-                      size: 44,
-                    ),
-                    const SizedBox(width: 14),
-                    Flexible(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text(
-                            known,
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: TextStyle(fontSize: 14.5, color: c.text),
-                          ),
-                          const SizedBox(height: 3),
-                          Text(
-                            details,
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: TextStyle(fontSize: 12.5, color: c.subtle),
-                          ),
-                        ],
-                      ),
-                    ),
-                  ],
+                FileTile(
+                  hub: hub,
+                  name: known,
+                  id: existing['id'] as String,
+                  kind: existing['kind'] as String?,
+                  details: details,
                 ),
                 if (name != known) ...[
                   const SizedBox(height: 14),
                   Text(tr('“$name” 与它内容相同。', '"$name" has the same content.')),
                 ],
                 if (many) ...[
-                  const SizedBox(height: 8),
+                  const SizedBox(height: Space.gap),
                   CheckboxListTile(
                     contentPadding: EdgeInsets.zero,
                     controlAffinity: ListTileControlAffinity.leading,
@@ -387,12 +361,12 @@ class FileThumbnail extends StatelessWidget {
       height: size,
       decoration: BoxDecoration(
         color: c.hover,
-        borderRadius: BorderRadius.circular(8),
+        borderRadius: BorderRadius.circular(Radii.small),
       ),
       child: Icon(data, size: size * .55, color: c.muted),
     );
     Widget image(Uint8List data) => ClipRRect(
-      borderRadius: BorderRadius.circular(8),
+      borderRadius: BorderRadius.circular(Radii.small),
       child: Image(
         image: CoverImage(data, side),
         width: size,
@@ -420,6 +394,51 @@ class FileThumbnail extends StatelessWidget {
         }
         return icon(Icons.image_outlined);
       },
+    );
+  }
+}
+
+/// A file in a list: its picture or icon, its name and [details] under it.
+class FileTile extends StatelessWidget {
+  final HubController hub;
+  final String name, details;
+  final String? id, kind;
+  const FileTile({
+    super.key,
+    required this.hub,
+    required this.name,
+    required this.details,
+    this.id,
+    this.kind,
+  });
+  @override
+  Widget build(BuildContext context) {
+    final c = HubColors.of(context);
+    return Row(
+      children: [
+        FileThumbnail(hub: hub, name: name, id: id, kind: kind, size: 40),
+        const SizedBox(width: 12),
+        Flexible(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                name,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(fontSize: FontSizes.body, color: c.text),
+              ),
+              const SizedBox(height: 2),
+              Text(
+                details,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(fontSize: FontSizes.caption, color: c.subtle),
+              ),
+            ],
+          ),
+        ),
+      ],
     );
   }
 }
@@ -491,15 +510,10 @@ class PendingFiles extends StatelessWidget {
           Container(
             key: ObjectKey(file),
             constraints: const BoxConstraints(maxWidth: 240),
-            padding: const EdgeInsets.fromLTRB(
-              Space.s6,
-              Space.s6,
-              Space.s2,
-              Space.s6,
-            ),
+            padding: const EdgeInsets.fromLTRB(6, 6, 2, 6),
             decoration: BoxDecoration(
               color: c.background,
-              borderRadius: BorderRadius.circular(12),
+              borderRadius: BorderRadius.circular(Radii.field),
               border: Border.all(
                 color: file.error != null ? c.danger : c.border,
               ),
@@ -510,7 +524,7 @@ class PendingFiles extends StatelessWidget {
                 Flexible(
                   // An uploaded file opens in the preview.
                   child: InkWell(
-                    borderRadius: BorderRadius.circular(8),
+                    borderRadius: BorderRadius.circular(Radii.small),
                     onTap: file.id == null ? null : () => preview(file),
                     child: Row(
                       mainAxisSize: MainAxisSize.min,
@@ -522,7 +536,7 @@ class PendingFiles extends StatelessWidget {
                           kind: file.kind,
                           bytes: file.thumbnail,
                         ),
-                        const SizedBox(width: 8),
+                        const SizedBox(width: Space.gap),
                         Flexible(
                           child: Column(
                             crossAxisAlignment: CrossAxisAlignment.start,
@@ -532,7 +546,10 @@ class PendingFiles extends StatelessWidget {
                                 file.name,
                                 maxLines: 1,
                                 overflow: TextOverflow.ellipsis,
-                                style: TextStyle(fontSize: 13, color: c.text),
+                                style: TextStyle(
+                                  fontSize: FontSizes.label,
+                                  color: c.text,
+                                ),
                               ),
                               Text(
                                 file.error != null
@@ -543,7 +560,7 @@ class PendingFiles extends StatelessWidget {
                                 maxLines: 1,
                                 overflow: TextOverflow.ellipsis,
                                 style: TextStyle(
-                                  fontSize: 11.5,
+                                  fontSize: FontSizes.caption,
                                   color: file.error != null
                                       ? c.danger
                                       : c.subtle,
@@ -558,7 +575,7 @@ class PendingFiles extends StatelessWidget {
                 ),
                 if (file.uploading)
                   const Padding(
-                    padding: EdgeInsets.symmetric(horizontal: Space.s8),
+                    padding: EdgeInsets.symmetric(horizontal: Space.gap),
                     child: SizedBox(
                       width: 14,
                       height: 14,
@@ -601,8 +618,8 @@ class MessageFiles extends StatelessWidget {
     ];
     return Wrap(
       alignment: alignment,
-      spacing: 8,
-      runSpacing: 8,
+      spacing: Space.gap,
+      runSpacing: Space.gap,
       children: [
         for (final (i, file) in entries.indexed)
           Builder(
@@ -616,7 +633,7 @@ class MessageFiles extends StatelessWidget {
                 return Tooltip(
                   message: name,
                   child: InkWell(
-                    borderRadius: BorderRadius.circular(8),
+                    borderRadius: BorderRadius.circular(Radii.small),
                     onTap: open,
                     child: FileThumbnail(
                       hub: hub,
@@ -629,25 +646,25 @@ class MessageFiles extends StatelessWidget {
                 );
               }
               return InkWell(
-                borderRadius: BorderRadius.circular(12),
+                borderRadius: BorderRadius.circular(Radii.field),
                 onTap: open,
                 child: Container(
                   constraints: const BoxConstraints(maxWidth: 260),
                   padding: const EdgeInsets.fromLTRB(
-                    Space.s8,
-                    Space.s8,
-                    Space.s12,
-                    Space.s8,
+                    Space.gap,
+                    Space.gap,
+                    12,
+                    Space.gap,
                   ),
                   decoration: BoxDecoration(
-                    borderRadius: BorderRadius.circular(12),
+                    borderRadius: BorderRadius.circular(Radii.field),
                     border: Border.all(color: c.border),
                   ),
                   child: Row(
                     mainAxisSize: MainAxisSize.min,
                     children: [
                       FileThumbnail(hub: hub, name: name, kind: kind),
-                      const SizedBox(width: 8),
+                      const SizedBox(width: Space.gap),
                       Flexible(
                         child: Column(
                           crossAxisAlignment: CrossAxisAlignment.start,
@@ -657,11 +674,17 @@ class MessageFiles extends StatelessWidget {
                               name,
                               maxLines: 1,
                               overflow: TextOverflow.ellipsis,
-                              style: TextStyle(fontSize: 13, color: c.text),
+                              style: TextStyle(
+                                fontSize: FontSizes.label,
+                                color: c.text,
+                              ),
                             ),
                             Text(
                               fileSize((file['size'] as num?) ?? 0),
-                              style: TextStyle(fontSize: 11.5, color: c.subtle),
+                              style: TextStyle(
+                                fontSize: FontSizes.caption,
+                                color: c.subtle,
+                              ),
                             ),
                           ],
                         ),
@@ -736,7 +759,7 @@ class _FileSearchFieldState extends State<FileSearchField> {
         },
         onSubmitted: (query) => search(query, now: true),
         textInputAction: TextInputAction.search,
-        style: const TextStyle(fontSize: 14),
+        style: const TextStyle(fontSize: FontSizes.body),
         decoration: InputDecoration(
           hintText: tr('搜索文件库', 'Search library'),
           prefixIcon: Icon(Icons.search, size: 20, color: c.muted),
@@ -816,19 +839,14 @@ class _LibraryDialogState extends State<_LibraryDialog> {
     final c = HubColors.of(context);
     final full = chosen.length >= room;
     return Dialog(
-      insetPadding: const EdgeInsets.all(Space.s24),
+      insetPadding: const EdgeInsets.all(24),
       child: ConstrainedBox(
         constraints: const BoxConstraints(maxWidth: 600, maxHeight: 620),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
             Padding(
-              padding: const EdgeInsets.fromLTRB(
-                Space.s24,
-                Space.s16,
-                Space.s12,
-                Space.s12,
-              ),
+              padding: const EdgeInsets.fromLTRB(24, Space.edge, 12, 12),
               child: Row(
                 children: [
                   Expanded(
@@ -850,7 +868,7 @@ class _LibraryDialogState extends State<_LibraryDialog> {
               ),
             ),
             Padding(
-              padding: const EdgeInsets.symmetric(horizontal: Space.s24),
+              padding: const EdgeInsets.symmetric(horizontal: 24),
               child: FileSearchField(
                 autofocus: true,
                 onSearch: (query) {
@@ -859,7 +877,7 @@ class _LibraryDialogState extends State<_LibraryDialog> {
                 },
               ),
             ),
-            const SizedBox(height: 8),
+            const SizedBox(height: Space.gap),
             Expanded(
               child: busy
                   ? const Center(child: CircularProgressIndicator())
@@ -876,10 +894,10 @@ class _LibraryDialogState extends State<_LibraryDialog> {
                     )
                   : ListView(
                       padding: const EdgeInsets.fromLTRB(
-                        Space.s14,
-                        Space.s4,
-                        Space.s14,
-                        Space.s8,
+                        Space.inset,
+                        4,
+                        Space.inset,
+                        Space.gap,
                       ),
                       children: [
                         for (final file in files)
@@ -911,10 +929,10 @@ class _LibraryDialogState extends State<_LibraryDialog> {
                         border: Border(top: BorderSide(color: c.border)),
                       ),
                       padding: const EdgeInsets.fromLTRB(
-                        Space.s24,
-                        Space.s12,
-                        Space.s20,
-                        Space.s16,
+                        24,
+                        12,
+                        20,
+                        Space.edge,
                       ),
                       child: Row(
                         children: [
@@ -929,14 +947,17 @@ class _LibraryDialogState extends State<_LibraryDialog> {
                                       : ''),
                               maxLines: 1,
                               overflow: TextOverflow.ellipsis,
-                              style: TextStyle(fontSize: 13.5, color: c.subtle),
+                              style: TextStyle(
+                                fontSize: FontSizes.label,
+                                color: c.subtle,
+                              ),
                             ),
                           ),
                           TextButton(
                             onPressed: () => Navigator.pop(context),
                             child: Text(tr('取消', 'Cancel')),
                           ),
-                          const SizedBox(width: 8),
+                          const SizedBox(width: Space.gap),
                           FilledButton(
                             onPressed: () =>
                                 Navigator.pop(context, chosen.values.toList()),
@@ -989,43 +1010,24 @@ class _LibraryRow extends StatelessWidget {
                 : hovered && onTap != null
                 ? c.hover
                 : Colors.transparent,
-            borderRadius: BorderRadius.circular(12),
+            borderRadius: BorderRadius.circular(Radii.field),
             child: InkWell(
-              borderRadius: BorderRadius.circular(12),
+              borderRadius: BorderRadius.circular(Radii.field),
               onTap: onTap,
               child: Padding(
                 padding: const EdgeInsets.symmetric(
-                  horizontal: Space.s10,
-                  vertical: Space.s9,
+                  horizontal: 10,
+                  vertical: 9,
                 ),
                 child: Row(
                   children: [
-                    FileThumbnail(
-                      hub: hub,
-                      name: name,
-                      id: file['id'] as String,
-                      kind: file['kind'] as String?,
-                      size: 44,
-                    ),
-                    const SizedBox(width: 14),
                     Expanded(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text(
-                            name,
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: TextStyle(fontSize: 14.5, color: c.text),
-                          ),
-                          const SizedBox(height: 3),
-                          Text(
-                            details,
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: TextStyle(fontSize: 12.5, color: c.subtle),
-                          ),
-                        ],
+                      child: FileTile(
+                        hub: hub,
+                        name: name,
+                        id: file['id'] as String,
+                        kind: file['kind'] as String?,
+                        details: details,
                       ),
                     ),
                     const SizedBox(width: 12),

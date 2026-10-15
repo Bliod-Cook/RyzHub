@@ -66,10 +66,6 @@ String? emulatedNote(String capability) => switch (capability) {
     '由平台用摘要替换较早的上下文。',
     'The platform replaces older context with a summary.',
   ),
-  'side_query' => tr(
-    '由平台另发一次只读请求回答，不进入主线。',
-    'The platform answers in a separate read-only request, off the main thread.',
-  ),
   _ => null,
 };
 

@@ -416,7 +416,7 @@ impl Default for WorkConfig {
             claude_model: String::new(),
             enabled: false,
             model: String::new(),
-            storage_root: "var/m2/blobs".into(),
+            storage_root: "var/blobs".into(),
             secondary_root: None,
             checkpoint_interval_secs: 300,
             checkpoint_retention_days: 30,
@@ -806,7 +806,7 @@ impl Default for PushConfig {
     }
 }
 
-/// Plugins (M5): packages and remote MCP servers members install.
+/// Plugins: packages and remote MCP servers members install.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PluginsConfig {

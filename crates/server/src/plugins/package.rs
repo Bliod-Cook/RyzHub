@@ -91,7 +91,7 @@ pub struct Permissions {
     /// How tool calls are treated: `allow`, `ask` or `deny` by default, for tools annotated
     /// read-only, and per tool.
     pub tools: ToolRules,
-    /// Workspace access a remote plugin asks for; `none` in v1.
+    /// Workspace access a remote plugin asks for; always `none` for now.
     pub workspace: String,
     /// Hosts a plugin running in the sandbox may reach (v2).
     pub network: Vec<String>,

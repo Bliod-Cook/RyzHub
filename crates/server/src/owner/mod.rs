@@ -51,7 +51,7 @@ pub fn result_subject(user: Uuid, cid: Uuid) -> String {
 /// What drives a conversation's runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Engine {
-    /// The M0 simulator (model gateway disabled).
+    /// The simulator (model gateway disabled).
     Mock,
     /// The platform's own agent loop.
     Chat,

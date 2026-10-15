@@ -10,7 +10,7 @@
 # sandboxes read it.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-node="${RYZHUB_EXECUTION_NODE:-ryzhub-m1-execution}"
+node="${RYZHUB_EXECUTION_NODE:-ryzhub-execution}"
 name="ryzhub.local/deps:build"
 ctr=(docker exec -i "$node" ctr --address /run/ryzhub-containerd.sock --namespace ryzhub)
 

@@ -1,10 +1,10 @@
 # 平台线协议 v1
 
-当前小版本为 6（`PROTOCOL_MINOR`）。唯一 schema 为 `proto/agentplatform/v1/wire.proto`；`prost + protox` 构建不依赖系统 protoc。WebSocket 子协议为 `ryzhub.v1.protobuf`，每个 binary message 对应一个 Frame；另有压缩子协议 `ryzhub.v1.protobuf+zstd`、开发用的 JSON 子协议和 SSE 降级，见“传输”。M0 支持 `text/part_index=0`。
+当前小版本为 8（`PROTOCOL_MINOR`）。唯一 schema 为 `proto/agentplatform/v1/wire.proto`；`prost + protox` 构建不依赖系统 protoc。WebSocket 子协议为 `ryzhub.v1.protobuf`，每个 binary message 对应一个 Frame；另有压缩子协议 `ryzhub.v1.protobuf+zstd`、开发用的 JSON 子协议和 SSE 降级，见“传输”。Delta 与 ItemFold 的 `part_index` 目前恒为 0，流为 `text` 或 `terminal_output`（见 v1.7）。
 
 ## 连接与身份
 
-原生连接使用 Authorization Bearer；浏览器先 POST `/auth/ticket`，再连接 `/ws?ticket=...`。ticket 哈希落库、30 秒有效，兑换使用 DELETE RETURNING，只能用一次。跨域 Origin 必须在配置白名单内。M0 HTTP/WS 由本地服务提供，部署时由反向代理终止 HTTPS/WSS。
+原生连接使用 Authorization Bearer；浏览器先 POST `/auth/ticket`，再连接 `/ws?ticket=...`。ticket 哈希落库、30 秒有效，兑换使用 DELETE RETURNING，只能用一次。跨域 Origin 必须在配置白名单内。服务本身只提供 HTTP/WS，部署时由反向代理终止 HTTPS/WSS。
 
 10 秒内发送 Hello，必须包含 major=1 和稳定 device_id。Welcome 返回连接 ID、协议版本、22 秒心跳和 1 MiB 帧限制。服务端不保存订阅集合：`resume_token` 恒为空、`resumed` 恒为 false，三个字段在 proto 中标为 deprecated，只为兼容旧客户端保留，客户端不再发送。重连后客户端按本地连续游标重新订阅；只有客户端知道自己真正应用到了哪里。
 
@@ -14,7 +14,7 @@
 
 - `conv:<uuid>`：私有对话，只有创建者可订阅；组织管理员不自动获得内容权限。
 - `user:<org_uuid>:<user_uuid>`：组织内该用户的会话摘要、已读位置和草稿；该用户的 CreateRun 与 UndoMemoryUpdate 也发在这里。
-- `org:<org_uuid>`：仅当前成员可订阅；M0 保留组织变更扩展点。
+- `org:<org_uuid>`：仅当前成员可订阅；预留给组织级变更，目前不发布事件。
 
 Subscribe 的 `since_seq` 是 optional：缺失表示首次快照，0 是有效的重放起点。Gateway 先建立并 flush NATS 订阅，再在 REPEATABLE READ 事务内读取投影和 head_seq；缓冲中的旧事件会去重。已过期的游标或超前游标转快照。快照提供最近 100 个 Item，历史由 REST `items?before_seq=` 分页，每页 100 个，响应为 `{items, has_more}`，`has_more` 表示是否还有更早的 Item。Flutter 在时间线顶端进入视野时自动加载下一页，`has_more` 为 false 后停止；Rust core 按 Item revision 合并历史，不覆盖同 revision 的流式文本，不推进 live cursor，并将结果持久化到同一缓存。
 
@@ -39,11 +39,11 @@ Owner 在频道行锁内完成事件发布、Delta 发布及 NATS flush，随后
 
 ## 命令
 
-M0 实现 SendMessage、DecideApproval、Cancel、MarkRead。M1 增加 Steer、SideQuery、AnswerQuestion；`GET /capabilities` 返回 Chat 模式及模型，Work 仍为 mock。
+对话频道上的命令有 SendMessage、DecideApproval、Cancel、MarkRead、Steer、SideQuery、AnswerQuestion，以及“运行设置与对话管理”中的 UpdateRunConfig、Compact、Fork 和 v1.8 的 InvokeMenuCommand。`GET /capabilities` 宣告服务端启用的模式与能力。
 
-harness 专属命令（如 Claude 的 `/review`）以 `/name` 文本经 SendMessage 原样透传，由 harness 自己识别。`InvokeMenuCommand` 只用于带参数表单、prompt 模板在服务端的插件命令（M5）。
+harness 专属命令（如 Claude 的 `/review`）以 `/name` 文本经 SendMessage 原样透传，由 harness 自己识别。`InvokeMenuCommand` 只用于带参数表单、prompt 模板在服务端的插件命令（见 v1.8）。
 
-M1 活跃主线期间新输入使用 Steer，持久 Item 状态先为 `accepted`，在下一次模型请求前变为 `injected`；任务结束仍未注入的补充标为 `cancelled`。SideQuery 创建 `read_only` run，不带工具，不写回主线。AnswerQuestion 携带 action_id、run_epoch 和 answer，与审批使用相同的待决状态/代次 CAS。客户端问题卡片通过 `PendingAction.options=["__answer__"]` 识别；该标记是 v1 的暂行约定。
+主线 run 活跃期间新输入使用 Steer，持久 Item 状态先为 `accepted`，在下一次模型请求前变为 `injected`；任务结束仍未注入的补充标为 `cancelled`。SideQuery 创建 `read_only` run，不带工具，不写回主线。AnswerQuestion 携带 action_id、run_epoch 和 answer，与审批使用相同的待决状态/代次 CAS。客户端问题卡片通过 `PendingAction.options=["__answer__"]` 识别；该标记是 v1 的暂行约定。
 
 RunState 支持 `running/requires_action/completed/cancelled/failed`，`read_only` 区分旁问与主线（缺省 false，兼容旧缓存）。前端运行状态以 RunState 为准；工具卡片与助手消息可先完成，不能据此推断整个 run 已结束。
 
@@ -101,7 +101,7 @@ cid 必须是 UUID；同一用户内全局唯一。重复请求必须有相同�
   - 有 `app` 时，客户端可以用 `POST /orgs/{org}/conversations/{conv}/apps {item_id}` 取得页面地址和这次调用的输入、结果，在沙箱化的 frame 里显示。
   - 页面与声明式组件里的工具调用走 `POST …/tool-calls {item_id, tool, arguments}`，规则与模型调用相同。必须审批的工具不能从界面调用。
 
-## 阶段 7 的 REST 补充
+## REST 与 capabilities 补充
 
 WebSocket 帧没有变化，小版本仍是 8。`GET /capabilities` 多了：
 
@@ -134,13 +134,9 @@ WebSocket 与本地缓存由 Flutter 外壳实现并注入 Rust 内核（原生�
 
 这些传输优化不改变上述一致性规则。
 
-## 边界
+## 运行设置与对话管理
 
-客户端主动断开/重连覆盖连接迁移机制；真实 Windows/Android 系统回调和 IME 表现仍需要实机 PoC。
-
-## M3 命令与状态
-
-新增 `UpdateRunConfig(config_json)`、`Compact`、`Fork(item_id)`，沿用 CID 幂等、Owner fencing 和提交后 ACK。模型/推理/审批/计划设置保存到对话，下一轮复制到 run；已有运行记录（或分叉带来的上下文种子）后 harness/protocol 不可变。设置变更不再写入时间线通知；`SendMessage.config_json` 可携带客户端尚未确认的设置，服务端在同一事务内先应用再创建 run，避免与单独的 UpdateRunConfig 乱序。客户端只传 `model` 时，服务端按模型路由推断 protocol，Work 未给 harness 时一并推断；切换到另一提供方或执行器的模型返回 `HARNESS_PROTOCOL_IMMUTABLE`，客户端改为新建对话。fork 是持久化后台作业，`GET /conversations/{id}/commands` 可查询结果。
+`UpdateRunConfig(config_json)`、`Compact`、`Fork(item_id)` 沿用 CID 幂等、Owner fencing 和提交后 ACK。模型/推理/审批/计划设置保存到对话，下一轮复制到 run；已有运行记录（或分叉带来的上下文种子）后 harness/protocol 不可变。设置变更不写入时间线；`SendMessage.config_json` 可携带客户端尚未确认的设置，服务端在同一事务内先应用再创建 run，避免与单独的 UpdateRunConfig 乱序。客户端只传 `model` 时，服务端按模型路由推断 protocol，Work 未给 harness 时一并推断；切换到另一提供方或执行器的模型返回 `HARNESS_PROTOCOL_IMMUTABLE`，客户端改为新建对话。fork 是持久化后台作业，`GET /conversations/{id}/commands` 可查询结果。
 
 补充输入区分 accepted/waiting/handed；handed 只代表转交。Claude 在当前原生轮结束后启动下一轮，仍属于同一平台 run；所有原生 turn ID 持久映射，迟到事件按原始 turn 路由。
 
@@ -149,3 +145,7 @@ WebSocket 与本地缓存由 Flutter 外壳实现并注入 Rust 内核（原生�
 Codex 的 `fork_points` 返回可分叉的 Item ID，仅包括已完成轮次末尾的原生 assistant 回复；轮次中间的回复或之后仍有工具操作的回复不可选择，服务端同样拒绝。客户端在 run 完成后刷新该列表。其他 harness 的 `fork_points` 为 null，沿用其消息边界。
 
 重命名和 Chat 归档在同一事务内更新对话并向用户频道写入 `ItemUpserted(kind=conversation)`；其 revision 使用所分配的用户频道 seq，保证连续修改可被客户端合并。标题和状态既支持在线推送，也支持按游标续传。
+
+## 边界
+
+客户端以主动断开、重连处理连接迁移；Windows/Android 的系统回调与输入法表现需要在真机上验证，见[真机验证清单](device-checklist.md)。

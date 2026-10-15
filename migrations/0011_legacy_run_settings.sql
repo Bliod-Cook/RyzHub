@@ -1,4 +1,4 @@
--- M1/M2 runs predate immutable run_config. Preserve their recorded model/harness
+-- Runs created before immutable run_config existed. Preserve their recorded model/harness
 -- during a rolling upgrade instead of resolving from today's instance defaults.
 UPDATE runs r SET
  protocol=CASE WHEN c.mode='work' AND NOT r.read_only THEN 'responses' ELSE 'anthropic' END,

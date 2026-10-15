@@ -1,4 +1,4 @@
-//! Plugins (M5): packages of remote MCP tools, skills, commands and UI that members install.
+//! Plugins: packages of remote MCP tools, skills, commands and UI that members install.
 //!
 //! A source is fetched and parsed into an immutable version. Installing confirms what the
 //! version asks for (servers, permissions, settings, the full text of its skills and commands)

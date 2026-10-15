@@ -122,7 +122,7 @@ async fn execute(
     let engine = Engine::of(config, &conversation.mode);
     let cid = envelope.cid.as_str();
     let command = envelope.command.as_ref().context(Code::InvalidCommand)?;
-    // The simulator supports only the M0 command set.
+    // The simulator handles messages, approvals and cancellation only.
     ensure!(
         engine != Engine::Mock
             || matches!(

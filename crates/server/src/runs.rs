@@ -24,7 +24,7 @@ use crate::{
 
 /// Longest accepted user message, steer or answer.
 const MAX_INPUT: usize = 65_536;
-/// The M0 simulator keeps its original, smaller limit.
+/// The simulator keeps its original, smaller limit.
 const MAX_MOCK_INPUT: usize = 4096;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -397,7 +397,7 @@ async fn context_seed(
     }
 }
 
-/// The M0 simulator: fixed policy names, a canned reply streamed by the mock engine, and
+/// The simulator: fixed policy names, a canned reply streamed by the mock engine, and
 /// `/approve` for a simulated approval.
 async fn create_mock(
     tx: &mut Tx<'_>,

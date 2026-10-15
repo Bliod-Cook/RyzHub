@@ -121,7 +121,7 @@ final _sections = [
       'policy',
       '能力',
       'capabilities',
-      'milestone',
+      'agent',
     ],
   ),
 ];
@@ -1344,10 +1344,9 @@ class _Server extends StatelessWidget {
               trailing: Text(hub.base, style: TextStyle(color: c.muted)),
             ),
             SettingRow(
-              title: tr('里程碑', 'Milestone'),
-              subtitle: hub.agentLabel,
+              title: tr('当前 Agent', 'Current agent'),
               trailing: Text(
-                show(caps['milestone']),
+                hub.agentLabel,
                 style: TextStyle(color: c.muted),
               ),
             ),

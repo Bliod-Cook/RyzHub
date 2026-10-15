@@ -1,4 +1,4 @@
--- Plugins (M5). A plugin is fetched from its source into an immutable version; a member
+-- Plugins. A plugin is fetched from its source into an immutable version; a member
 -- installs a version and confirms what it asks for; it is then on for their conversations
 -- unless a project or conversation turns it off. A run uses the plugins it started with.
 CREATE TABLE plugins (
@@ -24,7 +24,7 @@ CREATE TABLE plugin_versions (
 );
 CREATE TABLE plugin_installations (
  id uuid PRIMARY KEY, org_id uuid NOT NULL, plugin_id uuid NOT NULL,
- -- Member installations only in v1; organization-wide ones need its management UI.
+ -- Member installations only for now; organization-wide ones need its management UI.
  scope text NOT NULL DEFAULT 'member' CHECK (scope IN ('member','org')),
  user_id uuid REFERENCES users,
  version_id uuid NOT NULL,

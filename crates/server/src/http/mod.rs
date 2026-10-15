@@ -281,25 +281,10 @@ pub(crate) async fn user_orgs(store: &Store, user: Uuid) -> anyhow::Result<Vec<(
         .await?)
 }
 
-fn milestone(app: &App) -> &'static str {
-    let config = &app.config;
-    if config.search.enabled {
-        "M4"
-    } else if !config.work.claude_model.is_empty() {
-        "M3"
-    } else if config.work.enabled {
-        "M2"
-    } else if config.llm.enabled {
-        "M1"
-    } else {
-        "M0"
-    }
-}
-
 /// Liveness plus the database, which every request needs.
 async fn healthz(State(app): State<App>) -> ApiResult<Json<Value>> {
     sqlx::query("SELECT 1").execute(&app.store.pool).await?;
-    Ok(Json(json!({"status":"ok","milestone":milestone(&app)})))
+    Ok(Json(json!({"status":"ok"})))
 }
 
 async fn capabilities(State(app): State<App>) -> Json<Value> {
@@ -321,7 +306,6 @@ async fn capabilities(State(app): State<App>) -> Json<Value> {
         "responses_model": config.llm.responses_model,
         "harnesses": harnesses,
         "work_capabilities": if config.work.enabled { work } else { json!({}) },
-        "milestone": milestone(&app),
         "search": config.search.enabled,
         "memory": config.search.enabled,
         "conversation_temporary": config.search.enabled,
@@ -367,7 +351,6 @@ async fn admin_settings(State(app): State<App>, headers: HeaderMap) -> ApiResult
         "config": config,
         "backend": if config.sandbox.enabled { "containerd" } else { "disabled" },
         "isolation_level": isolation,
-        "milestone": milestone(&app),
         "capabilities": {
             "stream": "text/0",
             "approval": "native",

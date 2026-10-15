@@ -1,4 +1,4 @@
-//! The M0 simulator engine: streams a canned reply that echoes the user's message.
+//! The simulator engine: streams a canned reply that echoes the user's message.
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -32,7 +32,7 @@ pub async fn drive(app: App, lease: Lease, run: Uuid, link: OwnerLink) -> anyhow
         tx.commit().await?;
         (item, partial, prompt)
     };
-    let reply = format!("模拟 agent 已收到：{prompt}\n\n这是 M0 的可恢复流式响应。你好，Rust 🦀。");
+    let reply = format!("模拟 agent 已收到：{prompt}\n\n这是可恢复的流式响应。你好，Rust 🦀。");
     let live = LiveRef::of(&item);
     // A takeover resumes after the text a previous Owner already saved.
     let mut offset = if reply.starts_with(&partial) {

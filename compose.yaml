@@ -1,4 +1,4 @@
-name: ryzhub-m0
+name: ryzhub
 services:
   postgres:
     build: ./infra/postgres

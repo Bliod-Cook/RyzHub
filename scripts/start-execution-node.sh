@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 cd "$(dirname "$0")/.."
-node_name=ryzhub-m1-execution
+node_name=ryzhub-execution
 node_root="$PWD/var/execution"
 mkdir -p "$node_root/gateway"
 chmod 700 "$node_root"

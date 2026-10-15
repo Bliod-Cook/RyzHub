@@ -1,9 +1,9 @@
--- M4. Extensions are deployment prerequisites; no silent LIKE or synthetic-vector fallback.
+-- Search and memory. Extensions are deployment prerequisites; no silent LIKE or synthetic-vector fallback.
 CREATE EXTENSION IF NOT EXISTS pgroonga;
 CREATE EXTENSION IF NOT EXISTS vector;
 DO $$ BEGIN
  IF (SELECT string_to_array(extversion,'.')::int[] < ARRAY[0,8,2] FROM pg_extension WHERE extname='vector') THEN
-  RAISE EXCEPTION 'M4 requires pgvector >= 0.8.2';
+  RAISE EXCEPTION 'search requires pgvector >= 0.8.2';
  END IF;
 END $$;
 ALTER TABLE conversations ADD COLUMN search_revision bigint NOT NULL DEFAULT 1;

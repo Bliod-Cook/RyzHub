@@ -1,0 +1,162 @@
+# TODO
+
+平台原始设计中提出、但还没有实现的需求。2026-10-15 对照代码逐项核对；每项写明要做什么，以及现在做到哪一步。
+
+分为五部分：
+
+1. 设计要求、尚未完成
+2. 设计本身列为以后或按需
+3. 组织功能（2026-10-11 决定暂缓）
+4. 待实机或真实环境验证
+5. 已决定不做
+
+## 1. 设计要求、尚未完成
+
+### 执行与存储
+
+- [ ] **Work 空闲回收分别计时**：运行中、空闲、等待审批应各有回收时限。现在只有 `work.idle_suspend_secs` 一个计时：运行中与等待审批（`requires_action`）的沙箱一律不挂起，等待审批只受 `approval_ttl_secs` 约束。
+- [ ] **预热池**：每个节点保持若干已启动、未绑定组织的沙箱。新建 Chat 沙箱或全新 Work 工作区时领取，领取时才挂入组织目录、下发 virtual key。
+  - 目前没做：实测冷启动约 0.5 秒，Chat 沙箱又已空闲复用，收益小。
+  - 要做需要解决三件事：向运行中的容器注入挂载（只有 runc 可行，gVisor 不行）、领取后未确认的孤儿沙箱、沙箱与容器的身份映射。
+- [ ] **节点排空时迁移沙箱**：换节点前应先提交检查点，再迁到其他节点。
+  - 现在 `execution_nodes.state = 'draining'` 只让节点不再接收新沙箱，已有沙箱留在原地。
+  - 只有节点失联后，工作区才从检查点恢复到其他节点。
+- [ ] **归档剔除用户放进沙箱的凭据**：git token 这类秘密应从归档和检查点里剔除。
+  - 现在只剔除 `.env`、`.ssh`、`auth.json`；`.git-credentials`、`.netrc`、git 凭据助手的存储仍会进入归档。
+  - 恢复后提示重新配置的通知已经有了。
+- [ ] **恢复说明的文案**：从检查点恢复后，时间线里的说明应写成“文件已恢复到 hh:mm，之后的 N 个操作需要重新执行”。现在写的是检查点 ID 和水位 seq。
+- [ ] **Chat `exec` 的 PTY**：`exec` 的 `pty` 参数现在被拒绝（`PtyUnsupported`）。Work 的终端面板已经有 PTY。
+
+### Harness
+
+- [ ] **Work 旁问（btw）走原生分叉**：Codex 用 ephemeral 的 `thread/fork`，Claude Code 用 Agent SDK 的 `forkSession`，都只读一轮。
+  - 现在 Work 的旁问是模拟的：先摘要最近 20 条消息，再开一个不能访问文件的只读 run。
+  - Codex 声明的 `side_query` 能力为 unsupported。
+- [ ] **steer 的“中断后追加”**：harness 不支持原生 steer 时，默认把输入排到下一轮。还应提供一个选项：用户确认后中断当前轮，再追加输入。
+- [ ] **steer 的“已被采用”状态**：界面现在显示三种状态：已接收、等待注入点、已转交。harness 能确认已采纳时，还应显示“已被采用”。
+- [ ] **模拟取消**：harness 不支持中断时，应杀掉进程，再从最近的 session 恢复。现在所有 harness 都只用原生中断。
+- [ ] **harness 版本治理**：
+  - Codex 的协议类型应由 app-server 的 `generate-json-schema` 生成，现在是手写的。
+  - 每次升级 harness 时，应跑一套兼容测试：开始、流式、工具、审批、提问、中断、恢复、fork、模型列表。现在只有 `scripts/claude-adapter-smoke.py`。
+  - 已有会话应固定在创建时的 harness 版本。现在 Codex、Claude SDK 版本是平台常量（`ryzhub_execution::native`），检查点记录写入时的版本，恢复时要求与当前版本一致，所以升级后旧检查点无法恢复。
+
+### 模型网关
+
+- [ ] **Gemini 动态思考的上限**：`max_reasoning` 无法约束 `thinkingBudget = -1` 或不写预算的请求（由模型自定强度），网关直接放行。
+- [ ] **Responses 的按需加载工具**：插件工具很多时，Anthropic 模型已改用 `defer_loading` 加 tool search。Responses 模型还没有对应的处理，插件工具全部放进请求。
+
+### 插件
+
+- [ ] **Work 中打开 MCP Apps**：现在只有 Chat 的工具卡片能打开插件页面。Work 的工具条目来自 harness 的投影，MCP 调用记在 `mcp_calls`，还没有关联到插件页面。
+- [ ] **Work 中途增减插件的提示**：Work 在任务开始时锁定插件集合，中途增减插件需要重启 harness 会话，界面应如实提示。现在 `/mcp` 按 run 的插件集合列出工具（`listChanged: false`），关闭的插件立即撤下，但没有任何提示。
+- [ ] **远程插件访问工作区文件**：插件需要文件时，经平台文件接口按次授权。现在 `permissions.workspace` 只能是 `none`，没有这样的接口。
+- [ ] **签名插件自动更新**：可选开启，签名验证通过后自动更新。现在更新只能由成员手动触发（`/update`）。
+- [ ] **声明式组件**：
+  - 图表只有柱状图。
+  - 组件协议没有对齐 A2UI，也没有用 Flutter 的 genui；组件目录是自己用 Flutter 实现的。
+
+### 记忆与搜索
+
+- [ ] **标注本轮用到的记忆**：服务端已经产生 `memory_context` 条目，也有 `/memory-context/{item}` 接口，但客户端还不显示。
+- [ ] **移出项目时的提示只针对 `project_only`**：现在不管项目的记忆模式，菜单都写“记忆留在项目”。
+- [ ] **搜索覆盖更多来源**：工作区文件与插件目录还不在索引里。现在只索引标题、消息、项目文件和记忆。
+
+### 客户端与协议
+
+- [ ] **Gateway 补取中间缺口**：Gateway 每 5 秒核对数据库的最新 seq，只补取末尾缺失的事件。流中间出现跳号时，要等客户端内核发现缺口后重新订阅。设计要求 Gateway 发现跳号就从数据库补齐。
+- [ ] **在线状态**：WS 应推送成员的在线状态。现在服务端只记录设备是否在线，用来决定要不要推送通知，不下发给客户端。
+- [ ] **多设备审批显示处理设备**：决议已经记录 `resolved_device`。其他设备只看到“已在其他设备处理”，不知道是哪台。
+- [ ] **历史分页可被 CDN 缓存**：`GET …/items?before_seq=` 没有 `Cache-Control` 和 `ETag`。
+- [ ] **Android 网络切换先连后断**：现在用 connectivity_plus 监听网络变化后重连，并且先关掉旧连接。设计允许先建新连接、再关旧连接，以缩短中断。
+- [ ] **Web 中文字体**：只自托管了 emoji 分片。常用字靠打包的 GB2312 子集；GB2312 以外的中文没有自托管的回退分片，也没有预加载。
+- [ ] **构建**：
+  - 没有 Windows arm64 产物。
+  - release 已开 LTO 与 strip，但符号表没有单独保存与上传；Flutter 也没有用 `--split-debug-info`。
+- [ ] **截图测试用事件流做 fixture**：golden 测试现在读的是内核快照（`test/goldens/timeline.json`），没有把原始事件流经内核投影。
+- [ ] **“下一轮生效”标注**：只能在下一轮生效的设置，控件上应标出来。审批模式胶囊现在没有标注。
+
+### 运维与度量
+
+- [ ] **指标采集**：设计要求首批测量：
+  - 命令 ACK 延迟、事件端到端延迟、重连补齐耗时；
+  - 沙箱冷启动与热启动耗时、归档与恢复耗时（按 upper 体积分档）；
+  - 每个工作区的物理存储、deps 层命中率、每个活跃任务的内存；
+  - 每个任务的模型与计算成本。
+
+  现在没有 metrics 端点，也没有任何采集；`usage_records` 只有 token 用量。
+- [ ] **实例管理页**：`/admin` 现在只能只读查看生效配置。插件停用（`/admin/plugin-blocks`）只有接口；用户与组织的管理也没有界面。
+
+## 2. 设计本身列为以后或按需
+
+### 执行与存储
+
+- [ ] Firecracker 后端（多租户云，需要 KVM），以及快照恢复后重新播种随机数；Cloud Hypervisor 与 GPU 池。
+- [ ] 内容定义分块去重与跨检查点复用（desync/Nydus 式），以及 NBD 按块懒加载。跨组织去重只能用于来自公共 registry、校验过 integrity 的内容。
+- [ ] UFFD 内存快照与热暂停；整机 fork/branch。
+- [ ] 沙箱内的 stdio MCP：由 guest 启动 MCP server，经控制通道桥接给 Chat loop。现在安装时遇到 `stdio` 服务只提示、不启用。
+- [ ] 回退到某条消息并恢复文件：基于工作区检查点统一实现，不依赖各 harness 自己的机制。
+
+### Harness 与模型网关
+
+- [ ] 接入更多 ACP harness。Qwen、Goose、Copilot 等逐个验证能否把模型上游改到平台网关；现在只验证过 OpenCode。
+- [ ] 不能改上游的 harness 的兼容层：Cursor CLI、ACP 模式下的 Gemini CLI。
+- [ ] Bedrock、Vertex 上游，以及 Bedrock eventstream 的原样转发。
+- [ ] OpenAI Responses 的 WebSocket 模式代理，需要连接亲和。现在 Codex 配置为不用 WebSocket。
+- [ ] 跨格式的模型路由，例如让 Claude Code 使用 GPT 模型。
+
+### 插件
+
+- [ ] 插件自带的子 agent 与 hooks。现在包里的 `agents/`、`hooks/` 只提示、不使用。
+- [ ] 公开插件市场的评分与审核流程。
+
+### 记忆与搜索
+
+- [ ] 合成画像（类似 ChatGPT 的 Dreaming）：后台跨对话合成偏好与背景，随事实变化改写旧条目，以快照注入 `<memory>`。没有 `profile_snapshots`，自动抽取目前只用于对话摘要。
+- [ ] 图记忆。
+- [ ] reranker：对混合检索的 top-50 重排。
+- [ ] 托管数据库没有 PGroonga 时的退路：pg_bigm，或应用层 jieba-rs 预分词加原生 tsvector。
+- [ ] 规模变大后的选项：pgvectorscale、外置向量库；需要 BM25 时评估 ParadeDB（AGPL）。
+
+### 其他
+
+- [ ] Postgres 状态机之外的 durable 执行引擎（Temporal、Restate）。
+- [ ] WebTransport、WS over HTTP/3（目前 CDN 不透传到源站，只观察）。
+- [ ] iOS 与 macOS 客户端。
+
+## 3. 组织功能（2026-10-11 决定暂缓）
+
+后端已经按组织归属、`authorize`、RLS、配额与审计实现，用户注册时自动建个人组织。以下需要界面或接口的部分暂缓。新增的策略字段现在只能在实例配置里设置。
+
+- [ ] **组织策略编辑**：现在只有 `GET /orgs/{org}/policy`。组织策略行只在注册时写入空策略，有效策略 = 实例策略按组织策略收紧。
+- [ ] **成员级设置**：策略分实例、组织、用户三层，成员可以在组织上限内自行设置 `compute_idle_ttl`、`auto_archive_after`、`archive_retention`。现在只有前两层。
+- [ ] **团队组织**：创建组织、邀请与加入、修改角色、组（Group）。现在只有个人组织和 `DELETE /orgs/{org}/members/{user}`。
+  - 移除成员时：virtual key 被吊销，WS 订阅被撤销，进行中的模型流被切断；运行中的任务在 Owner 下一次检查时取消。
+  - 修改角色时的立即生效还没有对应的实现。
+- [ ] **组织删除与转让**：删除进入 `deletion_pending` 可恢复期，到期按 tombstone 流程清理热数据、归档和密钥；审计日志按法规单独保留。
+- [ ] **组织切换**：客户端的本地缓存已经按“用户 × 组织”分区，但登录后组织固定。切换组织时不重连 WS，只切换订阅与投影。推送带 `org_id`，点击通知时应切到对应组织，现在只在当前组织里打开对话。
+- [ ] **`org:<id>` 频道**：注册时建了频道，也允许订阅，但策略、成员、插件变更都没有发布到这里，客户端也不订阅。
+- [ ] **组织级插件**：组织级安装与强制启用、组织管理员在本组织内停用插件、组织共享的插件 OAuth 凭据。表结构保留了 `scope`，接口与界面只做了成员范围；停用只有实例管理员能做。
+- [ ] **组织级环境 profile**：现在只有实例配置里的 `[[sandbox.profiles]]`。
+- [ ] **组织共享记忆**：管理员可写、成员只读。`memory_items.scope` 现在只允许 `user` 和 `project`。
+- [ ] **历史引用的组织策略**：组织可以禁止临时对话以外的历史引用。现在只有个人的“引用历史对话”开关。
+- [ ] **共享对话与共享项目**：项目预留了成员表，共享项目强制 `project_only`。
+- [ ] **组织级 SSO**（OIDC / SAML）、SCIM 成员同步、按邮箱域名自动加入、自定义角色。现在的 OIDC、GitHub 登录是实例级的，角色固定为 owner、admin、member。
+- [ ] **部署模式**：实例级的“可信 / 多组织隔离”设置，在 UI 与 API 中公开 `isolation_level`。现在只有执行节点的 `RYZHUB_MULTI_TENANT` 能禁用 runc，`isolation_level` 只在 `/admin/settings` 返回。
+- [ ] **按组织的加密密钥**、按组织导出数据。
+- [ ] **用量与审计查询**：`GET /orgs/{org}/usage`、`/audit` 只返回最近 100 条，没有筛选、分页和汇总。
+- [ ] **配额与预算**：现在只记账、不执行。模型网关的每分钟限速来自实例配置，组织策略不能设置。
+- [ ] **按组织设置 events 保留期**：现在是实例级的 `events_retention_days`。
+- [ ] **对话删除的可恢复期**：对话的生命周期是 active / archived / deletion_pending / deleted。现在删除对话直接进入 `deleted`，只有删除项目时其中的对话有 30 天可恢复期。
+
+## 4. 待实机或真实环境验证
+
+- [ ] **Windows、Android 真机**：逐项清单见 [真机验证清单](device-checklist.md)。
+  - Windows：输入法、睡眠唤醒重连、会话保持、外部账号登录、MCP Apps 的 WebView2、字形与帧率。
+  - Android：切网、锁屏、FCM 通知、会话保持、MCP Apps 的 WebView、帧率。
+  - Web：首次显示中文的时间与弱网分位数。
+- [ ] **Windows 中文输入法的退路**：真机验证不通过时再做。先把输入框改为原生控件（RichEdit 支持 TSF），再考虑自写 TSF 插件或给 Flutter 引擎提补丁。
+- [ ] **FCM 实际投递**：现在只用本地替身验证过，需要 Firebase 项目的服务账号与 `google-services.json`。
+- [ ] **Anthropic 上下文压缩**：字段名与 beta 头（`compact-2026-01-12`、`compact-2026-09-04`）按官方文档实现，只用 fixture 验证过。
+  - 阈值压缩现在保留了压缩块之前的消息。用真实上游核对删除后的消息格式以后，再决定是否删掉它们。
+- [ ] **真实存储**：S3 直传与检查点存储只用本地 S3 替身验证过，NAS 目录作为二级存储也没有实际验证。
+- [ ] **容量与故障**：大工作区的归档与恢复压测，物理多节点的故障恢复。

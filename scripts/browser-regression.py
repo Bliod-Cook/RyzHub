@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Browser regression against a running M0 server and release Web client.
+"""Browser regression against a running simulator-mode server (scripts/dev.sh) and release Web client.
 
 Creates local test accounts; outputs no credentials. Requires Playwright Chromium.
 Run from the RyzHub root: uv run --with playwright python scripts/browser-regression.py
@@ -13,6 +13,9 @@ from playwright.sync_api import TimeoutError as PlaywrightTimeout, sync_playwrig
 ROOT = Path(__file__).resolve().parents[1]
 BASE = os.environ.get('RYZHUB_WEB_URL', 'http://127.0.0.1:3000')
 API = os.environ.get('RYZHUB_API_URL', 'http://127.0.0.1:8080')
+# Screenshots and reports; ignored by git.
+OUT = ROOT/'var/browser'
+OUT.mkdir(parents=True, exist_ok=True)
 
 
 def cache(page):
@@ -192,7 +195,7 @@ def main():
         page.get_by_role('button', name='复制代码', exact=True).first.click()
         assert 'println!' in page.evaluate('navigator.clipboard.readText()')
         passed.extend(['Unicode streaming and Markdown', 'code clipboard'])
-        page.screenshot(path=str(ROOT/'docs/browser-desktop.png'))
+        page.screenshot(path=str(OUT/'regression-desktop.png'))
 
         send(page, '/approve 拒绝测试')
         wait_state(page, lambda s: any(a['status']=='pending' for a in actions(s)))
@@ -255,7 +258,7 @@ def main():
         page.set_viewport_size({'width':390, 'height':844})
         page.get_by_role('button', name='打开侧边栏', exact=True).click()
         expect(page.get_by_role('button', name='新建对话', exact=True)).to_be_visible()
-        page.screenshot(path=str(ROOT/'docs/browser-mobile.png'))
+        page.screenshot(path=str(OUT/'regression-mobile.png'))
         passed.append('390px responsive navigation')
 
         page.set_viewport_size({'width':1280, 'height':900})
@@ -321,7 +324,7 @@ def main():
         assert not external, external
         passed.append('no uncaught JavaScript errors or external assets')
         report = {'browser':browser.version, 'environment':'Linux headless Chromium, localhost', 'passed':passed, 'count':len(passed), 'page_errors':errors, 'external_requests':external}
-        (ROOT/'docs/browser-regression.json').write_text(json.dumps(report,ensure_ascii=False,indent=2)+'\n')
+        (OUT/'regression.json').write_text(json.dumps(report,ensure_ascii=False,indent=2)+'\n')
         print(json.dumps(report,ensure_ascii=False))
         for c in contexts:
             c.close()

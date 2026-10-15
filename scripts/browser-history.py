@@ -78,6 +78,6 @@ with sync_playwright() as p:
     report = {'browser': browser.version, 'count': 4, 'passed': [
         'fresh device receives latest 100 items', 'two older pages load all 225 without moving cursor',
         'reload preserves complete cached history', 'live messages continue after pagination'], 'page_errors': errors}
-    (r.ROOT/'docs/browser-history.json').write_text(json.dumps(report, ensure_ascii=False, indent=2)+'\n')
+    (r.OUT/'history.json').write_text(json.dumps(report, ensure_ascii=False, indent=2)+'\n')
     print(json.dumps(report, ensure_ascii=False))
     browser.close()

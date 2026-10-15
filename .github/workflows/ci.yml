@@ -1,0 +1,94 @@
+name: RyzHub CI
+on: [push, pull_request]
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: .
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace --locked
+      - run: ./scripts/test-integration.sh
+      - if: always()
+        run: docker compose down -v
+  execution:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: .
+      - run: ./scripts/test-platform.sh
+      - uses: astral-sh/setup-uv@v6
+      - name: Install pinned Codex for local protocol tests
+        run: |
+          mkdir -p var/codex-release
+          curl -fsSL https://github.com/openai/codex/releases/download/rust-v0.154.0/codex-x86_64-unknown-linux-musl.tar.gz -o var/codex-release/codex.tar.gz
+          tar -xzf var/codex-release/codex.tar.gz -C var/codex-release
+          echo "RYZHUB_CODEX_BINARY=$PWD/var/codex-release/codex-x86_64-unknown-linux-musl" >> "$GITHUB_ENV"
+      - run: ./scripts/test-work.sh
+      - run: ./scripts/build-harness-image.sh
+      - run: ./scripts/test-search.sh
+      - run: ./scripts/test-harnesses.sh
+      - run: TEST_RUNTIME=runsc ./scripts/test-harnesses.sh
+      - if: always()
+        run: docker rm -f ryzhub-execution || true
+      - if: always()
+        run: docker compose down -v
+  flutter:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: client
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: .
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.47.5'
+          cache: true
+      - run: flutter pub get
+      # Widget tests render with the kernel built for this machine.
+      - run: ../scripts/test-client.sh
+  web:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.47.5'
+          cache: true
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: .
+      - run: rustup toolchain install nightly-2026-09-25 --profile minimal --component rust-src --target wasm32-unknown-unknown
+      - run: cargo install flutter_rust_bridge_codegen --version 2.11.1 --locked
+      - run: cargo install cargo-expand wasm-pack
+      - run: ./scripts/build-web.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ryzhub-web
+          path: client/build/web

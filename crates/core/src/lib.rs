@@ -210,19 +210,14 @@ impl Engine {
             state.waiting_events.clear();
             state.waiting_streams.clear();
         }
+        // A new connection has no subscriptions: only the subscribed channels are named.
         let channels: Vec<_> = self
             .channels
             .iter()
             .filter(|(_, s)| s.subscribed)
             .map(|(c, _)| c.clone())
             .collect();
-        let mut frames: Vec<_> = self
-            .channels
-            .iter()
-            .filter(|(_, s)| !s.subscribed)
-            .map(|(c, _)| frame(c, Body::Unsubscribe(Unsubscribe {})))
-            .collect();
-        frames.extend(channels.into_iter().map(|c| self.subscribe(c)));
+        let mut frames: Vec<_> = channels.into_iter().map(|c| self.subscribe(c)).collect();
         frames.extend(self.pending_commands.values().cloned());
         frames
     }

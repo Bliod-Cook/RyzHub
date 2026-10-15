@@ -229,21 +229,12 @@ fn excessive_future_deltas_request_fold_without_unbounded_buffering() {
 }
 
 #[test]
-fn subscription_diff_keeps_cache_but_removes_inactive_resume_subscriptions() {
+fn reconnecting_subscribes_only_to_subscribed_channels_and_keeps_the_cache() {
     let mut e = engine();
     e.apply(event(1, 1, "cached", "completed"));
     e.unsubscribe("conv:x".into());
-    let frames = e.reconnect();
-    assert!(
-        frames
-            .iter()
-            .any(|f| f.channel == "conv:x" && matches!(f.body, Some(Body::Unsubscribe(_))))
-    );
-    assert!(
-        !frames
-            .iter()
-            .any(|f| f.channel == "conv:x" && matches!(f.body, Some(Body::Subscribe(_))))
-    );
+    // A new connection starts with no subscriptions: nothing to unsubscribe from.
+    assert!(e.reconnect().iter().all(|f| f.channel != "conv:x"));
     assert_eq!(content(&e), "cached");
     assert!(
         e.apply(frame(

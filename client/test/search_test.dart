@@ -69,6 +69,11 @@ void main() {
         'matches': [
           {
             'text': '新的命中',
+            'snippet': '新的命中 · new hits',
+            'highlights': [
+              [2, 4],
+              [11, 15],
+            ],
             'conversation_id': 'conversation',
             'item_id': 'item',
             'seq': 42,
@@ -82,7 +87,15 @@ void main() {
         ],
       });
       await tester.pump();
-      expect(find.text('新的命中'), findsOneWidget);
+      final hit = tester.widget<Text>(find.text('新的命中 · new hits'));
+      final spans = (hit.textSpan! as TextSpan).children!.cast<TextSpan>();
+      expect(
+        [
+          for (final span in spans)
+            if (span.style?.fontWeight == FontWeight.bold) span.text,
+        ],
+        ['命中', 'hits'],
+      );
       expect(find.text('过期命中'), findsNothing);
       await tester.pumpWidget(const SizedBox());
     },

@@ -180,14 +180,14 @@ async fn database_idempotency_fencing_rls_and_transaction_outbox() -> anyhow::Re
     assert!(
         h.app
             .store
-            .accept(&ctx, conv, "device-a", &cmd)
+            .accept(ctx.org_id, ctx.user_id, conv, "device-a", &cmd)
             .await?
             .is_none()
     );
     assert!(
         h.app
             .store
-            .accept(&ctx, conv, "device-b", &cmd)
+            .accept(ctx.org_id, ctx.user_id, conv, "device-b", &cmd)
             .await?
             .is_none()
     );
@@ -198,11 +198,16 @@ async fn database_idempotency_fencing_rls_and_transaction_outbox() -> anyhow::Re
         .await?
         .unwrap();
     assert!(owner::process_with_config(&h.app.store, &old, &h.app.config).await?);
-    let first = h.app.store.command_result(&ctx, cid).await?.unwrap();
+    let first = h
+        .app
+        .store
+        .command_result(ctx.org_id, ctx.user_id, cid)
+        .await?
+        .unwrap();
     assert_eq!(
         h.app
             .store
-            .accept(&ctx, conv, "device-b", &cmd)
+            .accept(ctx.org_id, ctx.user_id, conv, "device-b", &cmd)
             .await?
             .unwrap(),
         first
@@ -210,7 +215,13 @@ async fn database_idempotency_fencing_rls_and_transaction_outbox() -> anyhow::Re
     assert!(
         h.app
             .store
-            .accept(&ctx, conv, "device-a", &message(cid, "different payload"))
+            .accept(
+                ctx.org_id,
+                ctx.user_id,
+                conv,
+                "device-a",
+                &message(cid, "different payload")
+            )
             .await
             .is_err()
     );
@@ -349,7 +360,7 @@ async fn disabled_engines_refuse_work_conversations_and_runs() -> anyhow::Result
         let cid = Uuid::now_v7();
         h.app
             .store
-            .accept(&ctx, conv, "a", &message(cid, "hello"))
+            .accept(ctx.org_id, ctx.user_id, conv, "a", &message(cid, "hello"))
             .await?;
         let lease = h
             .app
@@ -358,7 +369,12 @@ async fn disabled_engines_refuse_work_conversations_and_runs() -> anyhow::Result
             .await?
             .unwrap();
         owner::process_with_config(&h.app.store, &lease, config).await?;
-        let result = h.app.store.command_result(&ctx, cid).await?.unwrap();
+        let result = h
+            .app
+            .store
+            .command_result(ctx.org_id, ctx.user_id, cid)
+            .await?
+            .unwrap();
         assert!(
             matches!(&result.body, Some(Body::CommandRejected(r)) if r.code == code),
             "{mode}: {result:?}"
@@ -380,7 +396,13 @@ async fn two_devices_answer_cas_and_stale_execution_epoch() -> anyhow::Result<()
         .await?;
     h.app
         .store
-        .accept(&ctx, conv, "a", &message(Uuid::now_v7(), "question"))
+        .accept(
+            ctx.org_id,
+            ctx.user_id,
+            conv,
+            "a",
+            &message(Uuid::now_v7(), "question"),
+        )
         .await?;
     let lease = h
         .app
@@ -418,12 +440,15 @@ async fn two_devices_answer_cas_and_stale_execution_epoch() -> anyhow::Result<()
         .await?
         .unwrap();
     let stale = answer(epoch);
-    h.app.store.accept(&ctx, conv, "old-device", &stale).await?;
+    h.app
+        .store
+        .accept(ctx.org_id, ctx.user_id, conv, "old-device", &stale)
+        .await?;
     owner::process_with_config(&h.app.store, &lease, &h.app.config).await?;
     assert!(matches!(
         h.app
             .store
-            .command_result(&ctx, Uuid::parse_str(&stale.cid)?)
+            .command_result(ctx.org_id, ctx.user_id, Uuid::parse_str(&stale.cid)?)
             .await?
             .unwrap()
             .body,
@@ -431,8 +456,8 @@ async fn two_devices_answer_cas_and_stale_execution_epoch() -> anyhow::Result<()
     ));
     let (a, b) = (answer(lease.epoch), answer(lease.epoch));
     let (ra, rb) = tokio::join!(
-        h.app.store.accept(&ctx, conv, "a", &a),
-        h.app.store.accept(&ctx, conv, "b", &b)
+        h.app.store.accept(ctx.org_id, ctx.user_id, conv, "a", &a),
+        h.app.store.accept(ctx.org_id, ctx.user_id, conv, "b", &b)
     );
     ra?;
     rb?;
@@ -444,7 +469,7 @@ async fn two_devices_answer_cas_and_stale_execution_epoch() -> anyhow::Result<()
         match h
             .app
             .store
-            .command_result(&ctx, Uuid::parse_str(&cmd.cid)?)
+            .command_result(ctx.org_id, ctx.user_id, Uuid::parse_str(&cmd.cid)?)
             .await?
             .unwrap()
             .body
@@ -838,12 +863,47 @@ async fn member_removal_revokes_org_access_and_stops_waiting_run() -> anyhow::Re
         matches!(f.body, Some(Body::SubscriptionRevoked(_)))
     })
     .await?;
-    // The session survives for the member's other organizations; this one is gone.
+    // The session survives for the member's other organizations; this one is gone, to REST
+    // and to commands alike.
     h.app
         .store
         .authenticate(member["token"].as_str().unwrap())
         .await?;
     assert!(h.app.store.context(user, org).await.is_err());
+    let http = reqwest::Client::new();
+    let base = format!("{}/orgs/{org}", h.base);
+    for request in [
+        http.get(format!("{base}/conversations")),
+        http.post(format!("{base}/conversations"))
+            .json(&json!({"title": "after removal"})),
+        http.post(format!("{base}/memories"))
+            .json(&json!({"content": "after removal"})),
+        http.get(format!(
+            "{base}/conversations/{conv}/memory-context/{}",
+            Uuid::now_v7()
+        )),
+    ] {
+        let response = request
+            .bearer_auth(member["token"].as_str().unwrap())
+            .send()
+            .await?;
+        assert_eq!(response.status(), 403);
+    }
+    let user_channel = format!("user:{org}:{user}");
+    for (channel, command) in [
+        (&channel, message(Uuid::now_v7(), "after removal")),
+        (
+            &user_channel,
+            create_run(Uuid::now_v7(), Uuid::now_v7(), "after removal"),
+        ),
+    ] {
+        let cid = Uuid::parse_str(&command.cid)?;
+        send(&mut socket, frame(channel, Body::Command(command))).await?;
+        assert!(matches!(
+            result_of(&mut socket, cid).await?,
+            Body::CommandRejected(r) if r.code == "FORBIDDEN"
+        ));
+    }
     let mut stopped = false;
     for _ in 0..200 {
         let state: String = sqlx::query_scalar("SELECT state FROM runs WHERE conversation_id=$1")
@@ -934,7 +994,7 @@ async fn parallel_approvals_should_both_resolve() -> anyhow::Result<()> {
         let ctx = h.app.store.context(id(&user, "user_id"), org).await?;
         let lease = h.app.store.claim(org, conv, Uuid::now_v7(), 60000).await?.unwrap();
         let config = &h.app.config;
-        h.app.store.accept(&ctx, conv, "review", &message(Uuid::now_v7(), "parallel approval")).await?;
+        h.app.store.accept(ctx.org_id, ctx.user_id, conv, "review", &message(Uuid::now_v7(), "parallel approval")).await?;
         owner::process_with_config(&h.app.store, &lease, config).await?;
         let run: Uuid = sqlx::query_scalar("SELECT id FROM runs WHERE conversation_id=$1").bind(conv).fetch_one(&h.db).await?;
         let actions = [Uuid::now_v7(), Uuid::now_v7()];
@@ -946,11 +1006,11 @@ async fn parallel_approvals_should_both_resolve() -> anyhow::Result<()> {
         let mut replies = vec![];
         for (index, action) in actions.into_iter().enumerate() {
             let cmd = CommandEnvelope { cid: Uuid::now_v7().to_string(), command: Some(Command::DecideApproval(DecideApproval { action_id: action.to_string(),run_epoch:lease.epoch as u64,decision:"allow".into() })) };
-            h.app.store.accept(&ctx,conv,"review",&cmd).await?;
+            h.app.store.accept(ctx.org_id, ctx.user_id, conv,"review",&cmd).await?;
             owner::process_with_config(&h.app.store,&lease,config).await?;
             let state: String = sqlx::query_scalar("SELECT state FROM runs WHERE id=$1").bind(run).fetch_one(&h.db).await?;
             ensure!(state == if index == 0 { "requires_action" } else { "running" });
-            replies.push(h.app.store.command_result(&ctx,Uuid::parse_str(&cmd.cid)?).await?.unwrap());
+            replies.push(h.app.store.command_result(ctx.org_id, ctx.user_id, Uuid::parse_str(&cmd.cid)?).await?.unwrap());
         }
         let state: String = sqlx::query_scalar("SELECT state FROM runs WHERE id=$1").bind(run).fetch_one(&h.db).await?;
         let pending:i64 = sqlx::query_scalar("SELECT count(*) FROM pending_actions WHERE run_id=$1 AND status='pending'").bind(run).fetch_one(&h.db).await?;
@@ -1003,7 +1063,7 @@ async fn restore_failure_should_not_create_blank_workspace() -> anyhow::Result<(
         config.sandbox.image=format!("review@sha256:{}","b".repeat(64));
         config.work.storage_root=temp.path().join("missing-blobs").to_str().unwrap().into();
         config.work.secondary_root=None;
-        h.app.store.accept(&ctx,conv,"review",&message(Uuid::now_v7(),"first turn")).await?;
+        h.app.store.accept(ctx.org_id, ctx.user_id, conv,"review",&message(Uuid::now_v7(),"first turn")).await?;
         owner::process_with_config(&h.app.store,&lease,&config).await?;
         let run:Uuid=sqlx::query_scalar("SELECT id FROM runs WHERE conversation_id=$1").bind(conv).fetch_one(&h.db).await?;
         sqlx::query("UPDATE runs SET state='completed',ended_at=now() WHERE id=$1").bind(run).execute(&h.db).await?;
@@ -1027,9 +1087,9 @@ async fn restore_failure_should_not_create_blank_workspace() -> anyhow::Result<(
         let state:String=sqlx::query_scalar("SELECT state FROM workspace_jobs WHERE id=$1").bind(job).fetch_one(&h.db).await?;
         ensure!(state=="failed","expected unavailable blob to fail restore");
         let cmd=message(Uuid::now_v7(),"continue after failed restore");
-        h.app.store.accept(&ctx,conv,"review",&cmd).await?;
+        h.app.store.accept(ctx.org_id, ctx.user_id, conv,"review",&cmd).await?;
         owner::process_with_config(&h.app.store,&lease,&config).await?;
-        let response=h.app.store.command_result(&ctx,Uuid::parse_str(&cmd.cid)?).await?.unwrap();
+        let response=h.app.store.command_result(ctx.org_id, ctx.user_id, Uuid::parse_str(&cmd.cid)?).await?.unwrap();
         if matches!(response.body,Some(Body::CommandAck(_))) {
             let next:Uuid=sqlx::query_scalar("SELECT id FROM runs WHERE conversation_id=$1 AND state='running'").bind(conv).fetch_one(&h.db).await?;
             let err=ryzhub_server::work::ensure_work(&app,&lease,next).await.unwrap_err();
@@ -1112,11 +1172,11 @@ async fn checkpoint_sync_should_not_ack_next_turn_without_projection() -> anyhow
         config.work.model="gpt-5.4".into();
         config.sandbox.enabled=true;
         config.sandbox.host_socket=socket.to_str().unwrap().into();
-        h.app.store.accept(&ctx,conv,"review",&message(Uuid::now_v7(),"old turn")).await?;
+        h.app.store.accept(ctx.org_id, ctx.user_id, conv,"review",&message(Uuid::now_v7(),"old turn")).await?;
         owner::process_with_config(&h.app.store,&lease,&config).await?;
         let old:Uuid=sqlx::query_scalar("SELECT id FROM runs WHERE conversation_id=$1").bind(conv).fetch_one(&h.db).await?;
         sqlx::query("UPDATE runs SET state='completed',native_turn_id='old-turn',ended_at=now() WHERE id=$1").bind(old).execute(&h.db).await?;
-        h.app.store.accept(&ctx,conv,"review",&message(Uuid::now_v7(),"new turn")).await?;
+        h.app.store.accept(ctx.org_id, ctx.user_id, conv,"review",&message(Uuid::now_v7(),"new turn")).await?;
         owner::process_with_config(&h.app.store,&lease,&config).await?;
         let new:Uuid=sqlx::query_scalar("SELECT id FROM runs WHERE conversation_id=$1 AND state='running'").bind(conv).fetch_one(&h.db).await?;
 
@@ -1159,9 +1219,9 @@ async fn checkpoint_sync_should_not_ack_next_turn_without_projection() -> anyhow
         ryzhub_server::llm::gateway::validate_key(&mut tx,&first,true).await?;
         tx.commit().await?;
         let answer=CommandEnvelope{cid:Uuid::now_v7().to_string(),command:Some(Command::AnswerQuestion(AnswerQuestion{action_id:action.to_string(),run_epoch:lease.epoch as u64,answer:"green".into()}))};
-        h.app.store.accept(&ctx,conv,"review",&answer).await?;
+        h.app.store.accept(ctx.org_id, ctx.user_id, conv,"review",&answer).await?;
         owner::process_with_config(&h.app.store,&lease,&app.config).await?;
-        let response=h.app.store.command_result(&ctx,Uuid::parse_str(&answer.cid)?).await?.unwrap();
+        let response=h.app.store.command_result(ctx.org_id, ctx.user_id, Uuid::parse_str(&answer.cid)?).await?.unwrap();
         ensure!(matches!(response.body,Some(Body::CommandAck(_))));
         let answer:Value=sqlx::query_scalar("SELECT answer FROM native_requests WHERE action_id=$1").bind(action).fetch_one(&h.db).await?;
         ensure!(answer==json!({"type":"question","answers":{"color":"green"}}), "unexpected answer {answer}");
@@ -1273,7 +1333,7 @@ async fn runs_wait_for_idle_suspension_and_models_are_discovered_once() -> anyho
         let ctx = h.app.store.context(id(&user, "user_id"), org).await?;
         let lease = h.app.store.claim(org, conv, Uuid::now_v7(), 60_000).await?.unwrap();
         let config = work_config(&socket, temp.path());
-        h.app.store.accept(&ctx, conv, "review", &message(Uuid::now_v7(), "turn")).await?;
+        h.app.store.accept(ctx.org_id, ctx.user_id, conv, "review", &message(Uuid::now_v7(), "turn")).await?;
         owner::process_with_config(&h.app.store, &lease, &config).await?;
         let run: Uuid = sqlx::query_scalar("SELECT id FROM runs WHERE conversation_id=$1").bind(conv).fetch_one(&h.db).await?;
         sqlx::query("INSERT INTO sandboxes(id,org_id,conversation_id,run_id,lease_epoch,exec_epoch,state,handle,persistent,node_lease_until) VALUES($1,$2,$3,$4,1,$5,'running','{}',true,now()+interval '1 hour')")
@@ -1318,7 +1378,7 @@ async fn suspended_workspace_checkpoints_forks_and_archives_from_its_head() -> a
         let ctx = h.app.store.context(id(&user, "user_id"), org).await?;
         let lease = h.app.store.claim(org, conv, Uuid::now_v7(), 60_000).await?.unwrap();
         let config = work_config(&socket, temp.path());
-        h.app.store.accept(&ctx, conv, "review", &message(Uuid::now_v7(), "turn")).await?;
+        h.app.store.accept(ctx.org_id, ctx.user_id, conv, "review", &message(Uuid::now_v7(), "turn")).await?;
         owner::process_with_config(&h.app.store, &lease, &config).await?;
         let run: Uuid = sqlx::query_scalar("SELECT id FROM runs WHERE conversation_id=$1").bind(conv).fetch_one(&h.db).await?;
         sqlx::query("UPDATE runs SET state='completed',ended_at=now() WHERE id=$1").bind(run).execute(&h.db).await?;
@@ -1464,188 +1524,119 @@ async fn usage_partitions_move_stranded_rows_and_retention_drops_whole_months() 
     h.close().await
 }
 
-static JOBS_RUN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-fn job_succeeds<'a>(
-    _: &'a App,
-    _: &'a ryzhub_server::jobs::Job,
-) -> futures_util::future::BoxFuture<'a, anyhow::Result<()>> {
-    Box::pin(async {
-        JOBS_RUN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Ok(())
-    })
-}
-
-fn job_fails<'a>(
-    _: &'a App,
-    _: &'a ryzhub_server::jobs::Job,
-) -> futures_util::future::BoxFuture<'a, anyhow::Result<()>> {
-    Box::pin(async { anyhow::bail!("handler failed") })
-}
-
 #[tokio::test]
 #[ignore = "requires PostgreSQL 18 and NATS"]
-async fn jobs_deduplicate_retry_fence_stale_claims_and_die_after_their_attempts()
+async fn push_jobs_deduplicate_retry_fence_stale_claims_and_die_after_their_attempts()
 -> anyhow::Result<()> {
-    use ryzhub_server::jobs::{self, Handler, Job, NewJob};
+    use ryzhub_server::push::{self, Job, MAX_ATTEMPTS};
     let h = Harness::new().await?;
     let (user, other) = (h.user().await?, h.user().await?);
     let (org, other_org) = (id(&user, "org_id"), id(&other, "org_id"));
-    let app = App::new(h.app.store.clone(), h.app.nats.clone(), Config::default())?;
+    let mut config = Config::default();
+    config.push.enabled = true;
+    let app = App::new(h.app.store.clone(), h.app.nats.clone(), config)?;
     let worker = PgPool::connect(&h.worker_url).await?;
     let state = |job: Uuid| {
-        sqlx::query_as::<_, (String, i32)>("SELECT state,attempts FROM jobs WHERE id=$1")
+        sqlx::query_as::<_, (String, i32)>("SELECT state,attempts FROM push_jobs WHERE id=$1")
             .bind(job)
             .fetch_one(&h.db)
     };
+    // About a conversation that no longer exists: delivered as nothing to say. Without a
+    // user it cannot be delivered at all.
+    let gone = json!({"user": id(&user, "user_id"), "conversation": Uuid::now_v7()});
+    let broken = json!({});
 
     let mut tx = h.app.store.tx(org).await?;
-    let later = chrono::Utc::now() + chrono::Duration::hours(1);
-    let first = jobs::enqueue(
-        &mut tx,
-        org,
-        NewJob {
-            dedupe_key: Some("k"),
-            run_at: Some(later),
-            ..NewJob::new("test.ok", json!({"n": 1}))
-        },
-    )
-    .await?;
+    let first = push::enqueue(&mut tx, org, gone.clone(), "k").await?;
+    sqlx::query("UPDATE push_jobs SET run_at=now()+interval '1 hour' WHERE id=$1")
+        .bind(first)
+        .execute(&mut *tx)
+        .await?;
     // Merged into the queued job, which becomes due now; the first payload stays.
-    let merged = jobs::enqueue(
-        &mut tx,
-        org,
-        NewJob {
-            dedupe_key: Some("k"),
-            ..NewJob::new("test.ok", json!({"n": 2}))
-        },
-    )
-    .await?;
+    let merged = push::enqueue(&mut tx, org, broken.clone(), "k").await?;
     assert_eq!(first, merged);
-    let failing = jobs::enqueue(
-        &mut tx,
-        org,
-        NewJob {
-            max_attempts: 2,
-            ..NewJob::new("test.fail", json!({}))
-        },
-    )
-    .await?;
-    let unknown = jobs::enqueue(&mut tx, org, NewJob::new("test.unknown", json!({}))).await?;
+    let failing = push::enqueue(&mut tx, org, broken.clone(), "failing").await?;
     tx.commit().await?;
     let (payload, due): (Value, bool) =
-        sqlx::query_as("SELECT payload,run_at<=now() FROM jobs WHERE id=$1")
+        sqlx::query_as("SELECT payload,run_at<=now() FROM push_jobs WHERE id=$1")
             .bind(first)
             .fetch_one(&h.db)
             .await?;
-    assert!(payload == json!({"n": 1}) && due);
+    assert!(payload == gone && due);
     // A job enqueued by a transaction that rolls back never exists.
     let mut tx = h.app.store.tx(org).await?;
-    let rolled_back = jobs::enqueue(&mut tx, org, NewJob::new("test.ok", json!({}))).await?;
+    let rolled_back = push::enqueue(&mut tx, org, gone.clone(), "rolled back").await?;
     tx.rollback().await?;
     // Organizations see only their own jobs.
     let mut tx = h.app.store.tx(other_org).await?;
-    let visible: i64 = sqlx::query_scalar("SELECT count(*) FROM jobs")
+    let visible: i64 = sqlx::query_scalar("SELECT count(*) FROM push_jobs")
         .fetch_one(&mut *tx)
         .await?;
     tx.commit().await?;
     assert_eq!(visible, 0);
 
-    let lease = Duration::from_secs(30);
-    let handlers = vec![
-        Handler {
-            kind: "test.ok",
-            lease,
-            run: job_succeeds,
-        },
-        Handler {
-            kind: "test.fail",
-            lease,
-            run: job_fails,
-        },
-    ];
-    assert_eq!(jobs::run_due(&app, &worker, &handlers).await?, 2);
-    assert_eq!(JOBS_RUN.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(push::run_due(&app, &worker).await?, 2);
     assert_eq!(state(first).await?, ("completed".into(), 1));
     assert_eq!(
         state(failing).await?,
         ("queued".into(), 1),
         "retried with backoff"
     );
-    assert_eq!(
-        state(unknown).await?,
-        ("queued".into(), 0),
-        "no handler: left queued"
-    );
-    let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM jobs WHERE id=$1)")
+    let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM push_jobs WHERE id=$1)")
         .bind(rolled_back)
         .fetch_one(&h.db)
         .await?;
     assert!(!exists);
-    assert_eq!(
-        jobs::run_due(&app, &worker, &handlers).await?,
-        0,
-        "backoff not over"
-    );
-    sqlx::query("UPDATE jobs SET run_at=now() WHERE id=$1")
+    assert_eq!(push::run_due(&app, &worker).await?, 0, "backoff not over");
+    sqlx::query("UPDATE push_jobs SET run_at=now(),attempts=$2-1 WHERE id=$1")
         .bind(failing)
+        .bind(MAX_ATTEMPTS)
         .execute(&h.db)
         .await?;
-    jobs::run_due(&app, &worker, &handlers).await?;
-    assert_eq!(state(failing).await?, ("dead".into(), 2));
+    push::run_due(&app, &worker).await?;
+    assert_eq!(state(failing).await?, ("dead".into(), MAX_ATTEMPTS));
 
     // A worker whose lease expired loses the job: another worker reclaims and completes it,
     // and the first worker's token no longer completes anything.
     let mut tx = h.app.store.tx(org).await?;
-    let taken = jobs::enqueue(&mut tx, org, NewJob::new("test.ok", json!({}))).await?;
+    let taken = push::enqueue(&mut tx, org, gone.clone(), "taken").await?;
     tx.commit().await?;
     let stale = Uuid::now_v7();
-    sqlx::query(
-        "UPDATE jobs SET state='running',attempts=1,claim_token=$2,lease_until=now()-interval '1 second'
-         WHERE id=$1",
-    )
-    .bind(taken)
-    .bind(stale)
-    .execute(&h.db)
-    .await?;
-    assert_eq!(jobs::run_due(&app, &worker, &handlers).await?, 1);
+    let expire = "UPDATE push_jobs SET state='running',attempts=$3,claim_token=$2,
+                    lease_until=now()-interval '1 second'
+                  WHERE id=$1";
+    sqlx::query(expire)
+        .bind(taken)
+        .bind(stale)
+        .bind(1)
+        .execute(&h.db)
+        .await?;
+    assert_eq!(push::run_due(&app, &worker).await?, 1);
     assert_eq!(state(taken).await?, ("completed".into(), 2));
     let mut tx = h.app.store.tx(org).await?;
     let late = Job {
         id: taken,
         org_id: org,
-        kind: "test.ok".into(),
-        payload: json!({}),
-        attempts: 1,
+        payload: gone.clone(),
         claim_token: stale,
     };
-    assert!(!jobs::finish(&mut tx, &late).await?);
+    assert!(!push::finish(&mut tx, &late).await?);
     tx.commit().await?;
 
-    // A job whose last attempt's lease ran out (its handler took the process down) is dead
+    // A job whose last attempt's lease ran out (its delivery took the process down) is dead
     // rather than retried forever.
     let mut tx = h.app.store.tx(org).await?;
-    let crashed = jobs::enqueue(
-        &mut tx,
-        org,
-        NewJob {
-            max_attempts: 1,
-            ..NewJob::new("test.ok", json!({}))
-        },
-    )
-    .await?;
+    let crashed = push::enqueue(&mut tx, org, gone, "crashed").await?;
     tx.commit().await?;
-    sqlx::query(
-        "UPDATE jobs SET state='running',attempts=1,claim_token=$2,lease_until=now()-interval '1 second'
-         WHERE id=$1",
-    )
-    .bind(crashed)
-    .bind(Uuid::now_v7())
-    .execute(&h.db)
-    .await?;
-    assert_eq!(jobs::run_due(&app, &worker, &handlers).await?, 0);
-    jobs::sweep(&app, &worker).await?;
-    assert_eq!(state(crashed).await?, ("dead".into(), 1));
+    sqlx::query(expire)
+        .bind(crashed)
+        .bind(Uuid::now_v7())
+        .bind(MAX_ATTEMPTS)
+        .execute(&h.db)
+        .await?;
+    assert_eq!(push::run_due(&app, &worker).await?, 0);
+    push::sweep(&app, &worker).await?;
+    assert_eq!(state(crashed).await?, ("dead".into(), MAX_ATTEMPTS));
     worker.close().await;
     h.close().await
 }

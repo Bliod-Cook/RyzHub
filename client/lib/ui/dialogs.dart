@@ -313,35 +313,27 @@ class _SearchDialogState extends State<SearchDialog> {
     super.dispose();
   }
 
+  /// A hit's snippet with the server's highlights in bold, else the start of its text.
   Widget snippet(Map<String, dynamic> hit) {
-    final html = (hit['snippet_html'] ?? '').toString();
-    final text = (html.isEmpty
-        ? (hit['text'] ?? '').toString()
-        : html
-              .replaceAll(RegExp(r'<[^>]*>'), '')
-              .replaceAll('&amp;', '&')
-              .replaceAll('&lt;', '<')
-              .replaceAll('&gt;', '>')
-              .replaceAll('&quot;', '"')
-              .replaceAll('&#39;', "'"));
-    final needle = query.trim();
-    final at = needle.isEmpty
-        ? -1
-        : text.toLowerCase().indexOf(needle.toLowerCase());
-    if (at < 0 || at + needle.length > text.length) {
-      return Text(text, maxLines: 3, overflow: TextOverflow.ellipsis);
+    final snippet = (hit['snippet'] ?? '').toString();
+    final text = snippet.isEmpty ? (hit['text'] ?? '').toString() : snippet;
+    final spans = <TextSpan>[];
+    var at = 0;
+    for (final range
+        in snippet.isEmpty ? const [] : hit['highlights'] as List) {
+      final [int start, int end] = (range as List).cast<int>();
+      spans.add(TextSpan(text: text.substring(at, start)));
+      spans.add(
+        TextSpan(
+          text: text.substring(start, end),
+          style: const TextStyle(fontWeight: FontWeight.bold),
+        ),
+      );
+      at = end;
     }
+    spans.add(TextSpan(text: text.substring(at)));
     return Text.rich(
-      TextSpan(
-        children: [
-          TextSpan(text: text.substring(0, at)),
-          TextSpan(
-            text: text.substring(at, at + needle.length),
-            style: const TextStyle(fontWeight: FontWeight.bold),
-          ),
-          TextSpan(text: text.substring(at + needle.length)),
-        ],
-      ),
+      TextSpan(children: spans),
       maxLines: 3,
       overflow: TextOverflow.ellipsis,
     );

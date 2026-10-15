@@ -1,11 +1,12 @@
-//! Conversation-level commands: settings, compaction, fork, rename/archive and export.
+//! Conversation-level commands: settings, compaction, fork, rename/archive, export and deletion.
 //! Commands use the durable cid/Owner path; external effects run after commit.
 use anyhow::{Context, ensure};
 use axum::{
     Json,
-    extract::{Path, State},
-    http::HeaderMap,
+    extract::{Path, Query, State},
+    http::{HeaderMap, StatusCode},
 };
+use ryzhub_execution::HostCommand;
 use ryzhub_proto::{Item, ItemDetail, event_envelope::Event};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -132,7 +133,7 @@ pub async fn enqueue_fork(
     item: &str,
     cid: &str,
 ) -> anyhow::Result<()> {
-    crate::projects::idle(tx, lease.org_id, lease.conversation_id).await?;
+    idle(tx, lease.org_id, lease.conversation_id).await?;
     let item = Uuid::parse_str(item).map_err(|_| Code::InvalidFork)?;
     let (seq, run, turn, harness): (i64, Uuid, Option<String>, String) = sqlx::query_as(
         "SELECT i.last_seq,i.run_id,r.native_turn_id,r.harness FROM items i
@@ -325,7 +326,7 @@ pub async fn platform(
             .await?;
     }
     if let Some(archive) = input.archive {
-        crate::projects::idle(&mut tx, org, conv).await?;
+        idle(&mut tx, org, conv).await?;
         require!(c.mode != "work", Code::UseWorkspaceArchive);
         if archive {
             crate::lifecycle::archive(&mut tx, org, conv).await?;
@@ -370,6 +371,284 @@ pub async fn export(
     .await?;
     tx.commit().await?;
     Ok(Json(json!({"conversation":c,"items":items})))
+}
+
+/// Lock the conversation's channel (serializing with command admission) and require that
+/// nothing is running in it.
+pub async fn idle(tx: &mut Tx<'_>, org: Uuid, conv: Uuid) -> anyhow::Result<()> {
+    sqlx::query("SELECT id FROM channels WHERE org_id=$1 AND conversation_id=$2 FOR UPDATE")
+        .bind(org)
+        .bind(conv)
+        .fetch_one(&mut **tx)
+        .await?;
+    let busy: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM runs WHERE org_id=$1 AND conversation_id=$2
+             AND state IN ('running','requires_action'))
+           OR EXISTS(SELECT 1 FROM workspace_jobs WHERE org_id=$1 AND conversation_id=$2
+             AND kind IN ('archive','restore') AND state IN ('queued','running'))
+           OR EXISTS(SELECT 1 FROM conversation_operations WHERE org_id=$1 AND conversation_id=$2
+             AND state IN ('queued','running'))",
+    )
+    .bind(org)
+    .bind(conv)
+    .fetch_one(&mut **tx)
+    .await?;
+    ensure!(!busy, Code::ConversationBusy);
+    Ok(())
+}
+
+/// [`idle`], and no workspace job either: what deleting the conversation needs.
+pub async fn deletable(tx: &mut Tx<'_>, org: Uuid, conv: Uuid) -> anyhow::Result<()> {
+    idle(tx, org, conv).await?;
+    let busy: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM workspace_jobs WHERE org_id=$1 AND conversation_id=$2
+           AND state IN ('queued','running'))",
+    )
+    .bind(org)
+    .bind(conv)
+    .fetch_one(&mut **tx)
+    .await?;
+    ensure!(!busy, Code::WorkspaceBusy);
+    Ok(())
+}
+
+#[derive(Default, Deserialize)]
+pub struct DeleteQuery {
+    #[serde(default)]
+    pub delete_memories: bool,
+}
+
+/// `DELETE /orgs/{org}/conversations/{conv}?delete_memories=`: hide the conversation at once
+/// (and the memories it saved, when asked); [`collector`] purges its content.
+pub async fn delete(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Path((org, conv)): Path<(Uuid, Uuid)>,
+    Query(q): Query<DeleteQuery>,
+) -> ApiResult<StatusCode> {
+    let (ctx, mut tx) = crate::http::member_tx(&app, &headers, org).await?;
+    sqlx::query("SELECT id FROM channels WHERE org_id=$1 AND conversation_id=$2 FOR UPDATE")
+        .bind(org)
+        .bind(conv)
+        .fetch_optional(&mut *tx)
+        .await?
+        .context(Code::Forbidden)?;
+    conversation_in(&mut tx, &ctx, conv).await?;
+    deletable(&mut tx, org, conv).await?;
+    sqlx::query(
+        "UPDATE conversations SET state='deleted',memory_snapshot=NULL WHERE org_id=$1 AND id=$2",
+    )
+    .bind(org)
+    .bind(conv)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("DELETE FROM conversation_digests WHERE org_id=$1 AND conversation_id=$2")
+        .bind(org)
+        .bind(conv)
+        .execute(&mut *tx)
+        .await?;
+    if q.delete_memories {
+        sqlx::query(
+            "UPDATE memory_items SET status='deleted',invalid_at=now(),version=version+1
+             WHERE org_id=$1 AND user_id=$2 AND source_conversation_id=$3 AND status='active'",
+        )
+        .bind(org)
+        .bind(ctx.user_id)
+        .bind(conv)
+        .execute(&mut *tx)
+        .await?;
+    }
+    sqlx::query(
+        "UPDATE virtual_keys SET revoked_at=now()
+         WHERE org_id=$1 AND conversation_id=$2 AND revoked_at IS NULL",
+    )
+    .bind(org)
+    .bind(conv)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Owner-role loop purging deleted and expired temporary conversations.
+pub async fn collector(app: App, worker: sqlx::PgPool) -> anyhow::Result<()> {
+    loop {
+        let due: Vec<(Uuid, Uuid)> = sqlx::query_as(
+            "SELECT org_id,id FROM conversations
+             WHERE title<>'' AND (state='deleted' OR (temporary AND expires_at<=now())) LIMIT 100",
+        )
+        .fetch_all(&worker)
+        .await?;
+        for (org, conv) in due {
+            if let Err(error) = collect(&app, org, conv).await {
+                tracing::warn!(conversation = %conv, %error, "conversation deletion deferred");
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+    }
+}
+
+/// Purge `conv` if it is deleted or an expired temporary conversation and not yet purged.
+pub async fn collect(app: &App, org: Uuid, conv: Uuid) -> anyhow::Result<bool> {
+    let mut tx = app.store.tx(org).await?;
+    sqlx::query("SELECT id FROM channels WHERE org_id=$1 AND conversation_id=$2 FOR UPDATE")
+        .bind(org)
+        .bind(conv)
+        .execute(&mut *tx)
+        .await?;
+    let due: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM conversations WHERE org_id=$1 AND id=$2
+           AND (state='deleted' OR (temporary AND expires_at<=now())) AND title<>'')",
+    )
+    .bind(org)
+    .bind(conv)
+    .fetch_one(&mut *tx)
+    .await?;
+    if !due {
+        return Ok(false);
+    }
+    purge(app, &mut tx, org, conv).await?;
+    tx.commit().await?;
+    Ok(true)
+}
+
+/// Purge a conversation nothing works in: fence its writers, destroy its sandboxes and stored
+/// workspace, and delete its content, keeping ids and accounting rows as tombstones.
+pub async fn purge(app: &App, tx: &mut Tx<'_>, org: Uuid, conv: Uuid) -> anyhow::Result<()> {
+    deletable(tx, org, conv).await?;
+    // Its events go with the content: nothing is left to publish.
+    let epoch: i64 = sqlx::query_scalar(
+        "UPDATE channels SET writer_epoch=writer_epoch+1,owner_id=NULL,lease_until=NULL,
+           published_seq=last_seq
+         WHERE org_id=$1 AND conversation_id=$2 RETURNING writer_epoch",
+    )
+    .bind(org)
+    .bind(conv)
+    .fetch_one(&mut **tx)
+    .await?;
+    let sandboxes: Vec<(Uuid, i64, bool)> = sqlx::query_as(
+        "SELECT id,exec_epoch,state='deleted' FROM sandboxes WHERE org_id=$1 AND conversation_id=$2",
+    )
+    .bind(org)
+    .bind(conv)
+    .fetch_all(&mut **tx)
+    .await?;
+    // A deleted sandbox is gone; its workspace files may not be.
+    for (sandbox_id, old_epoch, _) in sandboxes.iter().filter(|(.., deleted)| !deleted) {
+        let destroy = HostCommand::Destroy {
+            sandbox_id: *sandbox_id,
+            exec_epoch: epoch.max(*old_epoch + 1) as u64,
+        };
+        crate::sandbox::host(app, org, *sandbox_id, destroy).await?;
+    }
+    if !sandboxes.is_empty() {
+        let artifacts: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM checkpoints WHERE org_id=$1 AND conversation_id=$2
+             UNION SELECT id FROM workspace_jobs WHERE org_id=$1 AND conversation_id=$2",
+        )
+        .bind(org)
+        .bind(conv)
+        .fetch_all(&mut **tx)
+        .await?;
+        let workspace = HostCommand::PurgeWorkspace {
+            org_id: org,
+            workspace_id: conv,
+            artifacts,
+        };
+        crate::sandbox::host_workspace(app, org, conv, workspace).await?;
+    }
+    erase(tx, org, conv, epoch).await
+}
+
+/// Delete a conversation's content, keeping ids and accounting rows as tombstones.
+async fn erase(tx: &mut Tx<'_>, org: Uuid, conv: Uuid, epoch: i64) -> anyhow::Result<()> {
+    // Every statement is scoped by ($1 org, $2 conversation), in dependency order. Table names
+    // are fixed identifiers, never input.
+    let runs = "SELECT id FROM runs WHERE org_id=$1 AND conversation_id=$2";
+    let mut statements = vec![
+        // Seed pointers reference loop steps about to be deleted.
+        "UPDATE runs SET seed_run_id=NULL,seed_step=NULL WHERE org_id=$1 AND conversation_id=$2"
+            .to_owned(),
+    ];
+    for table in [
+        "pending_inputs",
+        "loop_steps",
+        "native_requests",
+        "mcp_calls",
+        "tool_calls",
+        "pending_actions",
+    ] {
+        statements.push(format!(
+            "DELETE FROM {table} WHERE org_id=$1 AND run_id IN ({runs})"
+        ));
+    }
+    statements.push(
+        "DELETE FROM guest_events WHERE org_id=$1
+         AND sandbox_id IN (SELECT id FROM sandboxes WHERE org_id=$1 AND conversation_id=$2)"
+            .into(),
+    );
+    for table in [
+        "commands",
+        "conversation_operations",
+        "workspace_jobs",
+        "workspace_heads",
+        "chat_images",
+        // References only: the files stay in their owner's library.
+        "conversation_files",
+    ] {
+        statements.push(format!(
+            "DELETE FROM {table} WHERE org_id=$1 AND conversation_id=$2"
+        ));
+    }
+    statements.extend(
+        [
+            // A fork's restore pin is keyed by the forked conversation.
+            "DELETE FROM conversation_digests WHERE org_id=$1 AND conversation_id=$2",
+            "UPDATE conversations SET memory_snapshot=NULL,expires_at=NULL WHERE org_id=$1 AND id=$2",
+            "DELETE FROM restore_pins WHERE org_id=$1 AND id=$2",
+            "UPDATE checkpoints SET state='tombstoned',delete_after=now()
+             WHERE org_id=$1 AND conversation_id=$2 AND state<>'deleted'",
+            "UPDATE virtual_keys SET revoked_at=coalesce(revoked_at,now()) WHERE org_id=$1 AND conversation_id=$2",
+            "UPDATE items SET text='',detail=NULL,state='invalidated',revision=revision+1
+             WHERE org_id=$1 AND conversation_id=$2",
+            "UPDATE runs SET response_text='',seed_messages='[]' WHERE org_id=$1 AND conversation_id=$2",
+        ]
+        .map(String::from),
+    );
+    for statement in statements {
+        sqlx::query(sqlx::AssertSqlSafe(statement))
+            .bind(org)
+            .bind(conv)
+            .execute(&mut **tx)
+            .await?;
+    }
+    sqlx::query("DELETE FROM search_docs WHERE org_id=$1 AND conversation_id=$2")
+        .bind(org)
+        .bind(conv)
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query("DELETE FROM events WHERE org_id=$1 AND channel_id=$2")
+        .bind(org)
+        .bind(format!("conv:{conv}"))
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query(
+        "UPDATE sandboxes SET state='deleted',exec_epoch=$3 WHERE org_id=$1 AND conversation_id=$2",
+    )
+    .bind(org)
+    .bind(conv)
+    .bind(epoch)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        "UPDATE conversations SET state='deleted',title='',context_seed=NULL,native_fork=NULL,project_deleted_state=NULL
+         WHERE org_id=$1 AND id=$2",
+    )
+    .bind(org)
+    .bind(conv)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
 }
 
 /// Run the conversation's queued fork, if any.

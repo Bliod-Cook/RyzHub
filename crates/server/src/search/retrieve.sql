@@ -30,7 +30,7 @@ WITH eligible AS NOT MATERIALIZED (
 SELECT jsonb_build_object('id',d.id,'kind',d.doc_kind,'conversation_id',d.conversation_id,
  'item_id',d.item_id,'seq',d.seq,'project_id',s.project_id,'text',left(d.text,1500),
  'file',(SELECT name FROM project_files WHERE org_id=d.org_id AND id=d.id),
- 'snippet_html',array_to_string(pgroonga_snippet_html(d.text,ARRAY[$3]),' … '),'score',f.score,
+ 'snippet_html',array_to_string(pgroonga_snippet_html(d.text,pgroonga_query_extract_keywords(pgroonga_query_escape($3))),' … '),'score',f.score,
  'source',CASE WHEN d.conversation_id IS NOT NULL THEN '/orgs/'||d.org_id||'/conversations/'||d.conversation_id||'?item='||coalesce(d.item_id::text,'')||'&seq='||d.seq ELSE NULL END)
 FROM fused f JOIN eligible d ON d.id=f.id JOIN search_sources s ON s.org_id=d.org_id AND s.id=d.id AND s.doc_kind=d.doc_kind
 ORDER BY f.score DESC,d.id LIMIT 20

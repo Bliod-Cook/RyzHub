@@ -1722,7 +1722,7 @@ async fn vault_key_rotation_rewraps_credential_secrets() -> anyhow::Result<()> {
     let resolve = |app: App| async move {
         let mut tx = app.store.tx(org).await?;
         let policy = ryzhub_domain::Policy::default();
-        let resolved = ryzhub_server::llm::credentials::resolve(
+        let resolved = ryzhub_server::llm::credentials::member_key(
             &app,
             &mut tx,
             org,
@@ -1734,10 +1734,7 @@ async fn vault_key_rotation_rewraps_credential_secrets() -> anyhow::Result<()> {
         tx.commit().await?;
         anyhow::Ok(resolved)
     };
-    let expected = (
-        Some(id(&credential, "id")),
-        "personal-fixture-key".to_owned(),
-    );
+    let expected = Some((id(&credential, "id"), "personal-fixture-key".to_owned()));
     assert_eq!(resolve(h.app.clone()).await?, expected);
     let migrate = ryzhub_server::vault::migrate;
     assert_eq!(

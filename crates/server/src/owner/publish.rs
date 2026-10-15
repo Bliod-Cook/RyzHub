@@ -12,7 +12,8 @@ use crate::{
 };
 
 /// Frames above this are not sent live; subscribers repair the resulting seq gap from the
-/// event log. Items are bounded far below this, so it is only a guard.
+/// event log. Most items are far smaller, but a bounded item can still exceed it (256 file
+/// changes of 64 KiB each).
 fn fits(nats: &async_nats::Client, frame: &[u8]) -> bool {
     frame.len() + 1024 <= nats.server_info().max_payload
 }

@@ -264,6 +264,7 @@ pub(super) async fn create_account(
         .bind(org)
         .execute(&mut *tx)
         .await?;
+    // TODO(org): nothing is published on the organization channel yet.
     sqlx::query(
         "INSERT INTO channels(id,org_id,kind,user_id) VALUES($1,$2,'user',$3),($4,$2,'org',NULL)",
     )

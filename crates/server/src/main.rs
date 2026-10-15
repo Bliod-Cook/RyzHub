@@ -2,8 +2,8 @@
 //! reindex | migrate-secrets.
 use anyhow::{Context, ensure};
 use ryzhub_server::{
-    app::App, attachments, config::Config, jobs, lifecycle, memory, projects, retention, sandbox,
-    search, store::Store, workspace,
+    app::App, attachments, config::Config, conversation_commands, lifecycle, memory, projects,
+    push, retention, sandbox, search, store::Store, workspace,
 };
 use sqlx::PgPool;
 use std::{future::Future, time::Duration};
@@ -61,11 +61,12 @@ async fn run(args: Vec<String>) -> anyhow::Result<()> {
         if app.config.search.enabled {
             supervise("search index", &app, worker, search::worker);
         }
+        supervise("memory collector", &app, worker, memory::collector);
         supervise(
-            "memory and conversation collector",
+            "conversation collector",
             &app,
             worker,
-            memory::collector,
+            conversation_commands::collector,
         );
         supervise(
             "attachment collector",
@@ -73,11 +74,7 @@ async fn run(args: Vec<String>) -> anyhow::Result<()> {
             worker,
             attachments::gc::collector,
         );
-        if !jobs::handlers().is_empty() {
-            supervise("jobs", &app, worker, |app, worker| {
-                jobs::worker(app, worker, jobs::handlers())
-            });
-        }
+        supervise("push", &app, worker, push::worker);
         supervise("conversation lifecycle", &app, worker, lifecycle::collector);
         supervise("retention", &app, worker, retention::collector);
         if app.config.work.enabled || sandbox::chat_checkpoints(&app) {

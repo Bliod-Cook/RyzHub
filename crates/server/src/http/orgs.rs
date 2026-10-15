@@ -1,4 +1,5 @@
 //! Organization-scoped REST resources: conversations, history, members, policy, models, audit.
+use anyhow::Context;
 use axum::{
     Json,
     extract::{Path, Query, State},
@@ -41,24 +42,24 @@ pub async fn create_conversation(
     Path(org): Path<Uuid>,
     Json(input): Json<CreateConversation>,
 ) -> ApiResult<Json<Conversation>> {
-    let ctx = crate::http::member(&app, &headers, org).await?;
-    let conversation = app
-        .store
-        .create_configured(
-            &ctx,
-            &input.title,
-            &input.mode,
-            {
-                let mut settings = input.run_config;
-                if input.temporary {
-                    settings["temporary"] = json!(true);
-                }
-                settings
-            },
-            input.project_id,
-            Some(&app.config),
-        )
-        .await?;
+    let (ctx, mut tx) = crate::http::member_tx(&app, &headers, org).await?;
+    let mut settings = input.run_config;
+    if input.temporary {
+        settings["temporary"] = json!(true);
+    }
+    let conversation = crate::store::create_in(
+        &mut tx,
+        &ctx,
+        Uuid::now_v7(),
+        &input.title,
+        &input.mode,
+        settings,
+        input.project_id,
+        Some(&app.config),
+    )
+    .await?
+    .context(Code::ConversationIdTaken)?;
+    tx.commit().await?;
     Ok(Json(conversation))
 }
 
@@ -68,8 +69,10 @@ pub async fn list_conversations(
     headers: HeaderMap,
     Path(org): Path<Uuid>,
 ) -> ApiResult<Json<Vec<Conversation>>> {
-    let ctx = crate::http::member(&app, &headers, org).await?;
-    Ok(Json(app.store.list_conversations(&ctx).await?))
+    let (ctx, mut tx) = crate::http::member_tx(&app, &headers, org).await?;
+    let list = crate::store::list_conversations(&mut tx, &ctx).await?;
+    tx.commit().await?;
+    Ok(Json(list))
 }
 
 #[derive(Deserialize)]

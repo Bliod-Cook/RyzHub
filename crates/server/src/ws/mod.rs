@@ -457,14 +457,13 @@ async fn handle_command(
     command: &CommandEnvelope,
 ) -> anyhow::Result<Frame> {
     app.store.auth_by_session(auth.session_id).await?;
-    let ctx = app.store.authorize_channel(auth.user_id, channel).await?;
+    let user = auth.user_id;
+    // Membership is checked where the command is taken, in its transaction.
+    let org = app.store.channel_org(user, channel).await?;
     let cid = Uuid::parse_str(&command.cid).context(Code::InvalidCid)?;
-    let mut results = app
-        .nats
-        .subscribe(result_subject(auth.user_id, cid))
-        .await?;
+    let mut results = app.nats.subscribe(result_subject(user, cid)).await?;
     let conv = if channel.starts_with("user:") {
-        match crate::user_commands::accept(app, &ctx, channel, device, command).await? {
+        match crate::user_commands::accept(app, (org, user), channel, device, command).await? {
             Intake::Done(result) => return Ok(*result),
             Intake::Queued(conv) => conv,
         }
@@ -473,13 +472,13 @@ async fn handle_command(
             .strip_prefix("conv:")
             .and_then(|id| Uuid::parse_str(id).ok())
             .context(Code::InvalidCommand)?;
-        if let Some(result) = app.store.accept(&ctx, conv, device, command).await? {
+        if let Some(result) = app.store.accept(org, user, conv, device, command).await? {
             return Ok(result);
         }
         conv
     };
     app.nats
-        .publish(wake_subject(ctx.org_id, conv), Default::default())
+        .publish(wake_subject(org, conv), Default::default())
         .await?;
     let deadline = tokio::time::sleep(COMMAND_TIMEOUT);
     tokio::pin!(deadline);
@@ -491,7 +490,7 @@ async fn handle_command(
         tokio::select! {
             Some(message) = results.next() => return Ok(Frame::decode(message.payload)?),
             _ = fallback.tick() => {
-                if let Some(result) = app.store.command_result(&ctx, cid).await? {
+                if let Some(result) = app.store.command_result(org, user, cid).await? {
                     return Ok(result);
                 }
             }

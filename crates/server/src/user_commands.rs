@@ -7,14 +7,13 @@ use prost::Message;
 use ryzhub_domain::OrgContext;
 use ryzhub_proto::{command_envelope::Command, frame::Body, *};
 use serde_json::{Value, json};
-use sqlx::Acquire;
 use uuid::Uuid;
 
 use crate::{
     app::App,
-    error::{Code, code_of},
+    error::Code,
     runs,
-    store::{Tx, context_in, create_in},
+    store::{Cid, Tx, context_in, create_in, finish_command, retry, take_cid},
 };
 
 /// What became of a command.
@@ -25,44 +24,42 @@ pub enum Intake {
     Queued(Uuid),
 }
 
-/// The command first sent under the cid, if any: its conversation, payload and result.
-#[derive(sqlx::FromRow)]
-struct First {
-    conversation_id: Option<Uuid>,
-    payload: Vec<u8>,
-    result: Option<Vec<u8>>,
-}
-
-async fn first(tx: &mut Tx<'_>, ctx: &OrgContext, cid: Uuid) -> anyhow::Result<Option<First>> {
-    Ok(sqlx::query_as(
-        "SELECT conversation_id,payload,result FROM commands WHERE org_id=$1 AND user_id=$2 AND cid=$3",
-    )
-    .bind(ctx.org_id)
-    .bind(ctx.user_id)
-    .bind(cid)
-    .fetch_optional(&mut **tx)
-    .await?)
-}
-
+/// Take a command on the user channel of `user` in `org`. Membership is checked here, in the
+/// transaction that takes the command.
 pub async fn accept(
     app: &App,
-    ctx: &OrgContext,
+    (org, user): (Uuid, Uuid),
     channel: &str,
     device: &str,
     envelope: &CommandEnvelope,
 ) -> anyhow::Result<Intake> {
     let cid = Uuid::parse_str(&envelope.cid).context(Code::InvalidCid)?;
-    match envelope.command.as_ref().context(Code::InvalidCommand)? {
-        Command::CreateRun(create) => create_run(app, ctx, device, cid, envelope, create).await,
+    let mut tx = app.store.tx(org).await?;
+    let ctx = context_in(&mut tx, user, org).await?;
+    let intake = match envelope.command.as_ref().context(Code::InvalidCommand)? {
+        Command::CreateRun(create) => {
+            create_run(&mut tx, app, &ctx, device, cid, envelope, create).await?
+        }
         Command::UndoMemoryUpdate(undo) => {
-            undo_memory(app, ctx, channel, device, cid, envelope, undo).await
+            undo_memory(&mut tx, &ctx, channel, device, cid, envelope, undo).await?
         }
         _ => bail!(Code::InvalidCommand),
+    };
+    tx.commit().await?;
+    Ok(intake)
+}
+
+/// What became of a command, from its stored result.
+fn intake(conv: Uuid, result: Option<Box<Frame>>) -> Intake {
+    match result {
+        Some(result) => Intake::Done(result),
+        None => Intake::Queued(conv),
     }
 }
 
 /// Creates the conversation and queues the command under it, in one transaction.
 async fn create_run(
+    tx: &mut Tx<'_>,
     app: &App,
     ctx: &OrgContext,
     device: &str,
@@ -104,15 +101,13 @@ async fn create_run(
         create.title.clone()
     };
     let payload = envelope.encode_to_vec();
-    let mut tx = app.store.tx(ctx.org_id).await?;
-    let ctx = context_in(&mut tx, ctx.user_id, ctx.org_id).await?;
-    if let Some(intake) = retry(&mut tx, &ctx, cid, conv, &payload).await? {
-        tx.commit().await?;
-        return Ok(intake);
+    // Answered before anything is validated again: a retry gets the first result.
+    if let Some(result) = retry(tx, ctx, cid, Some(conv), &payload).await? {
+        return Ok(intake(conv, result));
     }
     let created = create_in(
-        &mut tx,
-        &ctx,
+        tx,
+        ctx,
         conv,
         &title,
         &create.mode,
@@ -123,48 +118,13 @@ async fn create_run(
     .await?;
     if created.is_none() {
         // The same command sent twice at once: the other took the id first.
-        if let Some(intake) = retry(&mut tx, &ctx, cid, conv, &payload).await? {
-            tx.commit().await?;
-            return Ok(intake);
-        }
-        bail!(Code::ConversationIdTaken);
+        let result = retry(tx, ctx, cid, Some(conv), &payload).await?;
+        return Ok(intake(conv, result.context(Code::ConversationIdTaken)?));
     }
-    sqlx::query(
-        "INSERT INTO commands(id,user_id,cid,org_id,conversation_id,device_id,payload)
-         VALUES($1,$2,$3,$4,$5,$6,$7)",
-    )
-    .bind(Uuid::now_v7())
-    .bind(ctx.user_id)
-    .bind(cid)
-    .bind(ctx.org_id)
-    .bind(conv)
-    .bind(device)
-    .bind(&payload)
-    .execute(&mut *tx)
-    .await?;
-    tx.commit().await?;
-    Ok(Intake::Queued(conv))
-}
-
-/// A retry of a command already taken: its result, or its conversation's Owner to wait for.
-async fn retry(
-    tx: &mut Tx<'_>,
-    ctx: &OrgContext,
-    cid: Uuid,
-    conv: Uuid,
-    payload: &[u8],
-) -> anyhow::Result<Option<Intake>> {
-    let Some(first) = first(tx, ctx, cid).await? else {
-        return Ok(None);
+    let Cid::Taken(_) = take_cid(tx, ctx, cid, Some(conv), device, &payload).await? else {
+        bail!(Code::CidReused);
     };
-    ensure!(
-        first.conversation_id == Some(conv) && first.payload == payload,
-        Code::CidReused
-    );
-    Ok(Some(match first.result {
-        Some(result) => Intake::Done(Box::new(Frame::decode(result.as_slice())?)),
-        None => Intake::Queued(conv),
-    }))
+    Ok(Intake::Queued(conv))
 }
 
 /// A conversation's title from its first message: its first line that is not a fence.
@@ -183,7 +143,7 @@ fn title_of(text: &str) -> String {
 }
 
 async fn undo_memory(
-    app: &App,
+    tx: &mut Tx<'_>,
     ctx: &OrgContext,
     channel: &str,
     device: &str,
@@ -193,66 +153,30 @@ async fn undo_memory(
 ) -> anyhow::Result<Intake> {
     let event = Uuid::parse_str(&undo.event_id).context(Code::InvalidArguments)?;
     let payload = envelope.encode_to_vec();
-    let mut tx = app.store.tx(ctx.org_id).await?;
-    let ctx = context_in(&mut tx, ctx.user_id, ctx.org_id).await?;
     // Taking the cid first makes a concurrent retry wait for this answer.
-    let taken: Option<Uuid> = sqlx::query_scalar(
-        "INSERT INTO commands(id,user_id,cid,org_id,conversation_id,device_id,payload)
-         VALUES($1,$2,$3,$4,NULL,$5,$6) ON CONFLICT(user_id,cid) DO NOTHING RETURNING id",
-    )
-    .bind(Uuid::now_v7())
-    .bind(ctx.user_id)
-    .bind(cid)
-    .bind(ctx.org_id)
-    .bind(device)
-    .bind(&payload)
-    .fetch_optional(&mut *tx)
-    .await?;
-    let Some(id) = taken else {
-        let first = first(&mut tx, &ctx, cid).await?.context(Code::CidReused)?;
-        ensure!(
-            first.conversation_id.is_none() && first.payload == payload,
-            Code::CidReused
-        );
-        let result = first.result.context(Code::TemporarilyUnavailable)?;
-        return Ok(Intake::Done(Box::new(Frame::decode(result.as_slice())?)));
+    let id = match take_cid(tx, ctx, cid, None, device, &payload).await? {
+        Cid::Taken(id) => id,
+        Cid::Retry(result) => {
+            return Ok(Intake::Done(result.context(Code::TemporarilyUnavailable)?));
+        }
     };
-    let mut savepoint = tx.begin().await?;
-    let body = match crate::memory::undo(&mut savepoint, ctx.org_id, ctx.user_id, event).await {
-        Ok(_) => {
-            savepoint.commit().await?;
-            Body::CommandAck(CommandAck {
+    let (org, user) = (ctx.org_id, ctx.user_id);
+    let response = finish_command(
+        tx,
+        org,
+        id,
+        channel,
+        &envelope.cid,
+        async |tx: &mut Tx<'_>| {
+            crate::memory::undo(tx, org, user, event).await?;
+            Ok(Body::CommandAck(CommandAck {
                 cid: envelope.cid.clone(),
                 accepted_seq: 0,
                 result: "undone".into(),
-            })
-        }
-        Err(error) => {
-            savepoint.rollback().await?;
-            if error.downcast_ref::<sqlx::Error>().is_some() {
-                return Err(error);
-            }
-            // Already undone, or changed since: undoing again cannot succeed.
-            let code = match code_of(&error) {
-                Some(Code::ConversationBusy) => Code::MemoryUndoUnavailable,
-                Some(code) => code,
-                None => return Err(error),
-            };
-            Body::CommandRejected(CommandRejected {
-                cid: envelope.cid.clone(),
-                code: code.to_string(),
-                retryable: false,
-            })
-        }
-    };
-    let response = frame(channel, body);
-    sqlx::query("UPDATE commands SET status='done',result=$3 WHERE org_id=$1 AND id=$2")
-        .bind(ctx.org_id)
-        .bind(id)
-        .bind(response.encode_to_vec())
-        .execute(&mut *tx)
-        .await?;
-    tx.commit().await?;
+            }))
+        },
+    )
+    .await?;
     Ok(Intake::Done(Box::new(response)))
 }
 

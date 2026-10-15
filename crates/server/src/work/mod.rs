@@ -74,7 +74,7 @@ pub(crate) async fn harness(
     }
     match reply["state"].as_str() {
         Some("completed") => {
-            Ok(serde_json::from_value(reply["result"].clone()).unwrap_or_default())
+            Ok(serde_json::from_value(reply["result"].clone()).context("harness result")?)
         }
         Some("failed") => anyhow::bail!(
             "harness request failed: {}",

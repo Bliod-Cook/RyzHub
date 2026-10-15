@@ -33,9 +33,10 @@ impl Store {
         config: Option<&Config>,
     ) -> anyhow::Result<Conversation> {
         let mut tx = self.tx(ctx.org_id).await?;
+        let ctx = context_in(&mut tx, ctx.user_id, ctx.org_id).await?;
         let conversation = create_in(
             &mut tx,
-            ctx,
+            &ctx,
             Uuid::now_v7(),
             title,
             mode,
@@ -48,31 +49,31 @@ impl Store {
         tx.commit().await?;
         Ok(conversation)
     }
-
-    pub async fn list_conversations(&self, ctx: &OrgContext) -> anyhow::Result<Vec<Conversation>> {
-        let mut tx = self.tx(ctx.org_id).await?;
-        context_in(&mut tx, ctx.user_id, ctx.org_id).await?;
-        // Pins are kept within the limit, but the list stays newest first: clients order pins
-        // themselves, and an unpinned conversation returns to its place among the others.
-        let list = sqlx::query_as(concat!(
-            "SELECT * FROM (SELECT ",
-            conversation_columns!(),
-            ",created_at FROM conversations
-              WHERE org_id=$1 AND creator_id=$2 AND state IN ('active','archived')
-              ORDER BY pinned_at DESC NULLS LAST, created_at DESC LIMIT 200) c
-             ORDER BY created_at DESC"
-        ))
-        .bind(ctx.org_id)
-        .bind(ctx.user_id)
-        .fetch_all(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        Ok(list)
-    }
 }
 
-/// Create conversation `id` in `tx`: None when a conversation already has that id. See
-/// [`Store::create_configured`].
+/// The caller's visible conversations, newest first.
+pub async fn list_conversations(
+    tx: &mut Tx<'_>,
+    ctx: &OrgContext,
+) -> anyhow::Result<Vec<Conversation>> {
+    // Pins are kept within the limit, but the list stays newest first: clients order pins
+    // themselves, and an unpinned conversation returns to its place among the others.
+    Ok(sqlx::query_as(concat!(
+        "SELECT * FROM (SELECT ",
+        conversation_columns!(),
+        ",created_at FROM conversations
+          WHERE org_id=$1 AND creator_id=$2 AND state IN ('active','archived')
+          ORDER BY pinned_at DESC NULLS LAST, created_at DESC LIMIT 200) c
+         ORDER BY created_at DESC"
+    ))
+    .bind(ctx.org_id)
+    .bind(ctx.user_id)
+    .fetch_all(&mut **tx)
+    .await?)
+}
+
+/// Create conversation `id` in `tx` for `ctx`, a membership resolved in `tx`: None when a
+/// conversation already has that id. See [`Store::create_configured`].
 #[allow(clippy::too_many_arguments)]
 pub async fn create_in(
     tx: &mut Tx<'_>,
@@ -88,7 +89,6 @@ pub async fn create_in(
         matches!(mode, "" | "chat" | "work") && !title.trim().is_empty() && title.len() <= 256,
         Code::InvalidConversation
     );
-    let ctx = context_in(tx, ctx.user_id, ctx.org_id).await?;
     authorize(
         &Principal::User(ctx.clone()),
         Action::UseConversation,
@@ -106,7 +106,7 @@ pub async fn create_in(
                 let policy = effective_policy(tx, &config.policy, ctx.org_id).await?;
                 ensure!(policy.allow_projects != Some(false), Code::PolicyDenied);
             }
-            apply_project_defaults(tx, &ctx, project, mode, settings).await?
+            apply_project_defaults(tx, ctx, project, mode, settings).await?
         }
         None => (mode.to_owned(), settings),
     };
@@ -159,7 +159,7 @@ pub async fn create_in(
         Event::ItemUpserted(conversation_item(&conversation, 1)),
     )
     .await?;
-    audit(tx, &ctx, "conversation.create", &id.to_string(), "allowed").await?;
+    audit(tx, ctx, "conversation.create", &id.to_string(), "allowed").await?;
     Ok(Some(conversation))
 }
 

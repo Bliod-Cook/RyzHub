@@ -177,7 +177,7 @@ async fn finished_runs_notify_offline_devices_of_signed_in_users() -> anyhow::Re
     let mut finished = false;
     for _ in 0..200 {
         finished = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM jobs WHERE kind='push' AND payload->>'run'=$1 AND state='completed')",
+            "SELECT EXISTS(SELECT 1 FROM push_jobs WHERE payload->>'run'=$1 AND state='completed')",
         )
         .bind(second.to_string())
         .fetch_one(&h.db)
@@ -219,7 +219,7 @@ async fn finished_runs_notify_offline_devices_of_signed_in_users() -> anyhow::Re
     let third = h.wait_after(conv, second).await?;
     for _ in 0..200 {
         let done: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM jobs WHERE kind='push' AND payload->>'run'=$1 AND state='completed')",
+            "SELECT EXISTS(SELECT 1 FROM push_jobs WHERE payload->>'run'=$1 AND state='completed')",
         )
         .bind(third.to_string())
         .fetch_one(&h.db)

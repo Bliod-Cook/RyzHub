@@ -182,7 +182,7 @@ impl Harness {
         };
         self.app
             .store
-            .accept(&ctx, conv, "test-device", &envelope)
+            .accept(ctx.org_id, ctx.user_id, conv, "test-device", &envelope)
             .await?;
         Ok(cid)
     }

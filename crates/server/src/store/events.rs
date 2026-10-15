@@ -436,6 +436,25 @@ impl Store {
 
     /// Resolve a channel to its organization and check the user may subscribe to it.
     pub async fn authorize_channel(&self, user: Uuid, channel: &str) -> anyhow::Result<OrgContext> {
+        let org = self.channel_org(user, channel).await?;
+        let ctx = self.context(user, org).await?;
+        authorize(
+            &Principal::User(ctx.clone()),
+            Action::Subscribe,
+            &Resource {
+                org_id: org,
+                id: org,
+                owner_user_id: Some(user),
+                target_role: None,
+            },
+        )
+        .map_err(|_| Code::Forbidden)?;
+        Ok(ctx)
+    }
+
+    /// The organization of a channel `user` may name: one of their conversations, their user
+    /// channel or an organization channel. Membership is for the caller to check.
+    pub async fn channel_org(&self, user: Uuid, channel: &str) -> anyhow::Result<Uuid> {
         let parts: Vec<_> = channel.split(':').collect();
         let org = match parts.as_slice() {
             ["conv", id] => {
@@ -452,22 +471,11 @@ impl Store {
                 ensure!(Uuid::parse_str(id).ok() == Some(user), Code::Forbidden);
                 Uuid::parse_str(org).context(Code::InvalidChannel)?
             }
+            // TODO(org): subscribable, though nothing is published on it yet.
             ["org", org] => Uuid::parse_str(org).context(Code::InvalidChannel)?,
             _ => anyhow::bail!(Code::InvalidChannel),
         };
-        let ctx = self.context(user, org).await?;
-        authorize(
-            &Principal::User(ctx.clone()),
-            Action::Subscribe,
-            &Resource {
-                org_id: org,
-                id: org,
-                owner_user_id: Some(user),
-                target_role: None,
-            },
-        )
-        .map_err(|_| Code::Forbidden)?;
-        Ok(ctx)
+        Ok(org)
     }
 
     /// Events after `since` if still retained, otherwise a snapshot. Returns the head seq the

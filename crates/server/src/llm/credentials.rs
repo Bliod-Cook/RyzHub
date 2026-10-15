@@ -4,7 +4,7 @@ use crate::{
     store::{Tx, audit, effective_policy},
     vault,
 };
-use anyhow::{Context, ensure};
+use anyhow::Context;
 use axum::{
     Json,
     extract::{Path, State},
@@ -189,34 +189,6 @@ pub async fn revoke(
     .await?;
     tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)
-}
-
-/// The upstream key for a request: the user's personal key, else the organization's, else the
-/// platform key when policy allows it.
-pub async fn resolve(
-    app: &App,
-    tx: &mut Tx<'_>,
-    org: Uuid,
-    user: Uuid,
-    policy: &ryzhub_domain::Policy,
-    provider: &str,
-) -> anyhow::Result<(Option<Uuid>, String)> {
-    if let Some((id, key)) = member_key(app, tx, org, user, policy, provider).await? {
-        return Ok((Some(id), key));
-    }
-    ensure!(
-        policy.allow_platform_credentials != Some(false),
-        Code::PlatformCredentialDenied
-    );
-    let env = if provider == "openai" {
-        &app.config.llm.responses_key_env
-    } else {
-        &app.config.llm.platform_key_env
-    };
-    Ok((
-        None,
-        std::env::var(env).context(Code::CredentialUnavailable)?,
-    ))
 }
 
 /// The member's or organization's own key for `provider`: the member's, else the

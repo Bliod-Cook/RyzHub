@@ -188,6 +188,7 @@ pub async fn active_conversations(
     worker: &sqlx::PgPool,
     config: &Config,
 ) -> anyhow::Result<Vec<(Uuid, Uuid)>> {
+    // TODO(org): the latest organization policy version; only registration writes one.
     Ok(sqlx::query_as(
         "SELECT org_id,conversation_id FROM commands WHERE status='queued'
          UNION SELECT org_id,conversation_id FROM runs WHERE state IN ('running','requires_action')

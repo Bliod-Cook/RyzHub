@@ -64,7 +64,6 @@ pub mod drafts;
 pub mod error;
 pub mod extract;
 pub mod http;
-pub mod jobs;
 pub mod lifecycle;
 pub mod llm;
 pub mod maintenance;

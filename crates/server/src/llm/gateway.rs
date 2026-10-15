@@ -137,42 +137,61 @@ pub async fn validate_key(
     Ok(())
 }
 
-/// The model is allowed for this key and by current policy.
+/// The model is allowed by current policy (and by the key, for a key's request), and so is the
+/// reasoning level the call asks for.
 async fn authorize_model(
     app: &App,
     tx: &mut Tx<'_>,
-    key: &GatewayKey,
-    model: &str,
+    org: Uuid,
+    key: Option<&GatewayKey>,
+    call: &Call,
 ) -> anyhow::Result<Policy> {
-    let policy = effective_policy(tx, &app.config.policy, key.org_id).await?;
+    let policy = effective_policy(tx, &app.config.policy, org).await?;
     ensure!(
-        key.models.iter().any(|m| m == model)
-            && policy.models.as_ref().is_none_or(|m| m.contains(model)),
+        key.is_none_or(|key| key.models.contains(&call.model))
+            && policy
+                .models
+                .as_ref()
+                .is_none_or(|m| m.contains(&call.model)),
         Code::ModelDenied
     );
+    if let (Some(limit), Some(asked)) = (
+        &policy.max_reasoning,
+        call.protocol.reasoning(&call.request),
+    ) {
+        ensure!(
+            ryzhub_domain::reasoning_rank(&asked) <= ryzhub_domain::reasoning_rank(limit),
+            Code::ReasoningDenied
+        );
+    }
     Ok(policy)
 }
 
-/// Fixed one-minute windows per organization and per key (loop keys: per run).
-async fn rate_limit(app: &App, tx: &mut Tx<'_>, key: &GatewayKey) -> anyhow::Result<()> {
-    let scopes = [
-        ("org".to_owned(), REQUESTS_PER_MINUTE_ORG),
-        (
-            match key.kind() {
-                KeyKind::Loop => format!("run:{}", key.run_id),
-                KeyKind::Sandbox => format!("key:{}", key.id),
-            },
-            app.config.llm.requests_per_minute_key,
-        ),
-    ];
-    for (scope, limit) in scopes {
+/// Fixed one-minute windows per organization and, for a key's request, per key (loop keys:
+/// per run).
+async fn rate_limit(
+    app: &App,
+    tx: &mut Tx<'_>,
+    org: Uuid,
+    key: Option<&GatewayKey>,
+) -> anyhow::Result<()> {
+    let per_key = key.map(|key| {
+        let scope = match key.kind() {
+            KeyKind::Loop => format!("run:{}", key.run_id),
+            KeyKind::Sandbox => format!("key:{}", key.id),
+        };
+        (scope, app.config.llm.requests_per_minute_key)
+    });
+    for (scope, limit) in
+        std::iter::once(("org".to_owned(), REQUESTS_PER_MINUTE_ORG)).chain(per_key)
+    {
         let count: i32 = sqlx::query_scalar(
             "INSERT INTO model_rate_limits(org_id,scope,minute,requests)
              VALUES($1,$2,floor(extract(epoch FROM now())/60)::bigint,1)
              ON CONFLICT(org_id,scope,minute) DO UPDATE SET requests=model_rate_limits.requests+1
              RETURNING requests",
         )
-        .bind(key.org_id)
+        .bind(org)
         .bind(scope)
         .fetch_one(&mut **tx)
         .await?;
@@ -403,7 +422,7 @@ struct Target {
 async fn targets(
     app: &App,
     tx: &mut Tx<'_>,
-    key: &GatewayKey,
+    (org, user): (Uuid, Uuid),
     policy: &Policy,
     call: &Call,
 ) -> anyhow::Result<(Option<Uuid>, Vec<Target>)> {
@@ -411,7 +430,7 @@ async fn targets(
     let (default_url, default_env) = call.protocol.default_upstream(llm);
     let credential = call.protocol.credential();
     if let Some((id, secret)) =
-        credentials::member_key(app, tx, key.org_id, key.user_id, policy, credential).await?
+        credentials::member_key(app, tx, org, user, policy, credential).await?
     {
         let target = Target {
             url: default_url.to_owned(),
@@ -500,44 +519,28 @@ async fn proxy(app: App, headers: HeaderMap, body: Bytes, call: Call) -> anyhow:
     let key = keys::resolve(&app.store, bearer(&headers)?).await?;
     let mut tx = app.store.tx(key.org_id).await?;
     validate_key(&mut tx, &key, false).await?;
-    let policy = authorize_model(&app, &mut tx, &key, &call.model).await?;
-    if let (Some(limit), Some(asked)) = (
-        &policy.max_reasoning,
-        call.protocol.reasoning(&call.request),
-    ) {
-        ensure!(
-            ryzhub_domain::reasoning_rank(&asked) <= ryzhub_domain::reasoning_rank(limit),
-            Code::ReasoningDenied
-        );
-    }
-    let (credential, targets) = targets(&app, &mut tx, &key, &policy, &call).await?;
-    let request_id = Uuid::now_v7();
+    let policy = authorize_model(&app, &mut tx, key.org_id, Some(&key), &call).await?;
+    let (credential, targets) =
+        targets(&app, &mut tx, (key.org_id, key.user_id), &policy, &call).await?;
+    let ledger = Ledger {
+        app: app.clone(),
+        org: key.org_id,
+        request_id: Uuid::now_v7(),
+        protocol: call.protocol,
+        input_bytes: body.len(),
+    };
     if !call.count_only {
-        rate_limit(&app, &mut tx, &key).await?;
-        let metadata = |name: &str| {
-            headers
-                .get(name)
-                .and_then(|h| h.to_str().ok())
-                .map(|h| h.chars().take(256).collect::<String>())
-        };
-        sqlx::query(
-            "INSERT INTO usage_records(id,org_id,user_id,run_id,virtual_key_id,model,credential_id,session_id,
-                 agent_id,parent_agent_id,provider)
-             VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
-        )
-        .bind(request_id)
-        .bind(key.org_id)
-        .bind(key.user_id)
-        .bind(key.run_id)
-        .bind((key.kind() == KeyKind::Sandbox).then_some(key.id))
-        .bind(&call.model)
-        .bind(credential)
-        .bind(metadata("x-claude-code-session-id"))
-        .bind(metadata("x-claude-code-agent-id"))
-        .bind(metadata("x-claude-code-parent-agent-id"))
-        .bind(call.protocol.credential())
-        .execute(&mut *tx)
-        .await?;
+        rate_limit(&app, &mut tx, key.org_id, Some(&key)).await?;
+        ledger
+            .start(
+                &mut tx,
+                key.user_id,
+                Some(&key),
+                &headers,
+                &call,
+                credential,
+            )
+            .await?;
         crate::store::audit_as(
             &mut tx,
             key.org_id,
@@ -548,33 +551,69 @@ async fn proxy(app: App, headers: HeaderMap, body: Bytes, call: Call) -> anyhow:
                 "sandbox"
             },
             "model.request",
-            &request_id.to_string(),
+            &ledger.request_id.to_string(),
             "accepted",
         )
         .await?;
     }
     tx.commit().await?;
 
+    let Some(upstream) = send(&app, &headers, &call, body, targets).await else {
+        if !call.count_only {
+            ledger
+                .finish(Value::Null, 0, false, "upstream_unreachable", None)
+                .await?;
+        }
+        anyhow::bail!(Code::UpstreamUnavailable);
+    };
     let meter = Meter {
-        app: app.clone(),
+        ledger,
         key,
         model: call.model.clone(),
         credential,
-        request_id,
-        input_bytes: body.len(),
-        protocol: call.protocol,
         streaming: call.streaming,
         count_only: call.count_only,
     };
-    // Each upstream in turn until one answers with something other than an outage.
-    let mut upstream = None;
+    let status = upstream.status();
+    let mut response = Response::builder().status(status);
+    for name in ["content-type", "request-id", "x-request-id"] {
+        if let Some(value) = upstream.headers().get(name) {
+            response = response.header(name, value);
+        }
+    }
+    response = response
+        .header("cache-control", "no-store")
+        .header("x-accel-buffering", "no");
+    if let Some(seconds) = upstream
+        .headers()
+        .get("retry-after")
+        .and_then(|h| h.to_str().ok())
+        .map(retry_after_seconds)
+    {
+        response = response.header("retry-after", seconds.to_string());
+    }
+    let (sender, receiver) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(8);
+    tokio::spawn(meter.forward(upstream, sender));
+    Ok(response.body(Body::from_stream(
+        tokio_stream::wrappers::ReceiverStream::new(receiver),
+    ))?)
+}
+
+/// Each upstream in turn until one answers with something other than an outage.
+async fn send(
+    app: &App,
+    headers: &HeaderMap,
+    call: &Call,
+    body: Bytes,
+    targets: Vec<Target>,
+) -> Option<reqwest::Response> {
     let last = targets.len() - 1;
     for (n, target) in targets.into_iter().enumerate() {
         let body = match &target.model {
             Some(model) if call.protocol != Protocol::Gemini => {
                 let mut request = call.request.clone();
                 request["model"] = json!(model);
-                Bytes::from(serde_json::to_vec(&request)?)
+                Bytes::from(serde_json::to_vec(&request).ok()?)
             }
             _ => body.clone(),
         };
@@ -609,47 +648,95 @@ async fn proxy(app: App, headers: HeaderMap, body: Bytes, call: Call) -> anyhow:
             {
                 tracing::info!(status = %response.status(), url = %target.url, "upstream refused; trying the next");
             }
-            Ok(response) => {
-                upstream = Some(response);
-                break;
-            }
+            Ok(response) => return Some(response),
             Err(error) if n < last => {
                 tracing::info!(%error, url = %target.url, "upstream unreachable; trying the next");
             }
             Err(_) => {}
         }
     }
-    let Some(upstream) = upstream else {
-        if !call.count_only {
-            meter
-                .finish(Value::Null, 0, false, "upstream_unreachable", None)
-                .await?;
-        }
+    None
+}
+
+/// A model call the server makes for `user` outside any run (history digests): held to the
+/// same model policy, routes, credentials, organization rate limit and usage ledger as a key's
+/// request. `protocol` is `responses` or `anthropic`; the answer comes at once, as JSON.
+pub async fn complete(
+    app: &App,
+    org: Uuid,
+    user: Uuid,
+    protocol: &str,
+    request: &Value,
+) -> anyhow::Result<Value> {
+    ensure!(app.config.llm.enabled, Code::ModelGatewayDisabled);
+    let (protocol, path) = match protocol {
+        "responses" => (Protocol::Responses, "/v1/responses"),
+        _ => (Protocol::Messages, "/v1/messages"),
+    };
+    let body = Bytes::from(serde_json::to_vec(request)?);
+    let call = Call::of(protocol, path, &body)?;
+    ensure!(!call.streaming, Code::InvalidInput);
+    let mut tx = app.store.tx(org).await?;
+    let ctx = context_in(&mut tx, user, org).await?;
+    let resource = Resource {
+        org_id: org,
+        id: org,
+        owner_user_id: Some(user),
+        target_role: None,
+    };
+    authorize(&Principal::User(ctx), Action::UseModel, &resource).map_err(|_| Code::Forbidden)?;
+    let policy = authorize_model(app, &mut tx, org, None, &call).await?;
+    let (credential, targets) = targets(app, &mut tx, (org, user), &policy, &call).await?;
+    rate_limit(app, &mut tx, org, None).await?;
+    let ledger = Ledger {
+        app: app.clone(),
+        org,
+        request_id: Uuid::now_v7(),
+        protocol,
+        input_bytes: body.len(),
+    };
+    let headers = HeaderMap::new();
+    ledger
+        .start(&mut tx, user, None, &headers, &call, credential)
+        .await?;
+    tx.commit().await?;
+    let Some(upstream) = send(app, &headers, &call, body, targets).await else {
+        ledger
+            .finish(Value::Null, 0, false, "upstream_unreachable", None)
+            .await?;
         anyhow::bail!(Code::UpstreamUnavailable);
     };
     let status = upstream.status();
-    let mut response = Response::builder().status(status);
-    for name in ["content-type", "request-id", "x-request-id"] {
-        if let Some(value) = upstream.headers().get(name) {
-            response = response.header(name, value);
+    let read = async {
+        let mut stream = upstream.bytes_stream();
+        let mut bytes = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            bytes.extend_from_slice(&chunk?);
+            ensure!(bytes.len() <= 4 * 1024 * 1024, Code::ContentTooLarge);
         }
+        Ok::<_, anyhow::Error>(bytes)
     }
-    response = response
-        .header("cache-control", "no-store")
-        .header("x-accel-buffering", "no");
-    if let Some(seconds) = upstream
-        .headers()
-        .get("retry-after")
-        .and_then(|h| h.to_str().ok())
-        .map(retry_after_seconds)
-    {
-        response = response.header("retry-after", seconds.to_string());
-    }
-    let (sender, receiver) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(8);
-    tokio::spawn(meter.forward(upstream, sender));
-    Ok(response.body(Body::from_stream(
-        tokio_stream::wrappers::ReceiverStream::new(receiver),
-    ))?)
+    .await;
+    let value: Value = read
+        .as_deref()
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(bytes).ok())
+        .unwrap_or_default();
+    let usage = value["usage"].clone();
+    let final_usage = usage.is_object();
+    let outcome = match (status.is_success(), final_usage) {
+        (false, _) => "upstream_error",
+        (true, true) => "completed",
+        (true, false) => "interrupted",
+    };
+    let output = read.as_ref().map_or(0, Vec::len);
+    let upstream_status = Some(status.as_u16() as i32);
+    ledger
+        .finish(usage, output, final_usage, outcome, upstream_status)
+        .await?;
+    read?;
+    ensure!(status.is_success(), Code::ModelRequestFailed);
+    Ok(value)
 }
 
 /// Integer seconds in [1, 60], as Claude Code expects.
@@ -666,15 +753,21 @@ fn retry_after_seconds(value: &str) -> u64 {
         .clamp(1, 60)
 }
 
+/// One request's usage record: started when the request is accepted, finished when it ends.
+struct Ledger {
+    app: App,
+    org: Uuid,
+    request_id: Uuid,
+    protocol: Protocol,
+    input_bytes: usize,
+}
+
 /// Forwards one upstream response, re-validates the caller while it streams, and records usage.
 struct Meter {
-    app: App,
+    ledger: Ledger,
     key: GatewayKey,
     model: String,
     credential: Option<Uuid>,
-    request_id: Uuid,
-    input_bytes: usize,
-    protocol: Protocol,
     streaming: bool,
     /// Token counting: nothing to record.
     count_only: bool,
@@ -784,7 +877,7 @@ impl Meter {
         let mut stream = upstream.bytes_stream();
         let mut decoder = SseDecoder::default();
         let mut parsed = StreamUsage::default();
-        let mut notices = self.app.revocations.subscribe();
+        let mut notices = self.ledger.app.revocations.subscribe();
         let mut recheck = tokio::time::interval(STREAM_RECHECK);
         recheck.tick().await;
         let (mut parse_ok, mut completed, mut received) = (true, true, 0usize);
@@ -825,7 +918,7 @@ impl Meter {
                     match decoder.push(&bytes) {
                         Ok(events) => {
                             for event in &events {
-                                parsed.observe(self.protocol, event);
+                                parsed.observe(self.ledger.protocol, event);
                             }
                         }
                         Err(_) => parse_ok = false,
@@ -848,7 +941,7 @@ impl Meter {
             (parsed.usage, parsed.finished)
         } else {
             let value: Value = serde_json::from_slice(&json_body).unwrap_or(Value::Null);
-            let usage = if self.protocol == Protocol::Gemini {
+            let usage = if self.ledger.protocol == Protocol::Gemini {
                 value["usageMetadata"].clone()
             } else {
                 value["usage"].clone()
@@ -863,17 +956,14 @@ impl Meter {
         } else {
             "interrupted"
         };
-        if let Err(error) = self
-            .finish(
-                usage,
-                received,
-                final_usage,
-                outcome,
-                Some(status.as_u16() as i32),
-            )
-            .await
-        {
-            tracing::error!(request_id = %self.request_id, %error, "usage finalization failed");
+        let upstream_status = Some(status.as_u16() as i32);
+        let finished = self
+            .ledger
+            .finish(usage, received, final_usage, outcome, upstream_status)
+            .await;
+        if let Err(error) = finished {
+            let request_id = self.ledger.request_id;
+            tracing::error!(%request_id, %error, "usage finalization failed");
         }
         // The response closes only after accounting; a disconnected client still leaves an
         // estimated record.
@@ -882,7 +972,7 @@ impl Meter {
 
     /// Authorization of an accepted stream: key binding, model policy and credential.
     async fn revalidate(&self) -> anyhow::Result<()> {
-        let mut tx = self.app.store.tx(self.key.org_id).await?;
+        let mut tx = self.ledger.app.store.tx(self.key.org_id).await?;
         let result = self.authorized(&mut tx).await;
         // Read-only: end it explicitly so the connection is back in the pool at once.
         tx.rollback().await?;
@@ -891,7 +981,7 @@ impl Meter {
 
     async fn authorized(&self, tx: &mut Tx<'_>) -> anyhow::Result<()> {
         validate_key(tx, &self.key, true).await?;
-        let policy = effective_policy(tx, &self.app.config.policy, self.key.org_id).await?;
+        let policy = effective_policy(tx, &self.ledger.app.config.policy, self.key.org_id).await?;
         ensure!(
             policy
                 .models
@@ -920,6 +1010,46 @@ impl Meter {
         }
         Ok(())
     }
+}
+
+impl Ledger {
+    /// Record the accepted request in `tx`, with the key and Claude Code's session metadata
+    /// when it came with them.
+    async fn start(
+        &self,
+        tx: &mut Tx<'_>,
+        user: Uuid,
+        key: Option<&GatewayKey>,
+        headers: &HeaderMap,
+        call: &Call,
+        credential: Option<Uuid>,
+    ) -> anyhow::Result<()> {
+        let metadata = |name: &str| {
+            headers
+                .get(name)
+                .and_then(|h| h.to_str().ok())
+                .map(|h| h.chars().take(256).collect::<String>())
+        };
+        sqlx::query(
+            "INSERT INTO usage_records(id,org_id,user_id,run_id,virtual_key_id,model,credential_id,session_id,
+                 agent_id,parent_agent_id,provider)
+             VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
+        )
+        .bind(self.request_id)
+        .bind(self.org)
+        .bind(user)
+        .bind(key.map(|key| key.run_id))
+        .bind(key.filter(|key| key.kind() == KeyKind::Sandbox).map(|key| key.id))
+        .bind(&call.model)
+        .bind(credential)
+        .bind(metadata("x-claude-code-session-id"))
+        .bind(metadata("x-claude-code-agent-id"))
+        .bind(metadata("x-claude-code-parent-agent-id"))
+        .bind(self.protocol.credential())
+        .execute(&mut **tx)
+        .await?;
+        Ok(())
+    }
 
     /// Record usage. Without final provider usage, tokens are estimated from bytes.
     async fn finish(
@@ -934,13 +1064,13 @@ impl Meter {
         let input = input.unwrap_or(self.input_bytes.div_ceil(4) as i64);
         let output = output.unwrap_or(output_bytes.div_ceil(4) as i64);
         let raw = if usage.is_object() { usage } else { json!({}) };
-        let mut tx = self.app.store.tx(self.key.org_id).await?;
+        let mut tx = self.app.store.tx(self.org).await?;
         sqlx::query(
             "UPDATE usage_records SET input_tokens=$3,output_tokens=$4,raw_usage=$5,estimated=$6,status=$7,
                  upstream_status=$8,finished_at=now()
              WHERE org_id=$1 AND id=$2",
         )
-        .bind(self.key.org_id)
+        .bind(self.org)
         .bind(self.request_id)
         .bind(input)
         .bind(output)

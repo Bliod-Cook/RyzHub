@@ -13,6 +13,9 @@ impl Harness {
             config.search.embedding_url = config.llm.upstream_url.clone();
             config.search.embedding_model = "fixture-embedding-v1".into();
             config.search.embedding_key_env = "RYZHUB_TEST_EMBEDDING_KEY".into();
+            // Digests are summarized by the fixture model.
+            config.llm.enabled = true;
+            config.llm.platform_key_env = "RYZHUB_TEST_EMBEDDING_KEY".into();
         })
         .await
     }
@@ -126,9 +129,8 @@ async fn acceptance(h: &Harness) -> anyhow::Result<()> {
     ensure!(
         hits.iter().any(|v| v["item_id"] == json!(item)
             && v["seq"] == 1
-            && v["snippet_html"]
-                .as_str()
-                .is_some_and(|s| s.contains("keyword"))),
+            && v["snippet"] == "我喜欢苹果，中文搜索测试"
+            && v["highlights"] == json!([[3, 5]])),
         "Chinese FTS/snippets/source navigation failed: {hits:?}"
     );
     // Vector and RRF queries use actual halfvec/HNSW, a separately tagged model and live ACL SQL.
@@ -254,7 +256,7 @@ async fn acceptance(h: &Harness) -> anyhow::Result<()> {
         .await?;
     h.drain(org).await?;
     ensure!(
-        !search::publish(&h.app, &old, prepared, vec![]).await?,
+        !search::publish(&h.app, &old, prepared, vec![], None).await?,
         "old worker overwrote v3"
     );
     ensure!(
@@ -293,7 +295,7 @@ async fn acceptance(h: &Harness) -> anyhow::Result<()> {
     let source = search::source(&mut tx, &job).await?;
     tx.commit().await?;
     ensure!(
-        !search::publish(&h.app, &job, source, vec![]).await?,
+        !search::publish(&h.app, &job, source, vec![], None).await?,
         "expired claim published"
     );
     search::process(&h.app, &replacement).await?;
@@ -496,6 +498,15 @@ async fn acceptance(h: &Harness) -> anyhow::Result<()> {
         memory::digest(&h.app, org, conv, owner).await?,
         "digest missing"
     );
+    let gateway: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM usage_records WHERE org_id=$1 AND model='fixture-model'
+           AND run_id IS NULL AND upstream_status=200)
+         AND EXISTS(SELECT 1 FROM model_rate_limits WHERE org_id=$1 AND scope='org')",
+    )
+    .bind(org)
+    .fetch_one(&h.db)
+    .await?;
+    ensure!(gateway, "digest summary bypassed the model gateway");
     h.request(
         &user,
         reqwest::Method::PATCH,
@@ -615,7 +626,7 @@ async fn acceptance(h: &Harness) -> anyhow::Result<()> {
         "associated memories survived requested deletion"
     );
     ensure!(
-        memory::collect_conversation(&h.app, org, conv).await?,
+        ryzhub_server::conversation_commands::collect(&h.app, org, conv).await?,
         "deleted conversation payload collection failed"
     );
     let payloads: i64 = sqlx::query_scalar(

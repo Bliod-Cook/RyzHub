@@ -306,7 +306,7 @@ pub async fn move_conversation(
     if let Some(project) = input.project_id {
         owned(&mut tx, org, ctx.user_id, project, true).await?;
     }
-    idle(&mut tx, org, conv).await?;
+    crate::conversation_commands::idle(&mut tx, org, conv).await?;
     // Deletion may have committed while we waited for the conversation channel.
     conversation_in(&mut tx, &ctx, conv).await?;
     let old: Option<String> = sqlx::query_scalar(
@@ -329,28 +329,6 @@ pub async fn move_conversation(
     Ok(Json(json!({"moved":true,"memory_notice":memory_notice})))
 }
 
-/// Lock the conversation's channel (serializing with command admission) and require that
-/// nothing is running in it.
-pub async fn idle(tx: &mut Tx<'_>, org: Uuid, conv: Uuid) -> anyhow::Result<()> {
-    sqlx::query("SELECT id FROM channels WHERE org_id=$1 AND conversation_id=$2 FOR UPDATE")
-        .bind(org)
-        .bind(conv)
-        .fetch_one(&mut **tx)
-        .await?;
-    let busy: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM runs WHERE org_id=$1 AND conversation_id=$2 AND state IN ('running','requires_action'))
-         OR EXISTS(SELECT 1 FROM workspace_jobs WHERE org_id=$1 AND conversation_id=$2 AND kind IN ('archive','restore')
-                   AND state IN ('queued','running'))
-         OR EXISTS(SELECT 1 FROM conversation_operations WHERE org_id=$1 AND conversation_id=$2 AND state IN ('queued','running'))",
-    )
-    .bind(org)
-    .bind(conv)
-    .fetch_one(&mut **tx)
-    .await?;
-    ensure!(!busy, Code::ConversationBusy);
-    Ok(())
-}
-
 /// `DELETE /orgs/{org}/projects/{project}`: hide the project and its conversations. It can be
 /// restored for [`RECOVERABLE_DAYS`]; after that the collector purges it.
 pub async fn delete(
@@ -368,11 +346,7 @@ pub async fn delete(
     .fetch_all(&mut *tx)
     .await?;
     for conv in convs {
-        idle(&mut tx, org, conv).await?;
-        require!(
-            !workspace_job_active(&mut tx, org, conv).await?,
-            Code::WorkspaceBusy
-        );
+        crate::conversation_commands::deletable(&mut tx, org, conv).await?;
     }
     sqlx::query(
         "UPDATE conversations SET project_deleted_state=state,state='deletion_pending'
@@ -516,30 +490,27 @@ pub async fn search(tx: &mut Tx<'_>, org: Uuid, run: Uuid, query: &str) -> anyho
         !query.trim().is_empty() && query.len() <= 512,
         Code::InvalidToolArguments
     );
-    let (project,user): (Option<Uuid>,Uuid) = sqlx::query_as("SELECT r.project_id,c.creator_id FROM runs r JOIN conversations c ON c.org_id=r.org_id AND c.id=r.conversation_id WHERE r.org_id=$1 AND r.id=$2")
-        .bind(org).bind(run).fetch_one(&mut **tx).await?;
+    let (project, user): (Option<Uuid>, Uuid) = sqlx::query_as(
+        "SELECT r.project_id,c.creator_id FROM runs r
+         JOIN conversations c ON c.org_id=r.org_id AND c.id=r.conversation_id
+         WHERE r.org_id=$1 AND r.id=$2",
+    )
+    .bind(org)
+    .bind(run)
+    .fetch_one(&mut **tx)
+    .await?;
     let Some(project) = project else {
         return Ok(json!({"matches":[]}));
     };
-    use crate::search::SearchBackend;
     let q = crate::search::SearchQuery {
         q: query.into(),
         project: Some(project),
         run: Some(run),
         ..Default::default()
     };
-    let mut matches = crate::search::PostgresSearch
-        .search(
-            tx,
-            org,
-            user,
-            &q,
-            crate::search::Boundary::default(),
-            "project_file",
-            None,
-            "",
-        )
-        .await?;
+    let boundary = crate::search::Boundary::default();
+    let mut matches =
+        crate::search::search(tx, org, user, &q, boundary, "project_file", None, "").await?;
     // A run keeps its immutable knowledge after a file edit. If that version is no
     // longer in the live index (or indexing is pending), query the frozen text with
     // PGroonga, still joining the live project/file/creator/member authorization.
@@ -547,17 +518,28 @@ pub async fn search(tx: &mut Tx<'_>, org: Uuid, run: Uuid, query: &str) -> anyho
         .iter()
         .filter_map(|v| v["file"].as_str().map(str::to_owned))
         .collect();
-    let frozen:Vec<Value>=sqlx::query_scalar("SELECT jsonb_build_object('file',entry.key,'line',1,'text',left(entry.value,1500),
-        'snippet_html',array_to_string(pgroonga_snippet_html(entry.value,ARRAY[$4]),' … '))
-        FROM runs r JOIN conversations c ON c.org_id=r.org_id AND c.id=r.conversation_id
-        JOIN projects p ON p.org_id=r.org_id AND p.id=r.project_id
-        JOIN project_revisions rev ON rev.org_id=r.org_id AND rev.id=r.project_revision_id
-        CROSS JOIN LATERAL jsonb_each_text(rev.files) entry
-        JOIN project_files f ON f.org_id=p.org_id AND f.project_id=p.id AND f.name=entry.key
-        WHERE r.org_id=$1 AND r.id=$2 AND c.creator_id=$3 AND p.creator_id=$3 AND p.state='active'
-          AND c.state IN ('active','archived') AND EXISTS(SELECT 1 FROM memberships WHERE org_id=$1 AND user_id=$3)
-          AND NOT (entry.key=ANY($5)) AND entry.value &@~ pgroonga_query_escape($4) LIMIT 20")
-        .bind(org).bind(run).bind(user).bind(query).bind(&indexed).fetch_all(&mut **tx).await?;
+    let mut frozen: Vec<Value> = sqlx::query_scalar(
+        "SELECT jsonb_build_object('file',entry.key,'line',1,'text',left(entry.value,1500),
+           'snippet_html',array_to_string(pgroonga_snippet_html(entry.value,
+             pgroonga_query_extract_keywords(pgroonga_query_escape($4))),' … '))
+         FROM runs r JOIN conversations c ON c.org_id=r.org_id AND c.id=r.conversation_id
+         JOIN projects p ON p.org_id=r.org_id AND p.id=r.project_id
+         JOIN project_revisions rev ON rev.org_id=r.org_id AND rev.id=r.project_revision_id
+         CROSS JOIN LATERAL jsonb_each_text(rev.files) entry
+         JOIN project_files f ON f.org_id=p.org_id AND f.project_id=p.id AND f.name=entry.key
+         WHERE r.org_id=$1 AND r.id=$2 AND c.creator_id=$3 AND p.creator_id=$3 AND p.state='active'
+           AND c.state IN ('active','archived')
+           AND EXISTS(SELECT 1 FROM memberships WHERE org_id=$1 AND user_id=$3)
+           AND NOT (entry.key=ANY($5)) AND entry.value &@~ pgroonga_query_escape($4) LIMIT 20",
+    )
+    .bind(org)
+    .bind(run)
+    .bind(user)
+    .bind(query)
+    .bind(&indexed)
+    .fetch_all(&mut **tx)
+    .await?;
+    crate::search::snippets(&mut frozen);
     matches.extend(frozen);
     matches.truncate(20);
     Ok(json!({"matches":matches}))
@@ -593,16 +575,6 @@ pub async fn mount(app: &App, lease: &Lease, run: Uuid, sandbox: Uuid) -> anyhow
     Ok(())
 }
 
-async fn workspace_job_active(tx: &mut Tx<'_>, org: Uuid, conv: Uuid) -> anyhow::Result<bool> {
-    Ok(sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM workspace_jobs WHERE org_id=$1 AND conversation_id=$2 AND state IN ('queued','running'))",
-    )
-    .bind(org)
-    .bind(conv)
-    .fetch_one(&mut **tx)
-    .await?)
-}
-
 /// Purge a project whose recovery window has passed: destroy its conversations' sandboxes and
 /// stored content. Ids and accounting stay as tombstones. Holds the same project and channel
 /// locks as restore and command admission.
@@ -628,60 +600,7 @@ pub async fn collect(app: &App, org: Uuid, project: Uuid) -> anyhow::Result<bool
     .fetch_all(&mut *tx)
     .await?;
     for conv in conversations {
-        idle(&mut tx, org, conv).await?;
-        ensure!(
-            !workspace_job_active(&mut tx, org, conv).await?,
-            Code::WorkspaceBusy
-        );
-        let epoch: i64 = sqlx::query_scalar(
-            "UPDATE channels SET writer_epoch=writer_epoch+1,owner_id=NULL,lease_until=NULL,published_seq=last_seq
-             WHERE org_id=$1 AND conversation_id=$2 RETURNING writer_epoch",
-        )
-        .bind(org)
-        .bind(conv)
-        .fetch_one(&mut *tx)
-        .await?;
-        let sandboxes: Vec<(Uuid, i64)> = sqlx::query_as(
-            "SELECT id,exec_epoch FROM sandboxes WHERE org_id=$1 AND conversation_id=$2",
-        )
-        .bind(org)
-        .bind(conv)
-        .fetch_all(&mut *tx)
-        .await?;
-        for (sandbox_id, old_epoch) in &sandboxes {
-            crate::sandbox::host(
-                app,
-                org,
-                *sandbox_id,
-                HostCommand::Destroy {
-                    sandbox_id: *sandbox_id,
-                    exec_epoch: epoch.max(*old_epoch + 1) as u64,
-                },
-            )
-            .await?;
-        }
-        if !sandboxes.is_empty() {
-            let artifacts: Vec<Uuid> = sqlx::query_scalar(
-                "SELECT id FROM checkpoints WHERE org_id=$1 AND conversation_id=$2
-                 UNION SELECT id FROM workspace_jobs WHERE org_id=$1 AND conversation_id=$2",
-            )
-            .bind(org)
-            .bind(conv)
-            .fetch_all(&mut *tx)
-            .await?;
-            crate::sandbox::host_workspace(
-                app,
-                org,
-                conv,
-                HostCommand::PurgeWorkspace {
-                    org_id: org,
-                    workspace_id: conv,
-                    artifacts,
-                },
-            )
-            .await?;
-        }
-        purge_conversation(&mut tx, org, conv, epoch).await?;
+        crate::conversation_commands::purge(app, &mut tx, org, conv).await?;
     }
     let memories: Vec<Uuid> =
         sqlx::query_scalar("SELECT id FROM memory_items WHERE org_id=$1 AND project_id=$2")
@@ -731,102 +650,6 @@ pub async fn collect(app: &App, org: Uuid, project: Uuid) -> anyhow::Result<bool
     }
     crate::workspace::collect_org(app, org).await?;
     Ok(true)
-}
-
-/// Delete a conversation's content, keeping ids and accounting rows as tombstones.
-pub(crate) async fn purge_conversation(
-    tx: &mut Tx<'_>,
-    org: Uuid,
-    conv: Uuid,
-    epoch: i64,
-) -> anyhow::Result<()> {
-    // Every statement is scoped by ($1 org, $2 conversation), in dependency order. Table names
-    // are fixed identifiers, never input.
-    let runs = "SELECT id FROM runs WHERE org_id=$1 AND conversation_id=$2";
-    let mut statements = vec![
-        // Seed pointers reference loop steps about to be deleted.
-        "UPDATE runs SET seed_run_id=NULL,seed_step=NULL WHERE org_id=$1 AND conversation_id=$2"
-            .to_owned(),
-    ];
-    for table in [
-        "pending_inputs",
-        "loop_steps",
-        "native_requests",
-        "mcp_calls",
-        "tool_calls",
-        "pending_actions",
-    ] {
-        statements.push(format!(
-            "DELETE FROM {table} WHERE org_id=$1 AND run_id IN ({runs})"
-        ));
-    }
-    statements.push(
-        "DELETE FROM guest_events WHERE org_id=$1
-         AND sandbox_id IN (SELECT id FROM sandboxes WHERE org_id=$1 AND conversation_id=$2)"
-            .into(),
-    );
-    for table in [
-        "commands",
-        "conversation_operations",
-        "workspace_jobs",
-        "workspace_heads",
-        "chat_images",
-        // References only: the files stay in their owner's library.
-        "conversation_files",
-    ] {
-        statements.push(format!(
-            "DELETE FROM {table} WHERE org_id=$1 AND conversation_id=$2"
-        ));
-    }
-    statements.extend(
-        [
-            // A fork's restore pin is keyed by the forked conversation.
-            "DELETE FROM conversation_digests WHERE org_id=$1 AND conversation_id=$2",
-            "UPDATE conversations SET memory_snapshot=NULL,expires_at=NULL WHERE org_id=$1 AND id=$2",
-            "DELETE FROM restore_pins WHERE org_id=$1 AND id=$2",
-            "UPDATE checkpoints SET state='tombstoned',delete_after=now()
-             WHERE org_id=$1 AND conversation_id=$2 AND state<>'deleted'",
-            "UPDATE virtual_keys SET revoked_at=coalesce(revoked_at,now()) WHERE org_id=$1 AND conversation_id=$2",
-            "UPDATE items SET text='',detail=NULL,state='invalidated',revision=revision+1
-             WHERE org_id=$1 AND conversation_id=$2",
-            "UPDATE runs SET response_text='',seed_messages='[]' WHERE org_id=$1 AND conversation_id=$2",
-        ]
-        .map(String::from),
-    );
-    for statement in statements {
-        sqlx::query(sqlx::AssertSqlSafe(statement))
-            .bind(org)
-            .bind(conv)
-            .execute(&mut **tx)
-            .await?;
-    }
-    sqlx::query("DELETE FROM search_docs WHERE org_id=$1 AND conversation_id=$2")
-        .bind(org)
-        .bind(conv)
-        .execute(&mut **tx)
-        .await?;
-    sqlx::query("DELETE FROM events WHERE org_id=$1 AND channel_id=$2")
-        .bind(org)
-        .bind(format!("conv:{conv}"))
-        .execute(&mut **tx)
-        .await?;
-    sqlx::query(
-        "UPDATE sandboxes SET state='deleted',exec_epoch=$3 WHERE org_id=$1 AND conversation_id=$2",
-    )
-    .bind(org)
-    .bind(conv)
-    .bind(epoch)
-    .execute(&mut **tx)
-    .await?;
-    sqlx::query(
-        "UPDATE conversations SET state='deleted',title='',context_seed=NULL,native_fork=NULL,project_deleted_state=NULL
-         WHERE org_id=$1 AND id=$2",
-    )
-    .bind(org)
-    .bind(conv)
-    .execute(&mut **tx)
-    .await?;
-    Ok(())
 }
 
 /// Owner-role loop purging projects whose recovery window has passed.

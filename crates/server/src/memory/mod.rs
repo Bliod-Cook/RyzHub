@@ -78,8 +78,15 @@ pub async fn run_access(
     org: Uuid,
     run: Uuid,
 ) -> anyhow::Result<Access> {
-    let (conv,user):(Uuid,Uuid)=sqlx::query_as("SELECT c.id,c.creator_id FROM runs r JOIN conversations c ON c.org_id=r.org_id AND c.id=r.conversation_id WHERE r.org_id=$1 AND r.id=$2")
-        .bind(org).bind(run).fetch_one(&mut **tx).await?;
+    let (conv, user): (Uuid, Uuid) = sqlx::query_as(
+        "SELECT c.id,c.creator_id FROM runs r
+         JOIN conversations c ON c.org_id=r.org_id AND c.id=r.conversation_id
+         WHERE r.org_id=$1 AND r.id=$2",
+    )
+    .bind(org)
+    .bind(run)
+    .fetch_one(&mut **tx)
+    .await?;
     access(tx, &app.config, org, conv, user).await
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -138,8 +145,15 @@ pub fn redact(text: &str) -> String {
         .collect()
 }
 pub async fn preferences(tx: &mut Tx<'_>, org: Uuid, user: Uuid) -> anyhow::Result<Value> {
-    Ok(sqlx::query_scalar("SELECT jsonb_build_object('enabled',enabled,'reference_history',reference_history) FROM memory_preferences WHERE org_id=$1 AND user_id=$2")
-        .bind(org).bind(user).fetch_optional(&mut **tx).await?.unwrap_or(json!({"enabled":true,"reference_history":true})))
+    Ok(sqlx::query_scalar(
+        "SELECT jsonb_build_object('enabled',enabled,'reference_history',reference_history)
+         FROM memory_preferences WHERE org_id=$1 AND user_id=$2",
+    )
+    .bind(org)
+    .bind(user)
+    .fetch_optional(&mut **tx)
+    .await?
+    .unwrap_or(json!({"enabled":true,"reference_history":true})))
 }
 pub async fn scope(
     tx: &mut Tx<'_>,
@@ -148,15 +162,30 @@ pub async fn scope(
     project: Option<Uuid>,
 ) -> anyhow::Result<()> {
     if let Some(project) = project {
-        let valid:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM projects WHERE org_id=$1 AND id=$2 AND creator_id=$3 AND state='active' AND memory_mode='project_only')")
-            .bind(org).bind(project).bind(user).fetch_one(&mut **tx).await?;
+        let valid: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM projects WHERE org_id=$1 AND id=$2 AND creator_id=$3
+               AND state='active' AND memory_mode='project_only')",
+        )
+        .bind(org)
+        .bind(project)
+        .bind(user)
+        .fetch_one(&mut **tx)
+        .await?;
         ensure!(valid, Code::Forbidden);
     }
     Ok(())
 }
 async fn row(tx: &mut Tx<'_>, org: Uuid, user: Uuid, id: Uuid) -> anyhow::Result<Value> {
-    sqlx::query_scalar("SELECT to_jsonb(m) FROM memory_items m WHERE org_id=$1 AND user_id=$2 AND id=$3 FOR UPDATE")
-        .bind(org).bind(user).bind(id).fetch_optional(&mut **tx).await?.context(Code::Forbidden)
+    sqlx::query_scalar(
+        "SELECT to_jsonb(m) FROM memory_items m
+         WHERE org_id=$1 AND user_id=$2 AND id=$3 FOR UPDATE",
+    )
+    .bind(org)
+    .bind(user)
+    .bind(id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .context(Code::Forbidden)
 }
 /// Categories the platform keeps out of memory, with the words that mark them.
 pub const CATEGORIES: [(&str, &[&str]); 6] = [
@@ -240,10 +269,20 @@ pub async fn save(
         .bind(user)
         .execute(&mut **tx)
         .await?;
-    if let Some(key)=&input.request_key && let Some((result,old))=sqlx::query_as::<_,(Value,Option<Vec<u8>>)>("SELECT after_state || jsonb_build_object('event_id',id),request_fingerprint FROM memory_events WHERE org_id=$1 AND user_id=$2 AND request_key=$3")
-        .bind(org).bind(user).bind(key).fetch_optional(&mut **tx).await? {
-        ensure!(old.as_ref()==Some(&fingerprint),Code::RequestIdReused);
-        return Ok(result);
+    if let Some(key) = &input.request_key {
+        let earlier: Option<(Value, Option<Vec<u8>>)> = sqlx::query_as(
+            "SELECT after_state || jsonb_build_object('event_id',id),request_fingerprint
+             FROM memory_events WHERE org_id=$1 AND user_id=$2 AND request_key=$3",
+        )
+        .bind(org)
+        .bind(user)
+        .bind(key)
+        .fetch_optional(&mut **tx)
+        .await?;
+        if let Some((result, old)) = earlier {
+            ensure!(old.as_ref() == Some(&fingerprint), Code::RequestIdReused);
+            return Ok(result);
+        }
     }
     let before = if let Some(id) = input.replace {
         let old = row(tx, org, user, id).await?;
@@ -272,20 +311,56 @@ pub async fn save(
     });
     let id = Uuid::now_v7();
     if let Some(old) = &before {
-        sqlx::query("UPDATE memory_items SET status='archived',invalid_at=now(),superseded_by=$4,version=version+1,updated_at=now() WHERE org_id=$1 AND user_id=$2 AND id=$3")
-            .bind(org).bind(user).bind(input.replace).bind(id).execute(&mut **tx).await?;
+        sqlx::query(
+            "UPDATE memory_items SET status='archived',invalid_at=now(),superseded_by=$4,
+               version=version+1,updated_at=now()
+             WHERE org_id=$1 AND user_id=$2 AND id=$3",
+        )
+        .bind(org)
+        .bind(user)
+        .bind(input.replace)
+        .bind(id)
+        .execute(&mut **tx)
+        .await?;
         ensure!(old["version"].is_i64(), Code::InvalidArguments);
     }
-    sqlx::query("INSERT INTO memory_items(id,org_id,user_id,scope,project_id,content,priority,source_conversation_id)
-        VALUES($1,$2,$3,$4,$5,$6,$7,$8)")
-        .bind(id).bind(org).bind(user).bind(if input.project_id.is_some(){"project"}else{"user"})
-        .bind(input.project_id).bind(redact(&input.content)).bind(priority).bind(source)
-        .execute(&mut **tx).await?;
+    sqlx::query(
+        "INSERT INTO memory_items(id,org_id,user_id,scope,project_id,content,priority,
+           source_conversation_id)
+         VALUES($1,$2,$3,$4,$5,$6,$7,$8)",
+    )
+    .bind(id)
+    .bind(org)
+    .bind(user)
+    .bind(if input.project_id.is_some() {
+        "project"
+    } else {
+        "user"
+    })
+    .bind(input.project_id)
+    .bind(redact(&input.content))
+    .bind(priority)
+    .bind(source)
+    .execute(&mut **tx)
+    .await?;
     let after = row(tx, org, user, id).await?;
     let event = Uuid::now_v7();
-    sqlx::query("INSERT INTO memory_events(id,org_id,user_id,memory_id,action,before_state,after_state,request_key,request_fingerprint) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)")
-        .bind(event).bind(org).bind(user).bind(id).bind(if before.is_some(){"update"}else{"add"})
-        .bind(before).bind(&after).bind(input.request_key).bind(fingerprint).execute(&mut **tx).await?;
+    sqlx::query(
+        "INSERT INTO memory_events(id,org_id,user_id,memory_id,action,before_state,after_state,
+           request_key,request_fingerprint)
+         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)",
+    )
+    .bind(event)
+    .bind(org)
+    .bind(user)
+    .bind(id)
+    .bind(if before.is_some() { "update" } else { "add" })
+    .bind(before)
+    .bind(&after)
+    .bind(input.request_key)
+    .bind(fingerprint)
+    .execute(&mut **tx)
+    .await?;
     Ok(
         json!({"id":id,"event_id":event,"content":after["content"],"version":1,"message":"记忆已更新"}),
     )
@@ -309,22 +384,52 @@ pub async fn forget(
         .bind(user)
         .execute(&mut **tx)
         .await?;
-    if let Some(key)=&key && let Some((event,old))=sqlx::query_as::<_,(Uuid,Option<Vec<u8>>)>("SELECT id,request_fingerprint FROM memory_events WHERE org_id=$1 AND user_id=$2 AND request_key=$3")
-        .bind(org).bind(user).bind(key).fetch_optional(&mut **tx).await? {
-        ensure!(old.as_ref()==Some(&fingerprint),Code::RequestIdReused);
-        return Ok(json!({"event_id":event,"message":"记忆已删除"}));
+    if let Some(key) = &key {
+        let earlier: Option<(Uuid, Option<Vec<u8>>)> = sqlx::query_as(
+            "SELECT id,request_fingerprint FROM memory_events
+             WHERE org_id=$1 AND user_id=$2 AND request_key=$3",
+        )
+        .bind(org)
+        .bind(user)
+        .bind(key)
+        .fetch_optional(&mut **tx)
+        .await?;
+        if let Some((event, old)) = earlier {
+            ensure!(old.as_ref() == Some(&fingerprint), Code::RequestIdReused);
+            return Ok(json!({"event_id":event,"message":"记忆已删除"}));
+        }
     }
     let before = row(tx, org, user, id).await?;
     ensure!(
         before["status"] == "active" && before["project_id"] == json!(project),
         Code::Forbidden
     );
-    sqlx::query("UPDATE memory_items SET status='deleted',invalid_at=now(),version=version+1,updated_at=now() WHERE org_id=$1 AND id=$2")
-        .bind(org).bind(id).execute(&mut **tx).await?;
+    sqlx::query(
+        "UPDATE memory_items SET status='deleted',invalid_at=now(),version=version+1,
+           updated_at=now()
+         WHERE org_id=$1 AND id=$2",
+    )
+    .bind(org)
+    .bind(id)
+    .execute(&mut **tx)
+    .await?;
     let after = row(tx, org, user, id).await?;
     let event = Uuid::now_v7();
-    sqlx::query("INSERT INTO memory_events(id,org_id,user_id,memory_id,action,before_state,after_state,request_key,request_fingerprint) VALUES($1,$2,$3,$4,'delete',$5,$6,$7,$8)")
-        .bind(event).bind(org).bind(user).bind(id).bind(before).bind(after).bind(key).bind(fingerprint).execute(&mut **tx).await?;
+    sqlx::query(
+        "INSERT INTO memory_events(id,org_id,user_id,memory_id,action,before_state,after_state,
+           request_key,request_fingerprint)
+         VALUES($1,$2,$3,$4,'delete',$5,$6,$7,$8)",
+    )
+    .bind(event)
+    .bind(org)
+    .bind(user)
+    .bind(id)
+    .bind(before)
+    .bind(after)
+    .bind(key)
+    .bind(fingerprint)
+    .execute(&mut **tx)
+    .await?;
     Ok(json!({"id":id,"event_id":event,"message":"记忆已删除"}))
 }
 pub async fn undo(tx: &mut Tx<'_>, org: Uuid, user: Uuid, event: Uuid) -> anyhow::Result<Value> {
@@ -332,12 +437,21 @@ pub async fn undo(tx: &mut Tx<'_>, org: Uuid, user: Uuid, event: Uuid) -> anyhow
         .bind(user)
         .execute(&mut **tx)
         .await?;
-    let e=sqlx::query("SELECT memory_id,before_state,after_state,undone_at FROM memory_events WHERE org_id=$1 AND user_id=$2 AND id=$3 FOR UPDATE")
-        .bind(org).bind(user).bind(event).fetch_optional(&mut **tx).await?.context(Code::Forbidden)?;
+    let e = sqlx::query(
+        "SELECT memory_id,before_state,after_state,undone_at FROM memory_events
+         WHERE org_id=$1 AND user_id=$2 AND id=$3 FOR UPDATE",
+    )
+    .bind(org)
+    .bind(user)
+    .bind(event)
+    .fetch_optional(&mut **tx)
+    .await?
+    .context(Code::Forbidden)?;
+    // Already undone, or changed since: undoing (again) cannot succeed.
     ensure!(
         e.get::<Option<chrono::DateTime<chrono::Utc>>, _>("undone_at")
             .is_none(),
-        Code::ConversationBusy
+        Code::MemoryUndoUnavailable
     );
     let id: Uuid = e.get("memory_id");
     let after: Value = e.get("after_state");
@@ -347,7 +461,7 @@ pub async fn undo(tx: &mut Tx<'_>, org: Uuid, user: Uuid, event: Uuid) -> anyhow
     scope(tx, org, user, project).await?;
     ensure!(
         current["version"] == after["version"],
-        Code::ConversationBusy
+        Code::MemoryUndoUnavailable
     );
     if let Some(old) = &before
         && old["id"] != after["id"]
@@ -357,15 +471,30 @@ pub async fn undo(tx: &mut Tx<'_>, org: Uuid, user: Uuid, event: Uuid) -> anyhow
         ensure!(
             current_old["superseded_by"] == json!(id)
                 && current_old["version"].as_i64() == old["version"].as_i64().map(|v| v + 1),
-            Code::ConversationBusy
+            Code::MemoryUndoUnavailable
         );
-        sqlx::query("UPDATE memory_items SET status='active',invalid_at=NULL,superseded_by=NULL,version=version+1,updated_at=now() WHERE org_id=$1 AND id=$2")
-            .bind(org).bind(old_id).execute(&mut **tx).await?;
+        sqlx::query(
+            "UPDATE memory_items SET status='active',invalid_at=NULL,superseded_by=NULL,
+               version=version+1,updated_at=now()
+             WHERE org_id=$1 AND id=$2",
+        )
+        .bind(org)
+        .bind(old_id)
+        .execute(&mut **tx)
+        .await?;
     }
     let restore = before.as_ref().is_some_and(|old| old["id"] == after["id"]);
-    sqlx::query("UPDATE memory_items SET status=$3,invalid_at=CASE WHEN $3='active' THEN NULL ELSE now() END,
-        version=version+1,updated_at=now() WHERE org_id=$1 AND id=$2")
-        .bind(org).bind(id).bind(if restore{"active"}else{"deleted"}).execute(&mut **tx).await?;
+    sqlx::query(
+        "UPDATE memory_items SET status=$3,
+           invalid_at=CASE WHEN $3='active' THEN NULL ELSE now() END,
+           version=version+1,updated_at=now()
+         WHERE org_id=$1 AND id=$2",
+    )
+    .bind(org)
+    .bind(id)
+    .bind(if restore { "active" } else { "deleted" })
+    .execute(&mut **tx)
+    .await?;
     sqlx::query("UPDATE memory_events SET undone_at=now() WHERE org_id=$1 AND id=$2")
         .bind(org)
         .bind(event)
@@ -409,18 +538,38 @@ pub async fn context(
     let snap = match old {
         Some(s) => s,
         None => {
-            let saved:Vec<Value>=sqlx::query_scalar("SELECT jsonb_build_object('id',id) FROM memory_items
-            WHERE org_id=$1 AND user_id=$2 AND status='active' AND project_id IS NOT DISTINCT FROM $3::uuid
-            ORDER BY priority DESC,last_used_at DESC NULLS LAST,created_at DESC LIMIT 1000")
-            .bind(org).bind(user).bind(a.project).fetch_all(&mut **tx).await?;
-            let recent:Vec<Value>=sqlx::query_scalar("SELECT jsonb_build_object('id',d.conversation_id,'title',d.title,'points',d.user_points,'source','/orgs/'||d.org_id||'/conversations/'||d.conversation_id)
-            FROM conversation_digests d JOIN conversations c ON c.org_id=d.org_id AND c.id=d.conversation_id
-            LEFT JOIN projects p ON p.org_id=c.org_id AND p.id=c.project_id
-            WHERE $5 AND d.org_id=$1 AND d.user_id=$2 AND c.creator_id=$2 AND NOT c.temporary AND c.state IN ('active','archived')
-              AND (c.project_id IS NULL OR p.state='active') AND c.id<>$4
-              AND (($3::uuid IS NOT NULL AND c.project_id=$3) OR ($3 IS NULL AND coalesce(p.memory_mode,'default')<>'project_only'))
-            ORDER BY d.updated_at DESC LIMIT 30")
-            .bind(org).bind(user).bind(a.project).bind(conversation).bind(a.history).fetch_all(&mut **tx).await?;
+            let saved: Vec<Value> = sqlx::query_scalar(
+                "SELECT jsonb_build_object('id',id) FROM memory_items
+                 WHERE org_id=$1 AND user_id=$2 AND status='active'
+                   AND project_id IS NOT DISTINCT FROM $3::uuid
+                 ORDER BY priority DESC,last_used_at DESC NULLS LAST,created_at DESC LIMIT 1000",
+            )
+            .bind(org)
+            .bind(user)
+            .bind(a.project)
+            .fetch_all(&mut **tx)
+            .await?;
+            let recent: Vec<Value> = sqlx::query_scalar(
+                "SELECT jsonb_build_object('id',d.conversation_id,'title',d.title,
+                   'points',d.user_points,
+                   'source','/orgs/'||d.org_id||'/conversations/'||d.conversation_id)
+                 FROM conversation_digests d
+                 JOIN conversations c ON c.org_id=d.org_id AND c.id=d.conversation_id
+                 LEFT JOIN projects p ON p.org_id=c.org_id AND p.id=c.project_id
+                 WHERE $5 AND d.org_id=$1 AND d.user_id=$2 AND c.creator_id=$2 AND NOT c.temporary
+                   AND c.state IN ('active','archived')
+                   AND (c.project_id IS NULL OR p.state='active')
+                   AND c.id<>$4 AND (($3::uuid IS NOT NULL AND c.project_id=$3)
+                     OR ($3 IS NULL AND coalesce(p.memory_mode,'default')<>'project_only'))
+                 ORDER BY d.updated_at DESC LIMIT 30",
+            )
+            .bind(org)
+            .bind(user)
+            .bind(a.project)
+            .bind(conversation)
+            .bind(a.history)
+            .fetch_all(&mut **tx)
+            .await?;
             let snap = json!({"saved":saved,"recent":recent});
             sqlx::query("UPDATE conversations SET memory_snapshot=$3 WHERE org_id=$1 AND id=$2")
                 .bind(org)
@@ -442,9 +591,18 @@ pub async fn context(
         .iter()
         .map(|v| Uuid::parse_str(v["id"].as_str().context("memory id")?).map_err(Into::into))
         .collect::<anyhow::Result<Vec<_>>>()?;
-    let active:Vec<(Uuid,String)>=sqlx::query_as("SELECT id,content FROM memory_items WHERE org_id=$1 AND user_id=$2 AND id=ANY($3) AND status='active' AND project_id IS NOT DISTINCT FROM $4::uuid")
-        .bind(org).bind(user).bind(&ids).bind(a.project).fetch_all(&mut **tx).await?;
-    let active: std::collections::HashMap<_, _> = active.into_iter().collect();
+    let active: std::collections::HashMap<Uuid, String> = sqlx::query_as(
+        "SELECT id,content FROM memory_items WHERE org_id=$1 AND user_id=$2 AND id=ANY($3)
+           AND status='active' AND project_id IS NOT DISTINCT FROM $4::uuid",
+    )
+    .bind(org)
+    .bind(user)
+    .bind(&ids)
+    .bind(a.project)
+    .fetch_all(&mut **tx)
+    .await?
+    .into_iter()
+    .collect();
     let mut used_ids = Vec::new();
     for entry in saved {
         let id = Uuid::parse_str(entry["id"].as_str().context("memory id")?)?;
@@ -466,19 +624,46 @@ pub async fn context(
     .execute(&mut **tx)
     .await?;
     if a.history {
-        for entry in snap["recent"].as_array().context("recent snapshot")? {
-            let id = Uuid::parse_str(entry["id"].as_str().context("conversation id")?)?;
-            if access(tx, config, org, id, user)
-                .await
-                .is_ok_and(|x| x.enabled && x.project == a.project)
-                && append_data(&mut text, &mut budget, "recent", entry)
-            {
+        let recent = snap["recent"].as_array().context("recent snapshot")?;
+        let ids = recent
+            .iter()
+            .map(|v| {
+                Uuid::parse_str(v["id"].as_str().context("conversation id")?).map_err(Into::into)
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let visible = visible_history(tx, org, user, a.project, &ids).await?;
+        for (entry, id) in recent.iter().zip(&ids) {
+            if visible.contains(id) && append_data(&mut text, &mut budget, "recent", entry) {
                 used.push(entry.clone());
             }
         }
     }
     text.push_str("</memory>\n");
     Ok(MemoryContext { text, used })
+}
+/// Of the conversations `ids`, those whose history the user's conversations in memory scope
+/// `project` may still show: the user's own, visible, not temporary and in the same scope.
+async fn visible_history(
+    tx: &mut Tx<'_>,
+    org: Uuid,
+    user: Uuid,
+    project: Option<Uuid>,
+    ids: &[Uuid],
+) -> anyhow::Result<Vec<Uuid>> {
+    Ok(sqlx::query_scalar(
+        "SELECT c.id FROM conversations c
+         LEFT JOIN projects p ON p.org_id=c.org_id AND p.id=c.project_id
+         WHERE c.org_id=$1 AND c.id=ANY($2) AND c.creator_id=$3 AND c.state IN ('active','archived')
+           AND NOT c.temporary AND (c.project_id IS NULL OR p.state='active')
+           AND (CASE WHEN p.memory_mode='project_only' THEN c.project_id END)
+             IS NOT DISTINCT FROM $4::uuid",
+    )
+    .bind(org)
+    .bind(ids)
+    .bind(user)
+    .bind(project)
+    .fetch_all(&mut **tx)
+    .await?)
 }
 fn append_data(text: &mut String, budget: &mut usize, tag: &str, value: &Value) -> bool {
     let encoded = value
@@ -506,15 +691,35 @@ pub async fn digest(app: &App, org: Uuid, conversation: Uuid, user: Uuid) -> any
         return Ok(false);
     }
     let words = forbidden_words(&policy);
-    let idle:bool=sqlx::query_scalar("SELECT NOT EXISTS(SELECT 1 FROM runs WHERE org_id=$1 AND conversation_id=$2 AND state IN ('running','requires_action'))")
-        .bind(org).bind(conversation).fetch_one(&mut *tx).await?;
+    let idle: bool = sqlx::query_scalar(
+        "SELECT NOT EXISTS(SELECT 1 FROM runs WHERE org_id=$1 AND conversation_id=$2
+           AND state IN ('running','requires_action'))",
+    )
+    .bind(org)
+    .bind(conversation)
+    .fetch_one(&mut *tx)
+    .await?;
     if !idle {
         return Ok(false);
     }
-    let (title,revision,version):(String,i64,i64)=sqlx::query_as("SELECT c.title,c.search_revision,coalesce((SELECT max(last_seq) FROM items WHERE org_id=c.org_id AND conversation_id=c.id),0) FROM conversations c WHERE org_id=$1 AND id=$2")
-        .bind(org).bind(conversation).fetch_one(&mut *tx).await?;
-    let points:Vec<String>=sqlx::query_scalar("SELECT text FROM items WHERE org_id=$1 AND conversation_id=$2 AND kind='user' AND state='completed' ORDER BY first_seq DESC LIMIT 12")
-        .bind(org).bind(conversation).fetch_all(&mut *tx).await?;
+    let (title, revision, version): (String, i64, i64) = sqlx::query_as(
+        "SELECT c.title,c.search_revision,coalesce((SELECT max(last_seq) FROM items
+           WHERE org_id=c.org_id AND conversation_id=c.id),0)
+         FROM conversations c WHERE org_id=$1 AND id=$2",
+    )
+    .bind(org)
+    .bind(conversation)
+    .fetch_one(&mut *tx)
+    .await?;
+    let points: Vec<String> = sqlx::query_scalar(
+        "SELECT text FROM items WHERE org_id=$1 AND conversation_id=$2 AND kind='user'
+           AND state='completed'
+         ORDER BY first_seq DESC LIMIT 12",
+    )
+    .bind(org)
+    .bind(conversation)
+    .fetch_all(&mut *tx)
+    .await?;
     tx.commit().await?;
     let points = redact(
         &points
@@ -528,7 +733,7 @@ pub async fn digest(app: &App, org: Uuid, conversation: Uuid, user: Uuid) -> any
     let points = if points.is_empty() {
         points
     } else {
-        summarize::summarize(app, org, user, points).await?
+        summarize::summarize(app, org, user, &policy, points).await?
     };
     let mut tx = app.store.tx(org).await?;
     // Admission and deletion lock the channel too: no new turn slips into publication.
@@ -541,53 +746,119 @@ pub async fn digest(app: &App, org: Uuid, conversation: Uuid, user: Uuid) -> any
     if !a.enabled || !a.history {
         return Ok(false);
     }
-    let current:bool=sqlx::query_scalar("SELECT search_revision=$3 AND coalesce((SELECT max(last_seq) FROM items WHERE org_id=$1 AND conversation_id=$2),0)=$4
-        AND NOT EXISTS(SELECT 1 FROM runs WHERE org_id=$1 AND conversation_id=$2 AND state IN ('running','requires_action')) FROM conversations WHERE org_id=$1 AND id=$2 FOR SHARE")
-        .bind(org).bind(conversation).bind(revision).bind(version).fetch_one(&mut *tx).await?;
+    let current: bool = sqlx::query_scalar(
+        "SELECT search_revision=$3 AND coalesce((SELECT max(last_seq) FROM items
+             WHERE org_id=$1 AND conversation_id=$2),0)=$4
+           AND NOT EXISTS(SELECT 1 FROM runs WHERE org_id=$1 AND conversation_id=$2
+             AND state IN ('running','requires_action'))
+         FROM conversations WHERE org_id=$1 AND id=$2 FOR SHARE",
+    )
+    .bind(org)
+    .bind(conversation)
+    .bind(revision)
+    .bind(version)
+    .fetch_one(&mut *tx)
+    .await?;
     if !current {
         return Ok(false);
     }
-    sqlx::query("INSERT INTO conversation_digests(org_id,conversation_id,user_id,title,user_points,source_version,source_revision) VALUES($1,$2,$3,$4,$5,$6,$7)
-        ON CONFLICT(conversation_id) DO UPDATE SET user_id=excluded.user_id,title=excluded.title,user_points=excluded.user_points,source_version=excluded.source_version,source_revision=excluded.source_revision,updated_at=now()
-        WHERE conversation_digests.source_version<=excluded.source_version AND conversation_digests.source_revision<=excluded.source_revision")
-        .bind(org).bind(conversation).bind(user).bind(redact(&title)).bind(points).bind(version).bind(revision).execute(&mut *tx).await?;
-    sqlx::query("UPDATE conversations SET digest_attempts=0,digest_available_at=now() WHERE org_id=$1 AND id=$2")
-        .bind(org).bind(conversation).execute(&mut *tx).await?;
+    sqlx::query(
+        "INSERT INTO conversation_digests(org_id,conversation_id,user_id,title,user_points,
+           source_version,source_revision)
+         VALUES($1,$2,$3,$4,$5,$6,$7)
+         ON CONFLICT(conversation_id) DO UPDATE SET user_id=excluded.user_id,title=excluded.title,
+           user_points=excluded.user_points,source_version=excluded.source_version,
+           source_revision=excluded.source_revision,updated_at=now()
+         WHERE conversation_digests.source_version<=excluded.source_version
+           AND conversation_digests.source_revision<=excluded.source_revision",
+    )
+    .bind(org)
+    .bind(conversation)
+    .bind(user)
+    .bind(redact(&title))
+    .bind(points)
+    .bind(version)
+    .bind(revision)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "UPDATE conversations SET digest_attempts=0,digest_available_at=now()
+         WHERE org_id=$1 AND id=$2",
+    )
+    .bind(org)
+    .bind(conversation)
+    .execute(&mut *tx)
+    .await?;
     tx.commit().await?;
     Ok(true)
 }
 pub async fn collector(app: App, worker: PgPool) -> anyhow::Result<()> {
     loop {
-        let rows:Vec<(Uuid,Uuid,Uuid)>=sqlx::query_as("SELECT c.org_id,c.id,c.creator_id FROM conversations c
-            LEFT JOIN conversation_digests d ON d.org_id=c.org_id AND d.conversation_id=c.id
-            LEFT JOIN memory_preferences m ON m.org_id=c.org_id AND m.user_id=c.creator_id
-            LEFT JOIN LATERAL (SELECT policy FROM org_policies WHERE org_id=c.org_id ORDER BY version DESC LIMIT 1) op ON true
-            WHERE $1 AND c.digest_available_at<=now() AND coalesce(op.policy->>'allow_memory','true')<>'false' AND c.state IN ('active','archived') AND NOT c.temporary AND coalesce(m.enabled,true) AND coalesce(m.reference_history,true)
-              AND EXISTS(SELECT 1 FROM memberships WHERE org_id=c.org_id AND user_id=c.creator_id)
-              AND EXISTS(SELECT 1 FROM items WHERE org_id=c.org_id AND conversation_id=c.id AND kind='user' AND state='completed')
-              AND (d.source_revision IS DISTINCT FROM c.search_revision OR d.user_id IS DISTINCT FROM c.creator_id OR EXISTS(SELECT 1 FROM items WHERE org_id=c.org_id AND conversation_id=c.id AND last_seq>coalesce(d.source_version,0)))
-              AND NOT EXISTS(SELECT 1 FROM runs WHERE org_id=c.org_id AND conversation_id=c.id AND (state IN ('running','requires_action') OR ended_at>now()-interval '30 seconds'))
-            ORDER BY c.digest_available_at,c.created_at LIMIT 100").bind(app.config.search.enabled).fetch_all(&worker).await?;
+        // TODO(org): the latest organization policy version; only registration writes one.
+        let rows: Vec<(Uuid, Uuid, Uuid)> = sqlx::query_as(
+            "SELECT c.org_id,c.id,c.creator_id FROM conversations c
+             LEFT JOIN conversation_digests d ON d.org_id=c.org_id AND d.conversation_id=c.id
+             LEFT JOIN memory_preferences m ON m.org_id=c.org_id AND m.user_id=c.creator_id
+             LEFT JOIN LATERAL (SELECT policy FROM org_policies WHERE org_id=c.org_id
+               ORDER BY version DESC LIMIT 1) op ON true
+             WHERE $1 AND c.digest_available_at<=now()
+               AND coalesce(op.policy->>'allow_memory','true')<>'false'
+               AND c.state IN ('active','archived') AND NOT c.temporary
+               AND coalesce(m.enabled,true) AND coalesce(m.reference_history,true)
+               AND EXISTS(SELECT 1 FROM memberships WHERE org_id=c.org_id AND user_id=c.creator_id)
+               AND EXISTS(SELECT 1 FROM items WHERE org_id=c.org_id AND conversation_id=c.id
+                 AND kind='user' AND state='completed')
+               AND (d.source_revision IS DISTINCT FROM c.search_revision
+                 OR d.user_id IS DISTINCT FROM c.creator_id
+                 OR EXISTS(SELECT 1 FROM items WHERE org_id=c.org_id AND conversation_id=c.id
+                   AND last_seq>coalesce(d.source_version,0)))
+               AND NOT EXISTS(SELECT 1 FROM runs WHERE org_id=c.org_id AND conversation_id=c.id
+                 AND (state IN ('running','requires_action')
+                   OR ended_at>now()-interval '30 seconds'))
+             ORDER BY c.digest_available_at,c.created_at LIMIT 100",
+        )
+        .bind(app.config.search.enabled)
+        .fetch_all(&worker)
+        .await?;
         for (org, conv, user) in rows {
             if app.config.policy.allow_memory == Some(false) {
                 break;
             }
             if let Err(error) = digest(&app, org, conv, user).await {
-                tracing::warn!(conversation=%conv,error=%error,"digest deferred");
+                tracing::warn!(conversation=%conv, %error, "digest deferred");
                 let mut tx = app.store.tx(org).await?;
-                sqlx::query("UPDATE conversations SET digest_attempts=digest_attempts+1,digest_available_at=now()+least(3600,30*power(2,least(digest_attempts,7))::int)*interval '1 second' WHERE org_id=$1 AND id=$2")
-                    .bind(org).bind(conv).execute(&mut *tx).await?;
+                sqlx::query(
+                    "UPDATE conversations SET digest_attempts=digest_attempts+1,
+                       digest_available_at=now()
+                         +least(3600,30*power(2,least(digest_attempts,7))::int)*interval '1 second'
+                     WHERE org_id=$1 AND id=$2",
+                )
+                .bind(org)
+                .bind(conv)
+                .execute(&mut *tx)
+                .await?;
                 tx.commit().await?;
             }
         }
-        let orgs:Vec<Uuid>=sqlx::query_scalar("SELECT DISTINCT org_id FROM memory_preferences WHERE NOT reference_history AND history_disabled_at<now()-interval '30 days'")
-            .fetch_all(&worker).await?;
+        let orgs: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT DISTINCT org_id FROM memory_preferences
+             WHERE NOT reference_history AND history_disabled_at<now()-interval '30 days'",
+        )
+        .fetch_all(&worker)
+        .await?;
         for org in orgs {
             let mut tx = app.store.tx(org).await?;
-            sqlx::query("DELETE FROM conversation_digests d USING memory_preferences m WHERE d.org_id=$1 AND m.org_id=d.org_id AND m.user_id=d.user_id AND NOT m.reference_history AND m.history_disabled_at<now()-interval '30 days'")
-                .bind(org).execute(&mut *tx).await?;
+            sqlx::query(
+                "DELETE FROM conversation_digests d USING memory_preferences m
+                 WHERE d.org_id=$1 AND m.org_id=d.org_id AND m.user_id=d.user_id
+                   AND NOT m.reference_history AND m.history_disabled_at<now()-interval '30 days'",
+            )
+            .bind(org)
+            .execute(&mut *tx)
+            .await?;
             tx.commit().await?;
         }
+        // TODO(org): organizations are never suspended or deleted yet.
         let organizations: Vec<Uuid> =
             sqlx::query_scalar("SELECT id FROM organizations WHERE state='active'")
                 .fetch_all(&worker)
@@ -598,6 +869,7 @@ pub async fn collector(app: App, worker: PgPool) -> anyhow::Result<()> {
             collect_history_references(&mut tx, org).await?;
             collect_stale_memories(&mut tx, org).await?;
             let policy = effective_policy(&mut tx, &app.config.policy, org).await?;
+            // TODO(org): freezes matter once an organization policy can turn memory off.
             if policy.allow_memory == Some(false) {
                 sqlx::query(
                     "INSERT INTO memory_policy_freezes(org_id) VALUES($1) ON CONFLICT DO NOTHING",
@@ -605,12 +877,21 @@ pub async fn collector(app: App, worker: PgPool) -> anyhow::Result<()> {
                 .bind(org)
                 .execute(&mut *tx)
                 .await?;
-                let expired:bool=sqlx::query_scalar("SELECT disabled_at<now()-interval '30 days' AND cleaned_at IS NULL FROM memory_policy_freezes WHERE org_id=$1").bind(org).fetch_one(&mut *tx).await?;
+                let expired: bool = sqlx::query_scalar(
+                    "SELECT disabled_at<now()-interval '30 days' AND cleaned_at IS NULL
+                     FROM memory_policy_freezes WHERE org_id=$1",
+                )
+                .bind(org)
+                .fetch_one(&mut *tx)
+                .await?;
                 if expired {
-                    sqlx::query("UPDATE conversations SET memory_snapshot=NULL WHERE org_id=$1 AND memory_snapshot IS NOT NULL")
-                        .bind(org)
-                        .execute(&mut *tx)
-                        .await?;
+                    sqlx::query(
+                        "UPDATE conversations SET memory_snapshot=NULL
+                         WHERE org_id=$1 AND memory_snapshot IS NOT NULL",
+                    )
+                    .bind(org)
+                    .execute(&mut *tx)
+                    .await?;
                     let ids: Vec<Uuid> =
                         sqlx::query_scalar("SELECT id FROM memory_items WHERE org_id=$1")
                             .bind(org)
@@ -636,17 +917,21 @@ pub async fn collector(app: App, worker: PgPool) -> anyhow::Result<()> {
                     .rows_affected()
                     > 0;
                 if unfrozen {
-                    sqlx::query("INSERT INTO search_jobs(org_id,source_id,source_kind,source_version,op,priority) SELECT org_id,id,'memory',version,'upsert',-10 FROM memory_items WHERE org_id=$1 AND status='active' ON CONFLICT(org_id,source_id,source_version) DO UPDATE SET state='queued',attempts=0,available_at=now(),priority=-10,claim_token=NULL,lease_until=NULL")
-                        .bind(org).execute(&mut *tx).await?;
+                    sqlx::query(
+                        "INSERT INTO search_jobs(org_id,source_id,source_kind,source_version,op,
+                           priority)
+                         SELECT org_id,id,'memory',version,'upsert',-10 FROM memory_items
+                         WHERE org_id=$1 AND status='active'
+                         ON CONFLICT(org_id,source_id,source_version) DO UPDATE SET state='queued',
+                           attempts=0,available_at=now(),priority=-10,claim_token=NULL,
+                           lease_until=NULL",
+                    )
+                    .bind(org)
+                    .execute(&mut *tx)
+                    .await?;
                 }
             }
             tx.commit().await?;
-        }
-        let deleted:Vec<(Uuid,Uuid)>=sqlx::query_as("SELECT org_id,id FROM conversations WHERE title<>'' AND (state='deleted' OR (temporary AND expires_at<=now())) LIMIT 100").fetch_all(&worker).await?;
-        for (org, conv) in deleted {
-            if let Err(error) = collect_conversation(&app, org, conv).await {
-                tracing::warn!(conversation=%conv,error=%error,"conversation deletion deferred");
-            }
         }
         tokio::time::sleep(std::time::Duration::from_secs(30)).await;
     }
@@ -654,10 +939,15 @@ pub async fn collector(app: App, worker: PgPool) -> anyhow::Result<()> {
 
 /// Timeline writes remain owned and fenced even when a Work harness writes through MCP.
 pub async fn project(tx: &mut Tx<'_>, lease: &crate::store::Lease) -> anyhow::Result<()> {
-    let events: Vec<(Uuid,Uuid,String)> = sqlx::query_as(
+    let events: Vec<(Uuid, Uuid, String)> = sqlx::query_as(
         "SELECT e.id,e.memory_id,e.action FROM memory_events e
-         WHERE e.org_id=$1 AND e.origin_conversation_id=$2 AND NOT e.emitted ORDER BY e.created_at FOR UPDATE OF e")
-        .bind(lease.org_id).bind(lease.conversation_id).fetch_all(&mut **tx).await?;
+         WHERE e.org_id=$1 AND e.origin_conversation_id=$2 AND NOT e.emitted
+         ORDER BY e.created_at FOR UPDATE OF e",
+    )
+    .bind(lease.org_id)
+    .bind(lease.conversation_id)
+    .fetch_all(&mut **tx)
+    .await?;
     for (event, id, action) in events {
         crate::store::append(
             tx,
@@ -684,71 +974,15 @@ pub async fn project(tx: &mut Tx<'_>, lease: &crate::store::Lease) -> anyhow::Re
     Ok(())
 }
 
-/// Asynchronous deletion of stored payloads/workspaces, after access was revoked by REST.
-pub async fn collect_conversation(app: &App, org: Uuid, conv: Uuid) -> anyhow::Result<bool> {
-    let mut tx = app.store.tx(org).await?;
-    sqlx::query("SELECT id FROM channels WHERE org_id=$1 AND conversation_id=$2 FOR UPDATE")
-        .bind(org)
-        .bind(conv)
-        .execute(&mut *tx)
-        .await?;
-    let due: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM conversations WHERE org_id=$1 AND id=$2
-        AND (state='deleted' OR (temporary AND expires_at<=now())) AND title<>'')",
-    )
-    .bind(org)
-    .bind(conv)
-    .fetch_one(&mut *tx)
-    .await?;
-    if !due {
-        return Ok(false);
-    }
-    let busy:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM runs WHERE org_id=$1 AND conversation_id=$2 AND state IN ('running','requires_action'))
-        OR EXISTS(SELECT 1 FROM workspace_jobs WHERE org_id=$1 AND conversation_id=$2 AND state IN ('queued','running'))")
-        .bind(org).bind(conv).fetch_one(&mut *tx).await?;
-    if busy {
-        return Ok(false);
-    }
-    let epoch:i64=sqlx::query_scalar("UPDATE channels SET writer_epoch=writer_epoch+1,owner_id=NULL,lease_until=now() WHERE org_id=$1 AND conversation_id=$2 RETURNING writer_epoch")
-        .bind(org).bind(conv).fetch_one(&mut *tx).await?;
-    let sandboxes:Vec<(Uuid,i64)>=sqlx::query_as("SELECT id,exec_epoch FROM sandboxes WHERE org_id=$1 AND conversation_id=$2 AND state<>'deleted'")
-        .bind(org).bind(conv).fetch_all(&mut *tx).await?;
-    for (sandbox, old_epoch) in &sandboxes {
-        crate::sandbox::host(
-            app,
-            org,
-            *sandbox,
-            ryzhub_execution::HostCommand::Destroy {
-                sandbox_id: *sandbox,
-                exec_epoch: epoch.max(old_epoch + 1) as u64,
-            },
-        )
-        .await?;
-    }
-    if !sandboxes.is_empty() {
-        let artifacts:Vec<Uuid>=sqlx::query_scalar("SELECT id FROM checkpoints WHERE org_id=$1 AND conversation_id=$2 UNION SELECT id FROM workspace_jobs WHERE org_id=$1 AND conversation_id=$2")
-            .bind(org).bind(conv).fetch_all(&mut *tx).await?;
-        crate::sandbox::host_workspace(
-            app,
-            org,
-            conv,
-            ryzhub_execution::HostCommand::PurgeWorkspace {
-                org_id: org,
-                workspace_id: conv,
-                artifacts,
-            },
-        )
-        .await?;
-    }
-    crate::projects::purge_conversation(&mut tx, org, conv, epoch).await?;
-    tx.commit().await?;
-    Ok(true)
-}
-
 /// Retain undo data for 30 days, then erase all persistent memory/event copies.
 pub async fn collect_stale_memories(tx: &mut Tx<'_>, org: Uuid) -> anyhow::Result<()> {
-    let ids:Vec<Uuid>=sqlx::query_scalar("SELECT id FROM memory_items WHERE org_id=$1 AND status<>'active' AND invalid_at<now()-interval '30 days' AND content<>''")
-        .bind(org).fetch_all(&mut **tx).await?;
+    let ids: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM memory_items WHERE org_id=$1 AND status<>'active'
+           AND invalid_at<now()-interval '30 days' AND content<>''",
+    )
+    .bind(org)
+    .fetch_all(&mut **tx)
+    .await?;
     purge_memories(tx, org, &ids).await
 }
 pub async fn purge_memories(tx: &mut Tx<'_>, org: Uuid, ids: &[Uuid]) -> anyhow::Result<()> {
@@ -756,10 +990,24 @@ pub async fn purge_memories(tx: &mut Tx<'_>, org: Uuid, ids: &[Uuid]) -> anyhow:
         return Ok(());
     }
     let strings: Vec<String> = ids.iter().map(ToString::to_string).collect();
-    sqlx::query("DELETE FROM memory_events WHERE org_id=$1 AND (memory_id=ANY($2) OR before_state->>'id'=ANY($3) OR after_state->>'id'=ANY($3))")
-        .bind(org).bind(ids).bind(&strings).execute(&mut **tx).await?;
-    sqlx::query("UPDATE memory_items SET status='deleted',content='',version=version+1,invalid_at=coalesce(invalid_at,now()) WHERE org_id=$1 AND id=ANY($2) AND (content<>'' OR status<>'deleted')")
-        .bind(org).bind(ids).execute(&mut **tx).await?;
+    sqlx::query(
+        "DELETE FROM memory_events WHERE org_id=$1
+           AND (memory_id=ANY($2) OR before_state->>'id'=ANY($3) OR after_state->>'id'=ANY($3))",
+    )
+    .bind(org)
+    .bind(ids)
+    .bind(&strings)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        "UPDATE memory_items SET status='deleted',content='',version=version+1,
+           invalid_at=coalesce(invalid_at,now())
+         WHERE org_id=$1 AND id=ANY($2) AND (content<>'' OR status<>'deleted')",
+    )
+    .bind(org)
+    .bind(ids)
+    .execute(&mut **tx)
+    .await?;
     sqlx::query("DELETE FROM search_docs WHERE org_id=$1 AND id=ANY($2)")
         .bind(org)
         .bind(ids)
@@ -768,24 +1016,35 @@ pub async fn purge_memories(tx: &mut Tx<'_>, org: Uuid, ids: &[Uuid]) -> anyhow:
     Ok(())
 }
 pub async fn collect_history_references(tx: &mut Tx<'_>, org: Uuid) -> anyhow::Result<()> {
-    sqlx::query("WITH affected AS MATERIALIZED (
-        SELECT c.id,c.memory_snapshot->'recent' AS old_recent,
-          coalesce(jsonb_agg(e.value ORDER BY e.ordinality) FILTER (WHERE s.id IS NOT NULL
-            AND s.state IN ('active','archived') AND NOT s.temporary AND s.creator_id=c.creator_id
-            AND (s.project_id IS NULL OR p.state='active')
-            AND (CASE WHEN own.memory_mode='project_only' THEN c.project_id END) IS NOT DISTINCT FROM (CASE WHEN p.memory_mode='project_only' THEN s.project_id END)
-            AND EXISTS(SELECT 1 FROM memberships WHERE org_id=c.org_id AND user_id=c.creator_id)), '[]'::jsonb) AS recent
-        FROM conversations c LEFT JOIN projects own ON own.org_id=c.org_id AND own.id=c.project_id
-        CROSS JOIN LATERAL jsonb_array_elements(c.memory_snapshot->'recent') WITH ORDINALITY e(value,ordinality)
-        LEFT JOIN conversations s ON s.org_id=c.org_id AND s.id=(e.value->>'id')::uuid
-        LEFT JOIN projects p ON p.org_id=s.org_id AND p.id=s.project_id
-        WHERE c.org_id=$1 AND c.memory_snapshot IS NOT NULL AND c.state IN ('active','archived')
-          AND NOT c.temporary AND (c.project_id IS NULL OR own.state='active')
-        GROUP BY c.id,c.memory_snapshot
-      ) UPDATE conversations c SET memory_snapshot=jsonb_set(c.memory_snapshot,'{recent}',a.recent)
-      FROM affected a WHERE c.org_id=$1 AND c.id=a.id AND a.old_recent IS DISTINCT FROM a.recent
-        AND c.memory_snapshot->'recent'=a.old_recent")
-        .bind(org).execute(&mut **tx).await?;
+    sqlx::query(
+        "WITH affected AS MATERIALIZED (
+           SELECT c.id,c.memory_snapshot->'recent' AS old_recent,
+             coalesce(jsonb_agg(e.value ORDER BY e.ordinality) FILTER (WHERE s.id IS NOT NULL
+               AND s.state IN ('active','archived') AND NOT s.temporary
+               AND s.creator_id=c.creator_id
+               AND (s.project_id IS NULL OR p.state='active')
+               AND (CASE WHEN own.memory_mode='project_only' THEN c.project_id END)
+                 IS NOT DISTINCT FROM (CASE WHEN p.memory_mode='project_only' THEN s.project_id END)
+               AND EXISTS(SELECT 1 FROM memberships
+                 WHERE org_id=c.org_id AND user_id=c.creator_id)),
+               '[]'::jsonb) AS recent
+           FROM conversations c
+           LEFT JOIN projects own ON own.org_id=c.org_id AND own.id=c.project_id
+           CROSS JOIN LATERAL jsonb_array_elements(c.memory_snapshot->'recent')
+             WITH ORDINALITY e(value,ordinality)
+           LEFT JOIN conversations s ON s.org_id=c.org_id AND s.id=(e.value->>'id')::uuid
+           LEFT JOIN projects p ON p.org_id=s.org_id AND p.id=s.project_id
+           WHERE c.org_id=$1 AND c.memory_snapshot IS NOT NULL AND c.state IN ('active','archived')
+             AND NOT c.temporary AND (c.project_id IS NULL OR own.state='active')
+           GROUP BY c.id,c.memory_snapshot
+         ) UPDATE conversations c
+           SET memory_snapshot=jsonb_set(c.memory_snapshot,'{recent}',a.recent)
+         FROM affected a WHERE c.org_id=$1 AND c.id=a.id AND a.old_recent IS DISTINCT FROM a.recent
+           AND c.memory_snapshot->'recent'=a.old_recent",
+    )
+    .bind(org)
+    .execute(&mut **tx)
+    .await?;
     Ok(())
 }
 
@@ -808,6 +1067,18 @@ pub async fn announce(
     .rows_affected()
         > 0;
     if changed {
+        // References only: details are resolved with current permissions when expanded.
+        let references: Vec<Value> = used
+            .iter()
+            .map(|v| {
+                let kind = if v.get("content").is_some() {
+                    "saved"
+                } else {
+                    "recent"
+                };
+                json!({"id": v["id"], "kind": kind})
+            })
+            .collect();
         crate::store::append(
             tx,
             lease.org_id,
@@ -820,7 +1091,7 @@ pub async fn announce(
                 kind: "memory_context".into(),
                 state: "completed".into(),
                 run_id: run.to_string(),
-                text: serde_json::to_string(&used.iter().map(|v|json!({"id":v["id"],"kind":if v.get("content").is_some(){"saved"}else{"recent"}})).collect::<Vec<_>>())?,
+                text: serde_json::to_string(&references)?,
                 ..Default::default()
             }),
         )

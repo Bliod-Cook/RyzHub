@@ -21,12 +21,14 @@ pub struct OrgContext {
 #[derive(Clone, Debug)]
 pub enum Principal {
     User(OrgContext),
+    // TODO(org): never constructed; gateway keys are checked as their user.
     VirtualKey {
         org_id: Uuid,
         user_id: Uuid,
         resource_id: Uuid,
         revoked: bool,
     },
+    // TODO(org): never constructed.
     Service {
         org_id: Uuid,
         actions: BTreeSet<Action>,
@@ -38,16 +40,16 @@ pub enum Action {
     UseConversation,
     Subscribe,
     UseModel,
-    UsePlugin,
-    InstallPersonalPlugin,
+    UsePlugin,             // TODO(org): never checked.
+    InstallPersonalPlugin, // TODO(org): never checked.
     SetPersonalCredential,
-    ManageOrgPlugin,
+    ManageOrgPlugin, // TODO(org): never checked.
     SetOrgCredential,
     ManageMember,
     ViewOrgUsage,
     ViewAudit,
-    SetPolicy,
-    DeleteOrganization,
+    SetPolicy,          // TODO(org): never checked.
+    DeleteOrganization, // TODO(org): never checked.
 }
 
 #[derive(Clone, Debug)]
@@ -159,7 +161,6 @@ pub struct Policy {
 /// Reasoning levels from least to most.
 pub const REASONING_LEVELS: [&str; 6] = ["minimal", "low", "medium", "high", "xhigh", "max"];
 
-/// A reasoning level's rank; unknown levels rank as the most.
 /// Whether `tool` (`<plugin>__<tool>`) matches one of `patterns` (`<plugin>__*` matches all of
 /// a plugin's tools).
 pub fn tool_matches(patterns: &BTreeSet<String>, tool: &str) -> bool {
@@ -171,6 +172,7 @@ pub fn tool_matches(patterns: &BTreeSet<String>, tool: &str) -> bool {
         })
 }
 
+/// A reasoning level's rank; unknown levels rank as the most.
 pub fn reasoning_rank(level: &str) -> usize {
     REASONING_LEVELS
         .iter()

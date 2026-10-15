@@ -1,9 +1,14 @@
 //! Notifications to Android devices through Firebase Cloud Messaging (HTTP v1).
 //!
-//! An approval or question waiting, and a run that ended, enqueue a `push` job in the
-//! transaction that caused them (jobs are the outbox). The job notifies the conversation's
+//! An approval or question waiting, and a run that ended, enqueue a push job in the
+//! transaction that caused them (the jobs are the outbox). The job notifies the conversation's
 //! creator on each registered device of a sign-in still valid, except devices with a live
 //! connection: they already show it. A token FCM no longer knows is forgotten.
+//!
+//! The Owner role's [`worker`] claims due jobs with `FOR UPDATE SKIP LOCKED` and retries
+//! failures with exponential backoff until [`MAX_ATTEMPTS`], after which a job is `dead`.
+//! Delivery is at least once: a delivery that outlives its lease may run again elsewhere (a
+//! device notified twice shows one notification). Completion is fenced by the claim token.
 use std::{
     sync::Mutex,
     time::{Duration, Instant},
@@ -15,20 +20,29 @@ use axum::{
     extract::{Path, State},
     http::HeaderMap,
 };
-use futures_util::FutureExt;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::{
     app::App,
     error::{ApiResult, Code},
-    jobs::{Handler, Job, NewJob},
     store::Tx,
 };
 
 /// A device stays online this long after its connection last showed it alive.
 const ONLINE_SECS: i64 = 60;
+/// Deliveries a notification gets.
+pub const MAX_ATTEMPTS: i32 = 5;
+/// A delivery is cut off after this long, and its job may be claimed again.
+const LEASE: Duration = Duration::from_secs(60);
+/// Idle wait between scans for due jobs.
+const IDLE: Duration = Duration::from_secs(1);
+/// How often finished jobs are swept.
+const SWEEP_EVERY: Duration = Duration::from_secs(600);
+/// Jobs claimed per organization per scan, so one busy organization cannot starve others.
+const PER_ORG: usize = 32;
 
 #[derive(Deserialize)]
 pub struct Register {
@@ -171,18 +185,190 @@ pub async fn notify(
             format!("run:{run}"),
         ),
     };
-    let mut job = NewJob::new("push", payload);
-    job.dedupe_key = Some(&key);
-    job.max_attempts = 5;
-    crate::jobs::enqueue(tx, org, job).await?;
+    enqueue(tx, org, payload, &key).await?;
     Ok(())
 }
 
-pub fn handler() -> Handler {
-    Handler {
-        kind: "push",
-        lease: Duration::from_secs(60),
-        run: |app, job| deliver(app, job).boxed(),
+/// Enqueue a push job in `tx`; returns its id, or that of the queued job with the same `key`
+/// it was merged into (keeping that job's payload, due no later than now).
+pub async fn enqueue(
+    tx: &mut Tx<'_>,
+    org: Uuid,
+    payload: Value,
+    key: &str,
+) -> anyhow::Result<Uuid> {
+    Ok(sqlx::query_scalar(
+        "INSERT INTO push_jobs(id,org_id,payload,dedupe_key) VALUES($1,$2,$3,$4)
+         ON CONFLICT (org_id,dedupe_key) WHERE dedupe_key IS NOT NULL AND state='queued'
+         DO UPDATE SET run_at=least(push_jobs.run_at,excluded.run_at)
+         RETURNING id",
+    )
+    .bind(Uuid::now_v7())
+    .bind(org)
+    .bind(payload)
+    .bind(key)
+    .fetch_one(&mut **tx)
+    .await?)
+}
+
+/// A claimed push job.
+#[derive(Clone, Debug, sqlx::FromRow)]
+pub struct Job {
+    pub id: Uuid,
+    pub org_id: Uuid,
+    pub payload: Value,
+    pub claim_token: Uuid,
+}
+
+/// Mark `job` completed. False if the claim was lost to another worker.
+pub async fn finish(tx: &mut Tx<'_>, job: &Job) -> anyhow::Result<bool> {
+    Ok(sqlx::query(
+        "UPDATE push_jobs SET state='completed',finished_at=now(),lease_until=NULL,error=NULL
+         WHERE org_id=$1 AND id=$2 AND state='running' AND claim_token=$3",
+    )
+    .bind(job.org_id)
+    .bind(job.id)
+    .bind(job.claim_token)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected()
+        > 0)
+}
+
+/// Requeue `job` with backoff, or mark it dead once it has used its attempts.
+async fn fail(app: &App, job: &Job, error: &str) -> anyhow::Result<()> {
+    let mut tx = app.store.tx(job.org_id).await?;
+    sqlx::query(
+        "UPDATE push_jobs SET
+           state=CASE WHEN attempts>=$5 THEN 'dead' ELSE 'queued' END,
+           finished_at=CASE WHEN attempts>=$5 THEN now() END,
+           run_at=now()+least(3600,power(2,least(attempts,12))::int)*interval '1 second',
+           error=$4,lease_until=NULL,claim_token=NULL
+         WHERE org_id=$1 AND id=$2 AND state='running' AND claim_token=$3",
+    )
+    .bind(job.org_id)
+    .bind(job.id)
+    .bind(job.claim_token)
+    .bind(error)
+    .bind(MAX_ATTEMPTS)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Claim the next due job in `org`: queued and due, or running past its lease with attempts
+/// left.
+async fn claim(app: &App, org: Uuid) -> anyhow::Result<Option<Job>> {
+    let mut tx = app.store.tx(org).await?;
+    let job = sqlx::query_as(
+        "WITH next AS (
+           SELECT id FROM push_jobs WHERE org_id=$1
+             AND ((state='queued' AND run_at<=now())
+                  OR (state='running' AND lease_until<now() AND attempts<$4))
+           ORDER BY run_at,id LIMIT 1 FOR UPDATE SKIP LOCKED)
+         UPDATE push_jobs j SET state='running',attempts=attempts+1,claim_token=$2,
+           lease_until=now()+$3*interval '1 millisecond'
+         FROM next WHERE j.org_id=$1 AND j.id=next.id
+         RETURNING j.id,j.org_id,j.payload,j.claim_token",
+    )
+    .bind(org)
+    .bind(Uuid::now_v7())
+    .bind(LEASE.as_millis() as f64)
+    .bind(MAX_ATTEMPTS)
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(job)
+}
+
+/// Deliver the due jobs; returns how many ran.
+pub async fn run_due(app: &App, worker: &PgPool) -> anyhow::Result<usize> {
+    let orgs: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT DISTINCT org_id FROM push_jobs
+         WHERE (state='queued' AND run_at<=now())
+            OR (state='running' AND lease_until<now() AND attempts<$1)
+         LIMIT 100",
+    )
+    .bind(MAX_ATTEMPTS)
+    .fetch_all(worker)
+    .await?;
+    let mut ran = 0;
+    for org in orgs {
+        for _ in 0..PER_ORG {
+            let Some(job) = claim(app, org).await? else {
+                break;
+            };
+            ran += 1;
+            match tokio::time::timeout(LEASE, deliver(app, &job)).await {
+                Ok(Ok(())) => {
+                    let mut tx = app.store.tx(job.org_id).await?;
+                    finish(&mut tx, &job).await?;
+                    tx.commit().await?;
+                }
+                Ok(Err(error)) => {
+                    tracing::warn!(job = %job.id, error = format!("{error:#}"), "push failed");
+                    fail(app, &job, crate::error::public_code(&error).as_str()).await?;
+                }
+                Err(_) => {
+                    tracing::warn!(job = %job.id, "push exceeded its lease");
+                    fail(app, &job, "LEASE_EXCEEDED").await?;
+                }
+            }
+        }
+    }
+    Ok(ran)
+}
+
+/// Mark jobs dead whose last attempt's lease ran out (a delivery that took its process down
+/// would otherwise be retried forever), and delete finished jobs: completed after a week,
+/// dead after thirty days.
+pub async fn sweep(app: &App, worker: &PgPool) -> anyhow::Result<()> {
+    let orgs: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT DISTINCT org_id FROM push_jobs WHERE
+           (state='running' AND lease_until<now() AND attempts>=$1)
+           OR (state='completed' AND finished_at<now()-interval '7 days')
+           OR (state='dead' AND finished_at<now()-interval '30 days')
+         LIMIT 1000",
+    )
+    .bind(MAX_ATTEMPTS)
+    .fetch_all(worker)
+    .await?;
+    for org in orgs {
+        let mut tx = app.store.tx(org).await?;
+        sqlx::query(
+            "UPDATE push_jobs SET state='dead',finished_at=now(),lease_until=NULL,claim_token=NULL,
+               error='LEASE_EXPIRED'
+             WHERE org_id=$1 AND state='running' AND lease_until<now() AND attempts>=$2",
+        )
+        .bind(org)
+        .bind(MAX_ATTEMPTS)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "DELETE FROM push_jobs WHERE org_id=$1 AND (
+               (state='completed' AND finished_at<now()-interval '7 days')
+               OR (state='dead' AND finished_at<now()-interval '30 days'))",
+        )
+        .bind(org)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+    }
+    Ok(())
+}
+
+/// The Owner role's push loop.
+pub async fn worker(app: App, worker: PgPool) -> anyhow::Result<()> {
+    let mut swept: Option<tokio::time::Instant> = None;
+    loop {
+        if swept.is_none_or(|at| at.elapsed() >= SWEEP_EVERY) {
+            sweep(&app, &worker).await?;
+            swept = Some(tokio::time::Instant::now());
+        }
+        if run_due(&app, &worker).await? == 0 {
+            tokio::time::sleep(IDLE).await;
+        }
     }
 }
 
@@ -246,7 +432,7 @@ async fn deliver(app: &App, job: &Job) -> anyhow::Result<()> {
     if devices.is_empty() {
         return Ok(());
     }
-    let fcm = Fcm::load(&app.config.push.fcm_credentials)?;
+    let fcm = Fcm::load(&app.config.push.fcm_credentials).await?;
     let access = fcm.access_token(&app.http.identity).await?;
     let mut retry = None;
     for (device, token, locale) in devices {
@@ -321,22 +507,26 @@ fn google_token_uri() -> String {
     "https://oauth2.googleapis.com/token".into()
 }
 
-/// The access token last obtained, per service account, until shortly before it expires.
-static TOKENS: Mutex<Vec<(String, String, Instant)>> = Mutex::new(Vec::new());
+/// The service account, read once.
+static ACCOUNT: tokio::sync::OnceCell<Fcm> = tokio::sync::OnceCell::const_new();
+/// The access token last obtained, until shortly before it expires.
+static TOKEN: Mutex<Option<(String, Instant)>> = Mutex::new(None);
 
 impl Fcm {
-    fn load(path: &str) -> anyhow::Result<Self> {
-        let text = std::fs::read_to_string(path).context("reading the FCM service account")?;
-        Ok(serde_json::from_str(&text)?)
+    async fn load(path: &str) -> anyhow::Result<&'static Self> {
+        ACCOUNT
+            .get_or_try_init(|| async {
+                let text =
+                    std::fs::read_to_string(path).context("reading the FCM service account")?;
+                Ok(serde_json::from_str(&text)?)
+            })
+            .await
     }
 
     /// An OAuth access token for FCM, from a JWT the service account signs.
     async fn access_token(&self, http: &reqwest::Client) -> anyhow::Result<String> {
-        if let Some((_, token, _)) = TOKENS
-            .lock()
-            .unwrap()
-            .iter()
-            .find(|(email, _, until)| *email == self.client_email && *until > Instant::now())
+        if let Some((token, until)) = TOKEN.lock().unwrap().as_ref()
+            && *until > Instant::now()
         {
             return Ok(token.clone());
         }
@@ -371,13 +561,8 @@ impl Fcm {
             .as_u64()
             .unwrap_or(3600)
             .saturating_sub(300);
-        let mut tokens = TOKENS.lock().unwrap();
-        tokens.retain(|(email, ..)| *email != self.client_email);
-        tokens.push((
-            self.client_email.clone(),
-            token.clone(),
-            Instant::now() + Duration::from_secs(lifetime),
-        ));
+        let until = Instant::now() + Duration::from_secs(lifetime);
+        *TOKEN.lock().unwrap() = Some((token.clone(), until));
         Ok(token)
     }
 }

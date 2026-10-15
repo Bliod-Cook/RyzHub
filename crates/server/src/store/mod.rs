@@ -5,7 +5,8 @@ mod conversations;
 mod events;
 mod rows;
 
-pub use conversations::create_in;
+pub use commands::{Cid, finish_command, retry, take_cid};
+pub use conversations::{create_in, list_conversations};
 pub use events::{
     MAX_DETAIL_FIELD, MAX_ITEM_TEXT, append, conversation_item, events_between, head_seq,
     lock_lease, publish_conversation, truncate_utf8, upsert_item,
@@ -156,6 +157,7 @@ impl Store {
 
 /// Membership is read afresh on every entry point; roles are never cached.
 pub async fn context_in(tx: &mut Tx<'_>, user: Uuid, org: Uuid) -> anyhow::Result<OrgContext> {
+    // TODO(org): organizations are never suspended or deleted yet.
     let role = sqlx::query_scalar!(
         "SELECT m.role FROM memberships m
          JOIN organizations o ON o.id=m.org_id JOIN users u ON u.id=m.user_id

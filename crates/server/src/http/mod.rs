@@ -135,7 +135,7 @@ pub fn router(app: App) -> Router {
         )
         .route(
             "/orgs/{org}/conversations/{conv}",
-            delete(memory::delete_conversation),
+            delete(conversations::delete),
         )
         .route("/healthz", get(healthz))
         .route("/capabilities", get(capabilities))

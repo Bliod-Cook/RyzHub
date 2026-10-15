@@ -2,15 +2,14 @@
 use anyhow::{Context, ensure};
 use prost::Message;
 use ryzhub_proto::{command_envelope::Command, frame::Body, *};
-use sqlx::Acquire;
 use uuid::Uuid;
 
 use crate::{
     config::Config,
     conversation_commands,
-    error::{Code, code_of, is_fenced},
+    error::Code,
     runs::{self, Resolution, RunKind},
-    store::{Lease, Store, Tx, context_in, conversation_in, head_seq, lock_lease},
+    store::{Lease, Store, Tx, context_in, conversation_in, finish_command, head_seq, lock_lease},
 };
 
 /// A processed command and the frame stored as its result.
@@ -43,38 +42,18 @@ pub async fn process_next(
         return Ok(None);
     };
     let command = CommandEnvelope::decode(payload.as_slice())?;
-    let mut savepoint = tx.begin().await?;
-    let body = match execute(&mut savepoint, lease, user, &device, &command, config).await {
-        Ok(body) => {
-            savepoint.commit().await?;
-            body
-        }
-        Err(error) => {
-            savepoint.rollback().await?;
-            // Database failures and lost leases are retried by the next Owner; the command
-            // stays queued. Everything else is a final answer for this cid.
-            if error.downcast_ref::<sqlx::Error>().is_some() || is_fenced(&error) {
-                return Err(error);
-            }
-            let code = code_of(&error).unwrap_or_else(|| {
-                tracing::error!(error = format!("{error:#}"), "command failed");
-                Code::InternalError
-            });
-            Body::CommandRejected(CommandRejected {
-                cid: command.cid.clone(),
-                code: code.to_string(),
-                retryable: false,
-            })
-        }
-    };
-    let accepted = matches!(body, Body::CommandAck(_));
-    let response = frame(lease.channel(), body);
-    sqlx::query("UPDATE commands SET status='done',result=$3 WHERE org_id=$1 AND id=$2")
-        .bind(lease.org_id)
-        .bind(command_id)
-        .bind(response.encode_to_vec())
-        .execute(&mut *tx)
-        .await?;
+    let execute = async |tx: &mut Tx<'_>| execute(tx, lease, user, &device, &command, config).await;
+    let channel = lease.channel();
+    let response = finish_command(
+        &mut tx,
+        lease.org_id,
+        command_id,
+        &channel,
+        &command.cid,
+        execute,
+    )
+    .await?;
+    let accepted = matches!(response.body, Some(Body::CommandAck(_)));
     crate::store::audit_as(
         &mut tx,
         lease.org_id,

@@ -108,6 +108,11 @@ void main() {
         offline.restore('https://hub.example'),
         throwsA(isA<http.ClientException>()),
       );
+      // Renewing likewise: only a refused refresh ends the session.
+      expect(await lapsed.renew(), isFalse);
+      final cut = _Hub({'/auth/refresh': http.ClientException('offline')});
+      addTearDown(cut.dispose);
+      await expectLater(cut.renew(), throwsA(isA<http.ClientException>()));
     },
   );
 

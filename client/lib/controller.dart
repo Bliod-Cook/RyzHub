@@ -873,7 +873,7 @@ class HubController extends ChangeNotifier with HubApi {
 
   /// Renew the session before it ends and carry the connection over to the new
   /// token, keeping its channels. Without a renewal the server closes the
-  /// connection at expiry, and reconnecting ends the session.
+  /// connection at expiry, and reconnecting renews or ends the session.
   Future<void> _carryOver() async {
     final generation = _generation, socket = _socket;
     if (await renew() &&
@@ -899,7 +899,8 @@ class HubController extends ChangeNotifier with HubApi {
   }
 
   /// A new access token through the device's refresh cookie, shared by the
-  /// requests that found theirs expired. False when the device is signed out.
+  /// requests that found theirs expired. False when the device is signed out;
+  /// a server out of reach throws.
   @override
   Future<bool> renew() => _renewing ??= () async {
     try {
@@ -908,8 +909,9 @@ class HubController extends ChangeNotifier with HubApi {
       token = result['token'];
       expiresAtMs = (result['expires_at_ms'] as num?)?.toInt() ?? 0;
       return true;
-    } catch (_) {
-      return false;
+    } catch (e) {
+      if ('$e'.contains('UNAUTHORIZED')) return false;
+      rethrow;
     } finally {
       _renewing = null;
     }
@@ -1514,7 +1516,7 @@ class HubController extends ChangeNotifier with HubApi {
     if (needsCommandRefresh) unawaited(refreshCommands().catchError((_) {}));
     if (update.error != null) error = update.error!;
     _results(update.resultsJson);
-    if (update.authExpiring) unawaited(_carryOver());
+    if (update.authExpiring) unawaited(_carryOver().catchError((_) {}));
     _sendFrames(update.outboundFrames);
     // Changes wait in the kernel to cross with what follows them.
     final wait = update.flushInMs;

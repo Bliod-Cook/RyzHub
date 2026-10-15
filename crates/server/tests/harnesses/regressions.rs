@@ -175,38 +175,6 @@ async fn concurrent_project_delete_and_move_remain_recoverable() -> anyhow::Resu
     outcome
 }
 
-pub(super) fn tool_turn_response(body: &Value, has_result: bool) -> axum::response::Response {
-    let rid = format!("resp_{}", Uuid::now_v7());
-    let text = if has_result {
-        "HARNESS_AFTER_TOOL"
-    } else {
-        "HARNESS_BEFORE_TOOL"
-    };
-    let mut output = vec![
-        json!({"id":format!("msg_{}",Uuid::now_v7()),"type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":text,"annotations":[]}],"phase":if has_result{"final_answer"}else{"commentary"}}),
-    ];
-    if !has_result {
-        output.push(json!({"id":format!("fc_{}",Uuid::now_v7()),"type":"function_call","call_id":"boundary-call","name":"exec_command","arguments":json!({"cmd":"printf HARNESS_TOOL_RESULT","max_output_tokens":100}).to_string(),"status":"completed"}));
-    }
-    let response = json!({"id":rid,"object":"response","model":body["model"],"status":"completed","output":output,"usage":{"input_tokens":20,"output_tokens":10,"total_tokens":30}});
-    let mut events = vec![
-        json!({"type":"response.created","response":{"id":rid,"object":"response","status":"in_progress","output":[]}}),
-    ];
-    for (index, item) in output.iter().enumerate() {
-        events.push(json!({"type":"response.output_item.added","output_index":index,"item":item}));
-        events.push(json!({"type":"response.output_item.done","output_index":index,"item":item}));
-    }
-    events.push(json!({"type":"response.completed","response":response}));
-    let data = events
-        .into_iter()
-        .map(|e| format!("event: {}\ndata: {e}\n\n", e["type"].as_str().unwrap()))
-        .collect::<String>();
-    axum::response::Response::builder()
-        .header("content-type", "text/event-stream")
-        .body(Body::from(data))
-        .unwrap()
-}
-
 #[tokio::test]
 #[ignore = "requires actual Codex in the harness image"]
 async fn codex_forks_only_at_completed_turn_boundaries() -> anyhow::Result<()> {

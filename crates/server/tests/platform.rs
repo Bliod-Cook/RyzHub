@@ -1,22 +1,19 @@
 //! Real PostgreSQL, NATS and containerd; only the paid model upstream is a protocol fixture.
 mod common;
 use anyhow::{Context, ensure};
-use axum::{
-    Json, Router,
-    body::{Body, Bytes},
-    extract::State,
-    http::HeaderMap,
-    routing::post,
+use axum::{Json, Router, body::Body, extract::State, http::HeaderMap, routing::post};
+use common::{
+    Harness, id, message,
+    upstream::{DOT_PNG, Requests},
 };
 use prost::Message;
 use ryzhub_proto::{command_envelope::Command, *};
 use ryzhub_server::{
     app::App,
     config::{Config, ModelRoute, Upstream},
-    http::router,
     llm::{gateway, keys},
     owner,
-    store::{Lease, Store, hash_token},
+    store::{Lease, hash_token},
 };
 use serde_json::{Value, json};
 use sqlx::{PgPool, Row};
@@ -25,424 +22,41 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
-use tokio::{
-    process::{Child, Command as Process},
-    task::JoinHandle,
-};
+use tokio::{process::Command as Process, task::JoinHandle};
 use uuid::Uuid;
 
-type Requests = Arc<Mutex<Vec<(Value, HeaderMap)>>>;
-/// A 1×1 PNG, small enough to reach the model unchanged.
-const DOT_PNG: &str =
-    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
-async fn upstream(
-    State(requests): State<Requests>,
-    headers: HeaderMap,
-    Json(body): Json<Value>,
-) -> axum::response::Response {
-    requests.lock().unwrap().push((body.clone(), headers));
-    let last = body["messages"].as_array().unwrap().last().unwrap()["content"].clone();
-    // A message carrying files is a list of parts; its text parts make the prompt.
-    let prompt = match &last {
-        Value::Array(parts) => parts
-            .iter()
-            .filter(|part| part["type"] == "text")
-            .filter_map(|part| part["text"].as_str())
-            .collect::<Vec<_>>()
-            .join("\n"),
-        other => other.as_str().unwrap_or("").to_owned(),
-    };
-    let prompt = prompt.as_str();
-    let result = last
-        .as_array()
-        .is_some_and(|blocks| blocks.iter().any(|b| b["type"] == "tool_result"));
-    // Re-sent assistant content continues a paused turn.
-    let continued = body["messages"].as_array().unwrap().last().unwrap()["role"] == "assistant";
-    // What the member last asked, past the tool results that followed it.
-    let asked = body["messages"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .rev()
-        .filter(|m| m["role"] == "user")
-        .map(|m| m["content"].to_string())
-        .find(|content| !content.contains("tool_result"))
-        .unwrap_or_default();
-    use axum::response::IntoResponse;
-    // Compaction on demand: a summary in place of the context, unless it says "nocompact".
-    if body.get("compaction").is_some() {
-        if body["messages"].to_string().contains("nocompact") {
-            return axum::response::Response::builder()
-                .status(400)
-                .header("content-type", "application/json")
-                .body(Body::from(json!({"type":"error","error":{"type":"invalid_request_error","message":"compaction unavailable"}}).to_string()))
-                .unwrap();
-        }
-        return Json(json!({"id":"fixture-compaction","type":"message","role":"assistant","model":"fixture-model",
-            "content":[{"type":"compaction","content":"压缩摘要"}],"stop_reason":"compaction",
-            "usage":{"input_tokens":0,"output_tokens":0,"iterations":[{"type":"compaction","input_tokens":40,"output_tokens":6}]}}))
-        .into_response();
-    }
-    // The summary a context falls back to.
-    if body["stream"] != true && prompt.starts_with("Summarize our conversation") {
-        return Json(json!({"id":"fixture-summary","type":"message","role":"assistant","model":"fixture-model",
-            "content":[{"type":"text","text":"摘要内容"}],"stop_reason":"end_turn","usage":{"input_tokens":30,"output_tokens":4}}))
-        .into_response();
-    }
-    let mut content = vec![
-        json!({"type":"thinking","thinking":"opaque reasoning","signature":"signed-block"}),
-        json!({"type":"redacted_thinking","data":"opaque-data"}),
-    ];
-    let mut paused = false;
-    if continued {
-        content.push(json!({"type":"text","text":"搜索结果显示 RyzHub 已发布","citations":[
-            {"type":"web_search_result_location","url":"https://example.com/a","title":"Example A","encrypted_index":"opaque-index","cited_text":"RyzHub released"},
-            {"type":"web_search_result_location","url":"https://example.com/a","title":"Example A","encrypted_index":"opaque-index-2","cited_text":"again"}
-        ]}));
-    } else if !result && body.get("tools").is_some() && prompt.contains("websearch") {
-        content.push(json!({"type":"text","text":"先搜索一下"}));
-        content.push(json!({"type":"server_tool_use","id":"srvtoolu_1","name":"web_search","input":{"query":"RyzHub"}}));
-        content.push(json!({"type":"web_search_tool_result","tool_use_id":"srvtoolu_1","content":[
-            {"type":"web_search_result","url":"https://example.com/a","title":"Example A","encrypted_content":"opaque-search","page_age":null}
-        ]}));
-        paused = true;
-    } else if !result && body.get("tools").is_some() && prompt.contains("sharefiles") {
-        let cmd = "mkdir -p out && printf 'quarterly report' > out/report.txt && ln -sf /etc/passwd leak && echo made";
-        content.push(json!({"type":"tool_use","id":"call_exec","name":"exec","input":{"cmd":cmd,"timeout_ms":10000}}));
-    } else if !result && body.get("tools").is_some() && prompt.contains("sharecheck") {
-        content.push(json!({"type":"tool_use","id":"call_exec","name":"exec","input":{"cmd":"cat /attachments/report.txt","timeout_ms":10000}}));
-    } else if result && asked.contains("sharefiles") {
-        content.push(json!({"type":"text","text":"文件在这里：[报告](sandbox:/workspace/out/report.txt)、[缺失](sandbox:/workspace/missing.txt)、[泄露](sandbox:/workspace/leak)、[目录](sandbox:/workspace/out)，代码里的 `[不算](sandbox:/workspace/out/report.txt)` 不算。"}));
-    } else if result && asked.contains("sharecheck") {
-        content.push(json!({"type":"text","text":"还是这份：[报告](sandbox:/workspace/out/report.txt)，也就是 [附件里的](/attachments/report.txt)。"}));
-    } else if !result && body.get("tools").is_some() && prompt.contains("attachfiles") {
-        let cmd = "cat /attachments/notes.csv; ls /attachments; touch /attachments/new 2>/dev/null || echo READONLY";
-        content.push(json!({"type":"tool_use","id":"call_exec","name":"exec","input":{"cmd":cmd,"timeout_ms":10000}}));
-    } else if !result && body.get("tools").is_some() && prompt.contains("fscheck") {
-        content.push(json!({"type":"tool_use","id":"call_a","name":"fs_upload","input":{"name":"notes.csv","path":"data/notes.csv"}}));
-        content.push(json!({"type":"tool_use","id":"call_b","name":"exec","input":{"cmd":"cat data/notes.csv; printf 'made here' > out.txt","timeout_ms":10000}}));
-        content.push(json!({"type":"tool_use","id":"call_c","name":"fs_download","input":{"path":"out.txt"}}));
-    } else if !result && body.get("tools").is_some() && prompt.contains("depscheck") {
-        content.push(json!({"type":"tool_use","id":"call_exec","name":"exec","input":{"cmd":"cat /opt/ryzhub-deps/marker","timeout_ms":10000}}));
-    } else if !result && body.get("tools").is_some() && prompt.contains("markercat") {
-        content.push(json!({"type":"tool_use","id":"call_exec","name":"exec","input":{"cmd":"printf once >> marker; cat marker","timeout_ms":10000}}));
-    } else if !result && body.get("tools").is_some() && prompt.contains("quotacheck") {
-        let cmd = "for f in /workspace/big /root/big; do dd if=/dev/zero of=$f bs=1M count=300 2>&1 | grep -oE 'No space left on device|Disk quota exceeded' | head -1; done; rm -f /workspace/big /root/big; awk 'BEGIN{s=\"x\"; while(1) s=s s}'; echo HOG=$?; echo small > /workspace/ok && echo SMALL_OK";
-        content.push(json!({"type":"tool_use","id":"call_exec","name":"exec","input":{"cmd":cmd,"timeout_ms":60000}}));
-    } else if !result && body.get("tools").is_some() && prompt.contains("egresscheck") {
-        let cmd = "apk update >/tmp/apk.log 2>&1 && echo APK_OK; wget -q -T 10 -O /dev/null http://example.com/; echo WGET=$?; wget -Y off -q -T 5 -O /dev/null http://1.1.1.1/; echo DIRECT=$?; printenv https_proxy";
-        content.push(json!({"type":"tool_use","id":"call_exec","name":"exec","input":{"cmd":cmd,"timeout_ms":60000}}));
-    } else if !result && body.get("tools").is_some() && prompt.contains("streamcheck") {
-        let cmd = "for i in 1 2 3; do echo line$i; sleep 1; done";
-        content.push(json!({"type":"tool_use","id":"call_exec","name":"exec","input":{"cmd":cmd,"timeout_ms":20000}}));
-    } else if !result && body.get("tools").is_some() && prompt.contains("attachls") {
-        content.push(json!({"type":"tool_use","id":"call_exec","name":"exec","input":{"cmd":"ls /attachments","timeout_ms":10000}}));
-    } else if !result && body.get("tools").is_some() && prompt.contains("exec") {
-        let command = if prompt.contains("proxyexec") {
-            r#"sleep 2; wget -Y off -qO- --header 'Content-Type: application/json' --post-data '{"model":"fixture-model","max_tokens":32,"stream":true,"messages":[{"role":"user","content":"guest local proxy"}]}' http://127.0.0.1:8090/v1/messages"#
-        } else {
-            "printf once >> marker; sleep 1; printf '真实沙箱结果'"
-        };
-        content.push(json!({"type":"text","text":"准备执行工具"}));
-        content.push(json!({"type":"tool_use","id":"call_exec","name":"exec","input":{"cmd":command,"timeout_ms":10000}}));
-    } else if !result && body.get("tools").is_some() && prompt.contains("viewimage") {
-        let cmd = format!("printf %s {DOT_PNG} | base64 -d > dot.png");
-        content.push(json!({"type":"tool_use","id":"call_a","name":"exec","input":{"cmd":cmd,"timeout_ms":10000}}));
-        content.push(
-            json!({"type":"tool_use","id":"call_b","name":"view_image","input":{"path":"dot.png"}}),
-        );
-    } else if !result && body.get("tools").is_some() && prompt.contains("bigoutput") {
-        let cmd = "head -c 6000 /dev/zero | tr '\\0' a";
-        content.push(json!({"type":"tool_use","id":format!("call_big_{}",Uuid::now_v7().simple()),"name":"exec","input":{"cmd":cmd,"timeout_ms":10000}}));
-    } else if !result && body.get("tools").is_some() && prompt.contains("readback") {
-        // A result moved out of the context, read back by the id its placeholder names.
-        let moved = body["messages"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .flat_map(|m| m["content"].as_array().into_iter().flatten())
-            .filter(|b| b["type"] == "tool_result")
-            .find(|b| {
-                b["content"]
-                    .as_str()
-                    .is_some_and(|c| c.starts_with("[Moved out"))
-            })
-            .map(|b| b["tool_use_id"].clone());
-        content.push(json!({"type":"tool_use","id":"call_read","name":"read_tool_output","input":{"id":moved}}));
-    } else if !result && prompt.contains("plugin") && body.get("tools").is_some() {
-        // Plugin tools, by the word after "plugin".
-        let (tool, input) = if prompt.contains("pluginlookup") {
-            ("acme-tracker__lookup", json!({"id": "7"}))
-        } else if prompt.contains("pluginask") {
-            ("acme-tracker__ask", json!({}))
-        } else if prompt.contains("pluginwidget") {
-            ("acme-tracker__widget", json!({}))
-        } else {
-            (
-                "load_skill",
-                json!({"plugin": "acme-tracker", "name": "triage"}),
-            )
-        };
-        content.push(json!({"type":"tool_use","id":format!("call_{}",Uuid::now_v7().simple()),"name":tool,"input":input}));
-    } else if !result && prompt.contains("autocompact") {
-        content.push(json!({"type":"compaction","content":"自动压缩摘要"}));
-        content.push(json!({"type":"text","text":"压缩后继续"}));
-    } else if !result && body.get("tools").is_some() && prompt.contains("question") {
-        content.push(json!({"type":"tool_use","id":"call_question","name":"ask_user","input":{"question":"选择一种颜色"}}));
-    } else {
-        content.push(json!({"type":"text","text":if result{"工具结果已用于回答"}else if body.get("tools").is_none(){"只读旁问完成"}else{"本地协议联调：你好 Rust"}}));
-    }
-    let tool = content.iter().any(|b| b["type"] == "tool_use");
-    let mut events = vec![
-        json!({"type":"message_start","message":{"id":"fixture-message","type":"message","role":"assistant","content":[],"model":"fixture-model","usage":{"input_tokens":25,"output_tokens":1,"cache_read_input_tokens":12}}}),
-        json!({"type":"ping"}),
-    ];
-    for (index, block) in content.iter().enumerate() {
-        let mut start = block.clone();
-        if block["type"] == "text" {
-            start = json!({"type":"text","text":""});
-        }
-        if block["type"] == "server_tool_use" {
-            start["input"] = json!({});
-        }
-        if block["type"] == "compaction" {
-            start["content"] = json!("");
-        }
-        events.push(json!({"type":"content_block_start","index":index,"content_block":start}));
-        if block["type"] == "compaction" {
-            events.push(json!({"type":"content_block_delta","index":index,"delta":{"type":"compaction_delta","content":block["content"]}}));
-        }
-        for citation in block["citations"].as_array().into_iter().flatten() {
-            events.push(json!({"type":"content_block_delta","index":index,"delta":{"type":"citations_delta","citation":citation}}));
-        }
-        if block["type"] == "text" {
-            events.push(json!({"type":"content_block_delta","index":index,"delta":{"type":"text_delta","text":block["text"]}}));
-        }
-        if block["type"] == "server_tool_use" {
-            events.push(json!({"type":"content_block_delta","index":index,"delta":{"type":"input_json_delta","partial_json":block["input"].to_string()}}));
-        }
-        events.push(json!({"type":"content_block_stop","index":index}));
-    }
-    let stop = if paused {
-        "pause_turn"
-    } else if tool {
-        "tool_use"
-    } else {
-        "end_turn"
-    };
-    events.push(
-        json!({"type":"message_delta","delta":{"stop_reason":stop},"usage":{"output_tokens":4}}),
-    );
-    events.push(json!({"type":"message_delta","delta":{},"usage":{"output_tokens":8}}));
-    events.push(json!({"type":"message_stop"}));
-    let delay = if prompt.contains("slow") { 100 } else { 5 };
-    if prompt.contains("interrupt") {
-        events.pop();
-    }
-    let stream = futures_util::stream::unfold(
-        (events.into_iter(), delay),
-        |(mut events, delay)| async move {
-            let event = events.next()?;
-            tokio::time::sleep(Duration::from_millis(delay)).await;
-            Some((
-                Ok::<_, std::io::Error>(Bytes::from(format!(
-                    "event: {}\ndata: {event}\n\n",
-                    event["type"].as_str().unwrap()
-                ))),
-                (events, delay),
-            ))
-        },
-    );
-    axum::response::Response::builder()
-        .header("content-type", "text/event-stream")
-        .body(Body::from_stream(stream))
-        .unwrap()
-}
-struct Harness {
-    name: String,
-    admin: PgPool,
-    db: PgPool,
-    app: App,
-    base: String,
-    gateway: String,
-    app_url: String,
-    worker_url: String,
-    requests: Requests,
-    tasks: Vec<JoinHandle<()>>,
-    config: tempfile::NamedTempFile,
-}
 impl Harness {
     async fn new() -> anyhow::Result<Self> {
         Self::with(|_| {}).await
     }
     /// A harness whose configuration `configure` adjusts last.
     async fn with(configure: impl FnOnce(&mut Config)) -> anyhow::Result<Self> {
-        let admin_url = std::env::var("TEST_ADMIN_URL").unwrap_or_else(|_| {
-            "postgres://postgres:local-development-only@127.0.0.1:55432/postgres".into()
-        });
-        let admin = PgPool::connect(&admin_url).await?;
-        common::sweep(
-            &admin,
-            admin_url.rsplit_once('/').unwrap().0,
-            &common::host_socket(),
-        )
-        .await;
-        let name = format!("ryzhub_test_{}", Uuid::now_v7().simple());
-        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {name}")))
-            .execute(&admin)
-            .await?;
-        let root = admin_url.rsplit_once('/').unwrap().0;
-        let db = PgPool::connect(&format!("{root}/{name}")).await?;
-        sqlx::migrate!("../../migrations").run(&db).await?;
-        let address = root.split('@').nth(1).context("test database URL")?;
-        let app_url = format!("postgres://ryzhub_app:local-app-only@{address}/{name}");
-        let worker_url = format!("postgres://ryzhub_worker:local-worker-only@{address}/{name}");
-        let store = Store::connect(&app_url).await?;
-        let nats = async_nats::connect("nats://127.0.0.1:54222").await?;
-        let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        let gateway_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        let api_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        let mut config = Config::default();
-        config.llm.enabled = true;
-        config.llm.model = "fixture-model".into();
-        config.llm.upstream_url = format!("http://{}", upstream_listener.local_addr()?);
-        config.llm.gateway_url = format!("http://{}", gateway_listener.local_addr()?);
-        config.llm.platform_key_env = "RYZHUB_TEST_UPSTREAM_KEY".into();
-        config.llm.vault_key_env = "RYZHUB_TEST_VAULT_KEY".into();
-        config.sandbox.enabled = true;
-        config.sandbox.runtime = std::env::var("TEST_RUNTIME").unwrap_or_else(|_| "runc".into());
-        // Sandboxes go when their run ends unless a test keeps them for reuse.
-        config.sandbox.chat_idle_secs = 0;
-        config.attachment_renderer = env!("CARGO_BIN_EXE_ryzhub-server").into();
-        config.work.storage_root = format!("/tmp/{name}/blobs");
-        let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .canonicalize()?;
-        config.sandbox.host_socket = std::env::var("TEST_HOST_SOCKET").unwrap_or_else(|_| {
-            workspace
-                .join("var/execution/host.sock")
-                .display()
-                .to_string()
-        });
-        config.sandbox.image = std::fs::read_to_string(workspace.join("var/execution/image.txt"))
-            .unwrap_or_default()
-            .trim()
-            .into();
-        let socket_dir = std::env::var_os("TEST_GATEWAY_DIR")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| workspace.join("var/execution/gateway"));
-        std::fs::create_dir_all(&socket_dir)?;
-        let socket_path = socket_dir.join(format!(
-            "llm-{}.sock",
-            &Uuid::now_v7().simple().to_string()[20..]
-        ));
-        let unix_listener = tokio::net::UnixListener::bind(&socket_path)?;
-        config.llm.unix_socket = Some(socket_path.display().to_string());
         // Plugin fixtures run on this machine; the app origin is served beside the API.
-        let content_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        config.plugins.insecure_hosts = vec!["127.0.0.1".into()];
-        config.public_url = format!("http://{}", api_listener.local_addr()?);
-        config.plugins.client_url = "http://client.test".into();
-        config.plugins.content_origin = format!("http://{}", content_listener.local_addr()?);
-        configure(&mut config);
-        let mut config_file = tempfile::NamedTempFile::new()?;
-        config_file.write_all(toml::to_string(&config)?.as_bytes())?;
-        let gateway = config.llm.gateway_url.clone();
-        let base = format!("http://{}", api_listener.local_addr()?);
-        let app = App::new(store, nats, config)?;
-        let requests = Requests::default();
-        let capture = requests.clone();
-        let a = app.clone();
-        let b = app.clone();
-        let c = app.clone();
-        let d = app.clone();
-        let tasks = vec![
-            tokio::spawn(async move {
-                axum::serve(
-                    content_listener,
-                    ryzhub_server::plugins::apps::content_router(d),
-                )
-                .await
-                .unwrap();
-            }),
-            tokio::spawn(async move {
-                axum::serve(unix_listener, gateway::router(c))
-                    .await
-                    .unwrap();
-            }),
-            tokio::spawn(async move {
-                axum::serve(
-                    upstream_listener,
-                    Router::new()
-                        .route("/v1/messages", post(upstream))
-                        .route(
-                            "/v1/messages/count_tokens",
-                            post(|| async { Json(json!({"input_tokens":7})) }),
-                        )
-                        .with_state(capture),
-                )
-                .await
-                .unwrap();
-            }),
-            tokio::spawn(async move {
-                axum::serve(gateway_listener, gateway::router(a))
-                    .await
-                    .unwrap();
-            }),
-            tokio::spawn(async move {
-                axum::serve(api_listener, router(b)).await.unwrap();
-            }),
-        ];
-        Ok(Self {
-            name,
-            admin,
-            db,
-            app,
-            base,
-            gateway,
-            app_url,
-            worker_url,
-            requests,
-            tasks,
-            config: config_file,
+        let content = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let origin = format!("http://{}", content.local_addr()?);
+        let mut h = Self::start(|config| {
+            config.llm.enabled = true;
+            config.sandbox.enabled = true;
+            // Sandboxes go when their run ends unless a test keeps them for reuse.
+            config.sandbox.chat_idle_secs = 0;
+            config.plugins.insecure_hosts = vec!["127.0.0.1".into()];
+            config.plugins.client_url = "http://client.test".into();
+            config.plugins.content_origin = origin;
+            configure(config);
         })
-    }
-    async fn user(&self) -> anyhow::Result<Value> {
-        Ok(reqwest::Client::new().post(format!("{}/auth/register",self.base)).json(&json!({"email":format!("{}@example.test",Uuid::now_v7()),"password":"test-password"})).send().await?.error_for_status()?.json().await?)
+        .await?;
+        let apps = ryzhub_server::plugins::apps::content_router(h.app.clone());
+        h.serve(content, apps);
+        Ok(h)
     }
     async fn conversation(&self, user: &Value) -> anyhow::Result<Uuid> {
-        let ctx = self
-            .app
-            .store
-            .context(id(user, "user_id"), id(user, "org_id"))
-            .await?;
+        let ctx = self.context(user).await?;
         Ok(self
             .app
             .store
             .create_conversation(&ctx, "Platform", "chat")
             .await?
             .id)
-    }
-    async fn send(&self, user: &Value, conv: Uuid, command: Command) -> anyhow::Result<Uuid> {
-        let ctx = self
-            .app
-            .store
-            .context(id(user, "user_id"), id(user, "org_id"))
-            .await?;
-        let cid = Uuid::now_v7();
-        self.app
-            .store
-            .accept(
-                &ctx,
-                conv,
-                "test-device",
-                &CommandEnvelope {
-                    cid: cid.to_string(),
-                    command: Some(command),
-                },
-            )
-            .await?;
-        Ok(cid)
     }
     /// The command's outcome once the Owner has processed it.
     async fn outcome(&self, cid: Uuid) -> anyhow::Result<frame::Body> {
@@ -477,36 +91,6 @@ impl Harness {
         );
         Ok(response.json().await?)
     }
-    fn owner(&self) -> anyhow::Result<Child> {
-        Ok(Process::new(env!("CARGO_BIN_EXE_ryzhub-server"))
-            .arg("owner")
-            .env("DATABASE_URL", &self.app_url)
-            .env("WORKER_DATABASE_URL", &self.worker_url)
-            .env("RYZHUB_CONFIG", self.config.path())
-            .env("RUST_LOG", "warn")
-            .kill_on_drop(true)
-            .spawn()?)
-    }
-    async fn wait_state(&self, conv: Uuid, state: &str) -> anyhow::Result<Uuid> {
-        for _ in 0..400 {
-            let row:Option<(Uuid,String)>=sqlx::query_as("SELECT id,state FROM runs WHERE conversation_id=$1 ORDER BY started_at DESC LIMIT 1").bind(conv).fetch_optional(&self.db).await?;
-            if let Some((run, current)) = row {
-                if current == state {
-                    return Ok(run);
-                }
-                if current == "failed" {
-                    let error: Option<String> =
-                        sqlx::query_scalar("SELECT error_code FROM runs WHERE id=$1")
-                            .bind(run)
-                            .fetch_one(&self.db)
-                            .await?;
-                    anyhow::bail!("run failed: {error:?}");
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        anyhow::bail!("run did not reach {state}")
-    }
     /// The run after `previous` once it completes.
     async fn wait_after(&self, conv: Uuid, previous: Uuid) -> anyhow::Result<Uuid> {
         for _ in 0..400 {
@@ -520,14 +104,6 @@ impl Harness {
         }
         anyhow::bail!("no run completed after {previous}")
     }
-    async fn action(&self, run: Uuid) -> anyhow::Result<(Uuid, i64)> {
-        Ok(sqlx::query_as(
-            "SELECT id,run_epoch FROM pending_actions WHERE run_id=$1 AND status='pending'",
-        )
-        .bind(run)
-        .fetch_one(&self.db)
-        .await?)
-    }
     /// A gateway key for one Owner model call, as the chat engine issues it.
     async fn loop_key(&self, lease: &Lease, user: Uuid, run: Uuid) -> anyhow::Result<String> {
         keys::issue_loop_key(
@@ -539,39 +115,6 @@ impl Harness {
         )
         .await
     }
-    async fn close(self) -> anyhow::Result<()> {
-        common::release(
-            &self.db,
-            std::path::Path::new(&self.app.config.sandbox.host_socket),
-        )
-        .await;
-        if let Some(path) = &self.app.config.llm.unix_socket {
-            let _ = std::fs::remove_file(path);
-        }
-        for task in self.tasks {
-            task.abort();
-            let _ = task.await;
-        }
-        self.app.store.pool.close().await;
-        self.db.close().await;
-        sqlx::query(sqlx::AssertSqlSafe(format!(
-            "DROP DATABASE {} WITH (FORCE)",
-            self.name
-        )))
-        .execute(&self.admin)
-        .await?;
-        self.admin.close().await;
-        Ok(())
-    }
-}
-fn id(value: &Value, key: &str) -> Uuid {
-    Uuid::parse_str(value[key].as_str().unwrap()).unwrap()
-}
-fn message(text: &str) -> Command {
-    Command::SendMessage(SendMessage {
-        text: text.into(),
-        ..Default::default()
-    })
 }
 
 #[tokio::test]
@@ -1181,7 +724,7 @@ async fn replies_hand_over_the_sandbox_files_they_link_to() -> anyhow::Result<()
         .await?;
     assert_eq!(library["files"].as_array().unwrap().len(), 1);
     owner.kill().await?;
-    Ok(())
+    h.close().await
 }
 
 #[tokio::test]

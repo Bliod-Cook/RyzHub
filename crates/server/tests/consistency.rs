@@ -1,5 +1,7 @@
 //! Requires the local PostgreSQL 18 + NATS services: scripts/test-integration.sh.
+mod common;
 use anyhow::{Context, ensure};
+use common::{Harness, id};
 use futures_util::{SinkExt, StreamExt};
 use prost::Message;
 use ryzhub_core::Engine;
@@ -7,17 +9,13 @@ use ryzhub_proto::{command_envelope::Command, event_envelope::Event, frame::Body
 use ryzhub_server::{
     app::App,
     config::Config,
-    http::router,
     owner::{self, OwnerLink},
-    store::{Store, append},
+    store::append,
 };
 use serde_json::{Value, json};
 use sqlx::PgPool;
-use std::{process::Stdio, time::Duration};
-use tokio::{
-    net::TcpStream,
-    process::{Child, Command as Process},
-};
+use std::time::Duration;
+use tokio::{net::TcpStream, process::Command as Process};
 use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream,
     tungstenite::{Message as WsMessage, client::IntoClientRequest},
@@ -25,60 +23,9 @@ use tokio_tungstenite::{
 use uuid::Uuid;
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
-struct Harness {
-    name: String,
-    admin: PgPool,
-    db: PgPool,
-    store: Store,
-    nats: async_nats::Client,
-    app_url: String,
-    worker_url: String,
-    base: String,
-    task: tokio::task::JoinHandle<()>,
-}
 impl Harness {
     async fn new() -> anyhow::Result<Self> {
-        Self::with(|_| {}).await
-    }
-    async fn with(configure: impl FnOnce(&mut Config)) -> anyhow::Result<Self> {
-        let admin_url = std::env::var("TEST_ADMIN_URL").unwrap_or_else(|_| {
-            "postgres://postgres:local-development-only@127.0.0.1:55432/postgres".into()
-        });
-        let admin = PgPool::connect(&admin_url).await?;
-        let name = format!("ryzhub_test_{}", Uuid::now_v7().simple());
-        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {name}")))
-            .execute(&admin)
-            .await?;
-        let root = admin_url.rsplit_once('/').unwrap().0;
-        let db = PgPool::connect(&format!("{root}/{name}")).await?;
-        sqlx::migrate!("../../migrations").run(&db).await?;
-        let address = root.split('@').nth(1).context("test URL")?;
-        let app_url = format!("postgres://ryzhub_app:local-app-only@{address}/{name}");
-        let worker_url = format!("postgres://ryzhub_worker:local-worker-only@{address}/{name}");
-        let store = Store::connect(&app_url).await?;
-        let nats = async_nats::connect("nats://127.0.0.1:54222").await?;
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        let base = format!("http://{}", listener.local_addr()?);
-        let mut config = Config::default();
-        configure(&mut config);
-        let app = App::new(store.clone(), nats.clone(), config)?;
-        let task = tokio::spawn(async move {
-            axum::serve(listener, router(app)).await.unwrap();
-        });
-        Ok(Self {
-            name,
-            admin,
-            db,
-            store,
-            nats,
-            app_url,
-            worker_url,
-            base,
-            task,
-        })
-    }
-    async fn user(&self) -> anyhow::Result<Value> {
-        Ok(reqwest::Client::new().post(format!("{}/auth/register",self.base)).json(&json!({"email":format!("{}@example.test",Uuid::now_v7()),"password":"correct-test-password"})).send().await?.error_for_status()?.json().await?)
+        Self::start(|_| {}).await
     }
     async fn conversation(&self, user: &Value) -> anyhow::Result<Uuid> {
         let response: Value = reqwest::Client::new()
@@ -96,34 +43,6 @@ impl Harness {
             .await?;
         Ok(Uuid::parse_str(response["id"].as_str().unwrap())?)
     }
-    fn owner(&self) -> anyhow::Result<Child> {
-        Ok(Process::new(env!("CARGO_BIN_EXE_ryzhub-server"))
-            .arg("owner")
-            .env("DATABASE_URL", &self.app_url)
-            .env("WORKER_DATABASE_URL", &self.worker_url)
-            .env("NATS_URL", "nats://127.0.0.1:54222")
-            .env("RUST_LOG", "warn")
-            .stderr(Stdio::inherit())
-            .kill_on_drop(true)
-            .spawn()?)
-    }
-    async fn close(self) -> anyhow::Result<()> {
-        self.task.abort();
-        let _ = self.task.await;
-        self.store.pool.close().await;
-        self.db.close().await;
-        sqlx::query(sqlx::AssertSqlSafe(format!(
-            "DROP DATABASE {} WITH (FORCE)",
-            self.name
-        )))
-        .execute(&self.admin)
-        .await?;
-        self.admin.close().await;
-        Ok(())
-    }
-}
-fn id(user: &Value, key: &str) -> Uuid {
-    Uuid::parse_str(user[key].as_str().unwrap()).unwrap()
 }
 fn message(cid: Uuid, text: &str) -> CommandEnvelope {
     CommandEnvelope {
@@ -250,6 +169,7 @@ async fn database_idempotency_fencing_rls_and_transaction_outbox() -> anyhow::Re
     let other = h.user().await?;
     let conv = h.conversation(&user).await?;
     let ctx = h
+        .app
         .store
         .context(id(&user, "user_id"), id(&user, "org_id"))
         .await?;
@@ -257,30 +177,38 @@ async fn database_idempotency_fencing_rls_and_transaction_outbox() -> anyhow::Re
     let cid = Uuid::now_v7();
     let cmd = message(cid, "atomic transaction");
     assert!(
-        h.store
+        h.app
+            .store
             .accept(&ctx, conv, "device-a", &cmd)
             .await?
             .is_none()
     );
     assert!(
-        h.store
+        h.app
+            .store
             .accept(&ctx, conv, "device-b", &cmd)
             .await?
             .is_none()
     );
     let old = h
+        .app
         .store
         .claim(ctx.org_id, conv, Uuid::now_v7(), 3000)
         .await?
         .unwrap();
-    assert!(owner::process_command(&h.store, &old).await?);
-    let first = h.store.command_result(&ctx, cid).await?.unwrap();
+    assert!(owner::process_command(&h.app.store, &old).await?);
+    let first = h.app.store.command_result(&ctx, cid).await?.unwrap();
     assert_eq!(
-        h.store.accept(&ctx, conv, "device-b", &cmd).await?.unwrap(),
+        h.app
+            .store
+            .accept(&ctx, conv, "device-b", &cmd)
+            .await?
+            .unwrap(),
         first
     );
     assert!(
-        h.store
+        h.app
+            .store
             .accept(&ctx, conv, "device-a", &message(cid, "different payload"))
             .await
             .is_err()
@@ -290,7 +218,7 @@ async fn database_idempotency_fencing_rls_and_transaction_outbox() -> anyhow::Re
         .fetch_one(&h.db)
         .await?;
     assert_eq!(count, 1);
-    let mut tx = h.store.tx(id(&other, "org_id")).await?;
+    let mut tx = h.app.store.tx(id(&other, "org_id")).await?;
     let count: i64 = sqlx::query_scalar("SELECT count(*) FROM items WHERE conversation_id=$1")
         .bind(conv)
         .fetch_one(&mut *tx)
@@ -300,17 +228,18 @@ async fn database_idempotency_fencing_rls_and_transaction_outbox() -> anyhow::Re
     tx.rollback().await?;
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT count(*) FROM items")
-            .fetch_one(&h.store.pool)
+            .fetch_one(&h.app.store.pool)
             .await?,
         0
     );
     assert!(
-        h.store
+        h.app
+            .store
             .authorize_channel(id(&other, "user_id"), &channel)
             .await
             .is_err()
     );
-    let pending = h.store.unpublished(ctx.org_id, &channel).await?;
+    let pending = h.app.store.unpublished(ctx.org_id, &channel).await?;
     assert_eq!(pending.len(), 3);
     // Process crashes after commit and before publishing: force only its lease to expire.
     sqlx::query("UPDATE channels SET lease_until=now()-interval '1 second' WHERE id=$1")
@@ -318,13 +247,14 @@ async fn database_idempotency_fencing_rls_and_transaction_outbox() -> anyhow::Re
         .execute(&h.db)
         .await?;
     let new = h
+        .app
         .store
         .claim(ctx.org_id, conv, Uuid::now_v7(), 3000)
         .await?
         .unwrap();
     assert!(new.epoch > old.epoch);
-    assert!(h.store.renew(&old, 3000).await.is_err());
-    let mut tx = h.store.tx(ctx.org_id).await?;
+    assert!(h.app.store.renew(&old, 3000).await.is_err());
+    let mut tx = h.app.store.tx(ctx.org_id).await?;
     assert!(
         append(
             &mut tx,
@@ -339,13 +269,28 @@ async fn database_idempotency_fencing_rls_and_transaction_outbox() -> anyhow::Re
     );
     tx.rollback().await?;
     assert!(
-        owner::publish(&h.store, &h.nats, ctx.org_id, &channel, Some(&old), vec![])
-            .await
-            .is_err()
+        owner::publish(
+            &h.app.store,
+            &h.app.nats,
+            ctx.org_id,
+            &channel,
+            Some(&old),
+            vec![]
+        )
+        .await
+        .is_err()
     );
-    let mut subscriber = h.nats.subscribe(owner::subject(&channel)).await?;
-    h.nats.flush().await?;
-    owner::publish(&h.store, &h.nats, ctx.org_id, &channel, Some(&new), vec![]).await?;
+    let mut subscriber = h.app.nats.subscribe(owner::subject(&channel)).await?;
+    h.app.nats.flush().await?;
+    owner::publish(
+        &h.app.store,
+        &h.app.nats,
+        ctx.org_id,
+        &channel,
+        Some(&new),
+        vec![],
+    )
+    .await?;
     let mut engine = Engine::default();
     engine.subscribe(channel.clone());
     for expected in 1..=4 {
@@ -357,7 +302,13 @@ async fn database_idempotency_fencing_rls_and_transaction_outbox() -> anyhow::Re
         engine.apply(f);
     }
     assert_eq!(engine.channels[&channel].cursor, 4);
-    assert!(h.store.unpublished(ctx.org_id, &channel).await?.is_empty());
+    assert!(
+        h.app
+            .store
+            .unpublished(ctx.org_id, &channel)
+            .await?
+            .is_empty()
+    );
     h.close().await
 }
 
@@ -368,18 +319,21 @@ async fn two_devices_approval_cas_and_stale_execution_epoch() -> anyhow::Result<
     let user = h.user().await?;
     let conv = h.conversation(&user).await?;
     let ctx = h
+        .app
         .store
         .context(id(&user, "user_id"), id(&user, "org_id"))
         .await?;
-    h.store
+    h.app
+        .store
         .accept(&ctx, conv, "a", &message(Uuid::now_v7(), "/approve test"))
         .await?;
     let lease = h
+        .app
         .store
         .claim(ctx.org_id, conv, Uuid::now_v7(), 10_000)
         .await?
         .unwrap();
-    owner::process_command(&h.store, &lease).await?;
+    owner::process_command(&h.app.store, &lease).await?;
     let (action, epoch): (Uuid, i64) =
         sqlx::query_as("SELECT id,run_epoch FROM pending_actions WHERE org_id=$1")
             .bind(ctx.org_id)
@@ -393,6 +347,7 @@ async fn two_devices_approval_cas_and_stale_execution_epoch() -> anyhow::Result<
     .execute(&h.db)
     .await?;
     let lease = h
+        .app
         .store
         .claim(ctx.org_id, conv, Uuid::now_v7(), 10_000)
         .await?
@@ -405,10 +360,11 @@ async fn two_devices_approval_cas_and_stale_execution_epoch() -> anyhow::Result<
             decision: "allow".into(),
         })),
     };
-    h.store.accept(&ctx, conv, "old-device", &stale).await?;
-    owner::process_command(&h.store, &lease).await?;
+    h.app.store.accept(&ctx, conv, "old-device", &stale).await?;
+    owner::process_command(&h.app.store, &lease).await?;
     assert!(matches!(
-        h.store
+        h.app
+            .store
             .command_result(&ctx, Uuid::parse_str(&stale.cid)?)
             .await?
             .unwrap()
@@ -429,17 +385,18 @@ async fn two_devices_approval_cas_and_stale_execution_epoch() -> anyhow::Result<
         ..a.clone()
     };
     let (ra, rb) = tokio::join!(
-        h.store.accept(&ctx, conv, "a", &a),
-        h.store.accept(&ctx, conv, "b", &b)
+        h.app.store.accept(&ctx, conv, "a", &a),
+        h.app.store.accept(&ctx, conv, "b", &b)
     );
     ra?;
     rb?;
-    owner::process_command(&h.store, &lease).await?;
-    owner::process_command(&h.store, &lease).await?;
+    owner::process_command(&h.app.store, &lease).await?;
+    owner::process_command(&h.app.store, &lease).await?;
     let mut accepted = 0;
     let mut rejected = 0;
     for cmd in [a, b] {
         match h
+            .app
             .store
             .command_result(&ctx, Uuid::parse_str(&cmd.cid)?)
             .await?
@@ -808,8 +765,9 @@ async fn member_removal_revokes_org_access_and_stops_waiting_run() -> anyhow::Re
         .bind(user)
         .execute(&h.db)
         .await?;
-    let ctx = h.store.context(user, org).await?;
+    let ctx = h.app.store.context(user, org).await?;
     let conv = h
+        .app
         .store
         .create_conversation(&ctx, "待审批任务", "work")
         .await?
@@ -838,10 +796,11 @@ async fn member_removal_revokes_org_access_and_stops_waiting_run() -> anyhow::Re
     })
     .await?;
     // The session survives for the member's other organizations; this one is gone.
-    h.store
+    h.app
+        .store
         .authenticate(member["token"].as_str().unwrap())
         .await?;
-    assert!(h.store.context(user, org).await.is_err());
+    assert!(h.app.store.context(user, org).await.is_err());
     let mut stopped = false;
     for _ in 0..200 {
         let state: String = sqlx::query_scalar("SELECT state FROM runs WHERE conversation_id=$1")
@@ -874,6 +833,7 @@ async fn delayed_nats_frames_from_retired_publisher_are_discarded() -> anyhow::R
     let org = id(&user, "org_id");
     let channel = format!("conv:{conv}");
     let old = h
+        .app
         .store
         .claim(org, conv, Uuid::now_v7(), 3000)
         .await?
@@ -883,6 +843,7 @@ async fn delayed_nats_frames_from_retired_publisher_are_discarded() -> anyhow::R
         .execute(&h.db)
         .await?;
     let current = h
+        .app
         .store
         .claim(org, conv, Uuid::now_v7(), 3000)
         .await?
@@ -907,11 +868,12 @@ async fn delayed_nats_frames_from_retired_publisher_are_discarded() -> anyhow::R
             }),
         );
         f.writer_epoch = epoch as u64;
-        h.nats
+        h.app
+            .nats
             .publish(owner::subject(&channel), f.encode_to_vec().into())
             .await?;
     }
-    h.nats.flush().await?;
+    h.app.nats.flush().await?;
     let received = next(&mut socket).await?;
     assert!(matches!(received.body,Some(Body::Delta(d)) if d.text=="current publisher"));
     socket.close(None).await?;
@@ -926,13 +888,13 @@ async fn parallel_approvals_should_both_resolve() -> anyhow::Result<()> {
         let user = h.user().await?;
         let org = id(&user, "org_id");
         let conv = h.conversation(&user).await?;
-        let ctx = h.store.context(id(&user, "user_id"), org).await?;
-        let lease = h.store.claim(org, conv, Uuid::now_v7(), 60000).await?.unwrap();
+        let ctx = h.app.store.context(id(&user, "user_id"), org).await?;
+        let lease = h.app.store.claim(org, conv, Uuid::now_v7(), 60000).await?.unwrap();
         let mut config = Config::default();
         config.llm.enabled = true;
         config.llm.model = "mock".into();
-        h.store.accept(&ctx, conv, "review", &message(Uuid::now_v7(), "parallel approval")).await?;
-        owner::process_with_config(&h.store, &lease, &config).await?;
+        h.app.store.accept(&ctx, conv, "review", &message(Uuid::now_v7(), "parallel approval")).await?;
+        owner::process_with_config(&h.app.store, &lease, &config).await?;
         let run: Uuid = sqlx::query_scalar("SELECT id FROM runs WHERE conversation_id=$1").bind(conv).fetch_one(&h.db).await?;
         let actions = [Uuid::now_v7(), Uuid::now_v7()];
         for action in actions {
@@ -943,11 +905,11 @@ async fn parallel_approvals_should_both_resolve() -> anyhow::Result<()> {
         let mut replies = vec![];
         for (index, action) in actions.into_iter().enumerate() {
             let cmd = CommandEnvelope { cid: Uuid::now_v7().to_string(), command: Some(Command::DecideApproval(DecideApproval { action_id: action.to_string(),run_epoch:lease.epoch as u64,decision:"allow".into() })) };
-            h.store.accept(&ctx,conv,"review",&cmd).await?;
-            owner::process_with_config(&h.store,&lease,&config).await?;
+            h.app.store.accept(&ctx,conv,"review",&cmd).await?;
+            owner::process_with_config(&h.app.store,&lease,&config).await?;
             let state: String = sqlx::query_scalar("SELECT state FROM runs WHERE id=$1").bind(run).fetch_one(&h.db).await?;
             ensure!(state == if index == 0 { "requires_action" } else { "running" });
-            replies.push(h.store.command_result(&ctx,Uuid::parse_str(&cmd.cid)?).await?.unwrap());
+            replies.push(h.app.store.command_result(&ctx,Uuid::parse_str(&cmd.cid)?).await?.unwrap());
         }
         let state: String = sqlx::query_scalar("SELECT state FROM runs WHERE id=$1").bind(run).fetch_one(&h.db).await?;
         let pending:i64 = sqlx::query_scalar("SELECT count(*) FROM pending_actions WHERE run_id=$1 AND status='pending'").bind(run).fetch_one(&h.db).await?;
@@ -962,59 +924,35 @@ async fn parallel_approvals_should_both_resolve() -> anyhow::Result<()> {
 #[tokio::test]
 #[ignore = "requires local PostgreSQL and NATS"]
 async fn restore_failure_should_not_create_blank_workspace() -> anyhow::Result<()> {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
     let h = Harness::new().await?;
     let temp = tempfile::tempdir()?;
     let socket = temp.path().join("host.sock");
-    let listener = tokio::net::UnixListener::bind(&socket)?;
-    let created = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let observed = created.clone();
-    let stopped = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    let stops = stopped.clone();
     let mut restored = false;
-    let stub = tokio::spawn(async move {
-        loop {
-            let (stream, _) = listener.accept().await.unwrap();
-            let (read, mut stream) = stream.into_split();
-            let mut reader = tokio::io::BufReader::new(read);
-            let mut line = String::new();
-            reader.read_line(&mut line).await.unwrap();
-            let command: Value = serde_json::from_str(&line).unwrap();
-            if command["kind"] == "artifact_upload" {
-                let mut body = vec![0; command["size"].as_u64().unwrap() as usize];
-                tokio::io::AsyncReadExt::read_exact(&mut reader, &mut body)
-                    .await
-                    .unwrap();
-            }
-            if command["kind"] == "stop" {
-                stops
-                    .lock()
-                    .unwrap()
-                    .push(command["sandbox_id"].as_str().unwrap().to_owned());
-            }
-            let reply = if command["kind"] == "restore" && !restored {
-                restored = true;
-                // Destination was created, but the Owner lost its lease before DB completion.
-                json!({"ok":false,"value":null,"error":"FENCED"})
-            } else if command["kind"] == "create" {
-                observed.store(true, std::sync::atomic::Ordering::SeqCst);
-                json!({"ok":false,"value":null,"error":"REVIEW_STOP_BEFORE_CREATE"})
-            } else {
-                json!({"ok":true,"value":{"stopped":true},"error":null})
-            };
-            stream
-                .write_all(format!("{reply}\n").as_bytes())
-                .await
-                .unwrap();
+    let (stub, requests) = recording_host(&socket, move |command| {
+        if command["kind"] == "restore" && !restored {
+            restored = true;
+            // Destination was created, but the Owner lost its lease before DB completion.
+            Err("FENCED")
+        } else if command["kind"] == "create" {
+            Err("REVIEW_STOP_BEFORE_CREATE")
+        } else {
+            Ok(json!({"stopped":true}))
         }
-    });
+    })?;
+    let created = || {
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|r| r["kind"] == "create")
+    };
     let outcome = async {
         let user=h.user().await?;
         let org=id(&user,"org_id");
         let conv=h.conversation(&user).await?;
         sqlx::query("UPDATE conversations SET mode='work',run_config='{}' WHERE id=$1").bind(conv).execute(&h.db).await?;
-        let ctx=h.store.context(id(&user,"user_id"),org).await?;
-        let lease=h.store.claim(org,conv,Uuid::now_v7(),60000).await?.unwrap();
+        let ctx=h.app.store.context(id(&user,"user_id"),org).await?;
+        let lease=h.app.store.claim(org,conv,Uuid::now_v7(),60000).await?.unwrap();
         let mut config=Config::default();
         config.llm.enabled=true;
         config.work.enabled=true;
@@ -1024,8 +962,8 @@ async fn restore_failure_should_not_create_blank_workspace() -> anyhow::Result<(
         config.sandbox.image=format!("review@sha256:{}","b".repeat(64));
         config.work.storage_root=temp.path().join("missing-blobs").to_str().unwrap().into();
         config.work.secondary_root=None;
-        h.store.accept(&ctx,conv,"review",&message(Uuid::now_v7(),"first turn")).await?;
-        owner::process_with_config(&h.store,&lease,&config).await?;
+        h.app.store.accept(&ctx,conv,"review",&message(Uuid::now_v7(),"first turn")).await?;
+        owner::process_with_config(&h.app.store,&lease,&config).await?;
         let run:Uuid=sqlx::query_scalar("SELECT id FROM runs WHERE conversation_id=$1").bind(conv).fetch_one(&h.db).await?;
         sqlx::query("UPDATE runs SET state='completed',ended_at=now() WHERE id=$1").bind(run).execute(&h.db).await?;
         let sandbox=Uuid::now_v7();
@@ -1042,22 +980,22 @@ async fn restore_failure_should_not_create_blank_workspace() -> anyhow::Result<(
         sqlx::query("INSERT INTO workspace_heads(org_id,conversation_id,checkpoint_id) VALUES($1,$2,$3)").bind(org).bind(conv).bind(checkpoint).execute(&h.db).await?;
         let job=Uuid::now_v7();
         sqlx::query("INSERT INTO workspace_jobs(id,org_id,conversation_id,kind) VALUES($1,$2,$3,'restore')").bind(job).bind(org).bind(conv).execute(&h.db).await?;
-        let app=App::new(h.store.clone(),h.nats.clone(),config.clone())?;
+        let app=App::new(h.app.store.clone(),h.app.nats.clone(),config.clone())?;
         let link=OwnerLink::detached();
         ryzhub_server::workspace::jobs(&app,&lease,&link).await?;
         let state:String=sqlx::query_scalar("SELECT state FROM workspace_jobs WHERE id=$1").bind(job).fetch_one(&h.db).await?;
         ensure!(state=="failed","expected unavailable blob to fail restore");
         let cmd=message(Uuid::now_v7(),"continue after failed restore");
-        h.store.accept(&ctx,conv,"review",&cmd).await?;
-        owner::process_with_config(&h.store,&lease,&config).await?;
-        let response=h.store.command_result(&ctx,Uuid::parse_str(&cmd.cid)?).await?.unwrap();
+        h.app.store.accept(&ctx,conv,"review",&cmd).await?;
+        owner::process_with_config(&h.app.store,&lease,&config).await?;
+        let response=h.app.store.command_result(&ctx,Uuid::parse_str(&cmd.cid)?).await?.unwrap();
         if matches!(response.body,Some(Body::CommandAck(_))) {
             let next:Uuid=sqlx::query_scalar("SELECT id FROM runs WHERE conversation_id=$1 AND state='running'").bind(conv).fetch_one(&h.db).await?;
             let err=ryzhub_server::work::ensure_work(&app,&lease,next).await.unwrap_err();
-            println!("restore job={state}; next message={response:?}; ensure_work={err}; create_sent={}",created.load(std::sync::atomic::Ordering::SeqCst));
+            println!("restore job={state}; next message={response:?}; ensure_work={err}; create_sent={}",created());
         }
         ensure!(matches!(response.body, Some(Body::CommandRejected(ref r)) if r.code == "WORKSPACE_RECOVERY_REQUIRED"), "message must fail before creating a run");
-        ensure!(!created.load(std::sync::atomic::Ordering::SeqCst),"failed restore allowed creation of a new blank workspace");
+        ensure!(!created(),"failed restore allowed creation of a new blank workspace");
         let mut headers=axum::http::HeaderMap::new();
         headers.insert("Authorization",format!("Bearer {}",user["token"].as_str().unwrap()).parse()?);
         let retried=ryzhub_server::workspace::enqueue(axum::extract::State(app.clone()),headers,
@@ -1067,11 +1005,12 @@ async fn restore_failure_should_not_create_blank_workspace() -> anyhow::Result<(
         let interrupted=ryzhub_server::workspace::jobs(&app,&lease,&link).await.unwrap_err();
         ensure!(ryzhub_server::error::is_fenced(&interrupted), "expected FENCED, got {interrupted:#}");
         sqlx::query("UPDATE channels SET lease_until=now()-interval '1 second' WHERE org_id=$1 AND conversation_id=$2").bind(org).bind(conv).execute(&h.db).await?;
-        let successor=h.store.claim(org,conv,Uuid::now_v7(),60000).await?.unwrap();
+        let successor=h.app.store.claim(org,conv,Uuid::now_v7(),60000).await?.unwrap();
         ryzhub_server::workspace::jobs(&app,&successor,&link).await?;
         let state:String=sqlx::query_scalar("SELECT state FROM workspace_jobs WHERE id=$1").bind(job).fetch_one(&h.db).await?;
         ensure!(state=="completed");
-        ensure!(stopped.lock().unwrap().iter().all(|id| id==&sandbox.to_string()), "retry stopped destination");
+        let stopped = requests.lock().unwrap().iter().filter(|r| r["kind"] == "stop").all(|r| r["sandbox_id"] == sandbox.to_string());
+        ensure!(stopped, "retry stopped destination");
         let generation:i64=sqlx::query_scalar("SELECT generation FROM workspace_heads WHERE conversation_id=$1").bind(conv).fetch_one(&h.db).await?;
         ensure!(generation==2, "retry incremented generation again");
         let seq:i64=sqlx::query_scalar("SELECT last_seq FROM channels WHERE org_id=$1 AND conversation_id=$2").bind(org).bind(conv).fetch_one(&h.db).await?;
@@ -1079,7 +1018,7 @@ async fn restore_failure_should_not_create_blank_workspace() -> anyhow::Result<(
         ryzhub_server::workspace::restore(&app,&successor,job,&link).await?;
         let again:i64=sqlx::query_scalar("SELECT last_seq FROM channels WHERE org_id=$1 AND conversation_id=$2").bind(org).bind(conv).fetch_one(&h.db).await?;
         ensure!(seq==again);
-        let mut tx=h.store.tx(org).await?;
+        let mut tx=h.app.store.tx(org).await?;
         ryzhub_server::work::available(&mut tx,&successor).await?;
         tx.commit().await?;
         Ok::<_,anyhow::Error>(())
@@ -1092,57 +1031,39 @@ async fn restore_failure_should_not_create_blank_workspace() -> anyhow::Result<(
 #[tokio::test]
 #[ignore = "requires local PostgreSQL and NATS"]
 async fn checkpoint_sync_should_not_ack_next_turn_without_projection() -> anyhow::Result<()> {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
     let h = Harness::new().await?;
     let temp = tempfile::tempdir()?;
     let socket = temp.path().join("host.sock");
-    let listener = tokio::net::UnixListener::bind(&socket)?;
-    let tokens = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-    let observed = tokens.clone();
-    let stub = tokio::spawn(async move {
-        loop {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut line = String::new();
-            tokio::io::BufReader::new(&mut stream)
-                .read_line(&mut line)
-                .await
-                .unwrap();
-            let request: Value = serde_json::from_str(&line).unwrap();
-            let command = &request["request"]["command"];
-            if command["kind"] == "rotate_key" {
-                observed
-                    .lock()
-                    .unwrap()
-                    .push(command["token"].as_str().unwrap().to_owned());
-            }
-            let value = if command["kind"] == "replay" {
-                let events = vec![
-                    json!({"gseq":1,"op_id":"native","result":{"type":"item","phase":"completed","turn_id":"new-turn","native_id":"new-native-item","kind":"assistant","content":{"text":"NEW_RUN_CONTENT"}}}),
-                    json!({"gseq":2,"op_id":"native","result":{"type":"question_requested","request_id":"17","turn_id":"new-turn","questions":[{"id":"color","question":"Which color?"}]}}),
-                    json!({"gseq":3,"op_id":"native","result":{"type":"turn_started","turn_id":"restored-historical-turn"}}),
-                ];
-                let events: Vec<_> = events
-                    .into_iter()
-                    .filter(|e| e["gseq"].as_u64().unwrap() > command["after"].as_u64().unwrap())
-                    .collect();
-                json!({"events":events,"head":3,"folds":{}})
-            } else {
-                json!({"acked":1})
-            };
-            stream
-                .write_all(
-                    format!("{}\n", json!({"ok":true,"value":value,"error":null})).as_bytes(),
-                )
-                .await
-                .unwrap();
-        }
-    });
+    let (stub, requests) = recording_host(&socket, |request| {
+        let command = &request["request"]["command"];
+        Ok(if command["kind"] == "replay" {
+            let events = vec![
+                json!({"gseq":1,"op_id":"native","result":{"type":"item","phase":"completed","turn_id":"new-turn","native_id":"new-native-item","kind":"assistant","content":{"text":"NEW_RUN_CONTENT"}}}),
+                json!({"gseq":2,"op_id":"native","result":{"type":"question_requested","request_id":"17","turn_id":"new-turn","questions":[{"id":"color","question":"Which color?"}]}}),
+                json!({"gseq":3,"op_id":"native","result":{"type":"turn_started","turn_id":"restored-historical-turn"}}),
+            ];
+            let events: Vec<_> = events
+                .into_iter()
+                .filter(|e| e["gseq"].as_u64().unwrap() > command["after"].as_u64().unwrap())
+                .collect();
+            json!({"events":events,"head":3,"folds":{}})
+        } else {
+            json!({"acked":1})
+        })
+    })?;
+    // The key the host was last given.
+    let rotated = || {
+        let requests = requests.lock().unwrap();
+        let mut commands = requests.iter().rev().map(|r| &r["request"]["command"]);
+        let rotation = commands.find(|c| c["kind"] == "rotate_key").unwrap();
+        rotation["token"].as_str().unwrap().to_owned()
+    };
     let outcome=async {
         let user=h.user().await?;
         let org=id(&user,"org_id");
         let conv=h.conversation(&user).await?;
-        let ctx=h.store.context(id(&user,"user_id"),org).await?;
-        let lease=h.store.claim(org,conv,Uuid::now_v7(),60000).await?.unwrap();
+        let ctx=h.app.store.context(id(&user,"user_id"),org).await?;
+        let lease=h.app.store.claim(org,conv,Uuid::now_v7(),60000).await?.unwrap();
         let mut config=Config::default();
         config.llm.enabled=true;
         config.llm.model="mock".into();
@@ -1150,19 +1071,19 @@ async fn checkpoint_sync_should_not_ack_next_turn_without_projection() -> anyhow
         config.work.model="mock".into();
         config.sandbox.enabled=true;
         config.sandbox.host_socket=socket.to_str().unwrap().into();
-        h.store.accept(&ctx,conv,"review",&message(Uuid::now_v7(),"old turn")).await?;
-        owner::process_with_config(&h.store,&lease,&config).await?;
+        h.app.store.accept(&ctx,conv,"review",&message(Uuid::now_v7(),"old turn")).await?;
+        owner::process_with_config(&h.app.store,&lease,&config).await?;
         let old:Uuid=sqlx::query_scalar("SELECT id FROM runs WHERE conversation_id=$1").bind(conv).fetch_one(&h.db).await?;
         sqlx::query("UPDATE runs SET state='completed',native_turn_id='old-turn',ended_at=now() WHERE id=$1").bind(old).execute(&h.db).await?;
-        h.store.accept(&ctx,conv,"review",&message(Uuid::now_v7(),"new turn")).await?;
-        owner::process_with_config(&h.store,&lease,&config).await?;
+        h.app.store.accept(&ctx,conv,"review",&message(Uuid::now_v7(),"new turn")).await?;
+        owner::process_with_config(&h.app.store,&lease,&config).await?;
         let new:Uuid=sqlx::query_scalar("SELECT id FROM runs WHERE conversation_id=$1 AND state='running'").bind(conv).fetch_one(&h.db).await?;
 
         let sandbox=Uuid::now_v7();
         sqlx::query("INSERT INTO sandboxes(id,org_id,conversation_id,run_id,lease_epoch,exec_epoch,state,handle,persistent) VALUES($1,$2,$3,$4,1,$5,'running','{}',true)")
             .bind(sandbox).bind(org).bind(conv).bind(new).bind(lease.epoch).execute(&h.db).await?;
         sqlx::query("UPDATE runs SET sandbox_id=$2 WHERE id=ANY($1)").bind(vec![old,new]).bind(sandbox).execute(&h.db).await?;
-        let app=App::new(h.store.clone(),h.nats.clone(),config)?;
+        let app=App::new(h.app.store.clone(),h.app.nats.clone(),config)?;
         let link=OwnerLink::detached();
         // The event's turn is not registered yet: projection waits instead of acknowledging it.
         let waiting=tokio::time::timeout(Duration::from_millis(500),ryzhub_server::work::sync_through(&app,&lease,old,sandbox,1,&link)).await;
@@ -1182,24 +1103,24 @@ async fn checkpoint_sync_should_not_ack_next_turn_without_projection() -> anyhow
         // Rotation also works while waiting for user input, without starting a new turn, and
         // supersedes the previous key for new requests.
         ryzhub_server::work::refresh_key(&app,&lease,new,sandbox).await?;
-        let first=tokens.lock().unwrap().last().unwrap().clone();
+        let first=rotated();
         ryzhub_server::work::refresh_key(&app,&lease,new,sandbox).await?;
-        let second=tokens.lock().unwrap().last().unwrap().clone();
+        let second=rotated();
         ensure!(first != second);
-        let first=ryzhub_server::llm::keys::resolve(&h.store,&first).await?;
-        let second=ryzhub_server::llm::keys::resolve(&h.store,&second).await?;
-        let mut tx=h.store.tx(org).await?;
+        let first=ryzhub_server::llm::keys::resolve(&h.app.store,&first).await?;
+        let second=ryzhub_server::llm::keys::resolve(&h.app.store,&second).await?;
+        let mut tx=h.app.store.tx(org).await?;
         ensure!(ryzhub_server::llm::gateway::validate_key(&mut tx,&first,false).await.is_err());
         tx.rollback().await?;
-        let mut tx=h.store.tx(org).await?;
+        let mut tx=h.app.store.tx(org).await?;
         ryzhub_server::llm::gateway::validate_key(&mut tx,&second,false).await?;
         // An accepted stream outlives its key's supersession.
         ryzhub_server::llm::gateway::validate_key(&mut tx,&first,true).await?;
         tx.commit().await?;
         let answer=CommandEnvelope{cid:Uuid::now_v7().to_string(),command:Some(Command::AnswerQuestion(AnswerQuestion{action_id:action.to_string(),run_epoch:lease.epoch as u64,answer:"green".into()}))};
-        h.store.accept(&ctx,conv,"review",&answer).await?;
-        owner::process_with_config(&h.store,&lease,&app.config).await?;
-        let response=h.store.command_result(&ctx,Uuid::parse_str(&answer.cid)?).await?.unwrap();
+        h.app.store.accept(&ctx,conv,"review",&answer).await?;
+        owner::process_with_config(&h.app.store,&lease,&app.config).await?;
+        let response=h.app.store.command_result(&ctx,Uuid::parse_str(&answer.cid)?).await?.unwrap();
         ensure!(matches!(response.body,Some(Body::CommandAck(_))));
         let answer:Value=sqlx::query_scalar("SELECT answer FROM native_requests WHERE action_id=$1").bind(action).fetch_one(&h.db).await?;
         ensure!(answer==json!({"type":"question","answers":{"color":"green"}}), "unexpected answer {answer}");
@@ -1217,9 +1138,9 @@ async fn legacy_upgrade_preserves_native_model_and_existing_settings() -> anyhow
     let outcome = async {
         let user = h.user().await?;
         let org = id(&user,"org_id");
-        let ctx = h.store.context(id(&user,"user_id"),org).await?;
+        let ctx = h.app.store.context(id(&user,"user_id"),org).await?;
         for mode in ["chat","work"] {
-            let conv = h.store.create_conversation(&ctx,"Legacy upgrade",mode).await?.id;
+            let conv = h.app.store.create_conversation(&ctx,"Legacy upgrade",mode).await?.id;
             let run=Uuid::now_v7();
             sqlx::query("INSERT INTO runs(id,org_id,conversation_id,harness,model,exec_epoch,state,response_text,assistant_item_id,cause_cid) VALUES($1,$2,$3,$4,'pinned-legacy-model',1,'running','',$5,$6)")
                 .bind(run).bind(org).bind(conv).bind(if mode=="work" {"codex"}else{"chat"}).bind(Uuid::now_v7()).bind(Uuid::now_v7()).execute(&h.db).await?;
@@ -1243,29 +1164,33 @@ async fn legacy_upgrade_preserves_native_model_and_existing_settings() -> anyhow
 /// Every request a stub host received.
 type Recorded = std::sync::Arc<std::sync::Mutex<Vec<Value>>>;
 
-/// A host agent stub that records every request and answers each as a completed operation
-/// (with an empty model list for harness requests).
+/// A host agent stub on `socket` that records every request and answers it with `reply`.
 fn recording_host(
     socket: &std::path::Path,
+    mut reply: impl FnMut(&Value) -> Result<Value, &'static str> + Send + 'static,
 ) -> anyhow::Result<(tokio::task::JoinHandle<()>, Recorded)> {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
     let listener = tokio::net::UnixListener::bind(socket)?;
-    let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let requests = Recorded::default();
     let seen = requests.clone();
     let task = tokio::spawn(async move {
         loop {
             let (stream, _) = listener.accept().await.unwrap();
             let (read, mut write) = stream.into_split();
+            let mut reader = tokio::io::BufReader::new(read);
             let mut line = String::new();
-            tokio::io::BufReader::new(read)
-                .read_line(&mut line)
-                .await
-                .unwrap();
-            seen.lock()
-                .unwrap()
-                .push(serde_json::from_str::<Value>(&line).unwrap());
-            let value = json!({"state":"completed","result":{"models":[]}});
-            let reply = json!({"ok":true,"value":value,"error":null});
+            reader.read_line(&mut line).await.unwrap();
+            let request: Value = serde_json::from_str(&line).unwrap();
+            // An upload's content follows its request.
+            if request["kind"] == "artifact_upload" {
+                let mut body = vec![0; request["size"].as_u64().unwrap() as usize];
+                reader.read_exact(&mut body).await.unwrap();
+            }
+            let reply = match reply(&request) {
+                Ok(value) => json!({"ok":true,"value":value,"error":null}),
+                Err(error) => json!({"ok":false,"value":null,"error":error}),
+            };
+            seen.lock().unwrap().push(request);
             write
                 .write_all(format!("{reply}\n").as_bytes())
                 .await
@@ -1296,24 +1221,26 @@ async fn runs_wait_for_idle_suspension_and_models_are_discovered_once() -> anyho
     let h = Harness::new().await?;
     let temp = tempfile::tempdir()?;
     let socket = temp.path().join("host.sock");
-    let (stub, requests) = recording_host(&socket)?;
+    let (stub, requests) = recording_host(&socket, |_| {
+        Ok(json!({"state":"completed","result":{"models":[]}}))
+    })?;
     let outcome = async {
         let user = h.user().await?;
         let org = id(&user, "org_id");
         let conv = h.conversation(&user).await?;
         sqlx::query("UPDATE conversations SET mode='work',run_config='{}' WHERE id=$1").bind(conv).execute(&h.db).await?;
-        let ctx = h.store.context(id(&user, "user_id"), org).await?;
-        let lease = h.store.claim(org, conv, Uuid::now_v7(), 60_000).await?.unwrap();
+        let ctx = h.app.store.context(id(&user, "user_id"), org).await?;
+        let lease = h.app.store.claim(org, conv, Uuid::now_v7(), 60_000).await?.unwrap();
         let config = work_config(&socket, temp.path());
-        h.store.accept(&ctx, conv, "review", &message(Uuid::now_v7(), "turn")).await?;
-        owner::process_with_config(&h.store, &lease, &config).await?;
+        h.app.store.accept(&ctx, conv, "review", &message(Uuid::now_v7(), "turn")).await?;
+        owner::process_with_config(&h.app.store, &lease, &config).await?;
         let run: Uuid = sqlx::query_scalar("SELECT id FROM runs WHERE conversation_id=$1").bind(conv).fetch_one(&h.db).await?;
         sqlx::query("INSERT INTO sandboxes(id,org_id,conversation_id,run_id,lease_epoch,exec_epoch,state,handle,persistent,node_lease_until) VALUES($1,$2,$3,$4,1,$5,'running','{}',true,now()+interval '1 hour')")
             .bind(Uuid::now_v7()).bind(org).bind(conv).bind(run).bind(lease.epoch).execute(&h.db).await?;
         let suspension = Uuid::now_v7();
         sqlx::query("INSERT INTO workspace_jobs(id,org_id,conversation_id,kind,state) VALUES($1,$2,$3,'suspend','running')")
             .bind(suspension).bind(org).bind(conv).execute(&h.db).await?;
-        let app = App::new(h.store.clone(), h.nats.clone(), config)?;
+        let app = App::new(h.app.store.clone(), h.app.nats.clone(), config)?;
         // The suspension is about to stop the sandbox: the new run must not start using it.
         let waiting = tokio::time::timeout(Duration::from_millis(1500), ryzhub_server::work::ensure_work(&app, &lease, run)).await;
         ensure!(waiting.is_err(), "a run must wait for an in-progress suspension");
@@ -1339,17 +1266,19 @@ async fn suspended_workspace_checkpoints_forks_and_archives_from_its_head() -> a
     let h = Harness::new().await?;
     let temp = tempfile::tempdir()?;
     let socket = temp.path().join("host.sock");
-    let (stub, requests) = recording_host(&socket)?;
+    let (stub, requests) = recording_host(&socket, |_| {
+        Ok(json!({"state":"completed","result":{"models":[]}}))
+    })?;
     let outcome = async {
         let user = h.user().await?;
         let org = id(&user, "org_id");
         let conv = h.conversation(&user).await?;
         sqlx::query("UPDATE conversations SET mode='work',run_config='{}' WHERE id=$1").bind(conv).execute(&h.db).await?;
-        let ctx = h.store.context(id(&user, "user_id"), org).await?;
-        let lease = h.store.claim(org, conv, Uuid::now_v7(), 60_000).await?.unwrap();
+        let ctx = h.app.store.context(id(&user, "user_id"), org).await?;
+        let lease = h.app.store.claim(org, conv, Uuid::now_v7(), 60_000).await?.unwrap();
         let config = work_config(&socket, temp.path());
-        h.store.accept(&ctx, conv, "review", &message(Uuid::now_v7(), "turn")).await?;
-        owner::process_with_config(&h.store, &lease, &config).await?;
+        h.app.store.accept(&ctx, conv, "review", &message(Uuid::now_v7(), "turn")).await?;
+        owner::process_with_config(&h.app.store, &lease, &config).await?;
         let run: Uuid = sqlx::query_scalar("SELECT id FROM runs WHERE conversation_id=$1").bind(conv).fetch_one(&h.db).await?;
         sqlx::query("UPDATE runs SET state='completed',ended_at=now() WHERE id=$1").bind(run).execute(&h.db).await?;
         let sandbox = Uuid::now_v7();
@@ -1360,7 +1289,7 @@ async fn suspended_workspace_checkpoints_forks_and_archives_from_its_head() -> a
         sqlx::query("INSERT INTO checkpoints(id,org_id,conversation_id,sandbox_id,manifest,channel_seq,gseq) VALUES($1,$2,$3,$4,$5,0,0)")
             .bind(head).bind(org).bind(conv).bind(sandbox).bind(manifest).execute(&h.db).await?;
         sqlx::query("INSERT INTO workspace_heads(org_id,conversation_id,checkpoint_id) VALUES($1,$2,$3)").bind(org).bind(conv).bind(head).execute(&h.db).await?;
-        let app = App::new(h.store.clone(), h.nats.clone(), config)?;
+        let app = App::new(h.app.store.clone(), h.app.nats.clone(), config)?;
         let link = OwnerLink::detached();
         let job_state = |job: Uuid| {
             let db = h.db.clone();
@@ -1521,7 +1450,7 @@ async fn jobs_deduplicate_retry_fence_stale_claims_and_die_after_their_attempts(
     let h = Harness::new().await?;
     let (user, other) = (h.user().await?, h.user().await?);
     let (org, other_org) = (id(&user, "org_id"), id(&other, "org_id"));
-    let app = App::new(h.store.clone(), h.nats.clone(), Config::default())?;
+    let app = App::new(h.app.store.clone(), h.app.nats.clone(), Config::default())?;
     let worker = PgPool::connect(&h.worker_url).await?;
     let state = |job: Uuid| {
         sqlx::query_as::<_, (String, i32)>("SELECT state,attempts FROM jobs WHERE id=$1")
@@ -1529,7 +1458,7 @@ async fn jobs_deduplicate_retry_fence_stale_claims_and_die_after_their_attempts(
             .fetch_one(&h.db)
     };
 
-    let mut tx = h.store.tx(org).await?;
+    let mut tx = h.app.store.tx(org).await?;
     let later = chrono::Utc::now() + chrono::Duration::hours(1);
     let first = jobs::enqueue(
         &mut tx,
@@ -1570,11 +1499,11 @@ async fn jobs_deduplicate_retry_fence_stale_claims_and_die_after_their_attempts(
             .await?;
     assert!(payload == json!({"n": 1}) && due);
     // A job enqueued by a transaction that rolls back never exists.
-    let mut tx = h.store.tx(org).await?;
+    let mut tx = h.app.store.tx(org).await?;
     let rolled_back = jobs::enqueue(&mut tx, org, NewJob::new("test.ok", json!({}))).await?;
     tx.rollback().await?;
     // Organizations see only their own jobs.
-    let mut tx = h.store.tx(other_org).await?;
+    let mut tx = h.app.store.tx(other_org).await?;
     let visible: i64 = sqlx::query_scalar("SELECT count(*) FROM jobs")
         .fetch_one(&mut *tx)
         .await?;
@@ -1626,7 +1555,7 @@ async fn jobs_deduplicate_retry_fence_stale_claims_and_die_after_their_attempts(
 
     // A worker whose lease expired loses the job: another worker reclaims and completes it,
     // and the first worker's token no longer completes anything.
-    let mut tx = h.store.tx(org).await?;
+    let mut tx = h.app.store.tx(org).await?;
     let taken = jobs::enqueue(&mut tx, org, NewJob::new("test.ok", json!({}))).await?;
     tx.commit().await?;
     let stale = Uuid::now_v7();
@@ -1640,7 +1569,7 @@ async fn jobs_deduplicate_retry_fence_stale_claims_and_die_after_their_attempts(
     .await?;
     assert_eq!(jobs::run_due(&app, &worker, &handlers).await?, 1);
     assert_eq!(state(taken).await?, ("completed".into(), 2));
-    let mut tx = h.store.tx(org).await?;
+    let mut tx = h.app.store.tx(org).await?;
     let late = Job {
         id: taken,
         org_id: org,
@@ -1654,7 +1583,7 @@ async fn jobs_deduplicate_retry_fence_stale_claims_and_die_after_their_attempts(
 
     // A job whose last attempt's lease ran out (its handler took the process down) is dead
     // rather than retried forever.
-    let mut tx = h.store.tx(org).await?;
+    let mut tx = h.app.store.tx(org).await?;
     let crashed = jobs::enqueue(
         &mut tx,
         org,
@@ -1948,7 +1877,7 @@ fn hello(device: &str) -> Frame {
 #[ignore = "requires PostgreSQL/NATS: scripts/test-integration.sh"]
 async fn connections_compress_speak_json_fall_back_to_events_and_ride_http2() -> anyhow::Result<()>
 {
-    let h = Harness::with(|config| config.json_protocol = true).await?;
+    let h = Harness::start(|config| config.json_protocol = true).await?;
     let user = h.user().await?;
     let org = id(&user, "org_id");
     let user_channel = format!("user:{org}:{}", id(&user, "user_id"));

@@ -1,104 +1,20 @@
 //! Search and memory against isolated real PostgreSQL/PGroonga/pgvector; only the embedding upstream is a fixture.
+mod common;
 use anyhow::{Context, ensure};
-use axum::{Json, Router, routing::post};
-use ryzhub_server::{app::App, config::Config, http::router, memory, search, store::Store};
+use common::{Harness, id};
+use ryzhub_server::{memory, search};
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-struct Harness {
-    admin: PgPool,
-    db: PgPool,
-    worker: PgPool,
-    name: String,
-    app: App,
-    base: String,
-    task: tokio::task::JoinHandle<()>,
-    embedding: tokio::task::JoinHandle<()>,
-}
 impl Harness {
     async fn new() -> anyhow::Result<Self> {
-        let url = std::env::var("TEST_ADMIN_URL").unwrap_or_else(|_| {
-            "postgres://postgres:local-development-only@127.0.0.1:55432/postgres".into()
-        });
-        let admin = PgPool::connect(&url).await?;
-        let root = url.rsplit_once('/').context("test URL")?.0;
-        let name = format!("ryzhub_test_{}", Uuid::now_v7().simple());
-        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {name}")))
-            .execute(&admin)
-            .await?;
-        let db = PgPool::connect(&format!("{root}/{name}")).await?;
-        sqlx::migrate!("../../migrations").run(&db).await?;
-        let address = root.split('@').nth(1).context("test URL")?;
-        let worker = PgPool::connect(&format!(
-            "postgres://ryzhub_worker:local-worker-only@{address}/{name}"
-        ))
-        .await?;
-        let store = Store::connect(&format!(
-            "postgres://ryzhub_app:local-app-only@{address}/{name}"
-        ))
-        .await?;
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        let base = format!("http://{}", listener.local_addr()?);
-        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        let mut config = Config::default();
-        config.search.embedding_url = format!("http://{}", upstream.local_addr()?);
-        config.search.embedding_model = "fixture-embedding-v1".into();
-        config.search.embedding_key_env = "RYZHUB_TEST_EMBEDDING_KEY".into();
-        let embedding = tokio::spawn(async move {
-            let routes = Router::new().route(
-                "/v1/embeddings",
-                post(|Json(body): Json<Value>| async move {
-                    let input = body["input"].as_array().unwrap();
-                    if input
-                        .iter()
-                        .any(|v| v.as_str().unwrap().contains("embedding-unavailable"))
-                    {
-                        return (
-                            axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                            Json(json!({"error":"fixture unavailable"})),
-                        );
-                    }
-                    let data: Vec<Value> = input
-                        .iter()
-                        .enumerate()
-                        .map(|(n, t)| {
-                            let mut v = vec![0.0f32; 1024];
-                            v[if t.as_str().unwrap().contains("苹果") {
-                                0
-                            } else {
-                                1
-                            }] = 1.0;
-                            json!({"index":n,"embedding":v})
-                        })
-                        .collect();
-                    (
-                        axum::http::StatusCode::OK,
-                        Json(json!({"data":data,"usage":{"prompt_tokens":7,"total_tokens":7}})),
-                    )
-                }),
-            );
-            axum::serve(upstream, routes).await.unwrap();
-        });
-        let app = App::new(
-            store,
-            async_nats::connect("nats://127.0.0.1:54222").await?,
-            config,
-        )?;
-        let routes = router(app.clone());
-        let task = tokio::spawn(async move {
-            axum::serve(listener, routes).await.unwrap();
-        });
-        Ok(Self {
-            admin,
-            db,
-            worker,
-            name,
-            app,
-            base,
-            task,
-            embedding,
+        Self::start(|config| {
+            config.search.embedding_url = config.llm.upstream_url.clone();
+            config.search.embedding_model = "fixture-embedding-v1".into();
+            config.search.embedding_key_env = "RYZHUB_TEST_EMBEDDING_KEY".into();
         })
+        .await
     }
     async fn request(
         &self,
@@ -126,9 +42,6 @@ impl Harness {
         } else {
             Ok(serde_json::from_slice(&bytes)?)
         }
-    }
-    async fn user(&self) -> anyhow::Result<Value> {
-        self.request(&json!({}),reqwest::Method::POST,"/auth/register",Some(json!({"email":format!("{}@example.test",Uuid::now_v7()),"password":"correct-test-password"}))).await
     }
     async fn conv(
         &self,
@@ -177,23 +90,6 @@ impl Harness {
             .await?;
         Ok(result["matches"].as_array().unwrap().clone())
     }
-    async fn close(self) -> anyhow::Result<()> {
-        self.task.abort();
-        self.embedding.abort();
-        self.app.store.pool.close().await;
-        self.db.close().await;
-        self.worker.close().await;
-        sqlx::query(sqlx::AssertSqlSafe(format!(
-            "DROP DATABASE {} WITH (FORCE)",
-            self.name
-        )))
-        .execute(&self.admin)
-        .await?;
-        Ok(())
-    }
-}
-fn id(v: &Value, key: &str) -> Uuid {
-    Uuid::parse_str(v[key].as_str().unwrap()).unwrap()
 }
 
 #[tokio::test]
@@ -735,8 +631,9 @@ async fn acceptance(h: &Harness) -> anyhow::Result<()> {
     let fresh_org = id(&fresh, "org_id");
     let fresh_conv = h.conv(&fresh, None, false).await?;
     h.item(fresh_org, fresh_conv, "后台自动检索摘要").await?;
-    let digest_worker = tokio::spawn(memory::collector(h.app.clone(), h.worker.clone()));
-    let index_worker = tokio::spawn(search::worker(h.app.clone(), h.worker.clone()));
+    let worker = PgPool::connect(&h.worker_url).await?;
+    let digest_worker = tokio::spawn(memory::collector(h.app.clone(), worker.clone()));
+    let index_worker = tokio::spawn(search::worker(h.app.clone(), worker.clone()));
     let observed=tokio::time::timeout(std::time::Duration::from_secs(10),async{
         loop{
             let found:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM conversation_digests WHERE org_id=$1 AND conversation_id=$2)").bind(fresh_org).bind(fresh_conv).fetch_one(&h.db).await?;
@@ -748,6 +645,7 @@ async fn acceptance(h: &Harness) -> anyhow::Result<()> {
     }).await;
     digest_worker.abort();
     index_worker.abort();
+    worker.close().await;
     observed??;
     // Native Work callers reach built-in memory tools through the actual MCP HTTP gateway.
     let work_conv = h.conv(&fresh, None, false).await?;

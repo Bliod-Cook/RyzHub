@@ -160,13 +160,21 @@ async fn row(tx: &mut Tx<'_>, org: Uuid, user: Uuid, id: Uuid) -> anyhow::Result
 }
 /// Categories the platform keeps out of memory, with the words that mark them.
 pub const CATEGORIES: [(&str, &[&str]); 6] = [
-    ("race", &["种族", "民族", "race", "ethnic"]),
+    ("race", &["种族", "民族", "race", "ethnic", "ethnicity"]),
     ("religion", &["宗教", "信仰", "religion", "religious"]),
     ("sexuality", &["性取向", "sexuality", "sexual orientation"]),
     ("politics", &["政治", "political", "politics"]),
     (
         "health",
-        &["健康", "病史", "疾病", "health", "diagnos", "medical"],
+        &[
+            "健康",
+            "病史",
+            "疾病",
+            "health",
+            "diagnosis",
+            "diagnosed",
+            "medical",
+        ],
     ),
     ("criminal", &["犯罪", "前科", "criminal", "conviction"]),
 ];
@@ -187,10 +195,20 @@ pub fn forbidden_words(policy: &ryzhub_domain::Policy) -> Vec<String> {
     words
 }
 
-/// Whether `text` touches a forbidden category.
+/// Whether `text` touches a forbidden category. Latin words match whole words only (`race` is
+/// not in `trace`); CJK words match anywhere.
 pub fn forbidden(text: &str, words: &[String]) -> bool {
     let lower = text.to_lowercase();
-    words.iter().any(|word| lower.contains(word.as_str()))
+    let boundary = |c: Option<char>| !c.is_some_and(char::is_alphanumeric);
+    words.iter().any(|word| {
+        if !word.is_ascii() {
+            return lower.contains(word.as_str());
+        }
+        lower.match_indices(word.as_str()).any(|(at, _)| {
+            boundary(lower[..at].chars().next_back())
+                && boundary(lower[at + word.len()..].chars().next())
+        })
+    })
 }
 
 pub async fn save(
@@ -821,6 +839,16 @@ mod category_tests {
         assert!(forbidden("我有糖尿病病史", &platform));
         assert!(forbidden("Diagnosed with asthma", &platform));
         assert!(!forbidden("我喜欢用 Rust 写服务端", &platform));
+        for innocent in [
+            "Add a stack trace to the log",
+            "We embrace async Rust",
+            "The diagnostics panel is slow",
+            "Fix the healthcheck endpoint",
+        ] {
+            assert!(!forbidden(innocent, &platform), "{innocent}");
+        }
+        assert!(forbidden("Her race was mentioned", &platform));
+        assert!(forbidden("Health: fine.", &platform));
         let stricter = ryzhub_domain::Policy {
             memory_forbidden_categories: Some(["salary".to_owned(), "health".to_owned()].into()),
             ..Default::default()

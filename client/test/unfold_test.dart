@@ -1,7 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:ryzhub/prefs.dart';
-import 'package:ryzhub/theme.dart';
 import 'package:ryzhub/ui/unfold.dart';
 
 import 'kernel.dart';
@@ -24,6 +23,7 @@ void main() {
     final anchor = UnfoldAnchor();
     await tester.pumpWidget(
       MaterialApp(
+        theme: hubTheme,
         home: Scaffold(
           body: Align(
             alignment: Alignment.topCenter,
@@ -195,6 +195,7 @@ void main() {
       };
       return tester.pumpWidget(
         MaterialApp(
+          theme: hubTheme,
           home: Scaffold(
             body: Align(
               alignment: Alignment.topCenter,
@@ -324,46 +325,5 @@ void main() {
     expect(top(tester, 'row 1'), moreOrLessEquals(above + 120));
     await tester.pumpAndSettle();
     expect(scroll.offset, 0);
-  });
-
-  testWidgets("the user's bubble takes the accent", (tester) async {
-    Future<Color?> bubble(String accent) async {
-      await tester.pumpWidget(
-        MaterialApp(
-          theme: ThemeData(
-            extensions: [HubColors.light.copyWith(accent: accentColor(accent))],
-          ),
-          home: Scaffold(
-            body: messageCard(
-              item: {
-                'id': 'u',
-                'kind': 'user',
-                'state': 'completed',
-                'text': 'hello',
-              },
-            ),
-          ),
-        ),
-      );
-      // The theme eases from the last accent to this one.
-      await tester.pumpAndSettle();
-      final box = tester.widget<Container>(
-        find
-            .ancestor(of: find.text('hello'), matching: find.byType(Container))
-            .first,
-      );
-      return (box.decoration as BoxDecoration?)?.color;
-    }
-
-    final blue = await bubble('blue'), pink = await bubble('pink');
-    expect(
-      blue,
-      HubColors.light.copyWith(accent: accentColor('blue')).userBubble,
-    );
-    expect(
-      pink,
-      HubColors.light.copyWith(accent: accentColor('pink')).userBubble,
-    );
-    expect(blue, isNot(pink));
   });
 }

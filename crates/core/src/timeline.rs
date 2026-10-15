@@ -379,6 +379,9 @@ mod tests {
 
     #[test]
     fn steps_fold_before_the_answer() {
+        // What a retried model call discarded is not shown, nor is memory context.
+        let mut lost = item("x", "assistant", "run", 7, "lost");
+        lost.state = "discarded".into();
         let rows = rows(
             &channel(vec![
                 item("u", "user", "", 1, "hi"),
@@ -387,8 +390,9 @@ mod tests {
                 item("e", "assistant", "run", 4, " "),
                 item("i", "assistant", "run", 5, "interim"),
                 item("t2", "tool", "run", 6, ""),
-                item("a", "assistant", "run", 7, "answer"),
-                item("m", "memory_context", "", 8, ""),
+                lost,
+                item("a", "assistant", "run", 8, "answer"),
+                item("m", "memory_context", "run", 9, ""),
             ])
             .items,
         );

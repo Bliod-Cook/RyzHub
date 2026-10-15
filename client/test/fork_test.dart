@@ -1,7 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:ryzhub/controller.dart';
-import 'package:ryzhub/main.dart';
+import 'package:ryzhub/prefs.dart';
 
 import 'kernel.dart';
 
@@ -30,6 +30,7 @@ void main() {
     ];
     await tester.pumpWidget(
       MaterialApp(
+        theme: hubTheme,
         home: Scaffold(
           body: Column(
             children: [

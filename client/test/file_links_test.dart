@@ -1,6 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
-import 'package:ryzhub/main.dart';
+import 'package:ryzhub/prefs.dart';
 import 'package:ryzhub/ui/messages.dart';
 
 import 'kernel.dart';
@@ -58,6 +58,7 @@ void main() {
     final pages = <String>[], files = <String>[];
     await tester.pumpWidget(
       MaterialApp(
+        theme: hubTheme,
         home: Scaffold(
           body: messageCard(
             item: {

@@ -393,7 +393,6 @@ void main() {
       ]);
       expect(hub.error, isEmpty);
     },
-    skip: !kIsWeb,
   );
 
   test('a refresh on the current socket is still sent', () async {
@@ -411,5 +410,5 @@ void main() {
       [3],
     ]);
     expect(hub.error, isEmpty);
-  }, skip: !kIsWeb);
+  });
 }

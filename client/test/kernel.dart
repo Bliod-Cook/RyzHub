@@ -1,12 +1,13 @@
 import 'dart:convert';
 import 'dart:io';
 
-import 'package:flutter/widgets.dart';
+import 'package:flutter/material.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart'
     show ExternalLibrary;
 import 'package:flutter_test/flutter_test.dart';
 import 'package:ryzhub/rust/api.dart';
 import 'package:ryzhub/rust/frb_generated.dart';
+import 'package:ryzhub/theme.dart';
 import 'package:ryzhub/ui/messages.dart';
 
 /// Loads the kernel built for this machine, so messages render as the app renders them:
@@ -26,6 +27,9 @@ Future<void> loadKernel() async {
   }
   throw StateError('Build the kernel: cargo build -p ryzhub-bridge --release');
 }
+
+/// A theme with the app's colours, which widgets read from it.
+final hubTheme = ThemeData(extensions: const [HubColors.light]);
 
 /// The rows the kernel makes of [items], in sequence order: an item row is the item, a steps
 /// row `{id, kind: steps, run_id, steps, latest}` holds its step items.

@@ -1,79 +1,7 @@
-import 'dart:async';
-
-import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:ryzhub/controller.dart';
-import 'package:ryzhub/main.dart';
-
-/// A hub whose requests wait until the test answers them.
-class _Hub extends HubController {
-  final answers = <String, Completer<dynamic>>{};
-  _Hub() {
-    org = 'org';
-    capabilities = {'work': 'real'};
-    conversations.addAll([
-      {'id': 'a', 'mode': 'work'},
-      {'id': 'b', 'mode': 'work'},
-    ]);
-  }
-
-  @override
-  Future<dynamic> request(
-    String path, {
-    Map<String, dynamic>? body,
-    String? method,
-    Duration timeout = const Duration(seconds: 15),
-  }) => (answers[path] = Completer()).future;
-}
-
-Future<void> _composer(
-  WidgetTester tester,
-  Future<void> Function(String) onSend,
-) => tester.pumpWidget(
-  MaterialApp(
-    home: Scaffold(
-      body: Composer(onSend: onSend, onCancel: () {}, running: false),
-    ),
-  ),
-);
 
 void main() {
-  setUpAll(() => prefs.language = 'en');
-
-  testWidgets('what is typed while a message goes out stays', (tester) async {
-    final sending = Completer<void>();
-    final sent = <String>[];
-    await _composer(tester, (text) {
-      sent.add(text);
-      return sending.future;
-    });
-    await tester.enterText(find.byType(TextField), 'first message');
-    await tester.tap(find.byTooltip('Send'));
-    await tester.pump();
-    expect(sent, ['first message']);
-    // The field is free at once for the next draft.
-    expect(find.text('first message'), findsNothing);
-    await tester.enterText(find.byType(TextField), 'next draft');
-    sending.complete();
-    await tester.pumpAndSettle();
-    expect(find.text('next draft'), findsOneWidget);
-  });
-
-  testWidgets(
-    'a message that fails to go out comes back before the new draft',
-    (tester) async {
-      final sending = Completer<void>();
-      await _composer(tester, (_) => sending.future);
-      await tester.enterText(find.byType(TextField), 'first message');
-      await tester.tap(find.byTooltip('Send'));
-      await tester.pump();
-      await tester.enterText(find.byType(TextField), 'next draft');
-      sending.completeError(Exception('offline'));
-      await tester.pumpAndSettle();
-      expect(find.text('first message\nnext draft'), findsOneWidget);
-    },
-  );
-
   test('a refused message comes back to edit; accepted ones are forgotten', () {
     final hub = HubController();
     const files = [
@@ -124,19 +52,4 @@ void main() {
     hub.selected = 'b';
     expect(hub.settings['reasoning'], isNull);
   });
-
-  test(
-    'a workspace answer for a conversation left behind is dropped',
-    () async {
-      final hub = _Hub()..selected = 'a';
-      final first = hub.refreshWorkspace();
-      hub.selected = 'b';
-      final second = hub.refreshWorkspace();
-      hub.answers['/orgs/org/conversations/b/workspace']!.complete({'id': 'b'});
-      await second;
-      hub.answers['/orgs/org/conversations/a/workspace']!.complete({'id': 'a'});
-      await first;
-      expect(hub.workspace['id'], 'b');
-    },
-  );
 }

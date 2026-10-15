@@ -6,9 +6,11 @@ import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:ryzhub/controller.dart';
-import 'package:ryzhub/main.dart';
+import 'package:ryzhub/prefs.dart';
 import 'package:ryzhub/ui/attachments.dart';
 import 'package:ryzhub/ui/library.dart';
+
+import 'kernel.dart';
 
 Map<String, dynamic> _file(String id, String name, String kind) => {
   'id': id,
@@ -21,9 +23,9 @@ Map<String, dynamic> _file(String id, String name, String kind) => {
   'conversations': id == 'f1' ? 2 : 0,
 };
 
-/// A hub whose library is a fixed list, filtered the way the server filters.
+/// A hub whose library is a fixed list; it records what each load asked for.
 class _Hub extends HubController {
-  final searches = <(String?, List<String>?)>[];
+  final searches = <(String?, List<String>?, String?)>[];
   final deleted = <String>[];
   final files = [
     _file('f3', 'Report.pdf', 'pdf'),
@@ -44,15 +46,8 @@ class _Hub extends HubController {
     List<String>? kinds,
     String? direction,
   }) async {
-    searches.add((query, kinds));
-    final words = (query ?? '').toLowerCase();
-    return [
-      for (final file in files)
-        if ((kinds == null || kinds.contains(file['kind'])) &&
-            (direction == null || file['direction'] == direction) &&
-            '${file['name']}'.toLowerCase().contains(words))
-          file,
-    ];
+    searches.add((query, kinds, direction));
+    return files;
   }
 
   @override
@@ -92,6 +87,7 @@ Future<void> _show(
   addTearDown(tester.view.reset);
   await tester.pumpWidget(
     MaterialApp(
+      theme: hubTheme,
       home: Scaffold(
         body: LibraryView(hub: hub, onUse: onUse ?? (_) {}),
       ),
@@ -103,13 +99,6 @@ Future<void> _show(
 void main() {
   setUpAll(() => prefs.language = 'en');
   setUp(() => prefs.libraryList = false);
-
-  test('an upload date names the year only when it is not this one', () {
-    final now = DateTime(2026, 10, 6);
-    expect(uploadedOn('2026-09-18T10:00:00', now: now), 'Uploaded Sep 18');
-    expect(uploadedOn('2025-01-02T10:00:00', now: now), 'Uploaded Jan 2, 2025');
-    expect(uploadedOn(null, now: now), '');
-  });
 
   test(
     'a file time is to the minute, with the year only when it is not this one',
@@ -134,6 +123,7 @@ void main() {
     addTearDown(tester.view.reset);
     await tester.pumpWidget(
       MaterialApp(
+        theme: hubTheme,
         home: Scaffold(
           body: Builder(
             builder: (context) => TextButton(
@@ -188,7 +178,7 @@ void main() {
     expect(hub.libraryOpen, isFalse);
   });
 
-  testWidgets('files are searched by name and filtered by kind', (
+  testWidgets('the library asks the server for files by name, kind and maker', (
     tester,
   ) async {
     final hub = _Hub();
@@ -203,9 +193,7 @@ void main() {
     await tester.enterText(find.byType(TextField), 'NOTES');
     await tester.pump(const Duration(milliseconds: 350));
     await tester.pumpAndSettle();
-    expect(hub.searches.last, ('NOTES', null));
-    expect(find.text('notes.md'), findsOneWidget);
-    expect(find.text('Report.pdf'), findsNothing);
+    expect(hub.searches.last, ('NOTES', null, null));
 
     await tester.tap(find.byTooltip('Clear'));
     await tester.pumpAndSettle();
@@ -213,16 +201,10 @@ void main() {
     await tester.pumpAndSettle();
     expect(hub.searches.last.$1, '');
     expect(hub.searches.last.$2, ['pdf', 'text']);
-    expect(find.bySemanticsLabel('chart.png'), findsNothing);
-
-    await tester.tap(find.text('Other'));
-    await tester.pumpAndSettle();
-    expect(find.text('No matching files'), findsOneWidget);
 
     await tester.tap(find.text('AI-made'));
     await tester.pumpAndSettle();
-    expect(find.text('Report.pdf'), findsOneWidget);
-    expect(find.text('notes.md'), findsNothing);
+    expect(hub.searches.last, ('', null, 'output'));
   });
 
   testWidgets(

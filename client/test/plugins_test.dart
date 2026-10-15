@@ -6,7 +6,10 @@ import 'package:ryzhub/ui/plugin_app_bridge.dart';
 import 'package:ryzhub/ui/plugin_ui.dart';
 import 'package:ryzhub/ui/plugins.dart';
 
+import 'kernel.dart';
+
 Widget _page(Widget child) => MaterialApp(
+  theme: hubTheme,
   home: Scaffold(body: SingleChildScrollView(child: child)),
 );
 

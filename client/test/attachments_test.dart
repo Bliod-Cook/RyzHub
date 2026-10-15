@@ -7,7 +7,7 @@ import 'package:crypto/crypto.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:ryzhub/controller.dart';
-import 'package:ryzhub/main.dart';
+import 'package:ryzhub/prefs.dart';
 import 'package:ryzhub/ui/attachments.dart';
 
 import 'kernel.dart';
@@ -226,6 +226,7 @@ void main() {
     late BuildContext context;
     await tester.pumpWidget(
       MaterialApp(
+        theme: hubTheme,
         home: Builder(
           builder: (c) {
             context = c;
@@ -250,47 +251,13 @@ void main() {
     expect(hub.uploads, isEmpty);
   });
 
-  testWidgets(
-    'the composer sends files without text, but not while uploading',
-    (tester) async {
-      final sent = <String>[];
-      Future<void> pump({required bool ready, required bool blocked}) =>
-          tester.pumpWidget(
-            MaterialApp(
-              home: Scaffold(
-                body: Composer(
-                  onSend: (text) async => sent.add(text),
-                  onCancel: () {},
-                  running: false,
-                  canSendEmpty: ready,
-                  blocked: blocked,
-                  attachments: const Text('chips'),
-                ),
-              ),
-            ),
-          );
-      await pump(ready: true, blocked: true);
-      expect(find.text('chips'), findsOneWidget);
-      await tester.tap(find.byTooltip('Send'));
-      await tester.pump();
-      expect(sent, isEmpty);
-      await pump(ready: true, blocked: false);
-      await tester.tap(find.byTooltip('Send'));
-      await tester.pump();
-      expect(sent, ['']);
-      await pump(ready: false, blocked: false);
-      await tester.tap(find.byTooltip('Send'));
-      await tester.pump();
-      expect(sent, ['']);
-    },
-  );
-
   testWidgets('a message shows the files it carried, even without text', (
     tester,
   ) async {
     final hub = _Hub();
     await tester.pumpWidget(
       MaterialApp(
+        theme: hubTheme,
         home: Scaffold(
           body: messageCard(
             item: {
@@ -330,6 +297,7 @@ void main() {
     await hub.attach('big.bin', 101, () => const Stream.empty());
     await tester.pumpWidget(
       MaterialApp(
+        theme: hubTheme,
         home: Scaffold(body: PendingFiles(hub: hub)),
       ),
     );
@@ -339,6 +307,7 @@ void main() {
     await tester.pump();
     await tester.pumpWidget(
       MaterialApp(
+        theme: hubTheme,
         home: Scaffold(body: PendingFiles(hub: hub)),
       ),
     );

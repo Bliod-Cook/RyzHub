@@ -5,9 +5,11 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:ryzhub/controller.dart';
-import 'package:ryzhub/main.dart';
+import 'package:ryzhub/prefs.dart';
 import 'package:ryzhub/ui/attachments.dart';
 import 'package:ryzhub/ui/preview.dart';
+
+import 'kernel.dart';
 
 Map<String, dynamic> _file(
   String id,
@@ -69,6 +71,7 @@ Future<void> _show(
   addTearDown(tester.view.reset);
   await tester.pumpWidget(
     MaterialApp(
+      theme: hubTheme,
       home: Scaffold(
         body: ListenableBuilder(
           listenable: hub,
@@ -257,7 +260,10 @@ void main() {
   ) async {
     final hub = _Hub()
       ..contents['n'] = utf8.encode('line one')
-      ..openPreview([_file('n', 'notes.txt', 'text')], inConversation: true);
+      ..openPreview([
+        _file('n', 'notes.txt', 'text'),
+        _file('z', 'Managed.zip', 'file'),
+      ], inConversation: true);
     final asked = <String>[];
     await _show(
       tester,
@@ -265,9 +271,15 @@ void main() {
       floating: true,
       onAsk: (_, question) async => asked.add(question),
     );
-    // The page and the controls over it keep it open.
+    // The page and the controls over it keep it open, as does a notice in
+    // place of a page.
     await tester.tap(find.text('line one'));
     await tester.tap(find.text('notes.txt'));
+    await tester.pumpAndSettle();
+    expect(hub.previewFiles, isNotNull);
+    await tester.tap(find.byTooltip('Next'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Preview not available'));
     await tester.pumpAndSettle();
     expect(hub.previewFiles, isNotNull);
     // Questions go on in the conversation.
@@ -280,20 +292,6 @@ void main() {
     await tester.tapAt(const Offset(40, 400));
     await tester.pumpAndSettle();
     expect(find.text('closed'), findsOneWidget);
-  });
-
-  testWidgets('over the conversation, the notice of a file keeps it open', (
-    tester,
-  ) async {
-    final hub = _Hub()
-      ..openPreview([_file('z', 'Managed.zip', 'file')], inConversation: true);
-    await _show(tester, hub, floating: true);
-    await tester.tap(find.text('Preview not available'));
-    await tester.pumpAndSettle();
-    expect(hub.previewFiles, isNotNull);
-    await tester.tapAt(const Offset(1100, 100));
-    await tester.pumpAndSettle();
-    expect(hub.previewFiles, isNull);
   });
 
   testWidgets('the library\'s preview stays open around the file', (
@@ -314,6 +312,7 @@ void main() {
     final hub = _Hub();
     await tester.pumpWidget(
       MaterialApp(
+        theme: hubTheme,
         home: Scaffold(
           body: MessageFiles(
             hub: hub,

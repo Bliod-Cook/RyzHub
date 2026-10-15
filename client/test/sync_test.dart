@@ -16,10 +16,10 @@ class _Cache implements LocalCache {
   dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
 }
 
-HubController _hub(ClientCore core) =>
+HubController _hub(ClientCore core, _Cache cache) =>
     HubController.testing(
         core: core,
-        cache: _Cache(),
+        cache: cache,
         connect: (_) => throw UnimplementedError(),
       )
       ..org = 'o'
@@ -32,15 +32,17 @@ void main() {
     'a new chat is created by command, shown at once, withdrawn when refused',
     () async {
       final core = ClientCore(records: []);
-      final hub = _hub(core);
+      final cache = _Cache();
+      final hub = _hub(core, cache);
       addTearDown(hub.dispose);
       await hub.send('第一句话');
       final created = hub.conversations.single;
       expect(created['creating'], isTrue);
       expect(created['title'], '第一句话');
       expect(hub.selected, created['id']);
-      // The command waits in the kernel's queue; the conversation's own frames wait for it.
-      final pending = jsonDecode(core.viewJson())['pending_commands'] as Map;
+      // The command waits in the stored queue; the conversation's own frames wait for it.
+      final pending =
+          jsonDecode(cache.records['engine']!)['pending_commands'] as Map;
       final cid = pending.keys.single as String;
       expect(pending[cid]['channel'], 'user:o:u');
       expect(
@@ -68,7 +70,7 @@ void main() {
   test(
     'conversations with news since they were read are unread; drafts arrive',
     () async {
-      final hub = _hub(ClientCore(records: []));
+      final hub = _hub(ClientCore(records: []), _Cache());
       addTearDown(hub.dispose);
       hub.conversations.addAll([
         {'id': 'a', 'title': 'A', 'state': 'active', 'activity_seq': 0},
@@ -112,4 +114,47 @@ void main() {
       expect(hub.unread(b), isFalse);
     },
   );
+
+  test('timeline diffs keep the blocks they do not replace', () async {
+    final core = ClientCore(records: []);
+    final hub = HubController()..selected = 'c';
+    addTearDown(hub.dispose);
+    Future<void> merge(List<Map<String, dynamic>> items) => hub.debugChanges(
+      core
+          .mergeHistory(channel: 'conv:c', itemsJson: jsonEncode(items))
+          .changesJson,
+    );
+    await hub.debugChanges(core.subscribe(channel: 'conv:c').changesJson);
+    Map<String, dynamic> reply(int revision, String text) => {
+      'id': 'a',
+      'revision': revision,
+      'kind': 'assistant',
+      'state': 'streaming',
+      'text': text,
+      'first_seq': 1,
+    };
+    await merge([reply(1, 'one\n\ntw')]);
+    final first = hub.entry('a')!.blocks.first;
+    await merge([
+      reply(2, 'one\n\ntwo'),
+      {
+        'id': 'b',
+        'revision': 1,
+        'kind': 'user',
+        'state': 'completed',
+        'text': 'hi',
+        'first_seq': 2,
+      },
+    ]);
+    final a = hub.entry('a')!;
+    expect(a.item['text'], 'one\n\ntwo');
+    expect(
+      identical(a.blocks.first, first),
+      isTrue,
+      reason: 'kept, not rebuilt',
+    );
+    expect(a.blocks.last['inlines'][0]['text'], 'two');
+    expect(hub.rows.map((r) => r['id']), ['a', 'b']);
+    expect(hub.items.map((i) => i['id']), ['a', 'b']);
+  });
 }

@@ -83,6 +83,50 @@ async fn native_settings_reach_the_next_model_request() -> anyhow::Result<()> {
     outcome
 }
 
+#[tokio::test]
+#[ignore = "requires actual Claude SDK in the harness image"]
+async fn a_claude_session_that_dies_mid_turn_fails_the_run() -> anyhow::Result<()> {
+    let h = Harness::new().await?;
+    let user = h.user().await?;
+    let mut owner = h.owner()?;
+    let outcome = async {
+        let conv = h
+            .configured(&user, "work", json!({"harness":"claude"}), None)
+            .await?;
+        h.submit(&user, conv, message("HARNESS_EXEC")).await?;
+        let run = h.wait_state(conv, "requires_action").await?;
+        let (sandbox, epoch): (Uuid, i64) =
+            sqlx::query_as("SELECT id,exec_epoch FROM sandboxes WHERE run_id=$1")
+                .bind(run)
+                .fetch_one(&h.db)
+                .await?;
+        // Claude Code, the adapter's child, dies while the turn waits for an approval.
+        let killed = guest_exec(
+            std::path::Path::new(&h.app.config.sandbox.host_socket),
+            sandbox,
+            epoch,
+            "kill-claude",
+            "pkill -9 -P \"$(pgrep -f 'dist/adapte[r]')\"",
+        )
+        .await?;
+        ensure!(killed["exit_code"] == 0, "{killed}");
+        h.wait_state(conv, "failed").await?;
+        let error: Option<String> = sqlx::query_scalar("SELECT error_code FROM runs WHERE id=$1")
+            .bind(run)
+            .fetch_one(&h.db)
+            .await?;
+        ensure!(
+            error.as_deref() == Some("NATIVE_OUTCOME_UNKNOWN"),
+            "{error:?}"
+        );
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    owner.kill().await?;
+    h.close().await?;
+    outcome
+}
+
 async fn wait_for_channel_locks(db: &PgPool, count: i64) -> anyhow::Result<()> {
     for _ in 0..100 {
         let waiting: i64 = sqlx::query_scalar("SELECT count(*) FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND query LIKE 'SELECT id FROM channels%'").fetch_one(db).await?;

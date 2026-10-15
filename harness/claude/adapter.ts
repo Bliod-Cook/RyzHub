@@ -54,22 +54,17 @@ let sdk: Query | undefined;
 let input: Input | undefined;
 let session = '';
 let resume: string | undefined;
-let fork = false;
-let resumeAt: string | undefined;
 let turn: string | undefined;
 let interrupted = false;
 let config: Json = {model:process.env.RYZHUB_CLAUDE_MODEL,approval:'ask',reasoning:'medium',plan:false};
-let commands: Json[] = [];
 let started = new Set<string>();
 const blockIds=new Map<string,string[]>();
 const pending = new Map<string,(result:Json)=>void>();
-const tools = new Map<string,{name:string,input:Json}>();
 const permission = ():PermissionMode => config.plan ? 'plan' : config.approval==='allow_edits' ? 'acceptEdits' : 'default';
 const params = (extra:Json={}) => ({threadId:session,turnId:turn,...extra});
 /** An item event. What a subagent produces names the agent's call as its parent. */
-function item(method:string,id:string,type:string,data:Json,raw?:unknown) {
-  const parent=(raw as Json|undefined)?.parent_tool_use_id;
-  notify(method,params({item:{id,type,...data,...(parent?{parentItemId:parent}:{})},raw}));
+function item(method:string,id:string,type:string,data:Json,parent?:string|null) {
+  notify(method,params({item:{id,type,...data,...(parent?{parentItemId:parent}:{})}}));
 }
 async function authorize(tool:string, args:Json, signal:AbortSignal, toolId:string):Promise<PermissionResult> {
   if (signal.aborted) return {behavior:'deny',message:'Interrupted'};
@@ -97,38 +92,36 @@ async function start() {
   sdk=query({prompt:input,options:{
     cwd:process.env.RYZHUB_WORKSPACE??'/workspace',
     model:config.model,effort:config.reasoning,
-    ...(resume?{resume,forkSession:fork,resumeSessionAt:resumeAt}:{sessionId:session}),
+    ...(resume?{resume}:{sessionId:session}),
     permissionMode:permission(),
     settingSources:[], // User-controlled CLI settings cannot replace platform routing or hooks.
     systemPrompt:{type:'preset',preset:'claude_code',append:project},
     includePartialMessages:true,
     // What a subagent says arrives too, under the call that started it.
     forwardSubagentText:true,
-    env:{...process.env,ANTHROPIC_BASE_URL:process.env.ANTHROPIC_BASE_URL??'http://127.0.0.1:8090',ANTHROPIC_API_KEY:process.env.ANTHROPIC_API_KEY??'guest-proxy',CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC:'1'},
     ...(process.env.RYZHUB_MCP==='1'?{mcpServers:{ryzhub:{type:'http' as const,url:'http://127.0.0.1:8090/mcp'}}}:{}),
     canUseTool:(name,args,options)=>authorize(name,args,options.signal,options.toolUseID),
-    hooks:{PostToolUse:[{hooks:[async event=>{if(event.hook_event_name==='PostToolUse'){const output=JSON.stringify(event.tool_response);if(event.tool_name==='WebSearch')item('item/completed',event.tool_use_id,'webSearch',{query:(event.tool_input as Json)?.query??'',output},event);else item('item/completed',event.tool_use_id,'commandExecution',{command:event.tool_name,aggregatedOutput:output},event);}return {}; }]}]},
+    hooks:{PostToolUse:[{hooks:[async event=>{if(event.hook_event_name==='PostToolUse'){const output=JSON.stringify(event.tool_response);if(event.tool_name==='WebSearch')item('item/completed',event.tool_use_id,'webSearch',{query:(event.tool_input as Json)?.query??'',output});else item('item/completed',event.tool_use_id,'commandExecution',{command:event.tool_name,aggregatedOutput:output});}return {}; }]}]},
   }});
   const active=sdk;
-  void consume(active).catch(()=>{if(sdk===active){sdk=undefined;notify('harness/exited',{outcome:'unknown',error:'SDK_STREAM_FAILED'});}});
-  commands=await active.supportedCommands();
+  // The guest sees the session end as this process exiting, and fails what was running.
+  void consume(active).catch(()=>{if(sdk===active)process.exit(1);});
+  const commands=await active.supportedCommands();
   const models=(await active.supportedModels()).map(m=>({id:m.value,model:m.value}));
-  notify('session/capabilities',{harness:'claude',version:'0.3.283',commands,models,steer:'emulated'});
+  notify('session/capabilities',{commands,models});
 }
 async function consume(active:Query) {
   let currentMessage='';
   for await (const message of active) {
-    const raw=message as unknown as Json;
-    // Keep native payloads in the guest journal, never reconstruct sessions from UI text.
+    const parent=(message as unknown as Json).parent_tool_use_id;
     if (message.type==='system' && message.subtype==='init') {
       session=message.session_id;
-      notify('session/initialized',{sessionId:session,raw:message});
     } else if(message.type==='stream_event') {
       const e=message.event as unknown as Json;
       if(e.type==='message_start') currentMessage=e.message.id;
       if(e.type==='content_block_start') {const key=`${currentMessage}:${e.content_block.type}`;blockIds.set(key,[...(blockIds.get(key)??[]),`${currentMessage}:${e.index}`]);}
       if(e.type==='content_block_start' && e.content_block.type==='text') {
-        const id=`${currentMessage}:${e.index}`;started.add(id);item('item/started',id,'agentMessage',{text:''},message);
+        const id=`${currentMessage}:${e.index}`;started.add(id);item('item/started',id,'agentMessage',{text:''},parent);
       }
       if(e.type==='content_block_delta' && e.delta.type==='text_delta') notify('item/agentMessage/delta',params({itemId:`${currentMessage}:${e.index}`,delta:e.delta.text}));
     } else if(message.type==='assistant') {
@@ -137,29 +130,26 @@ async function consume(active:Query) {
         // SDK assistant frames may each contain one block, retaining a common message id.
         const key=`${message.message.id}:${block.type}`;
         const id=block.type==='tool_use'?block.id:(blockIds.get(key)?.shift()??`${message.uuid}:${n}`);
-        if(block.type==='text') {if(!started.has(id))item('item/started',id,'agentMessage',{text:''});item('item/completed',id,'agentMessage',{text:block.text,nativeMessageId:message.uuid},message);}
-        if(block.type==='thinking') item('item/completed',id,'reasoning',{summary:[block.thinking],nativeMessageId:message.uuid},message);
+        if(block.type==='text') {if(!started.has(id))item('item/started',id,'agentMessage',{text:''});item('item/completed',id,'agentMessage',{text:block.text,nativeMessageId:message.uuid},parent);}
+        if(block.type==='thinking') item('item/completed',id,'reasoning',{summary:[block.thinking],nativeMessageId:message.uuid},parent);
         // WebSearch runs on the provider; it is projected like Codex's search, not as a command.
-        if(block.type==='tool_use' && block.name==='WebSearch') {tools.set(id,{name:block.name,input:block.input});item('item/started',id,'webSearch',{query:block.input?.query??'',nativeMessageId:message.uuid},message);}
-        else if(block.type==='tool_use') {tools.set(id,{name:block.name,input:block.input});item('item/started',id,block.name==='TodoWrite'?'plan':'commandExecution',{command:block.name+' '+JSON.stringify(block.input),text:JSON.stringify(block.input),nativeMessageId:message.uuid},message);}
+        if(block.type==='tool_use' && block.name==='WebSearch') item('item/started',id,'webSearch',{query:block.input?.query??'',nativeMessageId:message.uuid},parent);
+        else if(block.type==='tool_use') item('item/started',id,block.name==='TodoWrite'?'plan':'commandExecution',{command:block.name+' '+JSON.stringify(block.input),text:JSON.stringify(block.input),nativeMessageId:message.uuid},parent);
       }
     } else if(message.type==='result') {
       const ended=turn;turn=undefined;
-      notify('turn/completed',{threadId:session,turn:{id:ended,status:interrupted?'interrupted':message.is_error?'failed':'completed'},raw:message});
-      interrupted=false;started.clear();blockIds.clear();tools.clear();
-    } else if(raw.type==='system' && raw.subtype==='compact_boundary') {
-      notify('session/compacted',{threadId:session,raw:message});
-    } else {notify('session/event',params({raw:message}));}
+      notify('turn/completed',{threadId:session,turn:{id:ended,status:interrupted?'interrupted':message.is_error?'failed':'completed'}});
+      interrupted=false;started.clear();blockIds.clear();
+    }
   }
-  if(sdk===active) {sdk=undefined;notify('harness/exited',{outcome:'unknown',error:'SDK_PROCESS_ENDED'});}
+  if(sdk===active)process.exit(1);
 }
 async function handle(request:Json):Promise<any> {
   const p=request.params??{};
   switch(request.method) {
-    case 'initialize':return {capabilities:{steer:'emulated',interrupt:'native',fork:'native'}};
+    case 'initialize':return {};
     case 'initialized':return;
     case 'model/list':return {data:[{id:config.model,model:config.model,supportedReasoningEfforts:['low','medium','high','xhigh','max'].map(reasoningEffort=>({reasoningEffort}))}]};
-    case 'skills/list':return {data:commands};
     case 'thread/start':session=randomUUID();config={...config,...(p.config??{}),model:p.model??config.model};return {thread:{id:session}};
     case 'thread/resume':
       if(sdk && session===p.threadId)return {thread:{id:session}};

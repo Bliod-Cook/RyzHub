@@ -5,7 +5,7 @@
 //! process-wide [`Hub`] without database work.
 //!
 //! A connection is the same whatever carries it: a WebSocket speaking protobuf, or protobuf
-//! with server frames through one zstd stream; or, where WebSockets do not get through,
+//! with larger server frames zstd-compressed one by one; or, where WebSockets do not get through,
 //! server-sent events with frames posted back ([`sse`]).
 mod hub;
 pub mod sse;

@@ -12,17 +12,20 @@ Map<String, dynamic> _m(
   String provider, {
   bool def = false,
   List<String> levels = const [],
+  bool pro = false,
 }) => {
   'id': id,
   'provider': provider,
   'default': def,
   'reasoning_levels': levels,
+  'pro': pro,
 };
 
 final _catalog = {
   'chat': [
     _m('fixture-model', 'anthropic', def: true),
     _m('gpt-5.4', 'openai', levels: ['low', 'medium', 'high', 'xhigh']),
+    _m('gpt-6.1-sol', 'openai', levels: ['low', 'medium'], pro: true),
   ],
   'work': [
     {
@@ -57,6 +60,13 @@ void main() {
     // Switching to a model without reasoning control drops the choice.
     hub.updateDraft(() => hub.draftModel = 'fixture-model');
     expect(hub.draftReasoning, isNull);
+    hub.updateDraft(() {
+      hub.draftModel = 'gpt-6.1-sol';
+      hub.draftPro = true;
+    });
+    expect(hub.draftPro, isTrue);
+    hub.updateDraft(() => hub.draftModel = 'gpt-5.4');
+    expect(hub.draftPro, isFalse);
     hub.startDraft(mode: 'work', harness: 'claude');
     expect(hub.draftModel, 'claude-sonnet-4-6');
     expect(hub.draftReasoningLevels.last, 'max');
@@ -199,6 +209,46 @@ void main() {
     await tester.tap(find.text('高'));
     await tester.pumpAndSettle();
     expect(levels, ['gpt-5.4:high']);
+  });
+
+  testWidgets('Pro mode is switched beside the levels of a model that has it', (
+    tester,
+  ) async {
+    final switched = <String>[];
+    Future<void> show({required bool pro}) => tester.pumpWidget(
+      MaterialApp(
+        theme: hubTheme,
+        home: Scaffold(
+          body: Center(
+            child: ModelPicker(
+              mode: 'chat',
+              chat: [
+                for (final e in _catalog['chat'] as List)
+                  Map<String, dynamic>.from(e),
+              ],
+              work: const [],
+              model: 'gpt-6.1-sol',
+              onPick: (_, _, _) {},
+              levelsFor: (_, _) => const ['low', 'medium'],
+              proFor: (_, id) => id == 'gpt-6.1-sol',
+              pro: pro,
+              onPro: (_, id, on) => switched.add('$id:$on'),
+            ),
+          ),
+        ),
+      ),
+    );
+    await show(pro: false);
+    expect(find.text('中'), findsOneWidget);
+    await tester.tap(find.bySemanticsLabel(RegExp('模型')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('gpt-6.1-sol').last);
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Pro'));
+    await tester.pumpAndSettle();
+    expect(switched, ['gpt-6.1-sol:true']);
+    await show(pro: true);
+    expect(find.text('中 · Pro'), findsOneWidget);
   });
 
   testWidgets('a click or an activation picks a model that has levels', (

@@ -20,6 +20,8 @@ pub struct RunConfig {
     pub reasoning: String,
     pub approval: String,
     pub plan: bool,
+    /// OpenAI's Pro mode.
+    pub pro: bool,
 }
 
 impl Default for RunConfig {
@@ -32,6 +34,7 @@ impl Default for RunConfig {
             reasoning: "medium".into(),
             approval: "ask".into(),
             plan: false,
+            pro: false,
         }
     }
 }
@@ -91,6 +94,8 @@ impl RunConfig {
         if c.harness == "claude" {
             c.protocol = "anthropic".into();
         }
+        // Pro follows the model, so switching to one without it turns it off.
+        c.pro &= pro_mode(config, &c.harness, &c.protocol, &c.model);
         ensure!(
             matches!(c.approval.as_str(), "ask" | "allow_edits" | "full_auto"),
             Code::InvalidApprovalMode
@@ -285,6 +290,18 @@ pub fn reasoning_levels(harness: &str, protocol: &str) -> Vec<&'static str> {
         // Chat over Messages, and ACP agents, which choose their own.
         _ => vec![],
     }
+}
+
+/// Whether `model` offers OpenAI's Pro mode on this path. Only Chat sets it: Codex has no such
+/// setting.
+pub fn pro_mode(config: &Config, harness: &str, protocol: &str, model: &str) -> bool {
+    harness == "chat"
+        && protocol == "responses"
+        && config
+            .llm
+            .pro_mode_models
+            .iter()
+            .any(|prefix| model.starts_with(prefix.as_str()))
 }
 
 /// Feature support by harness and protocol, as clients render it: `native`, `emulated` or
@@ -496,6 +513,23 @@ mod tests {
             code(json!({"plan":true}), "chat"),
             Some(Code::PlanUnsupported)
         );
+    }
+
+    #[test]
+    fn pro_mode_follows_the_model() {
+        let mut c = config();
+        c.llm.models.push(ModelRoute {
+            id: "gpt-6.1-sol".into(),
+            protocol: "responses".into(),
+            harnesses: vec!["chat".into(), "codex".into()],
+            ..Default::default()
+        });
+        let pro = |v, mode| RunConfig::resolve(v, mode, &c).unwrap().pro;
+        assert!(pro(json!({"model":"gpt-6.1-sol","pro":true}), "chat"));
+        // Elsewhere it is dropped, so switching models never fails on it.
+        assert!(!pro(json!({"model":"gpt-5.2","pro":true}), "chat"));
+        assert!(!pro(json!({"model":"claude-opus-4-6","pro":true}), "chat"));
+        assert!(!pro(json!({"model":"gpt-6.1-sol","pro":true}), "work"));
     }
 
     #[test]

@@ -279,6 +279,9 @@ pub struct LlmConfig {
     /// Anthropic models, by id prefix, that search their tools: Chat runs with many plugin
     /// tools load those on demand (`plugins.defer_tools_above`).
     pub tool_search_models: Vec<String>,
+    /// OpenAI models, by id prefix, that offer Pro mode (`reasoning.mode = "pro"`): Chat over
+    /// Responses lets members switch it on for them.
+    pub pro_mode_models: Vec<String>,
 }
 
 impl Default for LlmConfig {
@@ -335,6 +338,7 @@ impl Default for LlmConfig {
             ]
             .map(str::to_owned)
             .to_vec(),
+            pro_mode_models: ["gpt-5.6", "gpt-6"].map(str::to_owned).to_vec(),
         }
     }
 }

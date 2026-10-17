@@ -126,6 +126,7 @@ class HubController extends ChangeNotifier with HubApi {
   String connection = 'offline', error = '';
   String mode = 'chat', harness = 'codex';
   String? project, draftModel, draftReasoning;
+  bool draftPro = false;
 
   /// `GET /orgs/{org}/models`: Chat models, and Work models grouped by harness.
   /// The wire protocol is the server's business; it follows each model.
@@ -402,6 +403,10 @@ class HubController extends ChangeNotifier with HubApi {
             list.firstOrNull)?['id']
         as String?;
   }
+
+  /// The model offers OpenAI's Pro mode.
+  bool offersPro(String mode, String? harness, String? id) =>
+      modelEntry(mode, harness, id)?['pro'] == true;
 
   /// Levels accepted by the server for the draft's model.
   List<String> get draftReasoningLevels =>
@@ -1005,6 +1010,7 @@ class HubController extends ChangeNotifier with HubApi {
   }) {
     _resetSelection('');
     draftReasoning = null;
+    draftPro = false;
     temporary = false;
     this.project = project;
     final defaults = _projectDefaults;
@@ -1044,6 +1050,7 @@ class HubController extends ChangeNotifier with HubApi {
         [draftModel, projectModel, preferred].where(valid).firstOrNull ??
         defaultModel(mode, harness);
     if (!draftReasoningLevels.contains(draftReasoning)) draftReasoning = null;
+    if (!offersPro(mode, harness, draftModel)) draftPro = false;
   }
 
   /// Edits draft settings, then re-checks the model and reasoning choice.
@@ -1279,6 +1286,7 @@ class HubController extends ChangeNotifier with HubApi {
       if (mode == 'work') 'harness': harness,
       'model': ?draftModel,
       'reasoning': ?reasoning,
+      if (draftPro) 'pro': true,
     };
     final temporary = this.temporary && canTemporary;
     // Shown until the server's list replaces it.
@@ -1295,6 +1303,7 @@ class HubController extends ChangeNotifier with HubApi {
     final projectId = project;
     _resetSelection(id);
     draftReasoning = null;
+    draftPro = false;
     this.temporary = false;
     notifyListeners();
     await _schedule(() {

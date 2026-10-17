@@ -13,9 +13,10 @@ String providerLabel(String provider) => switch (provider) {
 
 /// One picker for the model. Chat lists models by provider; Work lists
 /// harnesses, each opening a flyout with its models. A model's reasoning
-/// levels open in a flyout to its right, so harness, model and level are all
-/// chosen from one control. Models that cannot be switched to in place
-/// (another provider or harness) start a new chat instead.
+/// levels, and Pro mode where it has it, open in a flyout to its right, so
+/// harness, model and level are all chosen from one control. Models that
+/// cannot be switched to in place (another provider or harness) start a new
+/// chat instead.
 class ModelPicker extends StatefulWidget {
   final String mode;
   final List<Map<String, dynamic>> chat;
@@ -32,6 +33,12 @@ class ModelPicker extends StatefulWidget {
 
   /// The current level; null is the server default (medium).
   final String? level;
+
+  /// Whether a model offers OpenAI's Pro mode, whether it is on, and the
+  /// switch.
+  final bool Function(String? harness, String id)? proFor;
+  final bool pro;
+  final void Function(String? harness, String id, bool on)? onPro;
   const ModelPicker({
     super.key,
     required this.mode,
@@ -44,6 +51,9 @@ class ModelPicker extends StatefulWidget {
     this.onNewChat,
     this.levelsFor,
     this.level,
+    this.proFor,
+    this.pro = false,
+    this.onPro,
   });
   @override
   State<ModelPicker> createState() => _ModelPickerState();
@@ -57,6 +67,9 @@ class _ModelPickerState extends State<ModelPicker> {
 
   List<String> levels(String? harness, String? id) =>
       id == null ? const [] : widget.levelsFor?.call(harness, id) ?? const [];
+
+  bool offersPro(String? harness, String? id) =>
+      id != null && (widget.proFor?.call(harness, id) ?? false);
 
   String? shown(List<String> levels) => levels.isEmpty
       ? null
@@ -109,6 +122,7 @@ class _ModelPickerState extends State<ModelPicker> {
       );
     }
     final active = current ? shown(options) : null;
+    final pro = current && widget.pro;
     return FlyoutButton(
       onPressed: () {
         close();
@@ -126,6 +140,14 @@ class _ModelPickerState extends State<ModelPicker> {
               child: Text(reasoningLabel(v)),
             ),
           ),
+        if (offersPro(harness, id)) ...[
+          const MenuDivider(),
+          MenuItemButton(
+            onPressed: () => widget.onPro!(harness, id, !pro),
+            trailingIcon: pro ? check(context) : null,
+            child: const Text('Pro'),
+          ),
+        ],
       ],
       child: label,
     );
@@ -201,6 +223,7 @@ class _ModelPickerState extends State<ModelPicker> {
     final c = HubColors.of(context);
     final compact = MediaQuery.sizeOf(context).width < narrowWidth;
     final level = shown(levels(widget.harness, widget.model));
+    final pro = widget.pro && offersPro(widget.harness, widget.model);
     // No hover tooltip: it would cover the footer or the open menu. The
     // label still names the control for assistive tech.
     return Semantics(
@@ -233,7 +256,9 @@ class _ModelPickerState extends State<ModelPicker> {
                 if (level != null) ...[
                   const SizedBox(width: 6),
                   Text(
-                    reasoningLabel(level),
+                    pro
+                        ? '${reasoningLabel(level)} · Pro'
+                        : reasoningLabel(level),
                     style: modelLabelStyle(
                       size: FontSizes.caption,
                       color: c.subtle,

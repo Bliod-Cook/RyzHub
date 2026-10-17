@@ -681,6 +681,12 @@ Widget? modelControl(HubController hub, RunAction action) {
                   const [])
               .cast<String>(),
       level: hub.draftReasoning,
+      proFor: (harness, id) => hub.offersPro(hub.mode, harness, id),
+      pro: hub.draftPro,
+      onPro: (_, id, on) => hub.updateDraft(() {
+        hub.draftModel = id;
+        hub.draftPro = on;
+      }),
     );
   }
   if (hub.commandCatalog.isEmpty) return null;
@@ -737,6 +743,12 @@ Widget conversationModelPicker(HubController hub, RunAction action) {
       };
       if (patch.isNotEmpty) action(() => hub.configure(patch));
     },
+    proFor: (h, id) => hub.offersPro(work ? 'work' : 'chat', h, id),
+    pro: settings['pro'] == true,
+    onPro: (h, id, on) => action(
+      () =>
+          hub.configure({if (id != settings['model']) 'model': id, 'pro': on}),
+    ),
     onNewChat: (h, id) => hub.startDraft(
       mode: work ? 'work' : 'chat',
       harness: h,

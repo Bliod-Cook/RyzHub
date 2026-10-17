@@ -2614,6 +2614,46 @@ async fn a_started_chat_keeps_its_provider_and_a_chosen_model_overrides_project_
     h.close().await
 }
 
+#[tokio::test]
+#[ignore = "requires PostgreSQL 18 and NATS"]
+async fn pro_mode_is_offered_where_the_model_has_it_and_reaches_its_requests() -> anyhow::Result<()>
+{
+    let h = Harness::start(|config| {
+        config.llm.enabled = true;
+        config.llm.models = vec![ModelRoute {
+            id: "gpt-6.1-sol".into(),
+            protocol: "responses".into(),
+            harnesses: vec!["chat".into()],
+            ..Default::default()
+        }];
+    })
+    .await?;
+    let user = h.user().await?;
+    let (_, catalog) = api(&h, &user, reqwest::Method::GET, "/models", json!({})).await?;
+    let pro = |id: &str| {
+        let mut chat = catalog["chat"].as_array().into_iter().flatten();
+        chat.find(|m| m["id"] == id).map(|m| m["pro"].clone())
+    };
+    assert_eq!(
+        (pro("gpt-6.1-sol"), pro("fixture-model")),
+        (Some(json!(true)), Some(json!(false))),
+        "{catalog}"
+    );
+    let ctx = h.context(&user).await?;
+    let settings = json!({"model":"gpt-6.1-sol","pro":true});
+    let conv = h.create(&ctx, "Pro", "chat", settings, None).await?.id;
+    let mut owner = h.owner()?;
+    h.send(&user, conv, common::message("hello")).await?;
+    h.wait_state(conv, "completed").await?;
+    owner.kill().await?;
+    let request = h.requests.lock().unwrap().last().unwrap().0.clone();
+    assert_eq!(
+        request["reasoning"],
+        json!({"effort":"medium","mode":"pro"})
+    );
+    h.close().await
+}
+
 /// Wait until `count` sessions wait for a channel row lock.
 async fn wait_for_channel_locks(db: &PgPool, count: i64) -> anyhow::Result<()> {
     for _ in 0..100 {

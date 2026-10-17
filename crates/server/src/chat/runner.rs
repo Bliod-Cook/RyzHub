@@ -423,9 +423,13 @@ fn request_body(app: &App, step: &Step) -> Value {
     );
     let responses = step.config.protocol == "responses";
     let mut body = if responses {
+        let mut reasoning = json!({"effort":step.config.reasoning});
+        if step.config.pro {
+            reasoning["mode"] = json!("pro");
+        }
         json!({"model":step.config.model,"stream":true,"store":false,"input":step.messages,"instructions":system,
                "include":["reasoning.encrypted_content","web_search_call.action.sources"],
-               "reasoning":{"effort":step.config.reasoning}})
+               "reasoning":reasoning})
     } else {
         json!({"model":step.config.model,"max_tokens":app.config.llm.max_tokens,"stream":true,
                "messages":step.messages,"system":system})

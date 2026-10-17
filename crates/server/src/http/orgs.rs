@@ -94,7 +94,9 @@ pub async fn models(
             .map(|m| {
                 let provider = run_config::provider(&m.protocol);
                 let levels = run_config::reasoning_levels(harness, &m.protocol);
-                json!({"id":m.id,"provider":provider,"default":m.id==default,"reasoning_levels":levels})
+                let pro = run_config::pro_mode(config, harness, &m.protocol, &m.id);
+                json!({"id":m.id,"provider":provider,"default":m.id==default,"reasoning_levels":levels,
+                       "pro":pro})
             })
             .collect()
     };

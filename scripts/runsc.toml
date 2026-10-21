@@ -1,0 +1,6 @@
+binary_name = "/state/bin/runsc-containerd"
+[runsc_config]
+  overlay2 = "none"
+  platform = "systrap"
+  host-uds = "all"
+  network = "host"

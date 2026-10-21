@@ -21,14 +21,7 @@ PY
 fi
 cp scripts/runsc-containerd.sh var/execution/bin/runsc-containerd
 chmod +x var/execution/bin/runsc-containerd
-cat > var/execution/runsc.toml <<'EOF'
-binary_name = "/state/bin/runsc-containerd"
-[runsc_config]
-  overlay2 = "none"
-  platform = "systrap"
-  host-uds = "all"
-  network = "host"
-EOF
+cp scripts/runsc.toml var/execution/runsc.toml
 ./scripts/start-execution-node.sh
 # Install gVisor in the running node with the entrypoint's own install step.
 docker exec -i ryzhub-execution sh -s install-gvisor < scripts/execution-node-entrypoint.sh

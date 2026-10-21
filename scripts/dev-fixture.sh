@@ -7,7 +7,7 @@ mkdir -p var/dev
 chmod 700 var/dev
 [[ -f var/vault.env ]] || (umask 077; mkdir -p var; printf 'RYZHUB_VAULT_KEY=%s\n' "$(head -c 32 /dev/urandom | base64 | tr '+/' '-_' | tr -d '=')" > var/vault.env)
 [[ -S var/execution/host.sock ]] || ./scripts/prepare-runtimes.sh
-[[ -s var/execution/harness-image.txt ]] || ./scripts/build-harness-image.sh
+[[ -s var/execution/harness-image.txt ]] || ./scripts/build-harness-image.sh > var/execution/harness-image.txt
 set -a
 source .env.example
 source var/vault.env

@@ -6,5 +6,5 @@ export RYZHUB_TEST_VAULT_KEY=AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE
 export RYZHUB_TEST_UPSTREAM_KEY=local-fixture-key
 docker compose up -d --wait
 ./scripts/prepare-runtimes.sh
-[[ -s var/execution/harness-image.txt ]] || ./scripts/build-harness-image.sh
+[[ -s var/execution/harness-image.txt ]] || ./scripts/build-harness-image.sh > var/execution/harness-image.txt
 cargo test -p ryzhub-server --test harnesses -- --ignored --test-threads=1 --nocapture

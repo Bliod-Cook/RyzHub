@@ -7,22 +7,17 @@
 # Prints the digest-pinned reference for `[sandbox] deps`. The layer is mounted read-only over
 # the base image, so it may hold only what it adds (package caches, tools under /usr/local, ...).
 # Build it from trusted sources only: every organization's sandboxes read it.
+# RYZHUB_NODE names the node's container.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 name="ryzhub.local/deps:build"
-ctr=(docker exec -i ryzhub-execution ctr --address /run/ryzhub-containerd.sock --namespace ryzhub)
 
 if [[ "${1:-}" == "--dockerfile" ]]; then
-  docker build --quiet -t "$name" -f "$2" "${3:-.}" >/dev/null
+  docker build --quiet --provenance=false -t "$name" -f "$2" "${3:-.}" >/dev/null
 elif [[ -d "${1:-}" ]]; then
   tar -C "$1" -c . | docker import - "$name" >/dev/null
 else
   echo "usage: $0 DIR | --dockerfile FILE [CONTEXT]" >&2
   exit 2
 fi
-docker save "$name" | "${ctr[@]}" images import - >/dev/null
-digest=$("${ctr[@]}" images list | awk -v n="$name" '$1==n {print $3}')
-test -n "$digest"
-reference="ryzhub.local/deps@$digest"
-"${ctr[@]}" images tag --force "$name" "$reference" >/dev/null
-printf '%s\n' "$reference"
+scripts/load-image.sh "${RYZHUB_NODE:-ryzhub-execution}" "$name"

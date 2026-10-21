@@ -1,6 +1,6 @@
 # The Work sandbox base: the Claude Agent SDK adapter, and OpenCode for the `opencode` ACP
-# harness. The preparation script resolves BASE to a digest before building.
-ARG BASE
+# harness. BASE is pinned by digest, so a rebuild starts from the same Node.js and Alpine.
+ARG BASE=node:22-alpine@sha256:0a7108bf6c7bf5de370ffb1a3ed6be93d405b43ff159f681a8d18c0e2bc2e402
 FROM ${BASE} AS build
 WORKDIR /opt/ryzhub-claude
 COPY package.json package-lock.json tsconfig.json adapter.ts ./

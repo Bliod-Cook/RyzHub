@@ -1,0 +1,21 @@
+# Only what the images are built from. Never var/, target/ or data/ (large, partly
+# root-owned), nor .env and config.toml (secrets and instance settings).
+*
+!Cargo.toml
+!Cargo.lock
+!.sqlx
+!crates
+!migrations
+!proto
+!scripts
+!client
+!flutter_rust_bridge.yaml
+!deploy/Caddyfile
+!deploy/node-start.sh
+client/build
+client/.dart_tool
+client/android
+client/windows
+client/web/pkg
+client/web/syntaxes.bin
+crates/bridge/web

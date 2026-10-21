@@ -1,0 +1,22 @@
+# Three names under one domain: the web app, its API, and the separate origin plugin pages
+# (MCP Apps) load from. Caddy obtains and renews their certificates.
+
+{$RYZHUB_DOMAIN} {
+	root * /srv
+	encode zstd gzip
+	file_server
+	# The app's Rust core runs in WebAssembly threads, which need cross-origin isolation.
+	header {
+		Cross-Origin-Opener-Policy same-origin
+		Cross-Origin-Embedder-Policy require-corp
+		Cache-Control no-cache
+	}
+}
+
+api.{$RYZHUB_DOMAIN} {
+	reverse_proxy server:8080
+}
+
+apps.{$RYZHUB_DOMAIN} {
+	reverse_proxy server:8082
+}

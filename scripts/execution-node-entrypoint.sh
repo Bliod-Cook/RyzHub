@@ -9,7 +9,12 @@ if [ -f /state/bin/runsc ]; then
    mv "/usr/local/bin/$binary.new" "/usr/local/bin/$binary"
   fi
  done
- [ -d /usr/local/bin/gvisor-bin ] || cp -a /state/bin/gvisor-bin /usr/local/bin/
+ if ! diff -rq /state/bin/gvisor-bin /usr/local/bin/gvisor-bin >/dev/null 2>&1; then
+  rm -rf /usr/local/bin/gvisor-bin.new
+  cp -a /state/bin/gvisor-bin /usr/local/bin/gvisor-bin.new
+  rm -rf /usr/local/bin/gvisor-bin
+  mv /usr/local/bin/gvisor-bin.new /usr/local/bin/gvisor-bin
+ fi
 fi
 [ "${1:-}" = install-gvisor ] && exit 0
 export RYZHUB_RUNSC_CONFIG=/state/runsc.toml

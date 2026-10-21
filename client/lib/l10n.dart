@@ -196,6 +196,10 @@ String errorText(Object error) {
       '登录没有完成，请重试。',
       'Signing in did not finish. Try again.',
     ),
+    'REGISTRATION_CLOSED' => tr(
+      '此服务器不开放注册，请用已有账号登录。',
+      'This server takes no new accounts. Log in with an existing one.',
+    ),
     'ACCOUNT_EXISTS' => tr(
       '该邮箱已有账号。请用原方式登录后，在设置中连接此账号。',
       'This email has an account. Sign in as before, then connect this account in Settings.',

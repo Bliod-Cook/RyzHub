@@ -43,6 +43,9 @@ class _LoginPageState extends State<LoginPage> {
 
   /// The server's other ways to sign in: `{id, label, kind}`.
   List<Map<String, dynamic>> providers = [];
+
+  /// Whether the server takes new accounts.
+  bool canRegister = true;
   String providersOf = '';
 
   @override
@@ -61,14 +64,21 @@ class _LoginPageState extends State<LoginPage> {
           .timeout(const Duration(seconds: 8));
       final data = jsonDecode(response.body);
       if (!mounted || providersOf != address) return;
-      setState(
-        () => providers = [
+      setState(() {
+        providers = [
           for (final p in (data['auth_providers'] as List? ?? []))
             if (p is Map) Map<String, dynamic>.from(p),
-        ],
-      );
+        ];
+        canRegister = data['registration'] != false;
+        if (!canRegister) register = false;
+      });
     } catch (_) {
-      if (mounted && providersOf == address) setState(() => providers = []);
+      if (mounted && providersOf == address) {
+        setState(() {
+          providers = [];
+          canRegister = true;
+        });
+      }
     }
   }
 
@@ -229,16 +239,20 @@ class _LoginPageState extends State<LoginPage> {
                           ),
                       ],
                       const SizedBox(height: 6),
-                      TextButton(
-                        onPressed: busy
-                            ? null
-                            : () => setState(() => register = !register),
-                        child: Text(
-                          register
-                              ? tr('已有账号？登录', 'Already have an account? Log in')
-                              : tr('创建新账号', 'Create a new account'),
+                      if (canRegister)
+                        TextButton(
+                          onPressed: busy
+                              ? null
+                              : () => setState(() => register = !register),
+                          child: Text(
+                            register
+                                ? tr(
+                                    '已有账号？登录',
+                                    'Already have an account? Log in',
+                                  )
+                                : tr('创建新账号', 'Create a new account'),
+                          ),
                         ),
-                      ),
                     ],
                   ),
                 ),

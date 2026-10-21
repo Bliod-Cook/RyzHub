@@ -138,10 +138,7 @@ pub fn router(app: App) -> Router {
         )
         .route("/healthz", get(healthz))
         .route("/capabilities", get(capabilities))
-        .route(
-            "/admin",
-            get(|| async { Html(include_str!("../../../../docs/admin.html")) }),
-        )
+        .route("/admin", get(|| async { Html(include_str!("admin.html")) }))
         .route("/admin/settings", get(admin_settings))
         .route("/ws", any(crate::ws::upgrade))
         .route("/stream", get(crate::ws::sse::open))

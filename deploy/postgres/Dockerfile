@@ -6,3 +6,4 @@ RUN apk add --no-cache --virtual .vector-build build-base clang19 llvm19-dev git
     && make -C /tmp/pgvector install \
     && rm -rf /tmp/pgvector \
     && apk del .vector-build
+COPY --chmod=755 init-roles.sh /docker-entrypoint-initdb.d/

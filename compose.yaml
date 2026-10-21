@@ -1,16 +1,17 @@
 name: ryzhub
 services:
   postgres:
-    build: ./infra/postgres
+    build: ./deploy/postgres
     image: ryzhub-postgres:18-search
     environment:
       POSTGRES_DB: ryzhub
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: local-development-only
+      RYZHUB_APP_PASSWORD: local-app-only
+      RYZHUB_WORKER_PASSWORD: local-worker-only
     ports: ["127.0.0.1:55432:5432"]
     volumes:
       - postgres:/var/lib/postgresql
-      - ./infra/postgres/init-db.sql:/docker-entrypoint-initdb.d/roles.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d ryzhub"]
       interval: 2s

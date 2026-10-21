@@ -4,7 +4,7 @@
 
 - `crates/` contains the Rust workspace: `server` (API and orchestration), `execution` (sandbox hosts and agents), `core` (client state and rendering), `domain` (authorization), `proto` (protocol bindings), and `bridge` (Flutter FFI).
 - `client/lib/` holds Flutter UI; `client/test/` contains widget tests and `goldens/`; fonts live in `client/assets/fonts/`.
-- `proto/` defines wire schemas; `migrations/` holds numbered SQL migrations; `harness/claude/` contains the TypeScript adapter. Development scripts live in `scripts/`, infrastructure in `compose.yaml` and `infra/`, and documentation in `docs/`.
+- `proto/` defines wire schemas; `migrations/` holds numbered SQL migrations; `harness/claude/` contains the TypeScript adapter. Development scripts live in `scripts/`, infrastructure in `compose.yaml` and `deploy/`, and documentation in `docs/`.
 
 ## Build, Test, and Development Commands
 

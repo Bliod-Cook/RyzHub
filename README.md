@@ -132,7 +132,7 @@ sandboxes under containerd; a guest process inside each sandbox runs tools and h
 | `crates/bridge`, `client/` | flutter_rust_bridge layer and the Flutter app |
 | `crates/domain`, `crates/proto`, `proto/` | Authorization, policy, and the Protobuf wire schema |
 | `harness/claude` | TypeScript adapter between the guest and the Claude Agent SDK |
-| `migrations/`, `infra/`, `scripts/` | SQL migrations, the PostgreSQL image (PGroonga, pgvector), dev and test scripts |
+| `migrations/`, `deploy/`, `scripts/` | SQL migrations, the PostgreSQL image (PGroonga, pgvector), dev and test scripts |
 
 ## Deployment
 
@@ -154,7 +154,7 @@ sandboxes under containerd; a guest process inside each sandbox runs tools and h
 **Database accounts.** Running roles connect with `DATABASE_URL` and refuse superuser or
 `BYPASSRLS` accounts; owners also need a read-only `BYPASSRLS` `WORKER_DATABASE_URL`;
 `migrate`/`maintain` use `MIGRATION_DATABASE_URL`. PostgreSQL needs PGroonga and pgvector —
-use the image in `infra/postgres`. Messaging uses NATS (`NATS_URL`).
+use the image in `deploy/postgres`. Messaging uses NATS (`NATS_URL`).
 
 **Storage.** `work.storage_root` (and an optional `secondary_root` copy) is a directory or
 `s3config:<file>`, a TOML file naming an S3-compatible endpoint, bucket, region and the

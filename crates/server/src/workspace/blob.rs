@@ -63,7 +63,8 @@ impl BlobStore {
                 prefix: String::new(),
             });
         };
-        let config: S3Config = toml::from_str(&std::fs::read_to_string(path)?)?;
+        let config: S3Config =
+            crate::config::parse_toml(&std::fs::read_to_string(path)?).context(path.to_owned())?;
         let endpoint = reqwest::Url::parse(&config.endpoint)?;
         ensure!(
             matches!(endpoint.scheme(), "http" | "https")

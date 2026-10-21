@@ -27,6 +27,7 @@ base64 = "0.22"
 rand = "0.9"
 sha2 = "0.10"
 toml = "0.9"
+serde_ignored = "0.1"
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"], default-features = false }
 aes-gcm = "0.10"

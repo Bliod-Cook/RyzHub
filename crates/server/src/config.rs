@@ -1,6 +1,6 @@
 //! Instance configuration (`RYZHUB_CONFIG`, TOML). Every field has a default suitable for
 //! local development; `validate` rejects combinations that cannot work.
-use anyhow::ensure;
+use anyhow::{Context, ensure};
 use ryzhub_domain::Policy;
 use ryzhub_execution::host;
 use serde::{Deserialize, Serialize};
@@ -412,10 +412,24 @@ impl Default for RetentionConfig {
     }
 }
 
+/// A TOML document as `T`; a key `T` has no place for is an error, not a silent no-op.
+pub fn parse_toml<T: serde::de::DeserializeOwned>(text: &str) -> anyhow::Result<T> {
+    let mut unknown = vec![];
+    let value = serde_ignored::deserialize(toml::Deserializer::parse(text)?, |path| {
+        unknown.push(path.to_string())
+    })?;
+    ensure!(
+        unknown.is_empty(),
+        "unknown configuration keys: {}",
+        unknown.join(", ")
+    );
+    Ok(value)
+}
+
 impl Config {
     pub fn load() -> anyhow::Result<Self> {
         let config: Self = match std::env::var("RYZHUB_CONFIG") {
-            Ok(path) => toml::from_str(&std::fs::read_to_string(path)?)?,
+            Ok(path) => parse_toml(&std::fs::read_to_string(&path)?).context(path)?,
             Err(_) => Self::default(),
         };
         config.validate()?;
@@ -854,6 +868,23 @@ mod tests {
         }
         for disk in [256 * MIB, 1 << 40] {
             assert!(valid(&|s| s.disk_bytes = disk), "{disk}");
+        }
+    }
+
+    #[test]
+    fn unknown_keys_are_refused_wherever_they_appear() {
+        assert!(parse_toml::<Config>("[sandbox]\nmemory_bytes = 1").is_ok());
+        for (text, key) in [
+            ("listne = \"0.0.0.0:8080\"", "listne"),
+            ("[sandbox]\nmemroy_bytes = 1", "sandbox.memroy_bytes"),
+            ("[policy]\nallow_memroy = false", "policy.allow_memroy"),
+            (
+                "[[harness.acp]]\nname = \"x\"\ncomand = \"/x\"",
+                "harness.acp.0.comand",
+            ),
+        ] {
+            let error = parse_toml::<Config>(text).unwrap_err().to_string();
+            assert!(error.contains(key), "{text}: {error}");
         }
     }
 }

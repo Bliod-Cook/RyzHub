@@ -51,7 +51,8 @@ python3 scripts/serve-web.py
 ```
 
 Open <http://127.0.0.1:3000> and register with any email and a password of 8+ characters.
-Every new account gets a personal organization.
+Every new account gets a personal organization. To run an instance for real, see
+[Self-hosting](#self-hosting).
 
 ## Development
 
@@ -132,40 +133,14 @@ sandboxes under containerd; a guest process inside each sandbox runs tools and h
 | `crates/bridge`, `client/` | flutter_rust_bridge layer and the Flutter app |
 | `crates/domain`, `crates/proto`, `proto/` | Authorization, policy, and the Protobuf wire schema |
 | `harness/claude` | TypeScript adapter between the guest and the Claude Agent SDK |
-| `migrations/`, `deploy/`, `scripts/` | SQL migrations, the PostgreSQL image (PGroonga, pgvector), dev and test scripts |
+| `migrations/`, `scripts/` | SQL migrations, dev and test scripts |
+| `deploy/` | Self-hosting: images, Docker Compose, the PostgreSQL image (PGroonga, pgvector) |
 
-## Deployment
+## Self-hosting
 
-**Configuration.** `RYZHUB_CONFIG` points at a TOML file; every field is documented in
-[`crates/server/src/config.rs`](crates/server/src/config.rs) and has a working default.
-[`config/development.toml`](config/development.toml) is a small example.
-
-**Roles.** Run `ryzhub-server <role>`:
-
-| Role | Purpose |
-|---|---|
-| `all` | Every long-running role in one process |
-| `gateway`, `owner`, `llm-gateway` | Client API, conversation owners, model gateway — scale them separately |
-| `migrate` | Apply migrations |
-| `maintain [--loop]` | Create partitions and apply retention (daily) |
-| `reindex` | Rebuild search vectors after changing the embedding model |
-| `migrate-secrets` | Re-wrap stored secrets after rotating the vault key |
-
-**Database accounts.** Running roles connect with `DATABASE_URL` and refuse superuser or
-`BYPASSRLS` accounts; owners also need a read-only `BYPASSRLS` `WORKER_DATABASE_URL`;
-`migrate`/`maintain` use `MIGRATION_DATABASE_URL`. PostgreSQL needs PGroonga and pgvector —
-use the image in `deploy/postgres`. Messaging uses NATS (`NATS_URL`).
-
-**Storage.** `work.storage_root` (and an optional `secondary_root` copy) is a directory or
-`s3config:<file>`, a TOML file naming an S3-compatible endpoint, bucket, region and the
-environment variables that hold its keys.
-
-**Execution nodes.** Declare nodes in `[[sandbox.nodes]]`. Remote nodes are reached over
-mutual TLS (`RYZHUB_TLS_*` on the node). Set `RYZHUB_QUOTA_VOLUME_SIZE` on a node to enforce
-per-sandbox disk quotas.
-
-**Sign-in and notifications.** Add OpenID Connect providers with `[[auth.oidc]]` and GitHub
-with `[auth.github]`; enable Android push with `[push]` and a Firebase service account.
+[deploy/README.md](deploy/README.md) runs an instance on one Linux machine with Docker
+Compose: `deploy/setup.sh ryz.example.com`, add a model provider key, and sign in. It also
+covers configuration, upgrades, backups and running on more than one machine.
 
 ## Plugins
 
@@ -186,6 +161,7 @@ until the member confirms them.
 
 ## Documentation
 
+- [Self-hosting](deploy/README.md) — install, configure and run an instance
 - [Wire protocol](docs/wire-protocol-v1.md) — client/server frames, channels and commands
 - [TODO](docs/TODO.md) — what the design calls for that isn't built yet
 - [Device checklist](docs/device-checklist.md) — manual checks on Windows and Android

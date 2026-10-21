@@ -7,7 +7,10 @@ use ryzhub_server::{
 };
 use sqlx::PgPool;
 use std::{future::Future, time::Duration};
-use tokio::task::JoinSet;
+use tokio::{
+    signal::unix::{SignalKind, signal},
+    task::JoinSet,
+};
 
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -34,13 +37,30 @@ async fn run(args: Vec<String>) -> anyhow::Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
     let role = args.get(1).map_or("all", String::as_str);
-    if matches!(role, "migrate" | "maintain" | "reindex" | "migrate-secrets") {
-        return maintain(role, args.iter().any(|a| a == "--loop")).await;
+    let repeat = args.iter().any(|a| a == "--loop");
+    match role {
+        "maintain" if repeat => until_stopped(maintain(role, true)).await,
+        "migrate" | "maintain" | "reindex" | "migrate-secrets" => maintain(role, repeat).await,
+        "all" | "gateway" | "owner" | "llm-gateway" => until_stopped(serve(role)).await,
+        _ => anyhow::bail!(
+            "usage: ryzhub-server [all|gateway|owner|llm-gateway|migrate|maintain [--loop]|reindex|migrate-secrets]"
+        ),
     }
-    ensure!(
-        matches!(role, "all" | "gateway" | "owner" | "llm-gateway"),
-        "usage: ryzhub-server [all|gateway|owner|llm-gateway|migrate|maintain [--loop]|reindex|migrate-secrets]"
-    );
+}
+
+/// Runs `task` until it ends or the process is asked to stop: Ctrl-C, or SIGTERM from
+/// `docker stop` and service managers. Connections are dropped; clients reconnect, and
+/// conversation leases move to another owner within seconds.
+async fn until_stopped(task: impl Future<Output = anyhow::Result<()>>) -> anyhow::Result<()> {
+    let mut terminate = signal(SignalKind::terminate())?;
+    tokio::select! {
+        result = task => result,
+        result = tokio::signal::ctrl_c() => Ok(result?),
+        _ = terminate.recv() => Ok(()),
+    }
+}
+
+async fn serve(role: &str) -> anyhow::Result<()> {
     let config = Config::load()?;
     let store = Store::connect(&env("DATABASE_URL")?).await?;
     let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:54222".into());
@@ -106,10 +126,9 @@ async fn run(args: Vec<String>) -> anyhow::Result<()> {
             servers.spawn(async move { axum::serve(listener, router).await.map_err(Into::into) });
         }
     }
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => Ok(()),
-        Some(result) = servers.join_next() => result?,
-        () = std::future::pending(), if servers.is_empty() => Ok(()),
+    match servers.join_next().await {
+        Some(result) => result?,
+        None => std::future::pending().await,
     }
 }
 

@@ -651,7 +651,8 @@ async fn websocket_reconnect_owner_process_restart_snapshot_and_isolation() -> a
 
 #[tokio::test]
 #[ignore = "requires PostgreSQL 18 and NATS"]
-async fn the_standalone_gateway_process_serves_client_subscriptions() -> anyhow::Result<()> {
+async fn the_standalone_gateway_process_serves_subscriptions_and_stops_on_sigterm()
+-> anyhow::Result<()> {
     let h = Harness::new().await?;
     let user = h.user().await?;
     let conv = h.conversation(&user).await?;
@@ -685,8 +686,17 @@ async fn the_standalone_gateway_process_serves_client_subscriptions() -> anyhow:
     })
     .await?;
     assert_eq!(synced.channel, channel);
-    gateway.kill().await?;
-    gateway.wait().await?;
+    // `docker stop` and service managers ask with SIGTERM; open connections do not hold it up.
+    let pid = gateway.id().context("gateway pid")?.to_string();
+    ensure!(
+        Process::new("kill")
+            .args(["-TERM", &pid])
+            .status()
+            .await?
+            .success()
+    );
+    let status = tokio::time::timeout(Duration::from_secs(5), gateway.wait()).await??;
+    assert!(status.success(), "{status}");
     h.close().await
 }
 

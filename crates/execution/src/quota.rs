@@ -7,7 +7,7 @@
 //! the host creates on first start, so it needs no particular host filesystem.
 use std::{
     ffi::CString,
-    os::fd::AsRawFd,
+    os::{fd::AsRawFd, unix::fs::MetadataExt},
     path::{Path, PathBuf},
 };
 
@@ -75,6 +75,25 @@ const FS_PROJ_QUOTA: i8 = 2;
 const FS_DQ_BHARD: u16 = 1 << 3;
 const FS_DQ_BSOFT: u16 = 1 << 2;
 
+/// `struct loop_info64` from `linux/loop.h`.
+#[repr(C)]
+struct LoopInfo64 {
+    device: u64,
+    inode: u64,
+    rdevice: u64,
+    offset: u64,
+    size_limit: u64,
+    number: u32,
+    encrypt_type: u32,
+    encrypt_key_size: u32,
+    flags: u32,
+    file_name: [u8; 64],
+    crypt_name: [u8; 64],
+    encrypt_key: [u8; 32],
+    init: [u64; 2],
+}
+const LOOP_GET_STATUS64: u32 = 0x4C05;
+
 impl Volume {
     /// The volume at `mountpoint`, backed by `image`: created (`size` bytes) and formatted on
     /// first use, attached to a loop device and mounted with project quotas unless it already
@@ -107,7 +126,7 @@ impl Volume {
         }
         std::fs::create_dir_all(mountpoint)?;
         if mountinfo(mountpoint)?.is_none() {
-            let device = match attached(image_text).await? {
+            let device = match attached(image)? {
                 Some(device) => device,
                 None => attach(image_text).await?,
             };
@@ -210,27 +229,72 @@ fn set_project(dir: &Path, project: u32) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The loop device `image` is attached to, if any. `losetup -a` lists `DEVICE: …` lines
-/// naming the backing file (busybox: `/dev/loop0: 0 /path`; util-linux:
-/// `/dev/loop0: [2049]:12 (/path)`); busybox has no `-j`.
-async fn attached(image: &str) -> anyhow::Result<Option<String>> {
-    let listing = run("losetup", &["-a"]).await?;
-    Ok(listing.lines().find_map(|line| {
-        let (device, rest) = line.split_once(':')?;
-        rest.split_whitespace()
-            .any(|word| word.trim_matches(['(', ')']) == image)
-            .then(|| device.to_owned())
-    }))
+/// The loop device `image` is attached to, if any. Loop devices belong to the kernel, so a
+/// container sees them all, each under the name it was attached with, and every node calls its
+/// image `<root>/volume.img`: the backing file is matched by device and inode, not by name.
+fn attached(image: &Path) -> anyhow::Result<Option<String>> {
+    let file = std::fs::metadata(image)?;
+    for entry in std::fs::read_dir("/sys/block")? {
+        let entry = entry?;
+        let Some(minor) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.strip_prefix("loop"))
+            .and_then(|minor| minor.parse().ok())
+        else {
+            continue;
+        };
+        // Only attached devices have a backing file.
+        if !entry.path().join("loop/backing_file").exists() {
+            continue;
+        }
+        let device = device_node(minor)?;
+        if backing_file(&device)? == Some((file.dev(), file.ino())) {
+            return Ok(Some(device));
+        }
+    }
+    Ok(None)
 }
 
-/// Attach `image` to a free loop device, creating the device node if this mount namespace
-/// lacks it (containers usually only have `/dev/loop-control`).
+/// The device and inode of the file a loop device reads; None once it has been detached.
+fn backing_file(device: &str) -> anyhow::Result<Option<(u64, u64)>> {
+    let file = std::fs::File::open(device)?;
+    // SAFETY: integers and byte arrays, for which all zeroes is a valid value.
+    let mut info: LoopInfo64 = unsafe { std::mem::zeroed() };
+    // SAFETY: `info` matches the kernel's `struct loop_info64` and outlives the call.
+    let result = unsafe {
+        libc::ioctl(
+            file.as_raw_fd(),
+            LOOP_GET_STATUS64 as _,
+            &mut info as *mut LoopInfo64,
+        )
+    };
+    if result != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ENXIO) {
+            return Ok(None);
+        }
+        anyhow::bail!("reading {device} failed: {error}");
+    }
+    Ok(Some((info.device, info.inode)))
+}
+
+/// Attach `image` to a free loop device.
 async fn attach(image: &str) -> anyhow::Result<String> {
     let device = run("losetup", &["-f"]).await?.trim().to_owned();
-    let minor: u64 = device
+    let minor = device
         .strip_prefix("/dev/loop")
         .context("UNEXPECTED_LOOP_DEVICE")?
         .parse()?;
+    let device = device_node(minor)?;
+    run("losetup", &[&device, image]).await?;
+    Ok(device)
+}
+
+/// `/dev/loop<minor>`, created if this mount namespace lacks it (containers usually only have
+/// `/dev/loop-control`).
+fn device_node(minor: u64) -> anyhow::Result<String> {
+    let device = format!("/dev/loop{minor}");
     if !Path::new(&device).exists() {
         nix::sys::stat::mknod(
             device.as_str(),
@@ -239,7 +303,6 @@ async fn attach(image: &str) -> anyhow::Result<String> {
             nix::sys::stat::makedev(7, minor),
         )?;
     }
-    run("losetup", &[&device, image]).await?;
     Ok(device)
 }
 
@@ -251,6 +314,7 @@ mod tests {
     fn kernel_structures_have_their_abi_sizes() {
         assert_eq!(std::mem::size_of::<FsXattr>(), 28);
         assert_eq!(std::mem::size_of::<FsDiskQuota>(), 112);
+        assert_eq!(std::mem::size_of::<LoopInfo64>(), 232);
         // _IOR('X', 31, struct fsxattr) and _IOW('X', 32, struct fsxattr).
         assert_eq!(FS_IOC_FSGETXATTR, (2 << 30) | (28 << 16) | (0x58 << 8) | 31);
         assert_eq!(FS_IOC_FSSETXATTR, (1 << 30) | (28 << 16) | (0x58 << 8) | 32);

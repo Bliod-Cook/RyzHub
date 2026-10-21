@@ -3,6 +3,7 @@ use anyhow::{Context, ensure};
 use serde_json::json;
 use std::{
     collections::BTreeSet,
+    ops::RangeInclusive,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     sync::{Arc, Weak},
@@ -38,6 +39,10 @@ pub struct VolumeConfig {
 
 /// The disk limit of a sandbox whose spec names none.
 pub const DEFAULT_DISK_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+/// What a sandbox may ask for; control planes check their configuration against the same.
+pub const MEMORY_BYTES: RangeInclusive<u64> = 64 * 1024 * 1024..=4 * 1024 * 1024 * 1024;
+pub const PIDS_LIMIT: RangeInclusive<u64> = 16..=1024;
+pub const DISK_BYTES: RangeInclusive<u64> = 256 * 1024 * 1024..=1024 * 1024 * 1024 * 1024;
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Entry {
@@ -1529,11 +1534,10 @@ pub fn validate_spec(spec: &SandboxSpec, multi_tenant: bool) -> anyhow::Result<(
         "ISOLATION_POLICY_DENIED"
     );
     ensure!(
-        (64 * 1024 * 1024..=4 * 1024 * 1024 * 1024).contains(&spec.memory_bytes)
-            && (16..=1024).contains(&spec.pids_limit)
+        MEMORY_BYTES.contains(&spec.memory_bytes)
+            && PIDS_LIMIT.contains(&spec.pids_limit)
             && spec.exec_epoch > 0
-            && (spec.disk_bytes == 0
-                || (256 * 1024 * 1024..=1024 * 1024 * 1024 * 1024).contains(&spec.disk_bytes)),
+            && (spec.disk_bytes == 0 || DISK_BYTES.contains(&spec.disk_bytes)),
         "INVALID_RESOURCES"
     );
     ensure!(

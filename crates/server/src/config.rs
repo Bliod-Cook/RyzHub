@@ -2,6 +2,7 @@
 //! local development; `validate` rejects combinations that cannot work.
 use anyhow::ensure;
 use ryzhub_domain::Policy;
+use ryzhub_execution::host;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -551,10 +552,9 @@ impl Config {
             ensure!(
                 self.sandbox.image.contains("@sha256:")
                     && matches!(self.sandbox.runtime.as_str(), "runc" | "runsc")
-                    && self.sandbox.memory_bytes >= 32 * 1024 * 1024
-                    && self.sandbox.pids_limit > 0
-                    && (256 * 1024 * 1024..=1024 * 1024 * 1024 * 1024)
-                        .contains(&self.sandbox.disk_bytes),
+                    && host::MEMORY_BYTES.contains(&self.sandbox.memory_bytes)
+                    && host::PIDS_LIMIT.contains(&self.sandbox.pids_limit)
+                    && host::DISK_BYTES.contains(&self.sandbox.disk_bytes),
                 "invalid sandbox configuration"
             );
             ensure!(
@@ -567,7 +567,7 @@ impl Config {
                 "invalid sandbox.egress_allow"
             );
             ensure!(
-                self.sandbox.deps.is_empty() || ryzhub_execution::host::pinned(&self.sandbox.deps),
+                self.sandbox.deps.is_empty() || host::pinned(&self.sandbox.deps),
                 "sandbox.deps must be pinned by digest"
             );
             let mut names = std::collections::BTreeSet::new();
@@ -829,6 +829,31 @@ mod tests {
             vec![("a", "relative.sock")],
         ] {
             assert!(with_nodes(bad).validate().is_err());
+        }
+    }
+
+    #[test]
+    fn sandbox_limits_match_what_nodes_accept() {
+        const MIB: u64 = 1 << 20;
+        let valid = |set: &dyn Fn(&mut SandboxConfig)| {
+            let mut config = with_nodes(vec![]);
+            set(&mut config.sandbox);
+            config.validate().is_ok()
+        };
+        for memory in [64 * MIB, 4096 * MIB] {
+            assert!(valid(&|s| s.memory_bytes = memory), "{memory}");
+        }
+        for memory in [32 * MIB, 63 * MIB, 4096 * MIB + 1] {
+            assert!(!valid(&|s| s.memory_bytes = memory), "{memory}");
+        }
+        for pids in [16, 1024] {
+            assert!(valid(&|s| s.pids_limit = pids), "{pids}");
+        }
+        for pids in [15, 1025] {
+            assert!(!valid(&|s| s.pids_limit = pids), "{pids}");
+        }
+        for disk in [256 * MIB, 1 << 40] {
+            assert!(valid(&|s| s.disk_bytes = disk), "{disk}");
         }
     }
 }

@@ -28,6 +28,12 @@ ryzhub-proto = { path = "crates/proto" }
 ryzhub-domain = { path = "crates/domain" }
 ryzhub-core = { path = "crates/core" }
 
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
 [profile.release]
 lto = "thin"
 strip = true

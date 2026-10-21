@@ -1,5 +1,10 @@
 /target/
 /.env
+# A deployment's secrets, settings and data (deploy/setup.sh)
+/deploy/.env
+/deploy/config.toml
+/deploy/compose.override.yaml
+/deploy/data/
 *.db
 *.db-shm
 *.db-wal

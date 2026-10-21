@@ -1,0 +1,130 @@
+# A RyzHub instance on one machine. Run ./setup.sh first: it writes .env and config.toml,
+# builds the images and starts everything. After that, docker compose commands work from
+# this directory. Local changes belong in compose.override.yaml, which git ignores.
+name: ryzhub-deploy
+
+x-logging: &logging
+  driver: json-file
+  options: { max-size: 10m, max-file: "3" }
+
+x-server-env: &server-env
+  DATABASE_URL: postgres://ryzhub_app:${RYZHUB_APP_PASSWORD}@postgres/ryzhub
+  WORKER_DATABASE_URL: postgres://ryzhub_worker:${RYZHUB_WORKER_PASSWORD}@postgres/ryzhub
+  NATS_URL: nats://nats:4222
+  RYZHUB_CONFIG: /etc/ryzhub/config.toml
+  RYZHUB_VAULT_KEY: ${RYZHUB_VAULT_KEY}
+  ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+  OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+  GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+  GITHUB_CLIENT_SECRET: ${GITHUB_CLIENT_SECRET:-}
+  RUST_LOG: ${RUST_LOG:-ryzhub_server=info}
+
+# Every server role runs from one image, as the user who ran setup.sh, so the files it
+# writes under data/ stay yours.
+x-server: &server
+  build: { context: .., dockerfile: deploy/Dockerfile, target: server }
+  image: ryzhub-server:local
+  user: "${RYZHUB_UID:?run ./setup.sh first}:${RYZHUB_GID:?run ./setup.sh first}"
+  environment: *server-env
+  volumes:
+    - ./config.toml:/etc/ryzhub/config.toml:ro
+  restart: unless-stopped
+  logging: *logging
+
+services:
+  postgres:
+    build: ./postgres
+    image: ryzhub-postgres:18-search
+    environment:
+      POSTGRES_DB: ryzhub
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?run ./setup.sh first}
+      RYZHUB_APP_PASSWORD: ${RYZHUB_APP_PASSWORD}
+      RYZHUB_WORKER_PASSWORD: ${RYZHUB_WORKER_PASSWORD}
+    volumes:
+      - ./data/postgres:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d ryzhub"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    restart: unless-stopped
+    logging: *logging
+
+  nats:
+    image: nats:2.11-alpine
+    restart: unless-stopped
+    logging: *logging
+
+  # Applies database migrations, then exits; the other server roles wait for it.
+  migrate:
+    <<: *server
+    command: migrate
+    environment:
+      <<: *server-env
+      MIGRATION_DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD}@postgres/ryzhub
+    restart: "no"
+    depends_on:
+      postgres: { condition: service_healthy }
+
+  # The API, conversation owners and the model gateway.
+  server:
+    <<: *server
+    command: all
+    volumes:
+      - ./config.toml:/etc/ryzhub/config.toml:ro
+      - ./data/blobs:/data/blobs
+      - ./data/node:/state:ro
+      - ./data/node/gateway:/state/gateway
+    depends_on:
+      postgres: { condition: service_healthy }
+      nats: { condition: service_started }
+      migrate: { condition: service_completed_successfully }
+
+  # Daily partition upkeep and retention.
+  maintain:
+    <<: *server
+    command: [maintain, --loop]
+    environment:
+      <<: *server-env
+      MIGRATION_DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD}@postgres/ryzhub
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+
+  # Runs sandboxes in its own containerd; it needs a privileged container for that.
+  node:
+    build: { context: .., dockerfile: deploy/Dockerfile, target: node }
+    image: ryzhub-node:local
+    privileged: true
+    environment:
+      RYZHUB_CONTROL_UID: ${RYZHUB_UID}
+      RYZHUB_MULTI_TENANT: ${RYZHUB_MULTI_TENANT:-true}
+      RYZHUB_QUOTA_VOLUME_SIZE: ${RYZHUB_QUOTA_VOLUME_SIZE:?set it in .env}
+      RYZHUB_QUOTA_VOLUME_SPARSE: ${RYZHUB_QUOTA_VOLUME_SPARSE:-0}
+    volumes:
+      - ./data/node:/state
+    healthcheck:
+      test: ["CMD-SHELL", "ctr --address /run/ryzhub-containerd.sock version >/dev/null && kill -0 \"$$(cat /state/host.pid)\""]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+    restart: unless-stopped
+    logging: *logging
+
+  # The web app, and HTTPS for every public name.
+  caddy:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      target: web
+      args:
+        RYZHUB_SERVER_URL: https://api.${RYZHUB_DOMAIN}
+    image: ryzhub-web:local
+    ports: ["80:80", "443:443", "443:443/udp"]
+    environment:
+      RYZHUB_DOMAIN: ${RYZHUB_DOMAIN}
+    volumes:
+      - ./data/caddy:/data
+    depends_on: [server]
+    restart: unless-stopped
+    logging: *logging

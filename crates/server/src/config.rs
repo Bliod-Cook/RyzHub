@@ -892,4 +892,17 @@ mod tests {
             assert!(error.contains(key), "{text}: {error}");
         }
     }
+
+    #[test]
+    fn shipped_configurations_are_valid() {
+        for text in [
+            include_str!("../../../config/development.toml"),
+            include_str!("../../../deploy/config.example.toml"),
+        ] {
+            let mut config: Config = parse_toml(text).unwrap();
+            // setup.sh fills in the image it builds.
+            config.sandbox.image = format!("registry.test/base@sha256:{}", "0".repeat(64));
+            config.validate().unwrap();
+        }
+    }
 }

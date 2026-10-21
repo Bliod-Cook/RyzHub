@@ -1,0 +1,113 @@
+# RyzHub instance configuration.
+#
+# setup.sh copied this file to config.toml and put your domain in. Anything not set here
+# keeps its default; every setting is described in crates/server/src/config.rs. The server
+# refuses to start on a key it does not know, so a typo cannot go unnoticed.
+#
+# After editing, apply the change with:  docker compose restart server maintain
+
+# Caddy is the only thing that reaches the server; these are the addresses people use.
+listen = "0.0.0.0:8080"
+public_url = "https://api.ryz.example.com"
+allowed_origins = ["https://ryz.example.com"]
+
+[auth]
+# Anyone who can reach the instance may create an account, and every account can spend
+# your model provider keys. Once everyone you expect has signed up, set this to false:
+# existing members keep signing in, newcomers are turned away.
+registration = true
+# Where sign-in with another account may send people back to: the web app, and native apps
+# listening on this device. Keep the trailing slash; without it, look-alike hosts such as
+# ryz.example.com.attacker.net would also match.
+return_urls = ["https://ryz.example.com/", "http://127.0.0.1:"]
+
+# Sign-in with an OpenID Connect provider (Google, Microsoft Entra, Keycloak, ...).
+# Register https://api.ryz.example.com/auth/oauth/corp/callback as the redirect URI.
+# [[auth.oidc]]
+# name = "corp"
+# label = "Corp SSO"
+# issuer = "https://login.example.com"
+# client_id = "ryzhub"
+# client_secret_env = "CORP_CLIENT_SECRET"   # passed to the server in compose.override.yaml
+
+# Sign-in with GitHub. Callback URL: https://api.ryz.example.com/auth/oauth/github/callback
+# The client secret goes in .env as GITHUB_CLIENT_SECRET.
+# [auth.github]
+# client_id = "Iv1.0123456789abcdef"
+
+[llm]
+enabled = true
+# Sandboxes reach the model gateway through this socket, shared with the execution node.
+unix_socket = "/state/gateway/llm.sock"
+# The model new chats start with.
+model = "claude-sonnet-5-5"
+
+# The models people can pick, and what each is for: chat, and the Work agents claude
+# (Claude Code) and codex. Anthropic models use ANTHROPIC_API_KEY, OpenAI models
+# OPENAI_API_KEY; both go in .env. A model whose key is missing simply fails to answer.
+[[llm.models]]
+id = "claude-sonnet-5-5"
+protocol = "anthropic"
+harnesses = ["chat", "claude"]
+
+[[llm.models]]
+id = "gpt-6"
+protocol = "responses"
+harnesses = ["chat", "codex"]
+
+# Other protocols: "gemini" (GEMINI_API_KEY) and "chat_completions" for any OpenAI-compatible
+# service. A model can also list its own upstreams, tried in priority order, each with the
+# environment variable that holds its key:
+# [[llm.models]]
+# id = "deepseek-chat"
+# protocol = "chat_completions"
+# harnesses = ["chat"]
+# upstreams = [{ url = "https://api.deepseek.com", key_env = "DEEPSEEK_API_KEY" }]
+
+[sandbox]
+enabled = true
+host_socket = "/state/host.sock"
+# gVisor gives every sandbox its own kernel. The node insists on it while
+# RYZHUB_MULTI_TENANT=true (the default in compose.yaml); "runc" is faster but only fit for
+# an instance whose members all trust each other.
+runtime = "runsc"
+# The sandbox image; setup.sh builds it and fills this in.
+image = ""
+# Per sandbox: memory from 64 MiB to 4 GiB, processes from 16 to 1024, and a disk limit
+# (10 GiB by default) within the volume RYZHUB_QUOTA_VOLUME_SIZE sets aside.
+memory_bytes = 1073741824
+pids_limit = 256
+
+[work]
+enabled = true
+# The models Work starts with for Codex and for Claude Code.
+model = "gpt-6"
+claude_model = "claude-sonnet-5-5"
+# Workspace checkpoints and everyone's file library. For S3-compatible storage, use
+# "s3config:/etc/ryzhub/s3.toml" and see "Storage" in README.md.
+storage_root = "/data/blobs"
+
+[plugins]
+# Plugin pages (MCP Apps) load from their own origin, apart from the web app.
+client_url = "https://ryz.example.com"
+content_origin = "https://apps.ryz.example.com"
+content_listen = "0.0.0.0:8082"
+
+[policy]
+# Limits for every organization; leaving a setting out means no limit.
+max_sandboxes = 4
+# allow_full_auto = false            # agents always ask before risky actions
+# attachment_quota_bytes = 1073741824
+# max_reasoning = "high"
+
+# Semantic search over messages and files, with any OpenAI-compatible embedding endpoint.
+# Without it, search is full-text only.
+# [search]
+# embedding_url = "https://api.openai.com"
+# embedding_model = "text-embedding-3-large"
+
+# Notifications to the Android app through Firebase Cloud Messaging; mount the service
+# account's key file in compose.override.yaml.
+# [push]
+# enabled = true
+# fcm_credentials = "/etc/ryzhub/firebase.json"

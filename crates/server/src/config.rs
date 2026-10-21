@@ -639,6 +639,10 @@ fn plain_url(url: &reqwest::Url) -> bool {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AuthConfig {
+    /// Anyone may create an account, with a password or by a first sign-in with another
+    /// account. Off: only existing members sign in, including identities that join an account
+    /// by its verified email.
+    pub registration: bool,
     pub oidc: Vec<OidcProvider>,
     pub github: Option<GithubProvider>,
     /// An identity whose provider verified its email joins the account with that email.
@@ -651,6 +655,7 @@ pub struct AuthConfig {
 impl Default for AuthConfig {
     fn default() -> Self {
         Self {
+            registration: true,
             oidc: vec![],
             github: None,
             link_verified_email: true,

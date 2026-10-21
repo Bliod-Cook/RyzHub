@@ -209,6 +209,7 @@ pub async fn register(
     headers: HeaderMap,
     Json(input): Json<Credentials>,
 ) -> ApiResult<impl IntoResponse> {
+    require!(app.config.auth.registration, Code::RegistrationClosed);
     let email = input.email.trim().to_lowercase();
     require!(
         (8..=256).contains(&input.password.len()) && email.contains('@') && email.len() <= 254,

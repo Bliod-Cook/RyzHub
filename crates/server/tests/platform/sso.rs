@@ -189,11 +189,11 @@ async fn serve_provider() -> anyhow::Result<(Shared, String, JoinHandle<()>)> {
 }
 
 /// Sign in through `provider` as a browser would; the address the client is sent back to.
-async fn through(h: &Harness, provider: &str, link: Option<&str>) -> anyhow::Result<url::Url> {
+async fn through(base: &str, provider: &str, link: Option<&str>) -> anyhow::Result<url::Url> {
     let browser = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
-    let mut start = url::Url::parse(&format!("{}/auth/oauth/{provider}/start", h.base))?;
+    let mut start = url::Url::parse(&format!("{base}/auth/oauth/{provider}/start"))?;
     start
         .query_pairs_mut()
         .append_pair("return_to", "http://client.test/app");
@@ -265,7 +265,7 @@ async fn members_sign_in_with_oidc_and_github_and_keep_one_way_in() -> anyhow::R
     assert_eq!(caps["auth_providers"].as_array().map(Vec::len), Some(2));
 
     // A first sign-in makes the account; the code works once.
-    let back = through(&h, "corp", None).await?;
+    let back = through(&h.base, "corp", None).await?;
     let code = param(&back, "login_code").expect("a login code");
     let (status, session) = exchange(&h, &code).await?;
     assert_eq!(status, 200, "{session}");
@@ -273,7 +273,7 @@ async fn members_sign_in_with_oidc_and_github_and_keep_one_way_in() -> anyhow::R
     let user = session["user_id"].clone();
     assert_eq!(exchange(&h, &code).await?.0, 401, "spent");
     // The same identity signs in to the same account.
-    let again = through(&h, "corp", None).await?;
+    let again = through(&h.base, "corp", None).await?;
     assert_eq!(
         exchange(&h, &param(&again, "login_code").unwrap()).await?.1["user_id"],
         user
@@ -282,7 +282,7 @@ async fn members_sign_in_with_oidc_and_github_and_keep_one_way_in() -> anyhow::R
     // What the provider signs is checked: nonce, audience, signature.
     for tamper in ["nonce", "audience", "signature"] {
         provider.lock().unwrap().tamper = Some(tamper);
-        let refused = through(&h, "corp", None).await?;
+        let refused = through(&h.base, "corp", None).await?;
         assert_eq!(
             param(&refused, "login_error").as_deref(),
             Some("LOGIN_FAILED"),
@@ -299,13 +299,13 @@ async fn members_sign_in_with_oidc_and_github_and_keep_one_way_in() -> anyhow::R
         .fetch_one(&h.db)
         .await?;
     provider.lock().unwrap().email = email.clone();
-    let joined = through(&h, "github", None).await?;
+    let joined = through(&h.base, "github", None).await?;
     let (_, session) = exchange(&h, &param(&joined, "login_code").unwrap()).await?;
     assert_eq!(session["user_id"], member["user_id"]);
     // An unverified email does not take over the account that has it.
     provider.lock().unwrap().verified = false;
     provider.lock().unwrap().subject = "corp-user-2".into();
-    let refused = through(&h, "corp", None).await?;
+    let refused = through(&h.base, "corp", None).await?;
     assert_eq!(
         param(&refused, "login_error").as_deref(),
         Some("ACCOUNT_EXISTS")
@@ -321,7 +321,7 @@ async fn members_sign_in_with_oidc_and_github_and_keep_one_way_in() -> anyhow::R
         .await?
         .json()
         .await?;
-    let linked = through(&h, "corp", ticket["ticket"].as_str()).await?;
+    let linked = through(&h.base, "corp", ticket["ticket"].as_str()).await?;
     assert_eq!(param(&linked, "login_linked").as_deref(), Some("corp"));
     let listed: Value = reqwest::Client::new()
         .get(format!("{}/me/identities", h.base))
@@ -347,7 +347,7 @@ async fn members_sign_in_with_oidc_and_github_and_keep_one_way_in() -> anyhow::R
     }
     // The account made by signing in has no password: its only identity stays.
     provider.lock().unwrap().subject = "corp-user-1".into();
-    let fresh = through(&h, "corp", None).await?;
+    let fresh = through(&h.base, "corp", None).await?;
     let (_, session) = exchange(&h, &param(&fresh, "login_code").unwrap()).await?;
     let last = reqwest::Client::new()
         .delete(format!("{}/me/identities/corp/corp-user-1", h.base))
@@ -378,6 +378,85 @@ async fn members_sign_in_with_oidc_and_github_and_keep_one_way_in() -> anyhow::R
         let refused = browser.get(start).send().await?;
         assert_eq!(refused.status(), 400, "{return_to}");
     }
+    task.abort();
+    h.close().await
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL/NATS and test gateway secrets"]
+async fn closing_registration_lets_members_in_and_keeps_newcomers_out() -> anyhow::Result<()> {
+    let (provider, issuer, task) = serve_provider().await?;
+    let mut h = Harness::with(move |c| {
+        c.auth.oidc = vec![ryzhub_server::config::OidcProvider {
+            name: "corp".into(),
+            label: "Corp SSO".into(),
+            issuer,
+            client_id: "ryzhub".into(),
+            ..Default::default()
+        }];
+        c.auth.return_urls = vec!["http://client.test/".into()];
+    })
+    .await?;
+    // Members from before sign-up closed: one with a password, one through the provider.
+    let member = h.user().await?;
+    let email: String = sqlx::query_scalar("SELECT email FROM users WHERE id=$1::uuid")
+        .bind(member["user_id"].as_str().unwrap())
+        .fetch_one(&h.db)
+        .await?;
+    through(&h.base, "corp", None).await?;
+
+    // The same instance with sign-up closed.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let base = format!("http://{}", listener.local_addr()?);
+    let mut config = (*h.app.config).clone();
+    config.public_url = base.clone();
+    config.auth.registration = false;
+    let closed = App::new(h.app.store.clone(), h.app.nats.clone(), config)?;
+    h.serve(listener, ryzhub_server::http::router(closed));
+    let caps: Value = reqwest::get(format!("{base}/capabilities"))
+        .await?
+        .json()
+        .await?;
+    assert_eq!(caps["registration"], false);
+
+    let client = reqwest::Client::new();
+    let register = client
+        .post(format!("{base}/auth/register"))
+        .json(&json!({"email":"newcomer@example.test","password":"test-password"}))
+        .send()
+        .await?;
+    assert_eq!(register.status(), 403);
+    assert_eq!(
+        register.json::<Value>().await?["error"],
+        "REGISTRATION_CLOSED"
+    );
+    let login = client
+        .post(format!("{base}/auth/login"))
+        .json(&json!({"email":email,"password":"test-password"}))
+        .send()
+        .await?;
+    assert_eq!(login.status(), 200);
+
+    // A known identity signs in, and a verified email joins its account; nobody new gets in.
+    let again = through(&base, "corp", None).await?;
+    assert!(param(&again, "login_code").is_some(), "{again}");
+    provider.lock().unwrap().subject = "corp-user-2".into();
+    provider.lock().unwrap().email = email;
+    let joined = through(&base, "corp", None).await?;
+    let (_, session) = exchange(&h, &param(&joined, "login_code").unwrap()).await?;
+    assert_eq!(session["user_id"], member["user_id"]);
+    provider.lock().unwrap().subject = "corp-user-3".into();
+    provider.lock().unwrap().email = "newcomer@example.test".into();
+    let refused = through(&base, "corp", None).await?;
+    assert_eq!(
+        param(&refused, "login_error").as_deref(),
+        Some("REGISTRATION_CLOSED")
+    );
+    let created: i64 = sqlx::query_scalar("SELECT count(*) FROM users WHERE email=$1")
+        .bind("newcomer@example.test")
+        .fetch_one(&h.db)
+        .await?;
+    assert_eq!(created, 0);
     task.abort();
     h.close().await
 }

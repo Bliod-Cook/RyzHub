@@ -521,6 +521,7 @@ async fn account(
         return link_identity(user).await;
     }
     ensure!(identity.verified, Code::IdentityEmailRequired);
+    ensure!(app.config.auth.registration, Code::RegistrationClosed);
     let (user, _) = auth::create_account(app, &email, identity.name.as_deref(), "!")
         .await?
         .context(Code::AccountExists)?;

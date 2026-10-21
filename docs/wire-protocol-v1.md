@@ -91,6 +91,7 @@ cid 必须是 UUID；同一用户内全局唯一。重复请求必须有相同�
 
 `GET /capabilities` 宣告服务端启用的功能：`chat`/`model`（Chat 的协议与默认模型）、`work`/`work_model`/`claude_model`/`harnesses`、`search`、`memory`、`conversation_temporary`、`conversation_delete`、`plugins`、`plugin_content_origin`，以及：
 
+- `registration`：为 `false` 时实例不开放注册，`POST /auth/register` 与外部账号的首次登录都返回 `REGISTRATION_CLOSED`，已有成员照常登录。
 - `auth_providers`：`[{id, label, kind}]`（`kind` 为 `oidc` 或 `github`），可用的外部登录。登录走 `/auth/oauth/{id}/start?return_to=`，回来时地址带 `login_code`（用 `POST /auth/oauth/exchange` 换会话）、`login_linked` 或 `login_error`。
 - `push`：服务端会向 Android 设备发通知；客户端登录后 `POST /devices` 登记 FCM 令牌，WebSocket 的 Hello 里的 `device_id` 与登记时的 `device` 相同，连接期间这台设备不收通知。
 - `attachments`：`max_bytes`、`max_per_message`；比 `part_bytes` 大的文件经 `/orgs/{org}/uploads` 分片上传。

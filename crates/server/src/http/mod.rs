@@ -287,6 +287,8 @@ async fn capabilities(State(app): State<App>) -> Json<Value> {
         "memory": config.search.enabled,
         "conversation_temporary": config.search.enabled,
         "conversation_delete": config.search.enabled,
+        // Whether `POST /auth/register`, and first sign-ins with other accounts, make accounts.
+        "registration": config.auth.registration,
         // Sign-in with other accounts: `/auth/oauth/<id>/start?return_to=`.
         "auth_providers": sso::providers(&app),
         // Plugins, their commands (InvokeMenuCommand) and questions (PendingAction.form_json),

@@ -138,6 +138,7 @@ codes! {
     IdentityTaken = "IDENTITY_TAKEN" => CONFLICT,
     IdentityEmailRequired = "IDENTITY_EMAIL_REQUIRED" => BAD_REQUEST,
     AccountExists = "ACCOUNT_EXISTS" => CONFLICT,
+    RegistrationClosed = "REGISTRATION_CLOSED" => FORBIDDEN,
     LastSignInMethod = "LAST_SIGN_IN_METHOD" => CONFLICT,
     NotFoundIdentity = "IDENTITY_NOT_FOUND" => NOT_FOUND,
     NoDocument = "DOCUMENT_NOT_FOUND" => NOT_FOUND,

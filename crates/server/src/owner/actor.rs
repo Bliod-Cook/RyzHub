@@ -92,7 +92,6 @@ pub struct OwnerLink {
 
 impl OwnerLink {
     /// A link with no Owner behind it, for tests: stream events are discarded.
-    #[cfg(feature = "test-support")]
     pub fn detached() -> Self {
         let (events, mut discard) = mpsc::channel(64);
         tokio::spawn(async move { while discard.recv().await.is_some() {} });

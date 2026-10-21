@@ -6,6 +6,7 @@ for arg do
     /usr/local/bin/runsc "$@" > "$log" 2>&1
     status=$?
     if [ "$status" -ne 0 ]; then cat "$log" >&2; fi
+    rm -f "$log"
     exit "$status"
   fi
 done

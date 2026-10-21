@@ -255,7 +255,7 @@ async fn members_sign_in_with_oidc_and_github_and_keep_one_way_in() -> anyhow::R
             api_url: format!("{issuer}/gh/api"),
             ..Default::default()
         });
-        c.auth.return_urls = vec!["http://client.test/".into()];
+        c.auth.return_urls = vec!["http://client.test/".into(), "http://127.0.0.1:".into()];
     })
     .await?;
     let caps: Value = reqwest::get(format!("{}/capabilities", h.base))
@@ -363,17 +363,21 @@ async fn members_sign_in_with_oidc_and_github_and_keep_one_way_in() -> anyhow::R
         .await?;
     assert_eq!(login.status(), 401);
 
-    // A return address the instance does not list is refused.
-    let refused = reqwest::Client::builder()
+    // A return address the instance does not list is refused, and so is one that only starts
+    // like a listed one: credentials before `@` would send the browser to another host.
+    let browser = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
-        .build()?
-        .get(format!(
-            "{}/auth/oauth/corp/start?return_to=https://evil.example/",
-            h.base
-        ))
-        .send()
-        .await?;
-    assert_eq!(refused.status(), 400);
+        .build()?;
+    for return_to in [
+        "https://evil.example/",
+        "http://127.0.0.1:x@evil.example/",
+        "http://127.0.0.1:@evil.example/",
+    ] {
+        let mut start = url::Url::parse(&format!("{}/auth/oauth/corp/start", h.base))?;
+        start.query_pairs_mut().append_pair("return_to", return_to);
+        let refused = browser.get(start).send().await?;
+        assert_eq!(refused.status(), 400, "{return_to}");
+    }
     task.abort();
     h.close().await
 }

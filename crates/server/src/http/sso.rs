@@ -133,8 +133,10 @@ pub async fn start(
     Query(start): Query<Start>,
 ) -> ApiResult<Redirect> {
     let provider = provider(&app, &name)?;
+    // Credentials before `@` would make a listed prefix name another host.
     require!(
-        url::Url::parse(&start.return_to).is_ok()
+        url::Url::parse(&start.return_to)
+            .is_ok_and(|url| url.username().is_empty() && url.password().is_none())
             && app
                 .config
                 .auth

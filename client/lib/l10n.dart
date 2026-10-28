@@ -147,6 +147,12 @@ String errorText(Object error) {
       'This reasoning level is not supported here.',
     ),
     'INVALID_CREDENTIALS' => tr('邮箱或密码不正确。', 'Incorrect email or password.'),
+    'ACCOUNT_DISABLED' => tr('账号已停用。', 'This account is disabled.'),
+    'CANNOT_CHANGE_SELF' => tr(
+      '不能对自己的账号这样做。',
+      'You cannot do this to your own account.',
+    ),
+    'USER_NOT_FOUND' => tr('找不到这个用户。', 'No such user.'),
     'CREDENTIAL_UNAVAILABLE' => tr(
       '模型凭据不可用。',
       'The model credential is unavailable.',

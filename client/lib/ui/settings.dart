@@ -8,6 +8,7 @@ import '../controller.dart';
 import '../l10n.dart';
 import '../prefs.dart';
 import '../theme.dart';
+import 'admin/admin.dart';
 import 'common.dart';
 import 'dialogs.dart';
 import 'login.dart';
@@ -130,8 +131,22 @@ class SettingsPage extends StatelessWidget {
         ('personal', () => tr('个人', 'Personal')),
         ('account', () => tr('账户与数据', 'Account and data')),
         ('integrations', () => tr('集成', 'Integrations')),
+        ('admin', () => tr('管理', 'Administration')),
       ],
-      sections: _sections,
+      sections: [
+        ..._sections,
+        if (hub.isInstanceAdmin)
+          PageSection(
+            'admin',
+            'admin',
+            Icons.admin_panel_settings_outlined,
+            () => tr('实例管理', 'Instance admin'),
+            ['管理', 'admin', '实例', 'instance', '用户', 'users'],
+            open: () => Navigator.of(context).push(
+              MaterialPageRoute<void>(builder: (_) => AdminPage(hub: hub)),
+            ),
+          ),
+      ],
       content: (context, s) => switch (s.id) {
         'memories' => MemorySettings(hub: hub),
         'general' => const _General(),

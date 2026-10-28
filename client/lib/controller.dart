@@ -674,6 +674,39 @@ class HubController extends ChangeNotifier with HubApi {
   Future<Map<String, dynamic>> me() async =>
       Map<String, dynamic>.from(await request('/me'));
 
+  /// The user administers the instance, as the server last said: at sign-in,
+  /// on every renewal, and when an admin request is refused.
+  bool isInstanceAdmin = false;
+
+  Future<void> _loadMe() async {
+    try {
+      final admin = (await me())['is_instance_admin'] == true;
+      if (_closed || admin == isInstanceAdmin) return;
+      isInstanceAdmin = admin;
+      notifyListeners();
+    } catch (_) {
+      // Kept as it was; the next renewal asks again.
+    }
+  }
+
+  /// A request to the instance admin API. Refused, the user is no longer an
+  /// admin.
+  Future<dynamic> admin(
+    String path, {
+    Map<String, dynamic>? body,
+    String? method,
+  }) async {
+    try {
+      return await request(path, body: body, method: method);
+    } catch (e) {
+      if ('$e' == 'Exception: FORBIDDEN' && isInstanceAdmin) {
+        isInstanceAdmin = false;
+        notifyListeners();
+      }
+      rethrow;
+    }
+  }
+
   Map<String, dynamic> workspace = {};
 
   /// Workspace jobs under way, by conversation: a job keeps running, and
@@ -908,6 +941,7 @@ class HubController extends ChangeNotifier with HubApi {
       if (_closed || result['user_id'] != user) return false;
       token = result['token'];
       expiresAtMs = (result['expires_at_ms'] as num?)?.toInt() ?? 0;
+      unawaited(_loadMe());
       return true;
     } catch (e) {
       if ('$e'.contains('UNAUTHORIZED')) return false;
@@ -972,6 +1006,7 @@ class HubController extends ChangeNotifier with HubApi {
           CacheRecord(key: key, value: value),
       ],
     );
+    await _loadMe();
     // A conversation's cached timeline shows when it opens.
     await refreshConversations();
     await refreshProjects();

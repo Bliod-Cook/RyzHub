@@ -1,4 +1,5 @@
 //! The public HTTP API: REST resources and the WebSocket endpoint.
+pub mod admin;
 mod auth;
 mod orgs;
 pub mod sso;
@@ -8,7 +9,6 @@ use axum::{
     Json, Router,
     extract::State,
     http::{HeaderMap, Method, header},
-    response::Html,
     routing::{any, delete, get, patch, post, put},
 };
 use serde_json::{Value, json};
@@ -88,11 +88,6 @@ pub fn router(app: App) -> Router {
             "/orgs/{org}/conversations/{conv}/tool-calls",
             post(crate::plugins::apps::call),
         )
-        .route(
-            "/admin/plugin-blocks",
-            get(plugins::blocks).post(plugins::block),
-        )
-        .route("/admin/plugin-blocks/{id}", delete(plugins::unblock))
         .route("/plugins/oauth/client.json", get(oauth::client_document))
         .route("/plugins/oauth/callback", get(oauth::callback))
         .route("/orgs/{org}/search", get(search::endpoint))
@@ -138,8 +133,6 @@ pub fn router(app: App) -> Router {
         )
         .route("/healthz", get(healthz))
         .route("/capabilities", get(capabilities))
-        .route("/admin", get(|| async { Html(include_str!("admin.html")) }))
-        .route("/admin/settings", get(admin_settings))
         .route("/ws", any(crate::ws::upgrade))
         .route("/stream", get(crate::ws::sse::open))
         .route("/stream/{connection}", post(crate::ws::sse::post))
@@ -225,6 +218,7 @@ pub fn router(app: App) -> Router {
             "/orgs/{org}/projects/{project}/files/upload",
             post(projects::upload_file),
         )
+        .merge(admin::routes())
         .layer(axum::extract::DefaultBodyLimit::max(2 * 1024 * 1024))
         .layer(cors)
         .with_state(app)
@@ -304,29 +298,4 @@ async fn capabilities(State(app): State<App>) -> Json<Value> {
             "part_bytes": crate::attachments::uploads::PART_SIZE,
         },
     }))
-}
-
-/// `GET /admin/settings`: the effective instance configuration, for instance admins.
-async fn admin_settings(State(app): State<App>, headers: HeaderMap) -> ApiResult<Json<Value>> {
-    let auth = authenticate(&app, &headers).await?;
-    require!(auth.is_instance_admin, Code::Forbidden);
-    let config = &app.config;
-    let isolation = match (config.sandbox.enabled, config.sandbox.runtime.as_str()) {
-        (false, _) => "none",
-        (true, "runsc") => "user_kernel",
-        (true, _) => "container",
-    };
-    Ok(Json(json!({
-        "config": config,
-        "backend": if config.sandbox.enabled { "containerd" } else { "disabled" },
-        "isolation_level": isolation,
-        "capabilities": {
-            "stream": "text/0",
-            "approval": "native",
-            "resume": "loop_steps",
-            "chat": config.llm.enabled.then_some("anthropic"),
-            "work": config.work.enabled.then_some("codex"),
-            "terminal": config.work.enabled && config.sandbox.enabled,
-        },
-    })))
 }

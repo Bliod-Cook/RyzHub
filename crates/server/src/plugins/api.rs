@@ -20,7 +20,7 @@ use super::{
 use crate::{
     app::App,
     error::{ApiResult, Code},
-    http::{authenticate, member_tx},
+    http::member_tx,
     store::{Tx, effective_policy},
 };
 use ryzhub_domain::OrgContext;
@@ -898,62 +898,4 @@ pub async fn project_toggle(
     Ok(Json(
         json!({"project": project, "installation": id, "enabled": toggle.enabled}),
     ))
-}
-
-#[derive(Deserialize)]
-pub struct BlockRequest {
-    name: Option<String>,
-    content_hash: Option<String>,
-    #[serde(default)]
-    reason: String,
-}
-
-/// `GET /admin/plugin-blocks`: plugins stopped for the whole instance.
-pub async fn blocks(State(app): State<App>, headers: HeaderMap) -> ApiResult<Json<Value>> {
-    let auth = authenticate(&app, &headers).await?;
-    require!(auth.is_instance_admin, Code::Forbidden);
-    let rows: Vec<Value> =
-        sqlx::query_scalar("SELECT to_jsonb(b) FROM plugin_blocks b ORDER BY created_at DESC")
-            .fetch_all(&app.store.pool)
-            .await?;
-    Ok(Json(json!({ "blocks": rows })))
-}
-
-/// `POST /admin/plugin-blocks`: stop a plugin everywhere, by name or content hash, at once.
-pub async fn block(
-    State(app): State<App>,
-    headers: HeaderMap,
-    Json(request): Json<BlockRequest>,
-) -> ApiResult<Json<Value>> {
-    let auth = authenticate(&app, &headers).await?;
-    require!(auth.is_instance_admin, Code::Forbidden);
-    require!(
-        request.name.is_some() || request.content_hash.is_some(),
-        Code::InvalidInput
-    );
-    let id = Uuid::now_v7();
-    sqlx::query("INSERT INTO plugin_blocks(id,name,content_hash,reason) VALUES($1,$2,$3,$4)")
-        .bind(id)
-        .bind(&request.name)
-        .bind(&request.content_hash)
-        .bind(&request.reason)
-        .execute(&app.store.pool)
-        .await?;
-    tracing::warn!(name = ?request.name, content_hash = ?request.content_hash, "plugin blocked for the instance");
-    Ok(Json(json!({ "id": id })))
-}
-
-/// `DELETE /admin/plugin-blocks/{id}`.
-pub async fn unblock(
-    State(app): State<App>,
-    headers: HeaderMap,
-    Path(id): Path<Uuid>,
-) -> ApiResult<Json<Value>> {
-    let auth = authenticate(&app, &headers).await?;
-    require!(auth.is_instance_admin, Code::Forbidden);
-    sqlx::query("DELETE FROM plugin_blocks WHERE id=$1")
-        .bind(id)
-        .execute(&app.store.pool)
-        .await?;
-    Ok(Json(json!({ "removed": id })))
 }

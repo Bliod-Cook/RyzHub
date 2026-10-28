@@ -5,4 +5,4 @@ export SQLX_OFFLINE=true CARGO_INCREMENTAL=0
 export RYZHUB_TEST_UPSTREAM_KEY=local-fixture-key
 cd "$(dirname "$0")/.."
 docker compose up -d --wait
-cargo test -p ryzhub-server --test consistency -- --ignored --test-threads=1
+cargo test -p ryzhub-server --test consistency --test admin -- --ignored --test-threads=1

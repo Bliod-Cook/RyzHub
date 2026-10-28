@@ -24,8 +24,9 @@ the work. This guide explains what it sets up and how to look after the instance
 | `nats` | Messaging between server roles |
 | `node` | Runs sandboxes in its own containerd, inside a privileged container |
 
-Everything the instance keeps is in this directory: `.env` holds the secrets, `config.toml`
-the settings, and `data/` the database, files, sandbox disks and certificates.
+Everything the instance keeps is in this directory: `.env` holds the secrets,
+`etc/config.toml` the settings, and `data/` the database, files, sandbox disks and
+certificates.
 
 ## Requirements
 
@@ -48,7 +49,7 @@ deploy/setup.sh ryz.example.com
 ```
 
 `setup.sh` writes `.env` with random database passwords and a vault key, copies
-`config.example.toml` to `config.toml` with your domain in it, builds the images, loads the
+`config.example.toml` to `etc/config.toml` with your domain in it, builds the images, loads the
 sandbox image into the execution node and starts everything. Then, in `deploy/` (where all
 `docker compose` commands run):
 
@@ -61,29 +62,48 @@ sandbox image into the execution node and starts everything. Then, in `deploy/` 
      "UPDATE users SET is_instance_admin = true WHERE email = 'you@example.com'"
    ```
 
-3. **Close sign-up** once everyone has joined: set `registration = false` under `[auth]` in
-   `config.toml` and run `docker compose restart server`. Existing members still sign in.
+   Granting and revoking admin rights is done this way only. Everything else is in the
+   admin panel: **Settings → Instance admin**.
+
+3. **Close sign-up** once everyone has joined: turn off registration in the panel
+   (Configuration → Sign-in). Existing members still sign in.
 
 **Back up `.env`**: the vault key in it encrypts the credentials members store, and nothing
 can recover them without it.
 
 ## Configuration
 
-`config.toml` is commented, and `crates/server/src/config.rs` describes every setting.
-Apply a change with `docker compose restart server maintain`. The server refuses to start
-on a key it doesn't know and names it in the log, so typos don't go unnoticed.
+Change settings in the admin panel, or edit `etc/config.toml`, which is commented;
+`crates/server/src/config/mod.rs` describes every setting. The panel rewrites only what you
+change and keeps the comments; it can't change listeners, storage roots, sign-in providers
+or the vault keys, which stay in the file.
 
-Settings that need extra environment variables or files go in `compose.override.yaml`.
-Compose reads it automatically, and git ignores it, so `git pull` never touches it:
+The server rereads the file within five seconds of a change. Most settings apply at once;
+some only to runs and sandboxes started afterwards; a few (what runs and where it listens:
+`llm.enabled`, `sandbox.enabled`, `work.enabled`, `plugins.enabled`, `search.enabled` and
+the like) wait for a restart, and the panel lists them with a button that restarts the
+server. A restart cuts streams in progress, as `docker compose restart server` does; a
+change to `.env` still needs `docker compose up -d`. A file the server can't use (an
+unknown key, an invalid value) is reported in the panel and the server keeps the last good
+configuration. `maintain` rereads the file before its daily run, so retention changes apply
+within a day.
+
+`etc/` is a directory of its own because the server replaces `config.toml` in it; it also
+keeps the previous version as `config.toml.bak`.
+
+Settings that need extra environment variables go in `compose.override.yaml`. Compose
+reads it automatically, and git ignores it, so `git pull` never touches it:
 
 ```yaml
 services:
   server:
     environment:
       DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY}   # the value itself goes in .env
-    volumes:
-      - ./s3.toml:/etc/ryzhub/s3.toml:ro
 ```
+
+The panel picks model keys only from the providers' usual variables and those the file
+already uses for model keys, so name a new one in `etc/config.toml` once by hand. Files the
+settings refer to can go in `etc/` too: the server sees it as `/etc/ryzhub`.
 
 ### Models
 
@@ -97,7 +117,7 @@ with failover. Members can also add their own keys in Settings unless `[policy]`
 
 Sandboxes run under gVisor, which gives each one its own kernel, and the node refuses
 anything else while `RYZHUB_MULTI_TENANT=true`. If you trust everyone with an account, you
-can trade that isolation for speed: set `runtime = "runc"` in `config.toml` and
+can trade that isolation for speed: set `runtime = "runc"` in the sandbox settings and
 `RYZHUB_MULTI_TENANT=false` in `.env`.
 
 - **Disk:** sandboxes share the volume `RYZHUB_QUOTA_VOLUME_SIZE` sets aside (20 GB),
@@ -126,15 +146,15 @@ access_env = "S3_ACCESS_KEY"   # variables holding the keys, passed to the serve
 secret_env = "S3_SECRET_KEY"
 ```
 
-Mount it and pass the two keys to the server in `compose.override.yaml`, then set
-`storage_root = "s3config:/etc/ryzhub/s3.toml"` under `[work]`. Browsers upload large files
+Put it in `etc/`, pass the two keys to the server in `compose.override.yaml`, then set
+`storage_root = "s3config:/etc/ryzhub/s3.toml"` under `[work]` and restart the server. Browsers upload large files
 straight to the bucket, so its CORS rules must allow `PUT` from `https://ryz.example.com`
 and expose the `ETag` header. `secondary_root` keeps a second copy of everything.
 
 ### Sign-in
 
 Besides email and password, people can sign in with any OpenID Connect provider or GitHub;
-`config.toml` has an example of each, with the callback URL to register. Someone signing
+`etc/config.toml` has an example of each, with the callback URL to register. Someone signing
 in this way for the first time joins the account that has the same email, if the provider
 has verified it (`auth.link_verified_email`).
 
@@ -159,7 +179,7 @@ deploy/setup.sh
 ```
 
 This rebuilds the images, migrates the database before the new server starts, and keeps
-your `.env` and `config.toml`. If the execution node's image changed, the node restarts and
+your `.env` and `etc/config.toml`. If the execution node's image changed, the node restarts and
 stops the sandboxes running on it, so pick a quiet moment.
 
 ### Logs and health
@@ -174,14 +194,14 @@ curl https://api.ryz.example.com/healthz
 
 ### Backups
 
-Keep a database dump, `data/blobs`, `.env` and `config.toml`. The node's state and the
+Keep a database dump, `data/blobs`, `.env` and `etc/`. The node's state and the
 certificates are rebuilt on their own.
 
 ```sh
 docker compose exec -T postgres pg_dump -U postgres -Fc ryzhub > ryzhub.dump
 ```
 
-To restore, put the old `.env`, `config.toml` and `data/blobs` in place, run `setup.sh`,
+To restore, put the old `.env`, `etc/` and `data/blobs` in place, run `setup.sh`,
 then replace the new database with the dump:
 
 ```sh
@@ -196,7 +216,7 @@ docker compose start server maintain
 
 1. In `.env`, rename `RYZHUB_VAULT_KEY` to `RYZHUB_VAULT_KEY_0` and add a new
    `RYZHUB_VAULT_KEY`: `head -c 32 /dev/urandom | base64 | tr '+/' '-_' | tr -d '=\n'`.
-2. Under `[llm]` in `config.toml`, set `vault_key_id = 1` and
+2. Under `[llm]` in `etc/config.toml`, set `vault_key_id = 1` and
    `vault_retired_keys = { "0" = "RYZHUB_VAULT_KEY_0" }`.
 3. Pass `RYZHUB_VAULT_KEY_0: ${RYZHUB_VAULT_KEY_0}` to `server` and `migrate` in
    `compose.override.yaml`, then run `docker compose up -d`.
@@ -205,8 +225,8 @@ docker compose start server maintain
 
 ### Search
 
-After changing the embedding model, rebuild the search index with
-`docker compose run --rm migrate reindex`.
+When the embedding settings change, the search index must be rebuilt: the panel offers to,
+and `docker compose run --rm migrate reindex` does the same.
 
 ### Removing the instance
 
@@ -218,7 +238,7 @@ docker run --rm --privileged -v "$PWD/data:/data" debian:trixie-slim sh -c \
 
 The sandbox volume stays attached to a loop device after the node stops, and part of
 `data/` belongs to root: the second command detaches the one and deletes the other.
-`data/blobs`, `.env` and `config.toml` are yours to keep or delete.
+`data/blobs`, `.env` and `etc/` are yours to keep or delete.
 
 ## Security
 
@@ -260,7 +280,7 @@ The sandbox volume stays attached to a loop device after the node stops, and par
 
 | Symptom | Cause |
 |---|---|
-| The server exits with `unknown configuration keys: …` | A misspelled or outdated key in `config.toml` |
+| The server exits with `unknown configuration keys: …` | A misspelled or outdated key in `etc/config.toml` |
 | No certificate, the browser can't connect | DNS for one of the three names, or ports 80/443 blocked: `docker compose logs caddy` |
 | The page loads but can't reach the server | The web app was built for another domain; rerun `setup.sh` after changing it |
 | Sandboxes fail with `ISOLATION_POLICY_DENIED` | `runtime = "runc"` while `RYZHUB_MULTI_TENANT=true` |

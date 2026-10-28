@@ -1,4 +1,4 @@
-# A RyzHub instance on one machine. Run ./setup.sh first: it writes .env and config.toml,
+# A RyzHub instance on one machine. Run ./setup.sh first: it writes .env and etc/config.toml,
 # builds the images and starts everything. After that, docker compose commands work from
 # this directory. Local changes belong in compose.override.yaml, which git ignores.
 name: ryzhub-deploy
@@ -27,7 +27,7 @@ x-server: &server
   user: "${RYZHUB_UID:?run ./setup.sh first}:${RYZHUB_GID:?run ./setup.sh first}"
   environment: *server-env
   volumes:
-    - ./config.toml:/etc/ryzhub/config.toml:ro
+    - ./etc:/etc/ryzhub:ro
   restart: unless-stopped
   logging: *logging
 
@@ -72,7 +72,9 @@ services:
     <<: *server
     command: all
     volumes:
-      - ./config.toml:/etc/ryzhub/config.toml:ro
+      # The admin panel replaces the file, which needs its directory: a file mounted on its
+      # own can be neither replaced nor seen to change.
+      - ./etc:/etc/ryzhub
       - ./data/blobs:/data/blobs
       - ./data/node:/state:ro
       - ./data/node/gateway:/state/gateway

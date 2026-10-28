@@ -1,10 +1,12 @@
 # RyzHub instance configuration.
 #
-# setup.sh copied this file to config.toml and put your domain in. Anything not set here
-# keeps its default; every setting is described in crates/server/src/config.rs. The server
-# refuses to start on a key it does not know, so a typo cannot go unnoticed.
+# setup.sh copied this file to etc/config.toml and put your domain in. Anything not set here
+# keeps its default; every setting is described in crates/server/src/config/mod.rs. The
+# server refuses a key it does not know, so a typo cannot go unnoticed.
 #
-# After editing, apply the change with:  docker compose restart server maintain
+# The admin panel edits this file in place and keeps its comments. Edits by hand apply
+# within seconds too; the panel shows the few that wait for:  docker compose restart server
+# Retention changes apply at the next daily maintenance.
 
 # Caddy is the only thing that reaches the server; these are the addresses people use.
 listen = "0.0.0.0:8080"

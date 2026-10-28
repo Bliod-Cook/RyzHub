@@ -2,7 +2,7 @@
 /.env
 # A deployment's secrets, settings and data (deploy/setup.sh)
 /deploy/.env
-/deploy/config.toml
+/deploy/etc/
 /deploy/compose.override.yaml
 /deploy/data/
 *.db

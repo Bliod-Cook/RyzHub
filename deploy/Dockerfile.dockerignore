@@ -1,5 +1,5 @@
 # Only what the images are built from. Never var/, target/ or data/ (large, partly
-# root-owned), nor .env and config.toml (secrets and instance settings).
+# root-owned), nor .env and etc/ (secrets and instance settings).
 *
 !Cargo.toml
 !Cargo.lock

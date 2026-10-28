@@ -5,7 +5,7 @@
 #                                     the API at api.<domain>, plugin pages at apps.<domain>
 #   deploy/setup.sh                   after a git pull, to upgrade
 #
-# It never replaces .env, whose vault key encrypts stored credentials, or config.toml.
+# It never replaces .env, whose vault key encrypts stored credentials, or etc/config.toml.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -48,12 +48,18 @@ EOF
 else
   current=$(sed -n 's/^RYZHUB_DOMAIN=//p' .env)
   [[ -z "$domain" || "$domain" == "$current" ]] ||
-    fail ".env is for $current; to move the instance, change the domain in .env and config.toml"
+    fail ".env is for $current; to move the instance, change the domain in .env and etc/config.toml"
   domain=$current
 fi
-if [[ ! -f config.toml ]]; then
-  sed "s/ryz\.example\.com/$domain/g" config.example.toml > config.toml
-  echo "Wrote config.toml"
+# The server rewrites its configuration from the admin panel, so it has a directory of its own.
+mkdir -p etc
+if [[ -f config.toml && ! -f etc/config.toml ]]; then
+  mv config.toml etc/config.toml
+  echo "Moved config.toml to etc/config.toml"
+fi
+if [[ ! -f etc/config.toml ]]; then
+  sed "s/ryz\.example\.com/$domain/g" config.example.toml > etc/config.toml
+  echo "Wrote etc/config.toml"
 fi
 mkdir -p data/blobs data/node/gateway
 chmod 700 data/node
@@ -68,7 +74,7 @@ echo "Loading the sandbox image into the execution node..."
 docker compose up -d --wait node
 image=$(RYZHUB_NODE=$(docker compose ps -q node) ../scripts/build-harness-image.sh)
 # Only an empty value, or an image this script set before, is replaced.
-sed -i -E "s#^image = \"(docker\.io/library/ryzhub-harness@sha256:[0-9a-f]{64})?\"\$#image = \"$image\"#" config.toml
+sed -i -E "s#^image = \"(docker\.io/library/ryzhub-harness@sha256:[0-9a-f]{64})?\"\$#image = \"$image\"#" etc/config.toml
 
 docker compose up -d --wait server maintain caddy
 
@@ -84,6 +90,6 @@ RyzHub is running. To finish:
   * Open https://$domain and create your account. Make it the instance admin with:
       docker compose exec postgres psql -U postgres ryzhub -c \\
         "UPDATE users SET is_instance_admin = true WHERE email = 'you@example.com'"
-  * When everyone has joined, set registration = false under [auth] in config.toml and
-    run: docker compose restart server
+    Settings then has an Instance admin page for users and configuration.
+  * When everyone has joined, turn off sign-up there (Configuration, Sign-in).
 EOF

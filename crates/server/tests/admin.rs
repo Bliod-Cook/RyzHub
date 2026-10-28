@@ -42,6 +42,19 @@ async fn set_status(
     .await
 }
 
+/// `PUT /admin/config/{section}` as `admin`, on the file's `version`.
+async fn put_config(
+    h: &Harness,
+    admin: &Value,
+    section: &str,
+    values: Value,
+    version: &str,
+) -> anyhow::Result<(StatusCode, Value)> {
+    let body = json!({"version": version, "values": values});
+    let path = format!("/admin/config/{section}");
+    call(h, admin, Method::PUT, &path, Some(body)).await
+}
+
 /// A new user the database makes an instance admin.
 async fn admin(h: &Harness) -> anyhow::Result<Value> {
     let user = h.user().await?;
@@ -58,7 +71,7 @@ async fn the_admin_api_serves_instance_admins_only() -> anyhow::Result<()> {
     let h = Harness::start(|_| {}).await?;
     let member = h.user().await?;
     let admin = admin(&h).await?;
-    for path in ["/admin/settings", "/admin/plugin-blocks"] {
+    for path in ["/admin/config", "/admin/plugin-blocks"] {
         let (status, _) = call(&h, &member, Method::GET, path, None).await?;
         assert_eq!(status, StatusCode::FORBIDDEN, "{path}");
         let (status, _) = call(&h, &admin, Method::GET, path, None).await?;
@@ -570,5 +583,127 @@ async fn a_running_gateway_follows_its_edited_file_within_seconds() -> anyhow::R
     }
     assert!(!allowed(allows("https://old.test").await?));
     gateway.kill().await?;
+    h.close().await
+}
+
+#[tokio::test]
+#[ignore = "requires local PostgreSQL and NATS"]
+async fn the_panel_edits_its_file_in_place_one_version_at_a_time() -> anyhow::Result<()> {
+    let h = Harness::start(|_| {}).await?;
+    let admin = admin(&h).await?;
+    let path = h.app.running.path.clone().unwrap();
+    let text = std::fs::read_to_string(&path)?;
+    std::fs::write(&path, format!("# Kept by every edit.\n{text}"))?;
+    let (_, config) = call(&h, &admin, Method::GET, "/admin/config", None).await?;
+    assert_eq!(config["editable"], true);
+    assert_eq!(
+        config["fields"]["llm.model"],
+        json!({"section": "models", "apply": "new", "editable": true})
+    );
+    assert_eq!(config["fields"]["listen"]["editable"], false);
+    assert_eq!(config["env"]["OPENAI_API_KEY"], false);
+    let version = config["version"].as_str().unwrap().to_owned();
+    let refused = |result: (StatusCode, Value)| result.1["error"].as_str().map(str::to_owned);
+    // Only what the panel may change, in its own section, with keys from known variables.
+    let locked = Some("CONFIG_FIELD_LOCKED".to_owned());
+    assert_eq!(
+        refused(
+            put_config(
+                &h,
+                &admin,
+                "general",
+                json!({"listen": "0.0.0.0:1"}),
+                &version
+            )
+            .await?
+        ),
+        locked
+    );
+    assert_eq!(
+        refused(put_config(&h, &admin, "general", json!({"llm.model": "x"}), &version).await?),
+        locked
+    );
+    assert_eq!(
+        refused(put_config(&h, &admin, "models", json!({"llm.models.0": {}}), &version).await?),
+        locked
+    );
+    let foreign = json!({"llm.platform_key_env": "RYZHUB_TEST_VAULT_KEY"});
+    assert_eq!(
+        refused(put_config(&h, &admin, "models", foreign, &version).await?).as_deref(),
+        Some("ENV_NOT_ALLOWED")
+    );
+    let invalid = put_config(
+        &h,
+        &admin,
+        "general",
+        json!({"approval_ttl_secs": 1}),
+        &version,
+    )
+    .await?;
+    assert_eq!(invalid.1["error"], "INVALID_CONFIG");
+    assert!(
+        invalid.1["message"]
+            .as_str()
+            .unwrap()
+            .contains("approval_ttl_secs")
+    );
+    // Two edits of one version: the second finds the file changed.
+    let (first, second) = tokio::join!(
+        put_config(
+            &h,
+            &admin,
+            "general",
+            json!({"approval_ttl_secs": 120}),
+            &version
+        ),
+        put_config(
+            &h,
+            &admin,
+            "general",
+            json!({"approval_ttl_secs": 180}),
+            &version
+        )
+    );
+    let (first, second) = (first?, second?);
+    let conflicts = [&first, &second]
+        .iter()
+        .filter(|(_, body)| body["error"] == "CONFIG_CHANGED")
+        .count();
+    assert_eq!(conflicts, 1, "{first:?} {second:?}");
+    let edited = std::fs::read_to_string(&path)?;
+    assert!(edited.starts_with("# Kept by every edit.\n"));
+    assert!(path.with_extension("toml.bak").exists());
+    // Applied at once, or listed until a restart.
+    assert!([120, 180].contains(&h.app.config().approval_ttl_secs));
+    let (_, config) = call(&h, &admin, Method::GET, "/admin/config", None).await?;
+    let version = config["version"].as_str().unwrap().to_owned();
+    let (status, config) = put_config(
+        &h,
+        &admin,
+        "plugins",
+        json!({"plugins.enabled": false}),
+        &version,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK, "{config}");
+    assert_eq!(config["pending_restart"], json!(["plugins.enabled"]));
+    assert!(h.app.config().plugins.enabled);
+    let audited: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM audit_logs WHERE action='admin.config.update'")
+            .fetch_one(&h.db)
+            .await?;
+    assert_eq!(audited, 2);
+    // An admin cannot shut out the page they edit from.
+    let version = config["version"].as_str().unwrap();
+    let body = json!({"version": version, "values": {"allowed_origins": ["https://other.test"]}});
+    let response = reqwest::Client::new()
+        .put(format!("{}/admin/config/general", h.base))
+        .bearer_auth(admin["token"].as_str().unwrap())
+        .header("origin", "http://localhost:3000")
+        .json(&body)
+        .send()
+        .await?;
+    let refused: Value = response.json().await?;
+    assert_eq!(refused["error"], "ORIGIN_REQUIRED");
     h.close().await
 }

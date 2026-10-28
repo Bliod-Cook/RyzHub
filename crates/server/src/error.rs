@@ -146,6 +146,11 @@ codes! {
     // Instance administration.
     UserNotFound = "USER_NOT_FOUND" => NOT_FOUND,
     CannotChangeSelf = "CANNOT_CHANGE_SELF" => CONFLICT,
+    ConfigReadOnly = "CONFIG_READ_ONLY" => CONFLICT,
+    ConfigChanged = "CONFIG_CHANGED" => CONFLICT,
+    ConfigFieldLocked = "CONFIG_FIELD_LOCKED" => BAD_REQUEST,
+    OriginRequired = "ORIGIN_REQUIRED" => BAD_REQUEST,
+    EnvNotAllowed = "ENV_NOT_ALLOWED" => BAD_REQUEST,
     // Plugins.
     PluginsDisabled = "PLUGINS_DISABLED" => SERVICE_UNAVAILABLE,
     PluginNotFound = "PLUGIN_NOT_FOUND" => NOT_FOUND,

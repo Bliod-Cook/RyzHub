@@ -17,6 +17,36 @@ use serde_json::{Value, json};
 use sqlx::PgPool;
 use uuid::Uuid;
 
+/// Queue every live source of every organization to be indexed again, as after a change of
+/// embedding model; how many. Each organization's sources are queued under its own scope, so
+/// this works for the row-level-secured runtime role too.
+pub async fn reindex(pool: &PgPool) -> anyhow::Result<u64> {
+    let orgs: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM organizations WHERE state='active'")
+        .fetch_all(pool)
+        .await?;
+    let mut queued = 0;
+    for org in orgs {
+        let mut tx = pool.begin().await?;
+        sqlx::query("SELECT set_config('app.org_id',$1,true)")
+            .bind(org.to_string())
+            .execute(&mut *tx)
+            .await?;
+        queued += sqlx::query(
+            "INSERT INTO search_jobs(org_id,source_id,source_kind,source_version,op,available_at,priority)
+             SELECT org_id,id,doc_kind,source_version,'upsert',now(),-10 FROM search_sources
+             WHERE org_id=$1 AND NOT deleted
+             ON CONFLICT(org_id,source_id,source_version) DO UPDATE SET state='queued',attempts=0,
+                 claim_token=NULL,lease_until=NULL,available_at=excluded.available_at,priority=-10",
+        )
+        .bind(org)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        tx.commit().await?;
+    }
+    Ok(queued)
+}
+
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct SearchQuery {
     pub q: String,

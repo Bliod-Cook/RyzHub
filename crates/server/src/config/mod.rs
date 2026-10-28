@@ -6,6 +6,7 @@ use ryzhub_execution::host;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+pub mod edit;
 pub mod reload;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

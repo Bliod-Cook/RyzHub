@@ -234,11 +234,8 @@ async fn maintain(role: &str, repeat: bool) -> anyhow::Result<()> {
         return Ok(());
     }
     if role == "reindex" {
-        sqlx::query("INSERT INTO search_jobs(org_id,source_id,source_kind,source_version,op,available_at,priority)
-            SELECT org_id,id,doc_kind,source_version,'upsert',now(),-10 FROM search_sources WHERE NOT deleted
-            ON CONFLICT(org_id,source_id,source_version) DO UPDATE SET state='queued',attempts=0,
-                claim_token=NULL,lease_until=NULL,available_at=excluded.available_at,priority=-10").execute(&pool).await?;
-        tracing::info!("search backfill queued");
+        let queued = search::reindex(&pool).await?;
+        tracing::info!(queued, "search backfill queued");
         return Ok(());
     }
     loop {

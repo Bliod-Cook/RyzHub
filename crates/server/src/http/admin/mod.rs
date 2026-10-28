@@ -11,6 +11,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
+mod config;
 mod users;
 
 use super::authenticate;
@@ -22,7 +23,7 @@ use crate::{
 
 pub fn routes() -> Router<App> {
     users::routes()
-        .route("/admin/settings", get(settings))
+        .merge(config::routes())
         .route("/admin/stats", get(stats))
         .route("/admin/plugin-blocks", get(blocks).post(block))
         .route("/admin/plugin-blocks/{id}", delete(unblock))
@@ -66,30 +67,6 @@ pub async fn audit(
     .execute(&mut **tx)
     .await?;
     Ok(())
-}
-
-/// `GET /admin/settings`: the effective instance configuration.
-async fn settings(State(app): State<App>, headers: HeaderMap) -> ApiResult<Json<Value>> {
-    admin(&app, &headers).await?;
-    let config = &app.config();
-    let isolation = match (config.sandbox.enabled, config.sandbox.runtime.as_str()) {
-        (false, _) => "none",
-        (true, "runsc") => "user_kernel",
-        (true, _) => "container",
-    };
-    Ok(Json(json!({
-        "config": config,
-        "backend": if config.sandbox.enabled { "containerd" } else { "disabled" },
-        "isolation_level": isolation,
-        "capabilities": {
-            "stream": "text/0",
-            "approval": "native",
-            "resume": "loop_steps",
-            "chat": config.llm.enabled.then_some("anthropic"),
-            "work": config.work.enabled.then_some("codex"),
-            "terminal": config.work.enabled && config.sandbox.enabled,
-        },
-    })))
 }
 
 #[derive(Deserialize)]

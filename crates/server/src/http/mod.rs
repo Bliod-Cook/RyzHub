@@ -12,7 +12,7 @@ use axum::{
     routing::{any, delete, get, patch, post, put},
 };
 use serde_json::{Value, json};
-use tower_http::cors::CorsLayer;
+use tower_http::cors::{AllowOrigin, CorsLayer};
 use uuid::Uuid;
 
 use crate::{
@@ -27,14 +27,16 @@ pub fn router(app: App) -> Router {
         attachments::http as attachments, attachments::uploads,
         conversation_commands as conversations, llm, memory, projects, search, workspace,
     };
-    let origins: Vec<axum::http::HeaderValue> = app
-        .config()
-        .allowed_origins
-        .iter()
-        .filter_map(|origin| origin.parse().ok())
-        .collect();
+    // Read per request, so a reloaded configuration applies at once.
+    let config = app.running.clone();
     let cors = CorsLayer::new()
-        .allow_origin(origins)
+        .allow_origin(AllowOrigin::predicate(move |origin, _| {
+            config
+                .current()
+                .allowed_origins
+                .iter()
+                .any(|allowed| origin.as_bytes() == allowed.as_bytes())
+        }))
         .allow_methods([
             Method::GET,
             Method::POST,

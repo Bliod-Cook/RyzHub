@@ -2,8 +2,16 @@
 //! reindex | migrate-secrets.
 use anyhow::{Context, ensure};
 use ryzhub_server::{
-    accounts, app::App, attachments, config::Config, conversation_commands, lifecycle, memory,
-    projects, push, retention, sandbox, search, store::Store, workspace,
+    accounts,
+    app::App,
+    attachments,
+    config::{
+        Config,
+        reload::{self, Running},
+    },
+    conversation_commands, lifecycle, memory, projects, push, retention, sandbox, search,
+    store::Store,
+    workspace,
 };
 use sqlx::PgPool;
 use std::{future::Future, time::Duration};
@@ -61,11 +69,17 @@ async fn until_stopped(task: impl Future<Output = anyhow::Result<()>>) -> anyhow
 }
 
 async fn serve(role: &str) -> anyhow::Result<()> {
-    let config = Config::load()?;
+    let running = Running::open()?;
     let store = Store::connect(&env("DATABASE_URL")?).await?;
     let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:54222".into());
     let nats = async_nats::connect(nats_url).await?;
-    let app = App::new(store, nats, config)?;
+    let app = App::new(store, nats, running)?;
+    let watched = app.running.clone();
+    tokio::spawn(async move {
+        if let Err(error) = reload::watch(watched).await {
+            tracing::error!(error = format!("{error:#}"), "configuration reload stopped");
+        }
+    });
     let owner = matches!(role, "all" | "owner");
     let model_gateway = app.config().llm.enabled && matches!(role, "all" | "llm-gateway");
     let worker = if owner || (model_gateway && app.config().work.enabled) {
@@ -213,7 +227,7 @@ async fn maintain(role: &str, repeat: bool) -> anyhow::Result<()> {
     if role == "migrate" {
         sqlx::migrate!("../../migrations").run(&pool).await?;
     }
-    let config = Config::load()?;
+    let mut config = Config::load()?;
     if role == "migrate-secrets" {
         let rewrapped = ryzhub_server::vault::migrate(&pool, &config.llm).await?;
         tracing::info!(rewrapped, "secrets migrated");
@@ -239,5 +253,13 @@ async fn maintain(role: &str, repeat: bool) -> anyhow::Result<()> {
             return Ok(());
         }
         tokio::time::sleep(Duration::from_secs(24 * 3600)).await;
+        // Retention changed meanwhile applies from the next round.
+        match Config::load() {
+            Ok(fresh) => config = fresh,
+            Err(error) => tracing::error!(
+                error = format!("{error:#}"),
+                "configuration not reloaded; maintaining with the previous one"
+            ),
+        }
     }
 }

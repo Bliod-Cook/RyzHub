@@ -515,3 +515,60 @@ async fn a_deleted_account_restores_and_once_due_is_purged_to_tombstones() -> an
     worker.close().await;
     h.close().await
 }
+
+#[tokio::test]
+#[ignore = "requires local PostgreSQL and NATS"]
+async fn a_running_gateway_follows_its_edited_file_within_seconds() -> anyhow::Result<()> {
+    let h = Harness::start(|_| {}).await?;
+    let reserve = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let addr = reserve.local_addr()?;
+    drop(reserve);
+    let file = tempfile::NamedTempFile::new()?;
+    let write = |origin: &str| {
+        std::fs::write(
+            file.path(),
+            format!("listen = \"{addr}\"\nallowed_origins = [\"{origin}\"]\n"),
+        )
+    };
+    write("https://old.test")?;
+    let mut gateway = tokio::process::Command::new(env!("CARGO_BIN_EXE_ryzhub-server"))
+        .arg("gateway")
+        .env("DATABASE_URL", &h.app_url)
+        .env("NATS_URL", "nats://127.0.0.1:54222")
+        .env("RYZHUB_CONFIG", file.path())
+        .kill_on_drop(true)
+        .spawn()?;
+    let base = format!("http://{addr}");
+    let allows = |origin: &'static str| {
+        reqwest::Client::new()
+            .request(Method::OPTIONS, format!("{base}/me"))
+            .header("origin", origin)
+            .header("access-control-request-method", "GET")
+            .send()
+    };
+    let mut started = false;
+    for _ in 0..200 {
+        started = reqwest::get(format!("{base}/healthz")).await.is_ok();
+        if started {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(started, "gateway startup timeout");
+    let allowed = |response: reqwest::Response| {
+        response
+            .headers()
+            .contains_key("access-control-allow-origin")
+    };
+    assert!(allowed(allows("https://old.test").await?));
+    assert!(!allowed(allows("https://new.test").await?));
+    write("https://new.test")?;
+    let edited = std::time::Instant::now();
+    while !allowed(allows("https://new.test").await?) {
+        assert!(edited.elapsed().as_secs() < 6, "the edit did not apply");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(!allowed(allows("https://old.test").await?));
+    gateway.kill().await?;
+    h.close().await
+}

@@ -1,11 +1,8 @@
 //! Process-wide state shared by every role.
-use std::{
-    sync::{Arc, RwLock},
-    time::Duration,
-};
+use std::{sync::Arc, time::Duration};
 
 use crate::{
-    config::Config,
+    config::{Config, reload::Running},
     revocation::Revocations,
     store::Store,
     ws::{Hub, sse::Streams},
@@ -15,8 +12,8 @@ use crate::{
 pub struct App {
     pub store: Store,
     pub nats: async_nats::Client,
-    /// The configuration every clone of this `App` shares; see [`App::config`].
-    config: Arc<RwLock<Arc<Config>>>,
+    /// The configuration every clone of this `App` shares, and its file; see [`App::config`].
+    pub running: Arc<Running>,
     pub http: Http,
     /// One NATS subscription per channel per process, shared by all local subscribers.
     pub hub: Hub,
@@ -26,14 +23,14 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(store: Store, nats: async_nats::Client, config: Config) -> anyhow::Result<Self> {
+    pub fn new(store: Store, nats: async_nats::Client, running: Running) -> anyhow::Result<Self> {
         let revocations = Revocations::new(store.pool.clone());
         let hub = Hub::new(store.clone(), nats.clone(), revocations.clone());
         Ok(Self {
             http: Http::new()?,
             store,
             nats,
-            config: Arc::new(RwLock::new(Arc::new(config))),
+            running: Arc::new(running),
             hub,
             revocations,
             streams: Streams::default(),
@@ -43,12 +40,12 @@ impl App {
     /// The configuration as it is now. Take it once per operation and read from that, so one
     /// operation never mixes two configurations.
     pub fn config(&self) -> Arc<Config> {
-        self.config.read().unwrap().clone()
+        self.running.current()
     }
 
     /// Run with `config` from now on.
     pub fn set_config(&self, config: Config) {
-        *self.config.write().unwrap() = Arc::new(config);
+        self.running.set(config);
     }
 }
 

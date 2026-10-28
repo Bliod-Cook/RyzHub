@@ -411,7 +411,11 @@ async fn closing_registration_lets_members_in_and_keeps_newcomers_out() -> anyho
     let mut config = (*h.app.config()).clone();
     config.public_url = base.clone();
     config.auth.registration = false;
-    let closed = App::new(h.app.store.clone(), h.app.nats.clone(), config)?;
+    let closed = App::new(
+        h.app.store.clone(),
+        h.app.nats.clone(),
+        Running::new(config, None),
+    )?;
     h.serve(listener, ryzhub_server::http::router(closed));
     let caps: Value = reqwest::get(format!("{base}/capabilities"))
         .await?

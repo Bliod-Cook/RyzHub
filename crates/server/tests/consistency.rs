@@ -9,7 +9,7 @@ use ryzhub_domain::OrgContext;
 use ryzhub_proto::{command_envelope::Command, event_envelope::Event, frame::Body, *};
 use ryzhub_server::{
     app::App,
-    config::{Config, ModelRoute},
+    config::{Config, ModelRoute, reload::Running},
     error::{Code, code_of},
     owner::{self, OwnerLink},
     store::{Lease, append, create_in},
@@ -1269,7 +1269,11 @@ async fn a_failed_restore_blocks_new_runs_until_its_retry_completes_once() -> an
         .bind(conv)
         .execute(&h.db)
         .await?;
-        let app = App::new(h.app.store.clone(), h.app.nats.clone(), config.clone())?;
+        let app = App::new(
+            h.app.store.clone(),
+            h.app.nats.clone(),
+            Running::new(config.clone(), None),
+        )?;
         let link = OwnerLink::detached();
         let job_state = || {
             sqlx::query_scalar::<_, String>("SELECT state FROM workspace_jobs WHERE id=$1")
@@ -1478,7 +1482,11 @@ async fn sync_projects_turn_events_before_acknowledging_them() -> anyhow::Result
             .bind(sandbox)
             .execute(&h.db)
             .await?;
-        let app = App::new(h.app.store.clone(), h.app.nats.clone(), config)?;
+        let app = App::new(
+            h.app.store.clone(),
+            h.app.nats.clone(),
+            Running::new(config, None),
+        )?;
         let link = OwnerLink::detached();
         let acked = || {
             sqlx::query_scalar::<_, i64>("SELECT acked_gseq FROM sandboxes WHERE id=$1")
@@ -1758,7 +1766,11 @@ async fn runs_wait_for_idle_suspension_and_models_are_discovered_once() -> anyho
         .bind(conv)
         .execute(&h.db)
         .await?;
-        let app = App::new(h.app.store.clone(), h.app.nats.clone(), config)?;
+        let app = App::new(
+            h.app.store.clone(),
+            h.app.nats.clone(),
+            Running::new(config, None),
+        )?;
         // The suspension is about to stop the sandbox: the new run must not start using it.
         let ensure_work = || ryzhub_server::work::ensure_work(&app, &lease, run);
         let waiting = tokio::time::timeout(Duration::from_millis(1500), ensure_work()).await;
@@ -1846,7 +1858,11 @@ async fn suspended_workspace_checkpoints_forks_and_archives_from_its_head() -> a
         .bind(head)
         .execute(&h.db)
         .await?;
-        let app = App::new(h.app.store.clone(), h.app.nats.clone(), config)?;
+        let app = App::new(
+            h.app.store.clone(),
+            h.app.nats.clone(),
+            Running::new(config, None),
+        )?;
         let link = OwnerLink::detached();
         // A job of `kind`, run once by the Owner; its state.
         let job = |kind: &'static str| {
@@ -2082,7 +2098,11 @@ async fn push_jobs_deduplicate_retry_fence_stale_claims_and_die_after_their_atte
     let (org, other_org) = (id(&user, "org_id"), id(&other, "org_id"));
     let mut config = Config::default();
     config.push.enabled = true;
-    let app = App::new(h.app.store.clone(), h.app.nats.clone(), config)?;
+    let app = App::new(
+        h.app.store.clone(),
+        h.app.nats.clone(),
+        Running::new(config, None),
+    )?;
     let worker = PgPool::connect(&h.worker_url).await?;
     let state = |job: Uuid| {
         sqlx::query_as::<_, (String, i32)>("SELECT state,attempts FROM push_jobs WHERE id=$1")

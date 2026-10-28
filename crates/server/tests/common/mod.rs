@@ -15,7 +15,7 @@ use ryzhub_execution::{ExecSpec, GuestCommand, GuestRequest, HostCommand};
 use ryzhub_proto::{CommandEnvelope, SendMessage, command_envelope::Command};
 use ryzhub_server::{
     app::App,
-    config::Config,
+    config::{Config, reload::Running},
     http::router,
     llm::gateway,
     store::{Conversation, Store, create_in},
@@ -123,7 +123,8 @@ impl Harness {
 
         let store = Store::connect(&app_url).await?;
         let nats = async_nats::connect("nats://127.0.0.1:54222").await?;
-        let app = App::new(store, nats, config)?;
+        let running = Running::new(config, Some(config_file.path().into()));
+        let app = App::new(store, nats, running)?;
         let mut h = Self {
             name,
             admin,

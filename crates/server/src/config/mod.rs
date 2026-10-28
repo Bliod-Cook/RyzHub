@@ -6,6 +6,8 @@ use ryzhub_execution::host;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+pub mod reload;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -896,8 +898,8 @@ mod tests {
     #[test]
     fn shipped_configurations_are_valid() {
         for text in [
-            include_str!("../../../config/development.toml"),
-            include_str!("../../../deploy/config.example.toml"),
+            include_str!("../../../../config/development.toml"),
+            include_str!("../../../../deploy/config.example.toml"),
         ] {
             let mut config: Config = parse_toml(text).unwrap();
             // setup.sh fills in the image it builds.

@@ -10,7 +10,7 @@ use prost::Message;
 use ryzhub_proto::{command_envelope::Command, *};
 use ryzhub_server::{
     app::App,
-    config::{Config, ModelRoute, Upstream},
+    config::{Config, ModelRoute, Upstream, reload::Running},
     llm::{gateway, keys},
     owner,
     store::{Lease, hash_token},
@@ -1384,7 +1384,11 @@ async fn virtual_key_lease_rotation_policy_rate_limit_and_interrupted_usage() ->
     assert_eq!(usage, (true, "interrupted".into()));
     let mut config = (*h.app.config()).clone();
     config.llm.requests_per_minute_key = 4;
-    let limited = App::new(h.app.store.clone(), h.app.nats.clone(), config)?;
+    let limited = App::new(
+        h.app.store.clone(),
+        h.app.nats.clone(),
+        Running::new(config, None),
+    )?;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let url = format!("http://{}/v1/messages", listener.local_addr()?);
     let task = tokio::spawn(async move {
@@ -1719,7 +1723,11 @@ async fn vault_key_rotation_rewraps_credential_secrets() -> anyhow::Result<()> {
     .await?;
     assert_eq!(kek, 1);
     rotated.llm.vault_retired_keys.clear();
-    let app = App::new(h.app.store.clone(), h.app.nats.clone(), rotated)?;
+    let app = App::new(
+        h.app.store.clone(),
+        h.app.nats.clone(),
+        Running::new(rotated, None),
+    )?;
     assert_eq!(resolve(app).await?, expected);
     h.close().await
 }
@@ -2354,7 +2362,11 @@ async fn a_dependency_layer_mounts_and_leaves_the_node_once_unused() -> anyhow::
     let worker = PgPool::connect(&h.worker_url).await?;
     let mut keep = (*h.app.config()).clone();
     keep.sandbox.image_gc_after_secs = 0;
-    let app = App::new(h.app.store.clone(), h.app.nats.clone(), keep.clone())?;
+    let app = App::new(
+        h.app.store.clone(),
+        h.app.nats.clone(),
+        Running::new(keep.clone(), None),
+    )?;
     let mut gone = false;
     for _ in 0..400 {
         gone = sqlx::query_scalar("SELECT state='deleted' FROM sandboxes WHERE run_id=$1")
@@ -2373,7 +2385,11 @@ async fn a_dependency_layer_mounts_and_leaves_the_node_once_unused() -> anyhow::
     assert!(held().await?, "a configured layer stays");
     // Once configuration no longer names it and nothing uses it, it leaves the node.
     keep.sandbox.deps.clear();
-    let app = App::new(h.app.store.clone(), h.app.nats.clone(), keep)?;
+    let app = App::new(
+        h.app.store.clone(),
+        h.app.nats.clone(),
+        Running::new(keep, None),
+    )?;
     ryzhub_server::sandbox::collect_images(&app, &worker).await?;
     tokio::time::sleep(Duration::from_millis(1100)).await;
     ryzhub_server::sandbox::collect_images(&app, &worker).await?;

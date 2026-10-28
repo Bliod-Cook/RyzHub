@@ -9,7 +9,7 @@ import '../l10n.dart';
 import '../theme.dart';
 import 'common.dart';
 import 'dialogs.dart';
-import 'settings.dart';
+import 'sectioned.dart';
 
 String trustLabel(String? trust) => switch (trust) {
   'signed' => tr('已签名', 'Signed'),

@@ -10,57 +10,49 @@ import '../prefs.dart';
 import '../theme.dart';
 import 'common.dart';
 import 'dialogs.dart';
-import 'icons.dart';
 import 'login.dart';
 import 'model_picker.dart';
 import 'memories.dart';
 import 'plugins.dart';
-
-class _Section {
-  final String id, group;
-  final IconData icon;
-  final String Function() title;
-  final List<String> keywords;
-  const _Section(this.id, this.group, this.icon, this.title, this.keywords);
-}
+import 'sectioned.dart';
 
 final _sections = [
-  _Section(
+  PageSection(
     'memories',
     'personal',
     Icons.psychology_outlined,
     () => tr('记忆', 'Memory'),
     ['记忆', 'memory', '历史', 'history'],
   ),
-  _Section(
+  PageSection(
     'general',
     'personal',
     Icons.settings_outlined,
     () => tr('通用', 'General'),
     ['语言', 'language', '发送', 'send', 'enter', '快捷键'],
   ),
-  _Section(
+  PageSection(
     'appearance',
     'personal',
     Icons.light_mode_outlined,
     () => tr('外观', 'Appearance'),
     ['主题', 'theme', '深色', 'dark', '浅色', 'light', '强调色', 'accent', 'color'],
   ),
-  _Section(
+  PageSection(
     'personalization',
     'personal',
     Icons.tune,
     () => tr('个性化', 'Personalization'),
     ['默认', 'default', '模式', 'mode', '执行路径', 'path', 'harness'],
   ),
-  _Section(
+  PageSection(
     'keyboard',
     'personal',
     Icons.keyboard_outlined,
     () => tr('键盘快捷键', 'Keyboard shortcuts'),
     ['快捷键', 'shortcut', 'keyboard', 'ctrl'],
   ),
-  _Section(
+  PageSection(
     'account',
     'account',
     Icons.person_outline,
@@ -79,35 +71,35 @@ final _sections = [
       'security',
     ],
   ),
-  _Section('usage', 'account', Icons.data_usage, () => tr('用量', 'Usage'), [
+  PageSection('usage', 'account', Icons.data_usage, () => tr('用量', 'Usage'), [
     'token',
     '模型',
     'model',
     '用量',
     'usage',
   ]),
-  _Section(
+  PageSection(
     'data',
     'account',
     Icons.inventory_2_outlined,
     () => tr('数据控制', 'Data controls'),
     ['归档', 'archive', '导出', 'export', '数据', 'data'],
   ),
-  _Section(
+  PageSection(
     'plugins',
     'integrations',
     Icons.extension_outlined,
     () => tr('插件', 'Plugins'),
     ['插件', 'plugin', 'mcp', '工具', 'tool', 'skill', '技能', '命令', 'command'],
   ),
-  _Section(
+  PageSection(
     'credentials',
     'integrations',
     Icons.key_outlined,
     () => tr('模型凭据', 'Model credentials'),
     ['api', 'key', '密钥', 'credential', 'anthropic', 'openai', 'byok'],
   ),
-  _Section(
+  PageSection(
     'server',
     'integrations',
     Icons.dns_outlined,
@@ -116,13 +108,7 @@ final _sections = [
   ),
 ];
 
-String _groupTitle(String group) => switch (group) {
-  'personal' => tr('个人', 'Personal'),
-  'account' => tr('账户与数据', 'Account and data'),
-  _ => tr('集成', 'Integrations'),
-};
-
-class SettingsPage extends StatefulWidget {
+class SettingsPage extends StatelessWidget {
   final HubController hub;
   final HubActions app;
   final String? initial;
@@ -132,337 +118,35 @@ class SettingsPage extends StatefulWidget {
     required this.app,
     this.initial,
   });
-  @override
-  State<SettingsPage> createState() => _SettingsPageState();
-}
-
-class _SettingsPageState extends State<SettingsPage> {
-  late String? section = widget.initial ?? (_narrow ? null : 'general');
-  String query = '';
-  bool navCollapsed = false;
-
-  bool get _narrow =>
-      WidgetsBinding
-              .instance
-              .platformDispatcher
-              .views
-              .first
-              .physicalSize
-              .width /
-          WidgetsBinding
-              .instance
-              .platformDispatcher
-              .views
-              .first
-              .devicePixelRatio <
-      wideWidth;
-
-  List<_Section> get matches {
-    final q = query.trim().toLowerCase();
-    if (q.isEmpty) return _sections;
-    return _sections
-        .where(
-          (s) =>
-              s.title().toLowerCase().contains(q) ||
-              s.keywords.any((k) => k.toLowerCase().contains(q)),
-        )
-        .toList();
-  }
-
-  Widget nav(BuildContext context, {required bool narrow}) {
-    final c = HubColors.of(context);
-    final list = matches;
-    return Material(
-      color: c.sidebar,
-      child: SafeArea(
-        right: false,
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            Padding(
-              padding: const EdgeInsets.fromLTRB(
-                Space.gap,
-                Space.gap,
-                Space.gap,
-                4,
-              ),
-              child: Row(
-                children: [
-                  if (!narrow)
-                    IconButton(
-                      tooltip: tr('收起侧边栏', 'Collapse sidebar'),
-                      icon: const HubIcon(HubIcons.sidebarExpanded),
-                      onPressed: () => setState(() => navCollapsed = true),
-                    ),
-                ],
-              ),
-            ),
-            NavRow(
-              icon: Icons.arrow_back,
-              label: tr('返回应用', 'Back to app'),
-              onTap: () => Navigator.pop(context),
-            ),
-            Padding(
-              padding: const EdgeInsets.fromLTRB(
-                Space.gap,
-                Space.gap,
-                Space.gap,
-                4,
-              ),
-              child: SizedBox(
-                height: 38,
-                child: TextField(
-                  onChanged: (v) => setState(() => query = v),
-                  style: const TextStyle(fontSize: FontSizes.body),
-                  decoration: InputDecoration(
-                    hintText: tr('搜索', 'Search'),
-                    prefixIcon: const Icon(Icons.search, size: 18),
-                    prefixIconConstraints: const BoxConstraints(minWidth: 36),
-                    filled: true,
-                    fillColor: c.hover,
-                    contentPadding: const EdgeInsets.symmetric(
-                      vertical: Space.gap,
-                    ),
-                    border: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(Radii.control),
-                      borderSide: BorderSide.none,
-                    ),
-                    enabledBorder: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(Radii.control),
-                      borderSide: BorderSide.none,
-                    ),
-                    focusedBorder: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(Radii.control),
-                      borderSide: BorderSide(color: c.border),
-                    ),
-                  ),
-                ),
-              ),
-            ),
-            Expanded(
-              child: ListView(
-                padding: const EdgeInsets.only(bottom: Space.edge),
-                children: [
-                  for (final group in ['personal', 'account', 'integrations'])
-                    if (list.any((s) => s.group == group)) ...[
-                      SectionLabel(_groupTitle(group)),
-                      for (final s in list.where((s) => s.group == group))
-                        NavRow(
-                          icon: s.icon,
-                          label: s.title(),
-                          selected: !narrow && section == s.id,
-                          onTap: () => setState(() => section = s.id),
-                        ),
-                    ],
-                  if (list.isEmpty)
-                    EmptyHint(tr('没有匹配的设置', 'No matching settings')),
-                ],
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Widget detail(BuildContext context, {required bool narrow}) {
-    final c = HubColors.of(context);
-    final s = _sections.firstWhere(
-      (s) => s.id == section,
-      orElse: () => _sections.first,
-    );
-    return SafeArea(
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          SizedBox(
-            height: 52,
-            child: Row(
-              children: [
-                const SizedBox(width: Space.gap),
-                if (narrow)
-                  IconButton(
-                    tooltip: tr('返回', 'Back'),
-                    icon: const Icon(Icons.arrow_back),
-                    onPressed: () => setState(() => section = null),
-                  )
-                else if (navCollapsed)
-                  IconButton(
-                    tooltip: tr('打开侧边栏', 'Open sidebar'),
-                    icon: const HubIcon(HubIcons.sidebarCollapsed),
-                    onPressed: () => setState(() => navCollapsed = false),
-                  ),
-              ],
-            ),
-          ),
-          Expanded(
-            child: SingleChildScrollView(
-              padding: const EdgeInsets.fromLTRB(20, 0, 20, 40),
-              child: Center(
-                child: ConstrainedBox(
-                  constraints: const BoxConstraints(maxWidth: 600),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.stretch,
-                    children: [
-                      Semantics(
-                        container: true,
-                        header: true,
-                        child: Text(
-                          s.title(),
-                          style: TextStyle(
-                            fontSize: 24,
-                            fontWeight: FontWeight.w500,
-                            color: c.text,
-                          ),
-                        ),
-                      ),
-                      const SizedBox(height: 20),
-                      KeyedSubtree(
-                        key: ValueKey(s.id),
-                        child: switch (s.id) {
-                          'memories' => MemorySettings(hub: widget.hub),
-                          'general' => const _General(),
-                          'appearance' => const _Appearance(),
-                          'personalization' => _Personalization(
-                            hub: widget.hub,
-                          ),
-                          'keyboard' => const _Keyboard(),
-                          'account' => _Account(
-                            hub: widget.hub,
-                            app: widget.app,
-                          ),
-                          'usage' => _Usage(hub: widget.hub),
-                          'data' => _Data(hub: widget.hub, app: widget.app),
-                          'credentials' => _Credentials(hub: widget.hub),
-                          'plugins' => PluginSettings(hub: widget.hub),
-                          _ => _Server(hub: widget.hub),
-                        },
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
 
   @override
   Widget build(BuildContext context) => ListenableBuilder(
-    listenable: Listenable.merge([widget.hub, prefs]),
-    builder: (context, _) {
-      final c = HubColors.of(context);
-      final narrow = MediaQuery.sizeOf(context).width < wideWidth;
-      return Scaffold(
-        body: narrow
-            ? section == null
-                  ? nav(context, narrow: true)
-                  : detail(context, narrow: true)
-            : Row(
-                children: [
-                  if (!navCollapsed)
-                    Container(
-                      width: 260,
-                      decoration: BoxDecoration(
-                        border: Border(right: BorderSide(color: c.border)),
-                      ),
-                      child: nav(context, narrow: false),
-                    ),
-                  Expanded(child: detail(context, narrow: false)),
-                ],
-              ),
-      );
-    },
+    listenable: Listenable.merge([hub, prefs]),
+    builder: (context, _) => SectionedPage(
+      back: tr('返回应用', 'Back to app'),
+      initial: initial,
+      home: 'general',
+      groups: [
+        ('personal', () => tr('个人', 'Personal')),
+        ('account', () => tr('账户与数据', 'Account and data')),
+        ('integrations', () => tr('集成', 'Integrations')),
+      ],
+      sections: _sections,
+      content: (context, s) => switch (s.id) {
+        'memories' => MemorySettings(hub: hub),
+        'general' => const _General(),
+        'appearance' => const _Appearance(),
+        'personalization' => _Personalization(hub: hub),
+        'keyboard' => const _Keyboard(),
+        'account' => _Account(hub: hub, app: app),
+        'usage' => _Usage(hub: hub),
+        'data' => _Data(hub: hub, app: app),
+        'credentials' => _Credentials(hub: hub),
+        'plugins' => PluginSettings(hub: hub),
+        _ => _Server(hub: hub),
+      },
+    ),
   );
-}
-
-class SettingsCard extends StatelessWidget {
-  final List<Widget> children;
-  final String? title;
-  const SettingsCard({super.key, required this.children, this.title});
-  @override
-  Widget build(BuildContext context) {
-    final c = HubColors.of(context);
-    return Padding(
-      padding: const EdgeInsets.only(bottom: 20),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          if (title != null)
-            Padding(
-              padding: const EdgeInsets.fromLTRB(4, 0, 4, Space.gap),
-              child: Text(
-                title!,
-                style: TextStyle(fontSize: FontSizes.label, color: c.subtle),
-              ),
-            ),
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: Space.edge),
-            decoration: BoxDecoration(
-              borderRadius: BorderRadius.circular(Radii.card),
-              border: Border.all(color: c.border),
-            ),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                for (final (i, child) in children.indexed) ...[
-                  if (i > 0) Divider(color: c.border),
-                  child,
-                ],
-              ],
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-class SettingRow extends StatelessWidget {
-  final String title;
-  final String? subtitle;
-  final Widget? trailing;
-  const SettingRow({
-    super.key,
-    required this.title,
-    this.subtitle,
-    this.trailing,
-  });
-  @override
-  Widget build(BuildContext context) {
-    final c = HubColors.of(context);
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 12),
-      child: Row(
-        children: [
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  title,
-                  style: TextStyle(fontSize: FontSizes.body, color: c.text),
-                ),
-                if (subtitle != null) ...[
-                  const SizedBox(height: 2),
-                  Text(
-                    subtitle!,
-                    style: TextStyle(
-                      fontSize: FontSizes.caption,
-                      color: c.subtle,
-                    ),
-                  ),
-                ],
-              ],
-            ),
-          ),
-          if (trailing != null) ...[const SizedBox(width: 16), trailing!],
-        ],
-      ),
-    );
-  }
 }
 
 class _General extends StatelessWidget {

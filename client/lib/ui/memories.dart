@@ -6,7 +6,7 @@ import '../theme.dart';
 import 'attachments.dart' show fileTime;
 import 'common.dart';
 import 'dialogs.dart';
-import 'settings.dart';
+import 'sectioned.dart';
 
 /// The priorities a memory can take, highest first.
 List<(int, String)> _priorities() => [

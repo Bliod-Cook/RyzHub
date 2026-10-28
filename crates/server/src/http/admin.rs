@@ -3,7 +3,7 @@
 use anyhow::Context;
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::HeaderMap,
     routing::{delete, get},
 };
@@ -21,6 +21,7 @@ use crate::{
 pub fn routes() -> Router<App> {
     Router::new()
         .route("/admin/settings", get(settings))
+        .route("/admin/stats", get(stats))
         .route("/admin/plugin-blocks", get(blocks).post(block))
         .route("/admin/plugin-blocks/{id}", delete(unblock))
 }
@@ -90,6 +91,38 @@ async fn settings(State(app): State<App>, headers: HeaderMap) -> ApiResult<Json<
             "terminal": config.work.enabled && config.sandbox.enabled,
         },
     })))
+}
+
+#[derive(Deserialize)]
+struct StatsQuery {
+    days: i32,
+    /// The viewer's offset from UTC in minutes, east positive: days are counted in it.
+    tz_offset: i32,
+}
+
+/// `GET /admin/stats?days=7|30|90&tz_offset=`: every overview figure, from data the instance
+/// keeps anyway.
+async fn stats(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Query(query): Query<StatsQuery>,
+) -> ApiResult<Json<Value>> {
+    admin(&app, &headers).await?;
+    require!(
+        matches!(query.days, 7 | 30 | 90) && (-14 * 60..=14 * 60).contains(&query.tz_offset),
+        Code::InvalidInput
+    );
+    let mut stats: Value = sqlx::query_scalar("SELECT instance_stats($1,make_interval(mins=>$2))")
+        .bind(query.days)
+        .bind(query.tz_offset)
+        .fetch_one(&app.store.pool)
+        .await?;
+    let retention = &app.config().retention;
+    stats["retention"] = json!({
+        "usage_days": retention.usage_days,
+        "audit_days": retention.audit_days,
+    });
+    Ok(Json(stats))
 }
 
 #[derive(Deserialize)]

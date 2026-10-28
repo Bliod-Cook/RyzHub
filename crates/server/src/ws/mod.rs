@@ -403,7 +403,10 @@ async fn session_revoked(app: &App, auth: &watch::Receiver<Auth>) -> bool {
     app.store.session_revoked(session).await.unwrap_or(false)
 }
 
-fn affects_session(notice: &Result<Notice, broadcast::error::RecvError>, user: Uuid) -> bool {
+pub(crate) fn affects_session(
+    notice: &Result<Notice, broadcast::error::RecvError>,
+    user: Uuid,
+) -> bool {
     match notice {
         Ok(notice) => {
             matches!(notice.table.as_str(), "auth_sessions" | "users")

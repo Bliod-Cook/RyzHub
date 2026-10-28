@@ -486,10 +486,12 @@ async fn account(
     .await?;
     if let Some((user, status)) = owner {
         ensure!(link.is_none_or(|l| l == user), Code::IdentityTaken);
-        ensure!(status == "active", Code::Unauthorized);
+        ensure!(status == "active", Code::AccountDisabled);
         return Ok(user);
     }
     let link_identity = |user: Uuid| async move {
+        let mut tx = pool.begin().await?;
+        crate::accounts::hold_active(&mut tx, user).await?;
         sqlx::query(
             "INSERT INTO user_identities(user_id,provider,subject,email) VALUES($1,$2,$3,$4)",
         )
@@ -497,8 +499,9 @@ async fn account(
         .bind(provider)
         .bind(&identity.subject)
         .bind(&identity.email)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         anyhow::Ok(user)
     };
     if let Some(user) = link {
@@ -516,9 +519,10 @@ async fn account(
     if let Some((user, status)) = existing {
         // Joining an account by email needs the provider to vouch for the email.
         ensure!(
-            identity.verified && app.config().auth.link_verified_email && status == "active",
+            identity.verified && app.config().auth.link_verified_email,
             Code::AccountExists
         );
+        ensure!(status == "active", Code::AccountDisabled);
         return link_identity(user).await;
     }
     ensure!(identity.verified, Code::IdentityEmailRequired);

@@ -11,6 +11,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
+mod users;
+
 use super::authenticate;
 use crate::{
     app::App,
@@ -19,7 +21,7 @@ use crate::{
 };
 
 pub fn routes() -> Router<App> {
-    Router::new()
+    users::routes()
         .route("/admin/settings", get(settings))
         .route("/admin/stats", get(stats))
         .route("/admin/plugin-blocks", get(blocks).post(block))
@@ -42,14 +44,11 @@ pub async fn audit(
     resource: &str,
     detail: Value,
 ) -> anyhow::Result<()> {
-    let org: Uuid = sqlx::query_scalar(
-        "SELECT o.id FROM list_user_orgs($1) l JOIN organizations o ON o.id=l.id
-         WHERE o.kind='personal' LIMIT 1",
-    )
-    .bind(admin.user_id)
-    .fetch_optional(&mut **tx)
-    .await?
-    .context("an instance admin without a personal organization")?;
+    let org: Uuid = sqlx::query_scalar::<_, Option<Uuid>>("SELECT personal_org($1)")
+        .bind(admin.user_id)
+        .fetch_one(&mut **tx)
+        .await?
+        .context("an instance admin without a personal organization")?;
     sqlx::query("SELECT set_config('app.org_id',$1,true)")
         .bind(org.to_string())
         .execute(&mut **tx)

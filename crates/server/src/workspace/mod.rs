@@ -80,10 +80,18 @@ impl Stores {
         }
         Ok(())
     }
+
+    /// Delete every object in both stores.
+    pub async fn clear(&self) -> anyhow::Result<()> {
+        for store in std::iter::once(&self.primary).chain(&self.secondary) {
+            store.clear().await?;
+        }
+        Ok(())
+    }
 }
 
 /// The checkpoint stores, scoped to `org`.
-fn stores(app: &App, org: Uuid) -> anyhow::Result<Stores> {
+pub(crate) fn stores(app: &App, org: Uuid) -> anyhow::Result<Stores> {
     let store = |root: &str| anyhow::Ok(BlobStore::configured(root)?.scoped(org));
     Ok(Stores {
         primary: store(&app.config().work.storage_root)?,

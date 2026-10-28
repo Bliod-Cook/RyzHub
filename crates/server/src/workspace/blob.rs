@@ -6,7 +6,7 @@
 use anyhow::{Context, ensure};
 use futures_util::{StreamExt, TryStreamExt};
 use object_store::{
-    ClientOptions, ObjectStoreExt, PutPayload, RetryConfig, WriteMultipart,
+    ClientOptions, ObjectStore, ObjectStoreExt, PutPayload, RetryConfig, WriteMultipart,
     aws::{AmazonS3, AmazonS3Builder},
     multipart::{MultipartStore, PartId},
     path::Path as ObjectPath,
@@ -297,6 +297,45 @@ impl BlobStore {
                 Err(error) => Err(error.into()),
             },
         }
+    }
+
+    /// Delete every object under this store's prefix, which must be scoped, and make sure none
+    /// is left.
+    pub async fn clear(&self) -> anyhow::Result<()> {
+        ensure!(
+            !self.prefix.is_empty(),
+            "an unscoped store is never cleared"
+        );
+        match &self.backend {
+            Backend::Local(root) => {
+                let dir = root.join(self.prefix.trim_end_matches('/'));
+                match tokio::fs::remove_dir_all(&dir).await {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e.into()),
+                }
+                ensure!(!tokio::fs::try_exists(&dir).await?, "objects remain");
+            }
+            Backend::S3(store) => {
+                let prefix = ObjectPath::from(self.prefix.as_str());
+                let objects: Vec<ObjectPath> = store
+                    .list(Some(&prefix))
+                    .map_ok(|meta| meta.location)
+                    .try_collect()
+                    .await?;
+                for object in objects {
+                    match store.delete(&object).await {
+                        Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+                ensure!(
+                    store.list(Some(&prefix)).next().await.is_none(),
+                    "objects remain"
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Whether clients can send objects straight to this store, over presigned URLs.

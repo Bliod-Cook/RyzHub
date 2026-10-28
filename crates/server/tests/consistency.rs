@@ -905,6 +905,102 @@ async fn member_removal_revokes_org_access_and_stops_waiting_run() -> anyhow::Re
 
 #[tokio::test]
 #[ignore = "requires PostgreSQL 18 and NATS"]
+async fn disabling_an_account_cuts_its_connections_devices_runs_and_sign_ins() -> anyhow::Result<()>
+{
+    let h = Harness::new().await?;
+    let http = reqwest::Client::new();
+    let admin = h.user().await?;
+    sqlx::query("UPDATE users SET is_instance_admin=true WHERE id=$1")
+        .bind(id(&admin, "user_id"))
+        .execute(&h.db)
+        .await?;
+    let member = h.user().await?;
+    let user = id(&member, "user_id");
+    let email = member["email"].as_str().unwrap();
+    let login = |password: &str| {
+        http.post(format!("{}/auth/login", h.base))
+            .json(&json!({"email": email, "password": password}))
+            .send()
+    };
+    let signed_in = login("test-password").await?;
+    let device = signed_in.headers()["set-cookie"]
+        .to_str()?
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+    let conv = h.conversation(&member).await?;
+    let channel = format!("conv:{conv}");
+    let mut owner = h.owner()?;
+    let mut socket = connect(&h.base, &member, "member-device").await?;
+    subscribe(&mut socket, &channel, None).await?;
+    send(
+        &mut socket,
+        frame(&channel, Body::Command(message(Uuid::now_v7(), "question"))),
+    )
+    .await?;
+    until(&mut socket, |f| {
+        matches!(event_of(f), Some(Event::PendingActionChanged(_)))
+    })
+    .await?;
+    let status = |value: &str| {
+        http.patch(format!("{}/admin/users/{user}", h.base))
+            .bearer_auth(admin["token"].as_str().unwrap())
+            .json(&json!({"status": value}))
+            .send()
+    };
+    let disabled: Value = status("disabled").await?.error_for_status()?.json().await?;
+    assert_eq!(disabled["status"], "disabled");
+    until(&mut socket, |f| {
+        matches!(f.body, Some(Body::SubscriptionRevoked(_)))
+    })
+    .await?;
+    let refreshed = http
+        .post(format!("{}/auth/refresh", h.base))
+        .header("cookie", &device)
+        .send()
+        .await?;
+    assert_eq!(refreshed.status(), 401);
+    let rejected: Value = login("test-password").await?.json().await?;
+    assert_eq!(rejected["error"], "ACCOUNT_DISABLED");
+    let rejected: Value = login("wrong-password").await?.json().await?;
+    assert_eq!(rejected["error"], "INVALID_CREDENTIALS");
+    let mut cancelled = false;
+    for _ in 0..200 {
+        let state: String = sqlx::query_scalar("SELECT state FROM runs WHERE conversation_id=$1")
+            .bind(conv)
+            .fetch_one(&h.db)
+            .await?;
+        cancelled = state == "cancelled";
+        if cancelled {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    assert!(cancelled);
+    let audited: Value = sqlx::query_scalar(
+        "SELECT detail FROM audit_logs WHERE action='admin.user.disable' AND resource=$1",
+    )
+    .bind(user.to_string())
+    .fetch_one(&h.db)
+    .await?;
+    assert_eq!(audited["email"], email);
+    // Enabled again, the account signs in afresh: nothing it had survives.
+    status("active").await?.error_for_status()?;
+    assert_eq!(login("test-password").await?.status(), 200);
+    let old = h
+        .app
+        .store
+        .authenticate(member["token"].as_str().unwrap())
+        .await;
+    assert!(old.is_err());
+    owner.kill().await?;
+    owner.wait().await?;
+    h.close().await
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL 18 and NATS"]
 async fn delayed_nats_frames_from_retired_publisher_are_discarded() -> anyhow::Result<()> {
     let h = Harness::new().await?;
     let user = h.user().await?;

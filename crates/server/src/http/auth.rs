@@ -166,6 +166,7 @@ pub(super) async fn sign_in(
     let refresh = new_token();
     let device = Uuid::now_v7();
     let mut tx = store.pool.begin().await?;
+    crate::accounts::hold_active(&mut tx, user).await?;
     sqlx::query(
         "INSERT INTO auth_refresh(id,user_id,refresh_hash,expires_at)
          VALUES($1,$2,$3,now()+($4::bigint*interval '1 day'))",
@@ -291,16 +292,18 @@ pub async fn login(
     );
     let email = input.email.trim().to_lowercase();
     require!(!limited(&email), Code::RateLimited);
-    let row = sqlx::query("SELECT id,password_hash FROM users WHERE email=$1 AND status='active'")
-        .bind(&email)
-        .fetch_optional(&app.store.pool)
-        .await?;
-    let (user, hash) = match &row {
+    let row =
+        sqlx::query("SELECT id,password_hash,status='active' AS active FROM users WHERE email=$1")
+            .bind(&email)
+            .fetch_optional(&app.store.pool)
+            .await?;
+    let (user, hash, active) = match &row {
         Some(row) => (
             Some(row.get::<Uuid, _>("id")),
             row.get::<String, _>("password_hash"),
+            row.get::<bool, _>("active"),
         ),
-        None => (None, DUMMY_HASH.clone()),
+        None => (None, DUMMY_HASH.clone(), false),
     };
     let password = input.password;
     let valid = blocking_hash(move || {
@@ -318,6 +321,8 @@ pub async fn login(
             return Err(Code::InvalidCredentials.into());
         }
     };
+    // Only the right password learns that the account is disabled.
+    require!(active, Code::AccountDisabled);
     let orgs = user_orgs(&app.store, user).await?;
     sign_in(&app.store, &headers, user, orgs.first().map(|(id, _)| *id)).await
 }
@@ -333,7 +338,7 @@ pub async fn refresh(State(app): State<App>, headers: HeaderMap) -> ApiResult<im
          FROM auth_refresh r JOIN users u ON u.id=r.user_id
          WHERE (r.refresh_hash=$1 OR r.previous_hash=$1) AND r.revoked_at IS NULL
            AND r.expires_at>now() AND u.status='active'
-         FOR UPDATE OF r",
+         FOR UPDATE OF r FOR SHARE OF u",
     )
     .bind(&hash)
     .bind(ROTATION_GRACE_SECS)

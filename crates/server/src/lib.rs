@@ -54,6 +54,7 @@ macro_rules! run_times {
     };
 }
 
+pub mod accounts;
 pub mod app;
 pub mod attachments;
 pub mod chat;

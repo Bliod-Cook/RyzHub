@@ -2,8 +2,8 @@
 //! reindex | migrate-secrets.
 use anyhow::{Context, ensure};
 use ryzhub_server::{
-    app::App, attachments, config::Config, conversation_commands, lifecycle, memory, projects,
-    push, retention, sandbox, search, store::Store, workspace,
+    accounts, app::App, attachments, config::Config, conversation_commands, lifecycle, memory,
+    projects, push, retention, sandbox, search, store::Store, workspace,
 };
 use sqlx::PgPool;
 use std::{future::Future, time::Duration};
@@ -97,6 +97,7 @@ async fn serve(role: &str) -> anyhow::Result<()> {
         supervise("push", &app, worker, push::worker);
         supervise("conversation lifecycle", &app, worker, lifecycle::collector);
         supervise("retention", &app, worker, retention::collector);
+        supervise("account deletion", &app, worker, accounts::collector);
         if app.config().work.enabled || sandbox::chat_checkpoints(&app) {
             supervise("checkpoint collector", &app, worker, workspace::collector);
         }

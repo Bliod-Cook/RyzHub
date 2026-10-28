@@ -394,6 +394,7 @@ async fn store(
     tokens: &Value,
 ) -> anyhow::Result<()> {
     let mut tx = app.store.tx(org).await?;
+    crate::accounts::hold_active(&mut tx, user).await?;
     let old: Option<Uuid> = sqlx::query_scalar(
         "SELECT token_secret FROM plugin_connections WHERE org_id=$1 AND installation_id=$2 AND user_id=$3 AND server=$4",
     )

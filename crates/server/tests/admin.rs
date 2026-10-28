@@ -24,6 +24,24 @@ async fn call(
     Ok((status, response.json().await.unwrap_or(Value::Null)))
 }
 
+/// `PATCH /admin/users/{target}` as `actor`.
+async fn set_status(
+    h: &Harness,
+    actor: &Value,
+    target: &Value,
+    status: &str,
+) -> anyhow::Result<(StatusCode, Value)> {
+    let path = format!("/admin/users/{}", id(target, "user_id"));
+    call(
+        h,
+        actor,
+        Method::PATCH,
+        &path,
+        Some(json!({"status": status})),
+    )
+    .await
+}
+
 /// A new user the database makes an instance admin.
 async fn admin(h: &Harness) -> anyhow::Result<Value> {
     let user = h.user().await?;
@@ -220,5 +238,280 @@ async fn the_overview_aggregates_the_whole_instance_by_the_viewers_days() -> any
     )
     .await?;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+    h.close().await
+}
+
+#[tokio::test]
+#[ignore = "requires local PostgreSQL and NATS"]
+async fn users_are_listed_newest_first_by_page_search_and_status() -> anyhow::Result<()> {
+    let h = Harness::start(|_| {}).await?;
+    let admin = admin(&h).await?;
+    let member = h.user().await?;
+    sqlx::query(
+        "INSERT INTO users(id,email,display_name,password_hash)
+         SELECT uuidv7(),'bulk'||n||'@example.test','Bulk '||n,'!' FROM generate_series(1,60) n",
+    )
+    .execute(&h.db)
+    .await?;
+    sqlx::query("UPDATE users SET status='disabled' WHERE email='bulk7@example.test'")
+        .execute(&h.db)
+        .await?;
+    let list = |query: &str| {
+        let path = format!("/admin/users?{query}");
+        let (h, admin) = (&h, &admin);
+        async move {
+            let (status, body) = call(h, admin, Method::GET, &path, None).await?;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            anyhow::Ok(body)
+        }
+    };
+    let first = list("").await?;
+    let page = first["users"].as_array().unwrap();
+    assert_eq!(page.len(), 50);
+    assert_eq!(page[0]["email"], "bulk60@example.test");
+    let second = list(&format!("before={}", first["next"].as_str().unwrap())).await?;
+    assert_eq!(second["users"].as_array().unwrap().len(), 12);
+    assert_eq!(second["next"], Value::Null);
+    let found = list("q=BULK7").await?;
+    assert_eq!(found["users"].as_array().unwrap().len(), 1);
+    let disabled = list("status=disabled").await?;
+    assert_eq!(disabled["users"][0]["email"], "bulk7@example.test");
+    // One account in detail: how it signs in, and what it has.
+    let path = format!("/admin/users/{}", id(&member, "user_id"));
+    let (_, detail) = call(&h, &admin, Method::GET, &path, None).await?;
+    assert_eq!(detail["email"], member["email"]);
+    assert_eq!(detail["status"], "active");
+    assert_eq!(detail["password"], true);
+    assert_eq!(detail["providers"], json!([]));
+    assert!(detail["created_at_ms"].as_i64().unwrap() > 0);
+    assert!(detail["last_sign_in_ms"].as_i64().unwrap() > 0);
+    assert_eq!(detail["devices"], 1);
+    assert_eq!(detail["conversations"], 0);
+    assert_eq!(detail["tokens_30d"], json!({"input": 0, "output": 0}));
+    let path = format!("/admin/users/{}", uuid::Uuid::now_v7());
+    let (status, _) = call(&h, &admin, Method::GET, &path, None).await?;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    h.close().await
+}
+
+#[tokio::test]
+#[ignore = "requires local PostgreSQL and NATS"]
+async fn admins_never_change_themselves_and_two_disabling_each_other_leave_one()
+-> anyhow::Result<()> {
+    let h = Harness::start(|_| {}).await?;
+    let (first, second) = (admin(&h).await?, admin(&h).await?);
+    let (status, body) = set_status(&h, &first, &first, "disabled").await?;
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (StatusCode::CONFLICT, Some("CANNOT_CHANGE_SELF"))
+    );
+    let (one, other) = tokio::join!(
+        set_status(&h, &first, &second, "disabled"),
+        set_status(&h, &second, &first, "disabled")
+    );
+    let succeeded = [one?.0, other?.0]
+        .iter()
+        .filter(|status| status.is_success())
+        .count();
+    assert_eq!(succeeded, 1);
+    let admins: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM users WHERE is_instance_admin AND status='active'",
+    )
+    .fetch_one(&h.db)
+    .await?;
+    assert_eq!(admins, 1);
+    h.close().await
+}
+
+#[tokio::test]
+#[ignore = "requires local PostgreSQL and NATS"]
+async fn a_sign_in_racing_a_disable_never_outlives_it() -> anyhow::Result<()> {
+    let h = Harness::start(|_| {}).await?;
+    let admin = admin(&h).await?;
+    let http = reqwest::Client::new();
+    for _ in 0..5 {
+        let member = h.user().await?;
+        let user = id(&member, "user_id");
+        let logins = (0..4).map(|_| {
+            http.post(format!("{}/auth/login", h.base))
+                .json(&json!({"email": member["email"], "password": "test-password"}))
+                .send()
+        });
+        let disable = set_status(&h, &admin, &member, "disabled");
+        let (_, disabled) = tokio::join!(futures_util::future::join_all(logins), disable);
+        assert!(disabled?.0.is_success());
+        let live: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM auth_sessions WHERE user_id=$1 AND revoked_at IS NULL",
+        )
+        .bind(user)
+        .fetch_one(&h.db)
+        .await?;
+        assert_eq!(live, 0);
+    }
+    h.close().await
+}
+
+#[tokio::test]
+#[ignore = "requires local PostgreSQL and NATS"]
+async fn a_deleted_account_restores_and_once_due_is_purged_to_tombstones() -> anyhow::Result<()> {
+    use ryzhub_server::{accounts, conversation_commands, projects};
+    let h = Harness::start(|config| config.llm.enabled = true).await?;
+    let worker = sqlx::PgPool::connect(&h.worker_url).await?;
+    let admin = admin(&h).await?;
+    let member = h.user().await?;
+    let (user, org) = (id(&member, "user_id"), id(&member, "org_id"));
+    // Something of everything the account keeps.
+    let ctx = h.context(&member).await?;
+    let conv = h
+        .create(&ctx, "secret plans", "chat", json!({}), None)
+        .await?
+        .id;
+    let mut owner = h.owner()?;
+    h.send(&member, conv, common::message("hello")).await?;
+    h.wait_state(conv, "completed").await?;
+    owner.kill().await?;
+    owner.wait().await?;
+    let base = format!("/orgs/{org}");
+    let body = json!({"name": "secret project"});
+    let (_, project) = call(
+        &h,
+        &member,
+        Method::POST,
+        &format!("{base}/projects"),
+        Some(body),
+    )
+    .await?;
+    let project = uuid::Uuid::parse_str(project["id"].as_str().unwrap())?;
+    let body = json!({"content": "secret memory"});
+    let (status, _) = call(
+        &h,
+        &member,
+        Method::POST,
+        &format!("{base}/memories"),
+        Some(body),
+    )
+    .await?;
+    assert!(status.is_success());
+    let file = reqwest::Client::new()
+        .post(format!("{}/orgs/{org}/attachments?name=secret.txt", h.base))
+        .bearer_auth(member["token"].as_str().unwrap())
+        .body("secret file")
+        .send()
+        .await?;
+    assert!(file.status().is_success());
+    let secret = uuid::Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO secrets(id,org_id,ciphertext,wrapped_dek,kek_id) VALUES($1,$2,'x','x',0)",
+    )
+    .bind(secret)
+    .bind(org)
+    .execute(&h.db)
+    .await?;
+    sqlx::query(
+        "INSERT INTO model_credentials(id,org_id,owner_user_id,name,provider,secret_id)
+         VALUES($1,$2,$3,'secret key','openai',$4)",
+    )
+    .bind(uuid::Uuid::now_v7())
+    .bind(org)
+    .bind(user)
+    .bind(secret)
+    .execute(&h.db)
+    .await?;
+
+    // Deleted, the account is disabled and can be restored, disabled.
+    let path = format!("/admin/users/{user}");
+    let (_, deleted) = call(&h, &admin, Method::DELETE, &path, None).await?;
+    assert_eq!(deleted["status"], "deletion_pending");
+    let days = (deleted["delete_after_ms"].as_i64().unwrap()
+        - chrono::Utc::now().timestamp_millis())
+        / 86_400_000;
+    assert_eq!(days, 29);
+    let login = json!({"email": member["email"], "password": "test-password"});
+    let refused: Value = reqwest::Client::new()
+        .post(format!("{}/auth/login", h.base))
+        .json(&login)
+        .send()
+        .await?
+        .json()
+        .await?;
+    assert_eq!(refused["error"], "ACCOUNT_DISABLED");
+    let restore = format!("{path}/restore");
+    let (_, restored) = call(&h, &admin, Method::POST, &restore, None).await?;
+    assert_eq!(
+        (
+            restored["status"].clone(),
+            restored["delete_after_ms"].clone()
+        ),
+        (json!("disabled"), Value::Null)
+    );
+    call(&h, &admin, Method::DELETE, &path, None).await?;
+    sqlx::query("UPDATE users SET delete_after=now()-interval '1 second' WHERE id=$1")
+        .bind(user)
+        .execute(&h.db)
+        .await?;
+
+    // Due, it is anonymized at once and its organization emptied over rounds.
+    accounts::expire(&h.app, &worker, user).await?;
+    let (_, gone) = call(&h, &admin, Method::GET, &path, None).await?;
+    assert_eq!(gone["email"], format!("deleted+{user}@invalid"));
+    assert_eq!(
+        (gone["status"].clone(), gone["purging"].clone()),
+        (json!("deleted"), json!(true))
+    );
+    assert!(
+        !accounts::purge(&h.app, org).await?,
+        "conversations wait for their collector"
+    );
+    assert!(conversation_commands::collect(&h.app, org, conv).await?);
+    assert!(projects::collect(&h.app, org, project).await?);
+    // A failed round leaves the organization to the next one.
+    let files = std::path::Path::new(&h.app.config().work.storage_root)
+        .join(org.to_string())
+        .join("attachments");
+    let mode =
+        |bits| std::fs::set_permissions(&files, std::os::unix::fs::PermissionsExt::from_mode(bits));
+    mode(0o500)?;
+    let failed = accounts::purge(&h.app, org).await;
+    mode(0o700)?;
+    assert!(failed.is_err());
+    assert!(accounts::purge(&h.app, org).await?);
+
+    let state: String = sqlx::query_scalar("SELECT state FROM organizations WHERE id=$1")
+        .bind(org)
+        .fetch_one(&h.db)
+        .await?;
+    assert_eq!(state, "deleted");
+    assert!(!files.parent().unwrap().exists(), "stored objects remain");
+    let left: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT 'conversation',count(*) FROM conversations WHERE org_id=$1 AND (state<>'deleted' OR title<>'')
+         UNION ALL SELECT 'item',count(*) FROM items WHERE org_id=$1 AND text<>''
+         UNION ALL SELECT 'project',count(*) FROM projects WHERE org_id=$1 AND (state<>'deleted' OR name<>'')
+         UNION ALL SELECT 'memory',count(*) FROM memory_items WHERE org_id=$1 AND content<>''
+         UNION ALL SELECT 'attachment',count(*) FROM attachments WHERE org_id=$1
+         UNION ALL SELECT 'credential',count(*) FROM model_credentials
+             WHERE org_id=$1 AND (revoked_at IS NULL OR name<>'' OR secret_id IS NOT NULL)
+         UNION ALL SELECT 'secret',count(*) FROM secrets WHERE org_id=$1
+         UNION ALL SELECT 'search',count(*) FROM search_docs WHERE org_id=$1
+         UNION ALL SELECT 'event',count(*) FROM events WHERE org_id=$1
+         UNION ALL SELECT 'identity',count(*) FROM user_identities WHERE user_id=$2",
+    )
+    .bind(org)
+    .bind(user)
+    .fetch_all(&h.db)
+    .await?;
+    assert!(left.iter().all(|(_, n)| *n == 0), "{left:?}");
+    // Usage keeps the id; the email is free again.
+    let usage: i64 = sqlx::query_scalar("SELECT count(*) FROM usage_records WHERE user_id=$1")
+        .bind(user)
+        .fetch_one(&h.db)
+        .await?;
+    assert!(usage > 0);
+    let again = reqwest::Client::new()
+        .post(format!("{}/auth/register", h.base))
+        .json(&login)
+        .send()
+        .await?;
+    assert!(again.status().is_success());
+    worker.close().await;
     h.close().await
 }

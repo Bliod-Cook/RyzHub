@@ -739,6 +739,20 @@ async fn s3_sigv4_storage_roundtrip_and_authentication() -> anyhow::Result<()> {
     store.delete(&target).await?;
     let abandoned = store.start_direct(&target).await?;
     store.abort_direct(&target, &abandoned).await?;
+    // Clearing an organization's store takes everything under it, and nothing of another's.
+    let other = s3_store("RYZHUB_TEST_S3_SECRET")?.scoped(Uuid::now_v7());
+    other.put(&key, body.as_bytes()).await?;
+    store.put(&key, body.as_bytes()).await?;
+    store
+        .clone()
+        .within("attachments")
+        .put(&key, body.as_bytes())
+        .await?;
+    store.clear().await?;
+    assert!(store.get(&key).await.is_err());
+    assert!(store.clone().within("attachments").get(&key).await.is_err());
+    assert_eq!(other.get(&key).await?, body.as_bytes());
+    other.clear().await?;
     // Signed with the wrong secret, nothing is stored.
     let bad = s3_store("RYZHUB_TEST_UPSTREAM_KEY")?;
     assert!(bad.put(&key, body.as_bytes()).await.is_err());
@@ -760,8 +774,8 @@ fn s3_store(secret_env: &str) -> anyhow::Result<ryzhub_server::workspace::blob::
 }
 #[tokio::test]
 #[ignore = "requires PostgreSQL/NATS, containerd and Codex"]
-async fn a_work_terminal_runs_commands_resumes_detached_and_is_cut_by_fencing() -> anyhow::Result<()>
-{
+async fn a_work_terminal_runs_commands_resumes_detached_and_is_cut_by_fencing_and_disabling()
+-> anyhow::Result<()> {
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::{Message as Ws, client::IntoClientRequest};
     let h = Harness::new().await?;
@@ -771,12 +785,11 @@ async fn a_work_terminal_runs_commands_resumes_detached_and_is_cut_by_fencing() 
     h.send(&user, conv, message("hello codex")).await?;
     h.wait_state(conv, "completed").await?;
     let token = user["token"].as_str().unwrap().to_owned();
-    let connect = |since: u64| {
+    let connect_as = |token: String, since: u64| {
         let url = format!(
             "{}/orgs/{org}/conversations/{conv}/terminal?cols=100&rows=30&since={since}",
             h.base.replacen("http", "ws", 1)
         );
-        let token = token.clone();
         async move {
             let mut request = url.into_client_request()?;
             request
@@ -786,6 +799,7 @@ async fn a_work_terminal_runs_commands_resumes_detached_and_is_cut_by_fencing() 
             anyhow::Ok(socket)
         }
     };
+    let connect = |since: u64| connect_as(token.clone(), since);
     // Output until `needle` appears, and how many bytes that was.
     async fn until(
         socket: &mut (
@@ -871,10 +885,64 @@ async fn a_work_terminal_runs_commands_resumes_detached_and_is_cut_by_fencing() 
         .bind(epoch + 1)
         .execute(&h.db)
         .await?;
-    // Under the new epoch the same session is still there; closing ends its shell.
+    // Under the new epoch the same session is still there.
     let mut socket = connect(0).await?;
     socket.next().await.context("attached")??;
     until(&mut socket, "again-2").await?;
+    // Disabling the account cuts its terminal and ends the shell rather than detaching it.
+    let admin = h.user().await?;
+    sqlx::query("UPDATE users SET is_instance_admin=true WHERE id=$1")
+        .bind(id(&admin, "user_id"))
+        .execute(&h.db)
+        .await?;
+    let status = |value: &'static str| {
+        reqwest::Client::new()
+            .patch(format!("{}/admin/users/{}", h.base, id(&user, "user_id")))
+            .bearer_auth(admin["token"].as_str().unwrap())
+            .json(&json!({"status": value}))
+            .send()
+    };
+    status("disabled").await?.error_for_status()?;
+    let cut = loop {
+        match tokio::time::timeout(Duration::from_secs(10), socket.next()).await? {
+            Some(Ok(Ws::Binary(_))) => continue,
+            other => break other,
+        }
+    };
+    assert!(
+        matches!(cut, None | Some(Ok(Ws::Close(_))) | Some(Err(_))),
+        "{cut:?}"
+    );
+    status("active").await?.error_for_status()?;
+    let login: Value = reqwest::Client::new()
+        .post(format!("{}/auth/login", h.base))
+        .json(&json!({"email": user["email"], "password": "test-password"}))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let token = login["token"].as_str().unwrap().to_owned();
+    // The ended shell may still be on its way out; the next attach starts a new one.
+    let mut tries = 0;
+    let (mut socket, fresh) = loop {
+        let mut socket = connect_as(token.clone(), 0).await?;
+        socket.next().await.context("attached")??;
+        socket
+            .send(Ws::Binary(b"echo fresh-$((2*2))\r".to_vec().into()))
+            .await?;
+        match until(&mut socket, "fresh-4").await {
+            Ok(fresh) => break (socket, fresh),
+            Err(_) if tries < 20 => tries += 1,
+            Err(error) => return Err(error),
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    };
+    assert!(
+        !String::from_utf8_lossy(&fresh).contains("again-2"),
+        "the shell outlived its account"
+    );
+    // Closing ends the shell.
     socket
         .send(Ws::Text(json!({"close": true}).to_string().into()))
         .await?;

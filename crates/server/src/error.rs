@@ -31,6 +31,7 @@ codes! {
     // Identity and access.
     Unauthorized = "UNAUTHORIZED" => UNAUTHORIZED,
     InvalidCredentials = "INVALID_CREDENTIALS" => UNAUTHORIZED,
+    AccountDisabled = "ACCOUNT_DISABLED" => FORBIDDEN,
     Forbidden = "FORBIDDEN" => FORBIDDEN,
     RateLimited = "RATE_LIMITED" => TOO_MANY_REQUESTS,
     PolicyDenied = "POLICY_DENIED" => BAD_REQUEST,
@@ -142,6 +143,9 @@ codes! {
     LastSignInMethod = "LAST_SIGN_IN_METHOD" => CONFLICT,
     NotFoundIdentity = "IDENTITY_NOT_FOUND" => NOT_FOUND,
     NoDocument = "DOCUMENT_NOT_FOUND" => NOT_FOUND,
+    // Instance administration.
+    UserNotFound = "USER_NOT_FOUND" => NOT_FOUND,
+    CannotChangeSelf = "CANNOT_CHANGE_SELF" => CONFLICT,
     // Plugins.
     PluginsDisabled = "PLUGINS_DISABLED" => SERVICE_UNAVAILABLE,
     PluginNotFound = "PLUGIN_NOT_FOUND" => NOT_FOUND,

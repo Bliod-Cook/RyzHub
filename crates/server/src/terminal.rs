@@ -7,7 +7,8 @@
 //! connected and `{"exit":code}` when the shell exits.
 //!
 //! A client that leaves without `close` detaches: the shell keeps running, and the client
-//! resumes by reconnecting with `since`, the count of output bytes it has. Terminal bytes never
+//! resumes by reconnecting with `since`, the count of output bytes it has. A revoked session
+//! (signed out, or its user disabled) ends the shell as `close` would. Terminal bytes never
 //! enter the event stream; the connection is the session's own, end to end.
 use anyhow::Context;
 use axum::{
@@ -26,12 +27,14 @@ use ryzhub_execution::{
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::time::Duration;
+use tokio::sync::broadcast;
 use uuid::Uuid;
 
 use crate::{
     app::App,
     error::{ApiError, Code},
-    store::conversation_in,
+    revocation::Notice,
+    store::{Auth, conversation_in},
 };
 
 /// How often an attached terminal marks its sandbox as in use.
@@ -78,84 +81,115 @@ pub async fn upgrade(
     };
     let socket = crate::sandbox::endpoint(&app, org, sandbox).await?;
     let (reply, host_read, host_write) = ryzhub_execution::attach(&socket, &command).await?;
+    // Subscribed before the session's last check, so no revocation falls in between.
+    let notices = app.revocations.subscribe();
+    require!(
+        !app.store.session_revoked(auth.session_id).await?,
+        Code::Unauthorized
+    );
     Ok(ws
         .max_message_size(MAX_INPUT)
         .on_upgrade(move |client| async move {
-            if let Err(error) =
-                relay(&app, org, sandbox, client, reply, host_read, host_write).await
+            let terminal = Terminal {
+                app: &app,
+                org,
+                sandbox,
+                auth: &auth,
+            };
+            if let Err(error) = terminal
+                .relay(client, reply, notices, host_read, host_write)
+                .await
             {
                 tracing::debug!(%error, "terminal closed");
             }
         }))
 }
 
-async fn relay(
-    app: &App,
+struct Terminal<'a> {
+    app: &'a App,
     org: Uuid,
     sandbox: Uuid,
-    client: WebSocket,
-    reply: Value,
-    mut host_read: impl tokio::io::AsyncRead + Unpin,
-    mut host_write: impl tokio::io::AsyncWrite + Unpin,
-) -> anyhow::Result<()> {
-    let (mut to_client, mut from_client) = client.split();
-    let attached = json!({"attached": {"start": reply["start"]}});
-    to_client
-        .send(Message::Text(attached.to_string().into()))
-        .await?;
-    let mut seen = tokio::time::interval(SEEN_EVERY);
-    loop {
-        tokio::select! {
-            message = from_client.next() => {
-                let frame = match message {
-                    Some(Ok(Message::Binary(bytes))) => Frame::Data(bytes.to_vec()),
-                    Some(Ok(Message::Text(text))) => {
-                        let control: Value = serde_json::from_str(&text)?;
-                        if control["close"] == true {
-                            Frame::Close
-                        } else if let (Some(cols), Some(rows)) = (
-                            control["resize"]["cols"].as_u64(),
-                            control["resize"]["rows"].as_u64(),
-                        ) {
-                            Frame::Resize { cols: cols.clamp(10, 500) as u16, rows: rows.clamp(2, 300) as u16 }
-                        } else {
-                            continue;
+    auth: &'a Auth,
+}
+
+impl Terminal<'_> {
+    async fn relay(
+        &self,
+        client: WebSocket,
+        reply: Value,
+        mut notices: broadcast::Receiver<Notice>,
+        mut host_read: impl tokio::io::AsyncRead + Unpin,
+        mut host_write: impl tokio::io::AsyncWrite + Unpin,
+    ) -> anyhow::Result<()> {
+        let (app, org, sandbox) = (self.app, self.org, self.sandbox);
+        let (mut to_client, mut from_client) = client.split();
+        let attached = json!({"attached": {"start": reply["start"]}});
+        to_client
+            .send(Message::Text(attached.to_string().into()))
+            .await?;
+        let mut seen = tokio::time::interval(SEEN_EVERY);
+        loop {
+            tokio::select! {
+                notice = notices.recv() => {
+                    if crate::ws::affects_session(&notice, self.auth.user_id)
+                        && app.store.session_revoked(self.auth.session_id).await.unwrap_or(false)
+                    {
+                        write_frame(&mut host_write, &Frame::Close).await?;
+                        let _ = to_client.close().await;
+                        return Ok(());
+                    }
+                }
+                message = from_client.next() => {
+                    let frame = match message {
+                        Some(Ok(Message::Binary(bytes))) => Frame::Data(bytes.to_vec()),
+                        Some(Ok(Message::Text(text))) => {
+                            let control: Value = serde_json::from_str(&text)?;
+                            if control["close"] == true {
+                                Frame::Close
+                            } else if let (Some(cols), Some(rows)) = (
+                                control["resize"]["cols"].as_u64(),
+                                control["resize"]["rows"].as_u64(),
+                            ) {
+                                Frame::Resize { cols: cols.clamp(10, 500) as u16, rows: rows.clamp(2, 300) as u16 }
+                            } else {
+                                continue;
+                            }
+                        }
+                        Some(Ok(_)) => continue,
+                        // The client left: the session stays, detached.
+                        None | Some(Err(_)) => return Ok(()),
+                    };
+                    let close = frame == Frame::Close;
+                    write_frame(&mut host_write, &frame).await?;
+                    if close {
+                        return Ok(());
+                    }
+                }
+                frame = read_frame(&mut host_read) => {
+                    match frame? {
+                        Some(Frame::Data(bytes)) => to_client.send(Message::Binary(bytes.into())).await?,
+                        Some(Frame::Exit(code)) => {
+                            to_client.send(Message::Text(json!({"exit": code}).to_string().into())).await?;
+                            let _ = to_client.close().await;
+                            return Ok(());
+                        }
+                        Some(_) => {}
+                        // The node cut the connection: the sandbox stopped or was fenced.
+                        None => {
+                            let _ = to_client.close().await;
+                            return Ok(());
                         }
                     }
-                    Some(Ok(_)) => continue,
-                    // The client left: the session stays, detached.
-                    None | Some(Err(_)) => return Ok(()),
-                };
-                let close = frame == Frame::Close;
-                write_frame(&mut host_write, &frame).await?;
-                if close {
-                    return Ok(());
                 }
-            }
-            frame = read_frame(&mut host_read) => {
-                match frame? {
-                    Some(Frame::Data(bytes)) => to_client.send(Message::Binary(bytes.into())).await?,
-                    Some(Frame::Exit(code)) => {
-                        to_client.send(Message::Text(json!({"exit": code}).to_string().into())).await?;
-                        let _ = to_client.close().await;
-                        return Ok(());
-                    }
-                    Some(_) => {}
-                    // The node cut the connection: the sandbox stopped or was fenced.
-                    None => {
-                        let _ = to_client.close().await;
-                        return Ok(());
-                    }
+                _ = seen.tick() => {
+                    let mut tx = app.store.tx(org).await?;
+                    sqlx::query("UPDATE sandboxes SET terminal_seen_at=now() WHERE org_id=$1 AND id=$2")
+                        .bind(org)
+                        .bind(sandbox)
+                        .execute(&mut *tx)
+                        .await?;
+                    tx.commit().await?;
                 }
-            }
-            _ = seen.tick() => {
-                let mut tx = app.store.tx(org).await?;
-                sqlx::query("UPDATE sandboxes SET terminal_seen_at=now() WHERE org_id=$1 AND id=$2")
-                    .bind(org)
-                    .bind(sandbox)
-                    .execute(&mut *tx)
-                    .await?;
-                tx.commit().await?;
             }
         }
     }

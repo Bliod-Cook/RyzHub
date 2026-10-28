@@ -85,13 +85,15 @@ pub async fn guarded<'a>(store: &'a Store, lease: &Lease, run: Uuid) -> anyhow::
     Ok(tx)
 }
 
-/// Lock the lease and require `run` to be running under it for a still-member creator.
+/// Lock the lease and require `run` to be running under it for a creator who is still an
+/// active member.
 pub async fn guard(tx: &mut Tx<'_>, lease: &Lease, run: Uuid) -> anyhow::Result<()> {
     lock_lease(tx, lease).await?;
     let valid = sqlx::query_scalar!(
         r#"SELECT EXISTS(SELECT 1 FROM runs r
              JOIN conversations c ON c.org_id=r.org_id AND c.id=r.conversation_id
              JOIN memberships m ON m.org_id=c.org_id AND m.user_id=c.creator_id
+             JOIN users u ON u.id=c.creator_id AND u.status='active'
          WHERE r.org_id=$1 AND r.id=$2 AND r.exec_epoch=$3 AND r.state='running') AS "valid!""#,
         lease.org_id,
         run,
@@ -761,12 +763,14 @@ pub async fn mark_read(
     Ok(())
 }
 
-/// Runs whose creator lost access or whose pending action expired end as cancelled.
+/// Runs whose creator lost access (left, or was disabled) or whose pending action expired end
+/// as cancelled.
 pub async fn expire_invalid(tx: &mut Tx<'_>, lease: &Lease) -> anyhow::Result<()> {
     let invalid: Vec<Uuid> = sqlx::query_scalar(
         "SELECT r.id FROM runs r JOIN conversations c ON c.org_id=r.org_id AND c.id=r.conversation_id
          WHERE r.org_id=$1 AND r.conversation_id=$2 AND r.state IN ('running','requires_action')
-           AND (NOT EXISTS(SELECT 1 FROM memberships m WHERE m.org_id=c.org_id AND m.user_id=c.creator_id)
+           AND (NOT EXISTS(SELECT 1 FROM memberships m JOIN users u ON u.id=m.user_id
+                           WHERE m.org_id=c.org_id AND m.user_id=c.creator_id AND u.status='active')
                 OR EXISTS(SELECT 1 FROM pending_actions a WHERE a.org_id=r.org_id AND a.run_id=r.id
                           AND a.status='pending' AND a.expires_at<=now()))",
     )

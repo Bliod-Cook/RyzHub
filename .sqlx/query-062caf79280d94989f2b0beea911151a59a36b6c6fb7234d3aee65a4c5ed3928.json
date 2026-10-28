@@ -1,0 +1,25 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT EXISTS(SELECT 1 FROM runs r\n             JOIN conversations c ON c.org_id=r.org_id AND c.id=r.conversation_id\n             JOIN memberships m ON m.org_id=c.org_id AND m.user_id=c.creator_id\n             JOIN users u ON u.id=c.creator_id AND u.status='active'\n         WHERE r.org_id=$1 AND r.id=$2 AND r.exec_epoch=$3 AND r.state='running') AS \"valid!\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "valid!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "062caf79280d94989f2b0beea911151a59a36b6c6fb7234d3aee65a4c5ed3928"
+}

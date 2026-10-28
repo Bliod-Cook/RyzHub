@@ -24,7 +24,7 @@ mod sources;
 pub use sources::{source as file_source, upload as upload_file};
 
 /// A deleted project can be restored this long.
-const RECOVERABLE_DAYS: i64 = 30;
+pub(crate) const RECOVERABLE_DAYS: i64 = 30;
 /// Total size of a project's knowledge files.
 const MAX_PROJECT_BYTES: u64 = 2 * 1024 * 1024;
 

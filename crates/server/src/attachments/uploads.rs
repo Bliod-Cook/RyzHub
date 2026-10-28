@@ -48,7 +48,7 @@ fn parts_store(app: &App, org: Uuid, id: Uuid) -> anyhow::Result<BlobStore> {
 }
 
 /// The bucket object a direct upload is assembled into, and its key there.
-fn direct_object(app: &App, org: Uuid, id: Uuid) -> anyhow::Result<(BlobStore, String)> {
+pub(crate) fn direct_object(app: &App, org: Uuid, id: Uuid) -> anyhow::Result<(BlobStore, String)> {
     let key = format!("{:x}", Sha256::digest(format!("upload:{id}")));
     Ok((attachment_stores(app, org)?.primary.within("uploads"), key))
 }

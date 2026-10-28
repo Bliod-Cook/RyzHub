@@ -26,4 +26,12 @@ export MIGRATION_DATABASE_URL="${MIGRATION_DATABASE_URL%/*}/$dev_database"
 export RYZHUB_CONFIG="$dev_config"
 cargo build -p ryzhub-server
 target/debug/ryzhub-server migrate
-exec target/debug/ryzhub-server all
+# The admin panel restarts the server by having it exit with 75; stopping this script stops it.
+trap 'kill "$server" 2>/dev/null; wait "$server"; exit' TERM INT
+while true; do
+  target/debug/ryzhub-server all &
+  server=$!
+  status=0
+  wait "$server" || status=$?
+  [[ $status -eq 75 ]] || exit "$status"
+done

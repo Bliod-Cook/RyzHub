@@ -59,6 +59,7 @@ pub mod app;
 pub mod attachments;
 pub mod chat;
 pub mod child;
+pub mod components;
 pub mod config;
 pub mod conversation_commands;
 pub mod drafts;

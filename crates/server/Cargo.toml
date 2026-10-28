@@ -43,7 +43,7 @@ zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
 flate2 = "1"
 tar = "0.4"
 ed25519-dalek = "2"
-nix = { version = "0.30", features = ["fs", "resource"] }
+nix = { version = "0.30", features = ["fs", "hostname", "resource"] }
 pdf-extract = "0.12"
 quick-xml = "0.41"
 # Local embeddings (`local-embedding`): Qwen3-Embedding on candle, no ONNX Runtime linked.

@@ -2,6 +2,7 @@
 use std::{sync::Arc, time::Duration};
 
 use crate::{
+    components::Components,
     config::{Config, reload::Running},
     revocation::Revocations,
     store::Store,
@@ -20,6 +21,8 @@ pub struct App {
     pub revocations: Revocations,
     /// Event-stream connections opened here.
     pub streams: Streams,
+    /// What runs in this process.
+    pub components: Components,
 }
 
 impl App {
@@ -34,6 +37,7 @@ impl App {
             hub,
             revocations,
             streams: Streams::default(),
+            components: Components::new("all"),
         })
     }
 

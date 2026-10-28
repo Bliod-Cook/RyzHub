@@ -11,6 +11,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
+mod components;
 mod config;
 mod users;
 
@@ -24,6 +25,7 @@ use crate::{
 pub fn routes() -> Router<App> {
     users::routes()
         .merge(config::routes())
+        .merge(components::routes())
         .route("/admin/stats", get(stats))
         .route("/admin/plugin-blocks", get(blocks).post(block))
         .route("/admin/plugin-blocks/{id}", delete(unblock))

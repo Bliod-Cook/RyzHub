@@ -5,6 +5,7 @@ use ryzhub_server::{
     accounts,
     app::App,
     attachments,
+    components::{self, Components},
     config::{
         Config,
         reload::{self, Running},
@@ -34,13 +35,18 @@ fn main() -> anyhow::Result<()> {
     if args.get(1).is_some_and(|role| role == "extract-text") {
         return ryzhub_server::extract::child_main(&args[2..]);
     }
-    tokio::runtime::Builder::new_multi_thread()
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .build()?
-        .block_on(run(args))
+        .build()?;
+    let stop = runtime.block_on(run(args))?;
+    drop(runtime);
+    if let Stop::Restart = stop {
+        std::process::exit(components::EXIT_RESTART);
+    }
+    Ok(())
 }
 
-async fn run(args: Vec<String>) -> anyhow::Result<()> {
+async fn run(args: Vec<String>) -> anyhow::Result<Stop> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
@@ -48,7 +54,9 @@ async fn run(args: Vec<String>) -> anyhow::Result<()> {
     let repeat = args.iter().any(|a| a == "--loop");
     match role {
         "maintain" if repeat => until_stopped(maintain(role, true)).await,
-        "migrate" | "maintain" | "reindex" | "migrate-secrets" => maintain(role, repeat).await,
+        "migrate" | "maintain" | "reindex" | "migrate-secrets" => {
+            maintain(role, repeat).await.map(|()| Stop::Done)
+        }
         "all" | "gateway" | "owner" | "llm-gateway" => until_stopped(serve(role)).await,
         _ => anyhow::bail!(
             "usage: ryzhub-server [all|gateway|owner|llm-gateway|migrate|maintain [--loop]|reindex|migrate-secrets]"
@@ -56,15 +64,23 @@ async fn run(args: Vec<String>) -> anyhow::Result<()> {
     }
 }
 
-/// Runs `task` until it ends or the process is asked to stop: Ctrl-C, or SIGTERM from
-/// `docker stop` and service managers. Connections are dropped; clients reconnect, and
-/// conversation leases move to another owner within seconds.
-async fn until_stopped(task: impl Future<Output = anyhow::Result<()>>) -> anyhow::Result<()> {
+/// Why the process stops.
+enum Stop {
+    Done,
+    /// An admin asked for a restart.
+    Restart,
+}
+
+/// Runs `task` until it ends or the process is asked to stop: Ctrl-C, SIGTERM from
+/// `docker stop` and service managers, or an admin's restart. Connections are dropped;
+/// clients reconnect, and conversation leases move to another owner within seconds.
+async fn until_stopped(task: impl Future<Output = anyhow::Result<()>>) -> anyhow::Result<Stop> {
     let mut terminate = signal(SignalKind::terminate())?;
     tokio::select! {
-        result = task => result,
-        result = tokio::signal::ctrl_c() => Ok(result?),
-        _ = terminate.recv() => Ok(()),
+        result = task => result.map(|()| Stop::Done),
+        result = tokio::signal::ctrl_c() => result.map(|()| Stop::Done).map_err(Into::into),
+        _ = terminate.recv() => Ok(Stop::Done),
+        () = components::restart_requested() => Ok(Stop::Restart),
     }
 }
 
@@ -73,12 +89,11 @@ async fn serve(role: &str) -> anyhow::Result<()> {
     let store = Store::connect(&env("DATABASE_URL")?).await?;
     let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:54222".into());
     let nats = async_nats::connect(nats_url).await?;
-    let app = App::new(store, nats, running)?;
+    let mut app = App::new(store, nats, running)?;
+    app.components = Components::new(role);
     let watched = app.running.clone();
-    tokio::spawn(async move {
-        if let Err(error) = reload::watch(watched).await {
-            tracing::error!(error = format!("{error:#}"), "configuration reload stopped");
-        }
+    (app.components).supervise("config-reload", true, move || {
+        reload::watch(watched.clone())
     });
     let owner = matches!(role, "all" | "owner");
     let model_gateway = app.config().llm.enabled && matches!(role, "all" | "llm-gateway");
@@ -91,39 +106,39 @@ async fn serve(role: &str) -> anyhow::Result<()> {
     let mut servers = JoinSet::new();
     if let (true, Some(worker)) = (owner, &worker) {
         supervise("owner", &app, worker, ryzhub_server::owner::run);
-        supervise("project collector", &app, worker, projects::collector);
+        supervise("project-collector", &app, worker, projects::collector);
         if app.config().search.enabled {
-            supervise("search index", &app, worker, search::worker);
+            supervise("search-index", &app, worker, search::worker);
         }
-        supervise("memory collector", &app, worker, memory::collector);
+        supervise("memory-collector", &app, worker, memory::collector);
         supervise(
-            "conversation collector",
+            "conversation-collector",
             &app,
             worker,
             conversation_commands::collector,
         );
         supervise(
-            "attachment collector",
+            "attachment-collector",
             &app,
             worker,
             attachments::gc::collector,
         );
         supervise("push", &app, worker, push::worker);
-        supervise("conversation lifecycle", &app, worker, lifecycle::collector);
+        supervise("conversation-lifecycle", &app, worker, lifecycle::collector);
         supervise("retention", &app, worker, retention::collector);
-        supervise("account deletion", &app, worker, accounts::collector);
+        supervise("account-deletion", &app, worker, accounts::collector);
         if app.config().work.enabled || sandbox::chat_checkpoints(&app) {
-            supervise("checkpoint collector", &app, worker, workspace::collector);
+            supervise("checkpoint-collector", &app, worker, workspace::collector);
         }
     }
     if let (true, true, Some(worker)) = (owner, app.config().sandbox.enabled, &worker) {
-        supervise("node reclamation", &app, worker, sandbox::reclaim);
+        supervise("node-reclamation", &app, worker, sandbox::reclaim);
     }
     if app.config().work.enabled
         && let Some(worker) = &worker
     {
         // Both roles renew node leases, so a rolling restart of either keeps them alive.
-        supervise("sandbox heartbeat", &app, worker, sandbox::heartbeat);
+        supervise("sandbox-heartbeat", &app, worker, sandbox::heartbeat);
     }
     if model_gateway {
         start_model_gateway(&app, &mut servers).await?;
@@ -133,12 +148,14 @@ async fn serve(role: &str) -> anyhow::Result<()> {
         tracing::info!(address = %app.config().listen, "RyzHub gateway listening");
         let router = ryzhub_server::http::router(app.clone());
         servers.spawn(async move { axum::serve(listener, router).await.map_err(Into::into) });
+        app.components.listening("api");
         if app.config().plugins.enabled {
             let plugins = &app.config().plugins;
             let listener = tokio::net::TcpListener::bind(&plugins.content_listen).await?;
             tracing::info!(address = %plugins.content_listen, "plugin content origin listening");
             let router = ryzhub_server::plugins::apps::content_router(app.clone());
             servers.spawn(async move { axum::serve(listener, router).await.map_err(Into::into) });
+            app.components.listening("plugin-content");
         }
     }
     match servers.join_next().await {
@@ -151,31 +168,17 @@ fn env(name: &str) -> anyhow::Result<String> {
     std::env::var(name).with_context(|| format!("{name} required"))
 }
 
-/// Run a background loop forever, restarting it with backoff when it fails.
+/// Run a background loop as long as the process runs (see [`Components::supervise`]). The
+/// Owner and what keeps sandboxes alive cannot be restarted on their own.
 fn supervise<F, Fut>(name: &'static str, app: &App, worker: &PgPool, task: F)
 where
     F: Fn(App, PgPool) -> Fut + Send + 'static,
-    Fut: Future<Output = anyhow::Result<()>> + Send,
+    Fut: Future<Output = anyhow::Result<()>> + Send + 'static,
 {
-    let (app, worker) = (app.clone(), worker.clone());
-    tokio::spawn(async move {
-        let mut backoff = Duration::from_millis(500);
-        loop {
-            let started = tokio::time::Instant::now();
-            match task(app.clone(), worker.clone()).await {
-                Ok(()) => tracing::warn!(task = name, "background task returned; restarting"),
-                Err(error) => tracing::error!(
-                    task = name,
-                    error = format!("{error:#}"),
-                    "background task failed; restarting"
-                ),
-            }
-            if started.elapsed() > Duration::from_secs(60) {
-                backoff = Duration::from_millis(500);
-            }
-            tokio::time::sleep(backoff).await;
-            backoff = (backoff * 2).min(Duration::from_secs(30));
-        }
+    let (owned, worker) = (app.clone(), worker.clone());
+    let restartable = !matches!(name, "owner" | "node-reclamation" | "sandbox-heartbeat");
+    app.components.supervise(name, restartable, move || {
+        task(owned.clone(), worker.clone())
     });
 }
 
@@ -190,10 +193,12 @@ async fn start_model_gateway(
         let socket = bind_unix_socket(path).await?;
         let router = ryzhub_server::llm::gateway::router(app.clone());
         servers.spawn(async move { axum::serve(socket, router).await.map_err(Into::into) });
+        app.components.listening("llm-gateway-socket");
     }
     tracing::info!(address = %llm.listen, "LLM gateway listening");
     let router = ryzhub_server::llm::gateway::router(app.clone());
     servers.spawn(async move { axum::serve(listener, router).await.map_err(Into::into) });
+    app.components.listening("llm-gateway");
     Ok(())
 }
 

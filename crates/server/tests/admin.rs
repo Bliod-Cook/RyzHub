@@ -707,3 +707,74 @@ async fn the_panel_edits_its_file_in_place_one_version_at_a_time() -> anyhow::Re
     assert_eq!(refused["error"], "ORIGIN_REQUIRED");
     h.close().await
 }
+
+#[tokio::test]
+#[ignore = "requires local PostgreSQL and NATS"]
+async fn a_process_restarts_by_exiting_for_its_supervisor_to_start_it_again() -> anyhow::Result<()>
+{
+    let h = Harness::start(|_| {}).await?;
+    let admin = admin(&h).await?;
+    let reserve = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let addr = reserve.local_addr()?;
+    drop(reserve);
+    let file = tempfile::NamedTempFile::new()?;
+    let text = format!("listen = \"{addr}\"\n[plugins]\nenabled = false\n");
+    std::fs::write(file.path(), text)?;
+    let mut gateway = tokio::process::Command::new(env!("CARGO_BIN_EXE_ryzhub-server"))
+        .arg("gateway")
+        .env("DATABASE_URL", &h.app_url)
+        .env("NATS_URL", "nats://127.0.0.1:54222")
+        .env("RYZHUB_CONFIG", file.path())
+        .kill_on_drop(true)
+        .spawn()?;
+    let base = format!("http://{addr}");
+    let http = reqwest::Client::new();
+    let mut started = false;
+    for _ in 0..200 {
+        started = reqwest::get(format!("{base}/healthz")).await.is_ok();
+        if started {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(started, "gateway startup timeout");
+    let token = admin["token"].as_str().unwrap();
+    let components: Value = http
+        .get(format!("{base}/admin/components"))
+        .bearer_auth(token)
+        .send()
+        .await?
+        .json()
+        .await?;
+    assert_eq!(components["process"]["role"], "gateway");
+    assert_eq!(components["process"]["pid"], gateway.id().unwrap());
+    let names: Vec<&str> = components["components"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["api", "config-reload"]);
+    assert_eq!(components["nodes"][0]["name"], "default");
+    let refused = http
+        .post(format!("{base}/admin/components/api/restart"))
+        .bearer_auth(token)
+        .send()
+        .await?;
+    assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+    let restarted = http
+        .post(format!("{base}/admin/components/config-reload/restart"))
+        .bearer_auth(token)
+        .send()
+        .await?;
+    assert_eq!(restarted.status(), StatusCode::ACCEPTED);
+    let restart = http
+        .post(format!("{base}/admin/process/restart"))
+        .bearer_auth(token)
+        .send()
+        .await?;
+    assert_eq!(restart.status(), StatusCode::ACCEPTED);
+    let status = tokio::time::timeout(std::time::Duration::from_secs(5), gateway.wait()).await??;
+    assert_eq!(status.code(), Some(75));
+    h.close().await
+}

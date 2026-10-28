@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:ryzhub/controller.dart';
 import 'package:ryzhub/prefs.dart';
+import 'package:ryzhub/ui/admin/fields.dart';
 import 'package:ryzhub/ui/admin/overview.dart';
 import 'package:ryzhub/ui/common.dart';
 import 'package:ryzhub/ui/settings.dart';
@@ -164,5 +165,24 @@ void main() {
     expect(find.text('heavy@example.test'), findsOneWidget);
     expect(find.text('3.0 GiB'), findsOneWidget);
     expect(find.text('10% estimated'), findsOneWidget);
+  });
+
+  test('numbers show in their largest whole unit and read back in bytes or seconds', () {
+    String shown(List<Scale> scales, int value) {
+      final (scale, n) = fit(scales, value);
+      return '$n ${scale.id}';
+    }
+
+    expect(shown(byteScales, 10 << 30), '10 GiB');
+    expect(shown(byteScales, 1536 << 20), '1536 MiB');
+    expect(shown(byteScales, 512 << 10), '0.5 MiB');
+    expect(shown(secondScales, 86400), '1 d');
+    expect(shown(secondScales, 1800), '30 min');
+    expect(shown(secondScales, 90), '90 s');
+    expect(shown(secondScales, 0), '0 s');
+    expect(unscale(byteScales[1], '1.5'), 3 << 29);
+    expect(unscale(secondScales[3], '7'), 7 * 86400);
+    expect(unscale(secondScales[0], '-1'), isNull);
+    expect(unscale(secondScales[0], 'soon'), isNull);
   });
 }

@@ -153,6 +153,27 @@ String errorText(Object error) {
       'You cannot do this to your own account.',
     ),
     'USER_NOT_FOUND' => tr('找不到这个用户。', 'No such user.'),
+    'CONFIG_CHANGED' => tr(
+      '配置文件已被修改，请重新加载后再改。',
+      'The configuration file changed. Reload it and try again.',
+    ),
+    'INVALID_CONFIG' => tr('配置无效。', 'The configuration is not valid.'),
+    'CONFIG_READ_ONLY' => tr(
+      '服务器的配置文件不可写。',
+      "The server's configuration file is read-only.",
+    ),
+    'CONFIG_FIELD_LOCKED' => tr(
+      '这一项只能在配置文件里修改。',
+      'This setting can only be changed in the configuration file.',
+    ),
+    'ORIGIN_REQUIRED' => tr(
+      '允许的来源必须包含当前页面的地址。',
+      "Allowed origins must include this page's address.",
+    ),
+    'ENV_NOT_ALLOWED' => tr(
+      '只能使用已列出的环境变量。',
+      'Only the listed environment variables can be used.',
+    ),
     'CREDENTIAL_UNAVAILABLE' => tr(
       '模型凭据不可用。',
       'The model credential is unavailable.',

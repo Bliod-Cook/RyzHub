@@ -3,6 +3,8 @@ import 'package:flutter/material.dart';
 import '../../controller.dart';
 import '../../l10n.dart';
 import '../sectioned.dart';
+import 'config.dart';
+import 'config_fields.dart';
 import 'overview.dart';
 import 'services.dart';
 import 'users.dart';
@@ -32,7 +34,10 @@ class _AdminPageState extends State<AdminPage> {
       return SectionedPage(
         back: tr('返回设置', 'Back to settings'),
         home: 'overview',
-        groups: [('main', () => '')],
+        groups: [
+          ('main', () => ''),
+          ('config', () => tr('配置', 'Configuration')),
+        ],
         sections: [
           PageSection(
             'overview',
@@ -58,11 +63,21 @@ class _AdminPageState extends State<AdminPage> {
             ['重启', 'restart', '组件', 'component', '节点', 'node'],
             width: 760,
           ),
+          for (final s in configSections)
+            PageSection(
+              s.id,
+              'config',
+              s.icon,
+              s.title,
+              s.keywords,
+              width: 760,
+            ),
         ],
         content: (context, s) => switch (s.id) {
           'overview' => Overview(hub: widget.hub),
           'users' => Users(hub: widget.hub),
-          _ => Services(hub: widget.hub),
+          'services' => Services(hub: widget.hub),
+          _ => ConfigSection(hub: widget.hub, section: s.id),
         },
       );
     },

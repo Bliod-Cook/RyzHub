@@ -74,7 +74,7 @@ async fn call(app: App, headers: HeaderMap, request: Value) -> anyhow::Result<Va
         "notifications/initialized" | "ping" => return Ok(json!({})),
         "tools/list" => {
             let mut tools: Vec<Value> = vec![];
-            if app.config.search.enabled {
+            if app.config().search.enabled {
                 tools.extend(crate::memory::definitions().into_iter().map(|t|json!({"name":t["name"],"description":t["description"],"inputSchema":t["input_schema"]})));
             }
             let mut tx = app.store.tx(key.org_id).await?;
@@ -129,7 +129,7 @@ async fn call(app: App, headers: HeaderMap, request: Value) -> anyhow::Result<Va
         let mut tx = app.store.tx(key.org_id).await?;
         let tools = crate::plugins::run_tools(&app, &mut tx, key.org_id, key.run_id).await?;
         let policy =
-            crate::store::effective_policy(&mut tx, &app.config.policy, key.org_id).await?;
+            crate::store::effective_policy(&mut tx, &app.config().policy, key.org_id).await?;
         tx.commit().await?;
         let tool = tools
             .into_iter()
@@ -293,7 +293,7 @@ async fn register(
     };
     let id = Uuid::now_v7();
     let action = Uuid::now_v7();
-    let ttl = app.config.approval_ttl_secs as i64;
+    let ttl = app.config().approval_ttl_secs as i64;
     sqlx::query(
         "INSERT INTO pending_actions(id,org_id,run_id,run_epoch,kind,summary,options,expires_at,form)
          SELECT $1,$2,id,exec_epoch,$4,$5,$6,now()+($7::bigint*interval '1 second'),$8

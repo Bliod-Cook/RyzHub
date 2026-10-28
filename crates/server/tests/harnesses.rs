@@ -221,7 +221,8 @@ impl Harness {
         .bind(conv)
         .fetch_one(&self.db)
         .await?;
-        let host = std::path::Path::new(&self.app.config.sandbox.host_socket);
+        let config = self.app.config();
+        let host = std::path::Path::new(&config.sandbox.host_socket);
         guest_exec(host, sandbox, epoch, op, cmd).await
     }
     /// The model's last request.

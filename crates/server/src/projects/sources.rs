@@ -54,7 +54,7 @@ pub async fn upload(
         })?;
     let (format, media_type) =
         Format::of(spool.head(), &query.name).context(Code::UnsupportedProjectFile)?;
-    let program = crate::child::program(&app.config.attachment_renderer)?;
+    let program = crate::child::program(&app.config().attachment_renderer)?;
     let extracted = extract::extract(&program, format, spool.path()).await?;
     require!(!extracted.text.trim().is_empty(), Code::DocumentUnreadable);
     // Text is its own source; a document is kept as it came.

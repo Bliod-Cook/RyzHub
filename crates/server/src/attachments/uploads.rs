@@ -144,7 +144,7 @@ pub async fn start(
 ) -> ApiResult<Json<Value>> {
     let name = display_name(&input.name).context(Code::InvalidAttachmentName)?;
     let (ctx, mut tx) = member_tx(&app, &headers, org).await?;
-    let policy = effective_policy(&mut tx, &app.config.policy, org).await?;
+    let policy = effective_policy(&mut tx, &app.config().policy, org).await?;
     let limit = limit(&policy);
     require!(
         input.size > 0 && input.size <= limit,
@@ -307,7 +307,7 @@ pub async fn complete(
 ) -> ApiResult<Json<Value>> {
     let (ctx, policy, row, parts) = {
         let (ctx, mut tx) = member_tx(&app, &headers, org).await?;
-        let policy = effective_policy(&mut tx, &app.config.policy, org).await?;
+        let policy = effective_policy(&mut tx, &app.config().policy, org).await?;
         let row = mine(&mut tx, org, ctx.user_id, id).await?;
         if let (Some(file), "completed") = (row.attachment_id, row.state.as_str()) {
             let file = describe(&mut tx, org, ctx.user_id, file).await?;

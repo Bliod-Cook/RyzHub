@@ -75,7 +75,7 @@ pub async fn gc(app: &App, org: Uuid, id: Uuid) -> anyhow::Result<bool> {
 
 /// Retire checkpoints beyond the configured age or count and reclaim expired ones.
 pub async fn collect_org(app: &App, org: Uuid) -> anyhow::Result<()> {
-    let work = &app.config.work;
+    let work = &app.config().work;
     let mut tx = app.store.tx(org).await?;
     sqlx::query(
         "UPDATE checkpoints c SET state='tombstoned',delete_after=now()+($4::bigint*interval '1 second')
@@ -119,7 +119,7 @@ pub async fn collect_org(app: &App, org: Uuid) -> anyhow::Result<()> {
 /// processed through its own tenant-scoped transactions.
 pub async fn collector(app: App, worker: sqlx::PgPool) -> anyhow::Result<()> {
     loop {
-        let work = &app.config.work;
+        let work = &app.config().work;
         let retention = work.checkpoint_retention_days > 0 || work.checkpoint_keep_last > 0;
         let orgs: Vec<Uuid> = sqlx::query_scalar(
             "SELECT DISTINCT org_id FROM checkpoints WHERE state IN ('tombstoned','uploading') OR ($1 AND state='committed')",

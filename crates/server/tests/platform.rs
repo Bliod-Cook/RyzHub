@@ -109,7 +109,7 @@ impl Harness {
             lease,
             user,
             run,
-            vec![self.app.config.llm.model.clone()],
+            vec![self.app.config().llm.model.clone()],
         )
         .await
     }
@@ -131,7 +131,7 @@ async fn gateway_passes_the_native_protocol_through_records_usage_and_fences_exe
         .claim(org, conv, Uuid::now_v7(), 60_000)
         .await?
         .unwrap();
-    owner::process_with_config(&h.app.store, &lease, &h.app.config).await?;
+    owner::process_with_config(&h.app.store, &lease, &h.app.config()).await?;
     let run: Uuid = sqlx::query_scalar("SELECT id FROM runs WHERE conversation_id=$1")
         .bind(conv)
         .fetch_one(&h.db)
@@ -237,7 +237,7 @@ async fn a_real_provider_answers_through_the_gateway_and_its_usage_is_recorded()
         .claim(org, conv, Uuid::now_v7(), 60_000)
         .await?
         .unwrap();
-    owner::process_with_config(&h.app.store, &lease, &h.app.config).await?;
+    owner::process_with_config(&h.app.store, &lease, &h.app.config()).await?;
     let run: Uuid = sqlx::query_scalar("SELECT id FROM runs WHERE conversation_id=$1")
         .bind(conv)
         .fetch_one(&h.db)
@@ -620,7 +620,7 @@ async fn a_conversation_held_by_a_lock_does_not_hold_up_others() -> anyhow::Resu
 async fn replies_hand_over_the_sandbox_files_they_link_to() -> anyhow::Result<()> {
     let h = Harness::new().await?;
     ensure!(
-        !h.app.config.sandbox.image.is_empty(),
+        !h.app.config().sandbox.image.is_empty(),
         "execution image missing"
     );
     let user = h.user().await?;
@@ -746,7 +746,7 @@ async fn library_files_reach_models_and_sandboxes_until_deleted() -> anyhow::Res
     let b64 = base64::engine::general_purpose::STANDARD;
     let h = Harness::new().await?;
     ensure!(
-        !h.app.config.sandbox.image.is_empty(),
+        !h.app.config().sandbox.image.is_empty(),
         "execution image missing"
     );
     let user = h.user().await?;
@@ -1138,7 +1138,7 @@ async fn library_files_reach_models_and_sandboxes_until_deleted() -> anyhow::Res
         .bind(Uuid::parse_str(&image_id)?)
         .fetch_one(&h.db)
         .await?;
-    let object = std::path::Path::new(&h.app.config.work.storage_root)
+    let object = std::path::Path::new(&h.app.config().work.storage_root)
         .join(org.to_string())
         .join("attachments")
         .join(&sha256);
@@ -1167,7 +1167,7 @@ async fn chat_tools_run_silently_and_viewed_images_reach_the_model() -> anyhow::
     use base64::Engine;
     let h = Harness::new().await?;
     ensure!(
-        !h.app.config.sandbox.image.is_empty(),
+        !h.app.config().sandbox.image.is_empty(),
         "execution image missing"
     );
     let user = h.user().await?;
@@ -1281,7 +1281,7 @@ async fn virtual_key_lease_rotation_policy_rate_limit_and_interrupted_usage() ->
         .claim(org, conv, Uuid::now_v7(), 60_000)
         .await?
         .unwrap();
-    owner::process_with_config(&h.app.store, &lease, &h.app.config).await?;
+    owner::process_with_config(&h.app.store, &lease, &h.app.config()).await?;
     let run: Uuid = sqlx::query_scalar("SELECT id FROM runs WHERE conversation_id=$1")
         .bind(conv)
         .fetch_one(&h.db)
@@ -1382,7 +1382,7 @@ async fn virtual_key_lease_rotation_policy_rate_limit_and_interrupted_usage() ->
     .fetch_one(&h.db)
     .await?;
     assert_eq!(usage, (true, "interrupted".into()));
-    let mut config = (*h.app.config).clone();
+    let mut config = (*h.app.config()).clone();
     config.llm.requests_per_minute_key = 4;
     let limited = App::new(h.app.store.clone(), h.app.nats.clone(), config)?;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -1446,7 +1446,7 @@ async fn a_tool_outlives_owner_and_host_restarts_once_and_its_sandbox_is_cleaned
 -> anyhow::Result<()> {
     let h = Harness::new().await?;
     ensure!(
-        !h.app.config.sandbox.image.is_empty(),
+        !h.app.config().sandbox.image.is_empty(),
         "execution image missing"
     );
     let user = h.user().await?;
@@ -1595,7 +1595,7 @@ async fn organization_credentials_are_sealed_revocable_and_kept_within_the_organ
         .claim(org, conv, Uuid::now_v7(), 60_000)
         .await?
         .unwrap();
-    owner::process_with_config(&h.app.store, &lease, &h.app.config).await?;
+    owner::process_with_config(&h.app.store, &lease, &h.app.config()).await?;
     let run: Uuid = sqlx::query_scalar("SELECT id FROM runs WHERE conversation_id=$1")
         .bind(conv)
         .fetch_one(&h.db)
@@ -1693,7 +1693,7 @@ async fn vault_key_rotation_rewraps_credential_secrets() -> anyhow::Result<()> {
     assert_eq!(resolve(h.app.clone()).await?, expected);
     let migrate = ryzhub_server::vault::migrate;
     assert_eq!(
-        migrate(&h.db, &h.app.config.llm).await?,
+        migrate(&h.db, &h.app.config().llm).await?,
         0,
         "nothing to rewrap"
     );
@@ -1706,7 +1706,7 @@ async fn vault_key_rotation_rewraps_credential_secrets() -> anyhow::Result<()> {
             URL_SAFE_NO_PAD.encode([5u8; 32]),
         )
     };
-    let mut rotated = (*h.app.config).clone();
+    let mut rotated = (*h.app.config()).clone();
     rotated.llm.vault_key_id = 1;
     rotated.llm.vault_key_env = "RYZHUB_TEST_VAULT_KEY_NEXT".into();
     rotated.llm.vault_retired_keys = [("0".into(), "RYZHUB_TEST_VAULT_KEY".into())].into();
@@ -2352,7 +2352,7 @@ async fn a_dependency_layer_mounts_and_leaves_the_node_once_unused() -> anyhow::
     };
     // Configured and used: kept.
     let worker = PgPool::connect(&h.worker_url).await?;
-    let mut keep = (*h.app.config).clone();
+    let mut keep = (*h.app.config()).clone();
     keep.sandbox.image_gc_after_secs = 0;
     let app = App::new(h.app.store.clone(), h.app.nats.clone(), keep.clone())?;
     let mut gone = false;
@@ -2438,7 +2438,7 @@ async fn removing_member_revokes_an_inflight_model_stream() -> anyhow::Result<()
         .claim(org, conv, Uuid::now_v7(), 60_000)
         .await?
         .unwrap();
-    owner::process_with_config(&h.app.store, &lease, &h.app.config).await?;
+    owner::process_with_config(&h.app.store, &lease, &h.app.config()).await?;
     let run: Uuid = sqlx::query_scalar("SELECT id FROM runs WHERE conversation_id=$1")
         .bind(conv)
         .fetch_one(&h.db)
@@ -2683,7 +2683,7 @@ async fn gateway_speaks_chat_completions_and_gemini_fails_over_and_caps_reasonin
         .claim(org, conv, Uuid::now_v7(), 60_000)
         .await?
         .unwrap();
-    owner::process_with_config(&h.app.store, &lease, &h.app.config).await?;
+    owner::process_with_config(&h.app.store, &lease, &h.app.config()).await?;
     let run: Uuid = sqlx::query_scalar("SELECT id FROM runs WHERE conversation_id=$1")
         .bind(conv)
         .fetch_one(&h.db)

@@ -345,7 +345,7 @@ pub(crate) async fn render(app: &App, file: &Path) -> Option<Rendition> {
 
 async fn rendition(app: &App, file: &Path) -> anyhow::Result<Rendition> {
     let _permit = RENDERS.acquire().await?;
-    let program = crate::child::program(&app.config.attachment_renderer)?;
+    let program = crate::child::program(&app.config().attachment_renderer)?;
     let input = tokio::fs::File::open(file).await?;
     let (edge, bytes) = (images::MAX_EDGE.to_string(), images::MAX_BYTES.to_string());
     let reply = crate::child::run(

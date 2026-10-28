@@ -67,8 +67,8 @@ async fn serve(role: &str) -> anyhow::Result<()> {
     let nats = async_nats::connect(nats_url).await?;
     let app = App::new(store, nats, config)?;
     let owner = matches!(role, "all" | "owner");
-    let model_gateway = app.config.llm.enabled && matches!(role, "all" | "llm-gateway");
-    let worker = if owner || (model_gateway && app.config.work.enabled) {
+    let model_gateway = app.config().llm.enabled && matches!(role, "all" | "llm-gateway");
+    let worker = if owner || (model_gateway && app.config().work.enabled) {
         Some(PgPool::connect(&env("WORKER_DATABASE_URL")?).await?)
     } else {
         None
@@ -78,7 +78,7 @@ async fn serve(role: &str) -> anyhow::Result<()> {
     if let (true, Some(worker)) = (owner, &worker) {
         supervise("owner", &app, worker, ryzhub_server::owner::run);
         supervise("project collector", &app, worker, projects::collector);
-        if app.config.search.enabled {
+        if app.config().search.enabled {
             supervise("search index", &app, worker, search::worker);
         }
         supervise("memory collector", &app, worker, memory::collector);
@@ -97,14 +97,14 @@ async fn serve(role: &str) -> anyhow::Result<()> {
         supervise("push", &app, worker, push::worker);
         supervise("conversation lifecycle", &app, worker, lifecycle::collector);
         supervise("retention", &app, worker, retention::collector);
-        if app.config.work.enabled || sandbox::chat_checkpoints(&app) {
+        if app.config().work.enabled || sandbox::chat_checkpoints(&app) {
             supervise("checkpoint collector", &app, worker, workspace::collector);
         }
     }
-    if let (true, true, Some(worker)) = (owner, app.config.sandbox.enabled, &worker) {
+    if let (true, true, Some(worker)) = (owner, app.config().sandbox.enabled, &worker) {
         supervise("node reclamation", &app, worker, sandbox::reclaim);
     }
-    if app.config.work.enabled
+    if app.config().work.enabled
         && let Some(worker) = &worker
     {
         // Both roles renew node leases, so a rolling restart of either keeps them alive.
@@ -114,12 +114,12 @@ async fn serve(role: &str) -> anyhow::Result<()> {
         start_model_gateway(&app, &mut servers).await?;
     }
     if matches!(role, "all" | "gateway") {
-        let listener = tokio::net::TcpListener::bind(&app.config.listen).await?;
-        tracing::info!(address = %app.config.listen, "RyzHub gateway listening");
+        let listener = tokio::net::TcpListener::bind(&app.config().listen).await?;
+        tracing::info!(address = %app.config().listen, "RyzHub gateway listening");
         let router = ryzhub_server::http::router(app.clone());
         servers.spawn(async move { axum::serve(listener, router).await.map_err(Into::into) });
-        if app.config.plugins.enabled {
-            let plugins = &app.config.plugins;
+        if app.config().plugins.enabled {
+            let plugins = &app.config().plugins;
             let listener = tokio::net::TcpListener::bind(&plugins.content_listen).await?;
             tracing::info!(address = %plugins.content_listen, "plugin content origin listening");
             let router = ryzhub_server::plugins::apps::content_router(app.clone());
@@ -168,7 +168,7 @@ async fn start_model_gateway(
     app: &App,
     servers: &mut JoinSet<anyhow::Result<()>>,
 ) -> anyhow::Result<()> {
-    let llm = &app.config.llm;
+    let llm = &app.config().llm;
     ryzhub_server::vault::secret(&llm.vault_key_env)?;
     let listener = tokio::net::TcpListener::bind(&llm.listen).await?;
     if let Some(path) = &llm.unix_socket {

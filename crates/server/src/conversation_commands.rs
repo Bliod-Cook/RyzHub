@@ -221,10 +221,10 @@ pub async fn catalog(
 ) -> ApiResult<Json<Value>> {
     let (ctx, mut tx) = crate::http::member_tx(&app, &headers, org).await?;
     let c = conversation_in(&mut tx, &ctx, conv).await?;
-    let settings = RunConfig::resolve(c.run_config, &c.mode, &app.config)?;
-    let policy = effective_policy(&mut tx, &app.config.policy, org).await?;
+    let settings = RunConfig::resolve(c.run_config, &c.mode, &app.config())?;
+    let policy = effective_policy(&mut tx, &app.config().policy, org).await?;
     let native = native_state(&mut tx, org, conv).await?;
-    let mut models = run_config::models(&app.config, &settings.harness, &settings.protocol);
+    let mut models = run_config::models(&app.config(), &settings.harness, &settings.protocol);
     models.retain(|m| policy.models.as_ref().is_none_or(|p| p.contains(m)));
     // Agent SDK accepts explicit model IDs through setModel. Its discovery list
     // contains convenience aliases, so explicit administrator routes remain valid.

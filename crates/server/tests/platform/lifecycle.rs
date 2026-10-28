@@ -74,7 +74,7 @@ async fn idle_conversations_archive_and_expired_workspaces_are_deleted() -> anyh
         .fetch_one(&h.db)
         .await?;
     let store =
-        ryzhub_server::workspace::blob::BlobStore::configured(&h.app.config.work.storage_root)?
+        ryzhub_server::workspace::blob::BlobStore::configured(&h.app.config().work.storage_root)?
             .scoped(org);
     assert!(store.get(&key).await.is_ok());
 

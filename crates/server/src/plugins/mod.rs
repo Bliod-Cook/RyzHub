@@ -75,7 +75,7 @@ pub struct Obtained {
 }
 
 pub fn fetcher(app: &App) -> fetch::Fetch {
-    fetch::Fetch::new(&app.config.plugins)
+    fetch::Fetch::new(&app.config().plugins)
 }
 
 /// Fetch and read `source`; `upload` is the archive of an upload.
@@ -152,7 +152,7 @@ pub async fn obtain(app: &App, source: &Source, upload: Option<&[u8]>) -> anyhow
 fn signed(app: &App, manifest: &Manifest, content_hash: &str) -> bool {
     manifest.signature.as_ref().is_some_and(|(key, signature)| {
         verify(
-            &app.config.plugins.trusted_keys,
+            &app.config().plugins.trusted_keys,
             key,
             signature,
             content_hash,
@@ -187,7 +187,7 @@ pub fn verify(
 
 /// The official catalog: `[{name, description, source, content_hash}]`.
 pub async fn catalog(app: &App) -> anyhow::Result<Vec<Value>> {
-    let url = &app.config.plugins.catalog_url;
+    let url = &app.config().plugins.catalog_url;
     if url.is_empty() {
         return Ok(vec![]);
     }
@@ -214,7 +214,7 @@ async fn catalog_entry(app: &App, name: &str) -> anyhow::Result<Value> {
 /// Unpack and read an archive in a `parse-plugin` process of its own.
 async fn parse_archive(app: &App, archive: &[u8]) -> anyhow::Result<(Manifest, String)> {
     ensure!(archive.len() <= package::MAX_BYTES, Code::PluginTooLarge);
-    let program = crate::child::program(&app.config.attachment_renderer)?;
+    let program = crate::child::program(&app.config().attachment_renderer)?;
     let timeout = std::time::Duration::from_secs(30);
     let reply = crate::child::run(&program, &["parse-plugin"], archive, 8 << 20, timeout)
         .await
@@ -475,7 +475,7 @@ pub async fn run_tools(
     org: Uuid,
     run: Uuid,
 ) -> anyhow::Result<Vec<RunTool>> {
-    if !app.config.plugins.enabled {
+    if !app.config().plugins.enabled {
         return Ok(vec![]);
     }
     type Row = (Uuid, String, Value, String, String, Value);
@@ -494,7 +494,7 @@ pub async fn run_tools(
     .bind(run)
     .fetch_all(&mut **tx)
     .await?;
-    let policy = crate::store::effective_policy(tx, &app.config.policy, org).await?;
+    let policy = crate::store::effective_policy(tx, &app.config().policy, org).await?;
     let apps = policy.allow_mcp_apps != Some(false);
     let mut tools = vec![];
     for (installation, plugin, manifest, server, remote, definition) in rows {
@@ -701,7 +701,7 @@ async fn open(
             };
             let purpose = format!("plugin:{installation}:{field}");
             let mut tx = app.store.tx(org).await?;
-            let secret = crate::vault::get(&mut tx, &app.config.llm, org, id, &purpose).await?;
+            let secret = crate::vault::get(&mut tx, &app.config().llm, org, id, &purpose).await?;
             tx.commit().await?;
             String::from_utf8(secret)?
         } else {

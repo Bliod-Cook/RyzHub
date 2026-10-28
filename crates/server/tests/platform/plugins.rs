@@ -602,7 +602,7 @@ async fn plugins_install_on_confirmation_and_serve_chat() -> anyhow::Result<()> 
         )
         .await?;
     let page_url = opened["url"].as_str().unwrap();
-    assert!(page_url.starts_with(&h.app.config.plugins.content_origin));
+    assert!(page_url.starts_with(&h.app.config().plugins.content_origin));
     assert_eq!(
         opened["result"]["structuredContent"]["tickets"],
         json!([1, 2])
@@ -915,7 +915,7 @@ async fn work_gateway_asks_once_for_tools_that_need_approval() -> anyhow::Result
         .claim(org, conv, Uuid::now_v7(), 60_000)
         .await?
         .unwrap();
-    owner::process_with_config(&h.app.store, &lease, &h.app.config).await?;
+    owner::process_with_config(&h.app.store, &lease, &h.app.config()).await?;
     let run: Uuid = sqlx::query_scalar("SELECT id FROM runs WHERE conversation_id=$1")
         .bind(conv)
         .fetch_one(&h.db)
@@ -1010,7 +1010,7 @@ async fn work_gateway_asks_once_for_tools_that_need_approval() -> anyhow::Result
         decision: "allow".into(),
     });
     h.send(&user, conv, decision).await?;
-    owner::process_with_config(&h.app.store, &lease, &h.app.config).await?;
+    owner::process_with_config(&h.app.store, &lease, &h.app.config()).await?;
     let answered = waiting.await??;
     assert!(
         answered["result"].to_string().contains("ticket 7 is open"),

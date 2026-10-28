@@ -45,7 +45,7 @@ pub async fn list(
     .fetch_all(&mut *tx)
     .await?;
     let prefs = preferences(&mut tx, org, ctx.user_id).await?;
-    let policy = effective_policy(&mut tx, &app.config.policy, org).await?;
+    let policy = effective_policy(&mut tx, &app.config().policy, org).await?;
     tx.commit().await?;
     let enabled = policy.allow_memory != Some(false);
     Ok(Json(
@@ -64,7 +64,7 @@ pub async fn put(
     // Membership is checked once: with the source conversation's access, else on its own.
     match input.source_conversation_id {
         Some(conv) => {
-            let a = access(&mut tx, &app.config, org, conv, user).await?;
+            let a = access(&mut tx, &app.config(), org, conv, user).await?;
             require!(
                 a.enabled && a.project == input.project_id,
                 Code::PolicyDenied
@@ -74,7 +74,7 @@ pub async fn put(
             context_in(&mut tx, user, org).await?;
         }
     }
-    let policy = effective_policy(&mut tx, &app.config.policy, org).await?;
+    let policy = effective_policy(&mut tx, &app.config().policy, org).await?;
     require!(policy.allow_memory != Some(false), Code::PolicyDenied);
     let prefs = preferences(&mut tx, org, user).await?;
     require!(prefs["enabled"] == true, Code::PolicyDenied);
@@ -160,7 +160,7 @@ pub async fn timeline_context(
 ) -> ApiResult<Json<Value>> {
     let user = authenticate(&app, &headers).await?.user_id;
     let mut tx = app.store.tx(org).await?;
-    let access = super::access(&mut tx, &app.config, org, conv, user).await?;
+    let access = super::access(&mut tx, &app.config(), org, conv, user).await?;
     let text: String = sqlx::query_scalar(
         "SELECT text FROM items WHERE org_id=$1 AND conversation_id=$2 AND id=$3
            AND kind='memory_context'",
@@ -275,7 +275,7 @@ pub async fn execute(
             } else {
                 "conversations"
             };
-            let model = &app.config.search.embedding_model;
+            let model = &app.config().search.embedding_model;
             let boundary = a.boundary();
             let matches =
                 crate::search::search(tx, org, a.user, &q, boundary, kind, vector, model).await?;
@@ -287,7 +287,7 @@ pub async fn execute(
             input.project_id = a.project;
             input.source_conversation_id = Some(a.conversation);
             input.request_key = Some(key);
-            let policy = crate::store::effective_policy(tx, &app.config.policy, org).await?;
+            let policy = crate::store::effective_policy(tx, &app.config().policy, org).await?;
             save(tx, org, a.user, input, &super::forbidden_words(&policy)).await?
         }
         "memory_forget" => {
@@ -315,7 +315,7 @@ fn search_args<'a>(app: &App, args: &'a Value) -> anyhow::Result<(&'a str, &'a s
     let query = args["query"].as_str().context(Code::InvalidToolArguments)?;
     let mode = args["mode"]
         .as_str()
-        .unwrap_or(if app.config.search.embeddings() {
+        .unwrap_or(if app.config().search.embeddings() {
             "hybrid"
         } else {
             "fulltext"

@@ -208,7 +208,7 @@ async fn database_idempotency_fencing_rls_and_transaction_outbox() -> anyhow::Re
         .claim(ctx.org_id, conv, Uuid::now_v7(), 3000)
         .await?
         .unwrap();
-    assert!(owner::process_with_config(&h.app.store, &old, &h.app.config).await?);
+    assert!(owner::process_with_config(&h.app.store, &old, &h.app.config()).await?);
     let first = h
         .app
         .store
@@ -365,12 +365,12 @@ async fn disabled_engines_refuse_work_conversations_and_runs() -> anyhow::Result
         Some(Code::WorkDisabled)
     );
     // A Work conversation from before, and a Chat one where no model gateway runs.
-    let mut without_models = (*h.app.config).clone();
+    let mut without_models = (*h.app.config()).clone();
     without_models.llm.enabled = false;
-    let mut before = (*h.app.config).clone();
+    let mut before = (*h.app.config()).clone();
     before.work.enabled = true;
     for (mode, config, code) in [
-        ("work", &*h.app.config, "WORK_DISABLED"),
+        ("work", &*h.app.config(), "WORK_DISABLED"),
         ("chat", &without_models, "MODEL_GATEWAY_DISABLED"),
     ] {
         let mut tx = h.app.store.tx(org).await?;
@@ -441,7 +441,7 @@ async fn two_devices_answer_cas_and_stale_execution_epoch() -> anyhow::Result<()
         .claim(ctx.org_id, conv, Uuid::now_v7(), 10_000)
         .await?
         .unwrap();
-    owner::process_with_config(&h.app.store, &lease, &h.app.config).await?;
+    owner::process_with_config(&h.app.store, &lease, &h.app.config()).await?;
     let run: Uuid = sqlx::query_scalar("SELECT id FROM runs WHERE conversation_id=$1")
         .bind(conv)
         .fetch_one(&h.db)
@@ -475,7 +475,7 @@ async fn two_devices_answer_cas_and_stale_execution_epoch() -> anyhow::Result<()
         .store
         .accept(ctx.org_id, ctx.user_id, conv, "old-device", &stale)
         .await?;
-    owner::process_with_config(&h.app.store, &lease, &h.app.config).await?;
+    owner::process_with_config(&h.app.store, &lease, &h.app.config()).await?;
     assert!(matches!(
         h.app
             .store
@@ -492,8 +492,8 @@ async fn two_devices_answer_cas_and_stale_execution_epoch() -> anyhow::Result<()
     );
     ra?;
     rb?;
-    owner::process_with_config(&h.app.store, &lease, &h.app.config).await?;
-    owner::process_with_config(&h.app.store, &lease, &h.app.config).await?;
+    owner::process_with_config(&h.app.store, &lease, &h.app.config()).await?;
+    owner::process_with_config(&h.app.store, &lease, &h.app.config()).await?;
     let mut accepted = 0;
     let mut rejected = 0;
     for cmd in [a, b] {
@@ -1004,7 +1004,7 @@ async fn parallel_approvals_each_resolve_and_the_run_resumes_after_the_last() ->
             .claim(org, conv, Uuid::now_v7(), 60000)
             .await?
             .unwrap();
-        let config = &h.app.config;
+        let config = &h.app.config();
         let turn = message(Uuid::now_v7(), "parallel approval");
         processed(&h, &ctx, &lease, config, &turn).await?;
         let run = only_run(&h, conv).await?;
@@ -1448,7 +1448,7 @@ async fn sync_projects_turn_events_before_acknowledging_them() -> anyhow::Result
             cid: Uuid::now_v7().to_string(),
             command: Some(Command::AnswerQuestion(answer)),
         };
-        let response = processed(&h, &ctx, &lease, &app.config, &envelope).await?;
+        let response = processed(&h, &ctx, &lease, &app.config(), &envelope).await?;
         ensure!(matches!(response, Body::CommandAck(_)));
         let answer: Value =
             sqlx::query_scalar("SELECT answer FROM native_requests WHERE action_id=$1")
@@ -2579,7 +2579,7 @@ async fn a_started_chat_keeps_its_provider_and_a_chosen_model_overrides_project_
             command: Some(command),
         };
         let (h, ctx, lease) = (&h, &ctx, &lease);
-        async move { processed(h, ctx, lease, &h.app.config, &envelope).await }
+        async move { processed(h, ctx, lease, &h.app.config(), &envelope).await }
     };
     let message = SendMessage {
         text: "hello".into(),

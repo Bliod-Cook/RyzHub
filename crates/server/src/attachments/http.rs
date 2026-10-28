@@ -48,7 +48,7 @@ pub async fn upload(
     // Authorized up front: a slow upload holds no database connection.
     let (ctx, policy) = {
         let (ctx, mut tx) = member_tx(&app, &headers, org).await?;
-        let policy = effective_policy(&mut tx, &app.config.policy, org).await?;
+        let policy = effective_policy(&mut tx, &app.config().policy, org).await?;
         tx.commit().await?;
         (ctx, policy)
     };

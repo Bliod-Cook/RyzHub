@@ -113,7 +113,7 @@ async fn create_run(
         &create.mode,
         settings,
         project,
-        &app.config,
+        &app.config(),
     )
     .await?;
     if created.is_none() {

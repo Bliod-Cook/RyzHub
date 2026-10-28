@@ -86,9 +86,9 @@ impl Stores {
 fn stores(app: &App, org: Uuid) -> anyhow::Result<Stores> {
     let store = |root: &str| anyhow::Ok(BlobStore::configured(root)?.scoped(org));
     Ok(Stores {
-        primary: store(&app.config.work.storage_root)?,
+        primary: store(&app.config().work.storage_root)?,
         secondary: app
-            .config
+            .config()
             .work
             .secondary_root
             .as_deref()
@@ -184,7 +184,7 @@ pub async fn enqueue(
     Json(input): Json<JobInput>,
 ) -> ApiResult<Json<Value>> {
     require!(
-        app.config.work.enabled
+        app.config().work.enabled
             && matches!(input.kind.as_str(), "checkpoint" | "archive" | "restore"),
         Code::InvalidInput
     );
@@ -306,8 +306,8 @@ async fn automatic_job(
     if checkpoint {
         return Ok(Some("checkpoint"));
     }
-    let policy = effective_policy(tx, &app.config.policy, org).await?;
-    let idle = app.config.idle_suspend_secs(&policy);
+    let policy = effective_policy(tx, &app.config().policy, org).await?;
+    let idle = app.config().idle_suspend_secs(&policy);
     if idle == 0 {
         return Ok(None);
     }

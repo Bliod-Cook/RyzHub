@@ -28,7 +28,7 @@ pub fn router(app: App) -> Router {
         conversation_commands as conversations, llm, memory, projects, search, workspace,
     };
     let origins: Vec<axum::http::HeaderValue> = app
-        .config
+        .config()
         .allowed_origins
         .iter()
         .filter_map(|origin| origin.parse().ok())
@@ -267,7 +267,7 @@ async fn healthz(State(app): State<App>) -> ApiResult<Json<Value>> {
 }
 
 async fn capabilities(State(app): State<App>) -> Json<Value> {
-    let config = &app.config;
+    let config = &app.config();
     let harnesses = crate::run_config::work_harnesses(config);
     // Null where the engine is off.
     Json(json!({

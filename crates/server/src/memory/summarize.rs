@@ -11,7 +11,7 @@ pub async fn summarize(
     policy: &ryzhub_domain::Policy,
     points: String,
 ) -> anyhow::Result<String> {
-    if !app.config.llm.enabled {
+    if !app.config().llm.enabled {
         return Ok(points);
     }
     // The organization may keep more out of memory than the platform does.
@@ -29,8 +29,9 @@ pub async fn summarize(
         explicitly asked to remember them. Return plain text in the user's language, at most \
         1200 characters."
     );
-    let model = &app.config.llm.model;
-    let protocol = crate::run_config::default_chat_protocol(&app.config);
+    let config = app.config();
+    let model = &config.llm.model;
+    let protocol = crate::run_config::default_chat_protocol(&config);
     let request = if protocol == "responses" {
         json!({"model": model, "instructions": system, "max_output_tokens": 512,
             "input": [{"role": "user", "content": points}], "stream": false})

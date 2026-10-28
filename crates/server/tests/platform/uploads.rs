@@ -116,7 +116,7 @@ async fn large_files_upload_in_parts_that_resume_and_complete_once() -> anyhow::
         .await?;
     assert_eq!(content.as_ref(), file.as_slice());
     let parts =
-        ryzhub_server::workspace::blob::BlobStore::configured(&h.app.config.work.storage_root)?
+        ryzhub_server::workspace::blob::BlobStore::configured(&h.app.config().work.storage_root)?
             .scoped(org)
             .within("attachments")
             .within("uploads")
@@ -145,7 +145,7 @@ async fn large_files_upload_in_parts_that_resume_and_complete_once() -> anyhow::
         .await?
         .error_for_status()?;
     let parts =
-        ryzhub_server::workspace::blob::BlobStore::configured(&h.app.config.work.storage_root)?
+        ryzhub_server::workspace::blob::BlobStore::configured(&h.app.config().work.storage_root)?
             .scoped(org)
             .within("attachments")
             .within("uploads")

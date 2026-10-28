@@ -243,7 +243,7 @@ impl Actor {
         self.persist_live().await?;
         let mut results = vec![];
         while results.len() < COMMAND_BATCH {
-            match process_next(&self.app.store, &self.lease, &self.app.config).await? {
+            match process_next(&self.app.store, &self.lease, &self.app.config()).await? {
                 Some(processed) => results.push(processed),
                 None => break,
             }

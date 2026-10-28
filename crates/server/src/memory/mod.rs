@@ -87,7 +87,7 @@ pub async fn run_access(
     .bind(run)
     .fetch_one(&mut **tx)
     .await?;
-    access(tx, &app.config, org, conv, user).await
+    access(tx, &app.config(), org, conv, user).await
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Save {
@@ -673,11 +673,11 @@ fn append_data(text: &mut String, budget: &mut usize, tag: &str, value: &Value) 
 /// Idle summaries contain user-supplied points only; tools and assistant speculation are excluded.
 pub async fn digest(app: &App, org: Uuid, conversation: Uuid, user: Uuid) -> anyhow::Result<bool> {
     let mut tx = app.store.tx(org).await?;
-    let a = access(&mut tx, &app.config, org, conversation, user).await?;
+    let a = access(&mut tx, &app.config(), org, conversation, user).await?;
     if !a.enabled || !a.history {
         return Ok(false);
     }
-    let policy = crate::store::effective_policy(&mut tx, &app.config.policy, org).await?;
+    let policy = crate::store::effective_policy(&mut tx, &app.config().policy, org).await?;
     if policy.allow_memory_auto_extract == Some(false) {
         return Ok(false);
     }
@@ -733,7 +733,7 @@ pub async fn digest(app: &App, org: Uuid, conversation: Uuid, user: Uuid) -> any
         .bind(conversation)
         .execute(&mut *tx)
         .await?;
-    let a = access(&mut tx, &app.config, org, conversation, user).await?;
+    let a = access(&mut tx, &app.config(), org, conversation, user).await?;
     if !a.enabled || !a.history {
         return Ok(false);
     }
@@ -808,11 +808,11 @@ pub async fn collector(app: App, worker: PgPool) -> anyhow::Result<()> {
                    OR ended_at>now()-interval '30 seconds'))
              ORDER BY c.digest_available_at,c.created_at LIMIT 100",
         )
-        .bind(app.config.search.enabled)
+        .bind(app.config().search.enabled)
         .fetch_all(&worker)
         .await?;
         for (org, conv, user) in rows {
-            if app.config.policy.allow_memory == Some(false) {
+            if app.config().policy.allow_memory == Some(false) {
                 break;
             }
             if let Err(error) = digest(&app, org, conv, user).await {
@@ -859,7 +859,7 @@ pub async fn collector(app: App, worker: PgPool) -> anyhow::Result<()> {
             // This short cleanup transaction holds no channel locks and performs no host IO.
             collect_history_references(&mut tx, org).await?;
             collect_stale_memories(&mut tx, org).await?;
-            let policy = effective_policy(&mut tx, &app.config.policy, org).await?;
+            let policy = effective_policy(&mut tx, &app.config().policy, org).await?;
             // TODO(org): freezes matter once an organization policy can turn memory off.
             if policy.allow_memory == Some(false) {
                 sqlx::query(

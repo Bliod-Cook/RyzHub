@@ -23,7 +23,7 @@ use uuid::Uuid;
 use super::{auth, authenticate, user_orgs};
 use crate::{
     app::App,
-    config::{GithubProvider, OidcProvider},
+    config::{Config, GithubProvider, OidcProvider},
     error::{ApiResult, Code},
     store::{hash_token, new_token},
 };
@@ -37,8 +37,8 @@ enum Provider<'a> {
     Github(&'a GithubProvider),
 }
 
-fn provider<'a>(app: &'a App, name: &str) -> anyhow::Result<Provider<'a>> {
-    let auth = &app.config.auth;
+fn provider<'a>(config: &'a Config, name: &str) -> anyhow::Result<Provider<'a>> {
+    let auth = &config.auth;
     if name == "github" {
         return auth
             .github
@@ -55,7 +55,7 @@ fn provider<'a>(app: &'a App, name: &str) -> anyhow::Result<Provider<'a>> {
 
 /// The providers clients offer: `[{id, label, kind}]`.
 pub fn providers(app: &App) -> Vec<Value> {
-    let auth = &app.config.auth;
+    let auth = &app.config().auth;
     auth.oidc
         .iter()
         .map(|p| {
@@ -72,7 +72,7 @@ pub fn providers(app: &App) -> Vec<Value> {
 fn callback_url(app: &App, name: &str) -> String {
     format!(
         "{}/auth/oauth/{name}/callback",
-        app.config.public_url.trim_end_matches('/')
+        app.config().public_url.trim_end_matches('/')
     )
 }
 
@@ -132,13 +132,13 @@ pub async fn start(
     Path(name): Path<String>,
     Query(start): Query<Start>,
 ) -> ApiResult<Redirect> {
-    let provider = provider(&app, &name)?;
+    let config = app.config();
+    let provider = provider(&config, &name)?;
     // Credentials before `@` would make a listed prefix name another host.
     require!(
         url::Url::parse(&start.return_to)
             .is_ok_and(|url| url.username().is_empty() && url.password().is_none())
-            && app
-                .config
+            && config
                 .auth
                 .return_urls
                 .iter()
@@ -266,7 +266,8 @@ pub async fn callback(
     let outcome = async {
         ensure!(returned.error.is_none(), Code::LoginFailed);
         let code = returned.code.context(Code::LoginFailed)?;
-        let identity = match provider(&app, &name)? {
+        let config = app.config();
+        let identity = match provider(&config, &name)? {
             Provider::Oidc(oidc) => {
                 oidc_identity(&app, oidc, &name, &code, &verifier, &nonce).await?
             }
@@ -515,13 +516,13 @@ async fn account(
     if let Some((user, status)) = existing {
         // Joining an account by email needs the provider to vouch for the email.
         ensure!(
-            identity.verified && app.config.auth.link_verified_email && status == "active",
+            identity.verified && app.config().auth.link_verified_email && status == "active",
             Code::AccountExists
         );
         return link_identity(user).await;
     }
     ensure!(identity.verified, Code::IdentityEmailRequired);
-    ensure!(app.config.auth.registration, Code::RegistrationClosed);
+    ensure!(app.config().auth.registration, Code::RegistrationClosed);
     let (user, _) = auth::create_account(app, &email, identity.name.as_deref(), "!")
         .await?
         .context(Code::AccountExists)?;

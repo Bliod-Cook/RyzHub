@@ -162,7 +162,7 @@ pub async fn retrieve(
     boundary: Boundary,
     kind: &str,
 ) -> anyhow::Result<Vec<Value>> {
-    ensure!(app.config.search.enabled, Code::TemporarilyUnavailable);
+    ensure!(app.config().search.enabled, Code::TemporarilyUnavailable);
     ensure!(
         valid(&q.q, &q.mode) && q.from.zip(q.to).is_none_or(|(from, to)| from <= to),
         Code::InvalidArguments
@@ -170,7 +170,7 @@ pub async fn retrieve(
     let vector = query_vector(app, org, user, &q.q, &q.mode).await?;
     let mut tx = app.store.tx(org).await?;
     context_in(&mut tx, user, org).await?;
-    let model = &app.config.search.embedding_model;
+    let model = &app.config().search.embedding_model;
     let rows = search(&mut tx, org, user, q, boundary, kind, vector, model).await?;
     tx.commit().await?;
     Ok(rows)
@@ -251,7 +251,7 @@ async fn retry_later(tx: &mut Tx<'_>, app: &App, job: &Job, error: &str) -> anyh
     .bind(job.source_id)
     .bind(job.source_version)
     .bind(job.claim_token)
-    .bind(app.config.search.max_attempts)
+    .bind(app.config().search.max_attempts)
     .bind(error)
     .execute(&mut **tx)
     .await?;
@@ -364,7 +364,7 @@ pub async fn publish(
                     .bind(n as i32)
                     .bind(text)
                     .bind(embedding::vector_literal(vector))
-                    .bind(&app.config.search.embedding_model)
+                    .bind(&app.config().search.embedding_model)
                     .bind(job.source_version)
                     .execute(&mut *tx)
                     .await?;
@@ -397,7 +397,7 @@ pub async fn process(app: &App, job: &Job) -> anyhow::Result<bool> {
         && s.doc_kind == "memory"
     {
         let policy =
-            crate::store::effective_policy(&mut tx, &app.config.policy, job.org_id).await?;
+            crate::store::effective_policy(&mut tx, &app.config().policy, job.org_id).await?;
         let prefs = crate::memory::preferences(&mut tx, job.org_id, s.owner_user_id).await?;
         policy.allow_memory != Some(false) && prefs["enabled"] == true
     } else {
@@ -409,7 +409,7 @@ pub async fn process(app: &App, job: &Job) -> anyhow::Result<bool> {
         && s.source_version == job.source_version
         && s.doc_kind != "title"
         && memory_allowed
-        && app.config.search.embeddings()
+        && app.config().search.embeddings()
     {
         let mut vectors = Vec::new();
         for batch in embedding::chunks(&s.text).chunks(64) {

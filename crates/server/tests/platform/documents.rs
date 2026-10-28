@@ -196,7 +196,7 @@ async fn documents_become_knowledge_files_and_keep_their_source() -> anyhow::Res
         .unwrap()
         .to_owned();
     let store =
-        ryzhub_server::workspace::blob::BlobStore::configured(&h.app.config.work.storage_root)?
+        ryzhub_server::workspace::blob::BlobStore::configured(&h.app.config().work.storage_root)?
             .scoped(org)
             .within("attachments");
     assert!(store.get(&sha).await.is_ok());

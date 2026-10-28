@@ -42,7 +42,7 @@ pub async fn preview(
 ) -> ApiResult<Json<Value>> {
     ensure_enabled(&app)?;
     let (ctx, mut tx) = member_tx(&app, &headers, org).await?;
-    let policy = effective_policy(&mut tx, &app.config.policy, org).await?;
+    let policy = effective_policy(&mut tx, &app.config().policy, org).await?;
     tx.commit().await?;
     require!(
         policy.allow_personal_plugins != Some(false),
@@ -126,7 +126,7 @@ pub async fn preview(
 }
 
 fn ensure_enabled(app: &App) -> anyhow::Result<()> {
-    ensure!(app.config.plugins.enabled, Code::PluginsDisabled);
+    ensure!(app.config().plugins.enabled, Code::PluginsDisabled);
     Ok(())
 }
 
@@ -314,8 +314,9 @@ async fn settings(
                 if field.secret {
                     let text = value.as_str().context(Code::InvalidArguments)?;
                     let purpose = format!("plugin:{installation}:{name}");
-                    let id = crate::vault::put(tx, &app.config.llm, org, &purpose, text.as_bytes())
-                        .await?;
+                    let id =
+                        crate::vault::put(tx, &app.config().llm, org, &purpose, text.as_bytes())
+                            .await?;
                     if let Some(old) = kept_secrets
                         .insert(name.clone(), json!(id))
                         .and_then(|v| v.as_str().and_then(|v| v.parse().ok()))
@@ -477,7 +478,7 @@ pub async fn list(
     let entries = list_in(&mut tx, &ctx, None).await?;
     tx.commit().await?;
     Ok(Json(
-        json!({"plugins": entries, "enabled": app.config.plugins.enabled}),
+        json!({"plugins": entries, "enabled": app.config().plugins.enabled}),
     ))
 }
 

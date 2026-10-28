@@ -82,7 +82,7 @@ pub async fn apply(
                 owner,
                 sandbox_id,
                 &harness,
-                &app.config,
+                &app.config(),
                 &shared,
             )
             .await?;

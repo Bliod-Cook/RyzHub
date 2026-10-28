@@ -27,7 +27,7 @@ static TLS_ENDPOINTS: Mutex<Option<HashMap<String, Endpoint>>> = Mutex::new(None
 /// Where `node`'s host agent listens: its Unix socket, or its TLS listener.
 pub fn node_endpoint(app: &App, node: &str) -> anyhow::Result<Endpoint> {
     let config = app
-        .config
+        .config()
         .sandbox
         .nodes()
         .into_iter()
@@ -54,7 +54,7 @@ pub fn node_endpoint(app: &App, node: &str) -> anyhow::Result<Endpoint> {
 
 /// The node `sandbox` runs on. With one node configured that is the answer without a lookup.
 pub async fn node_of(app: &App, org: Uuid, sandbox: Uuid) -> anyhow::Result<String> {
-    if let [only] = app.config.sandbox.nodes().as_slice() {
+    if let [only] = app.config().sandbox.nodes().as_slice() {
         return Ok(only.name.clone());
     }
     let mut tx = app.store.tx(org).await?;
@@ -73,7 +73,7 @@ pub async fn node_of(app: &App, org: Uuid, sandbox: Uuid) -> anyhow::Result<Stri
 /// below capacity, it is the one the conversation last ran on (its workspace is there), else
 /// the least loaded.
 pub async fn place(tx: &mut Tx<'_>, app: &App, conv: Uuid) -> anyhow::Result<String> {
-    let nodes = app.config.sandbox.nodes();
+    let nodes = app.config().sandbox.nodes();
     let chosen = if let [only] = nodes.as_slice() {
         only.clone()
     } else {
@@ -128,8 +128,8 @@ pub struct Limits {
 }
 
 pub async fn limits(tx: &mut Tx<'_>, app: &App, org: Uuid) -> anyhow::Result<Limits> {
-    let config = &app.config.sandbox;
-    let policy = crate::store::effective_policy(tx, &app.config.policy, org).await?;
+    let config = &app.config().sandbox;
+    let policy = crate::store::effective_policy(tx, &app.config().policy, org).await?;
     let egress = config
         .egress_allow
         .iter()
@@ -152,7 +152,7 @@ pub async fn limits(tx: &mut Tx<'_>, app: &App, org: Uuid) -> anyhow::Result<Lim
 /// A new sandbox of the lease's conversation: the configured image, layer and resources,
 /// within `limits`. Work sandboxes (`persistent`) get at least 512 MiB of memory.
 pub fn spec(app: &App, lease: &Lease, id: Uuid, persistent: bool, limits: Limits) -> SandboxSpec {
-    let config = &app.config.sandbox;
+    let config = &app.config().sandbox;
     SandboxSpec {
         id,
         org_id: lease.org_id,
@@ -182,7 +182,7 @@ pub async fn endpoint(app: &App, org: Uuid, sandbox: Uuid) -> anyhow::Result<End
 /// whose reply was lost to a broken connection is retried unchanged; application errors are
 /// not retried.
 pub async fn host_on(app: &App, node: &str, command: HostCommand) -> anyhow::Result<Value> {
-    ensure!(app.config.sandbox.enabled, Code::SandboxDisabled);
+    ensure!(app.config().sandbox.enabled, Code::SandboxDisabled);
     let endpoint = node_endpoint(app, node)?;
     let mut attempt = 0;
     loop {
@@ -215,7 +215,7 @@ pub async fn host_workspace(
     workspace: Uuid,
     command: HostCommand,
 ) -> anyhow::Result<()> {
-    let configured = app.config.sandbox.nodes();
+    let configured = app.config().sandbox.nodes();
     let nodes: Vec<String> = if let [only] = configured.as_slice() {
         vec![only.name.clone()]
     } else {
@@ -318,7 +318,7 @@ pub async fn ensure_sandbox(
     run: Uuid,
     link: &OwnerLink,
 ) -> anyhow::Result<Uuid> {
-    ensure!(app.config.sandbox.enabled, Code::SandboxDisabled);
+    ensure!(app.config().sandbox.enabled, Code::SandboxDisabled);
     cleanup(app, lease, true).await?;
     let (id, spec, fresh) = {
         let mut tx = crate::runs::guarded(&app.store, lease, run).await?;
@@ -404,7 +404,7 @@ pub async fn ensure_sandbox(
     crate::projects::mount(app, lease, run, id).await?;
     crate::attachments::sandbox::sync(app, lease, id).await?;
     // A fresh key per dispatch supersedes the previous one; accepted streams continue.
-    if app.config.llm.unix_socket.is_some() {
+    if app.config().llm.unix_socket.is_some() {
         let user = run_creator(app, lease, run).await?;
         let key = keys::issue_sandbox_key(
             &app.store,
@@ -415,7 +415,7 @@ pub async fn ensure_sandbox(
                 run_id: run,
                 sandbox_id: id,
                 lease_epoch: 1,
-                models: vec![app.config.llm.model.clone()],
+                models: vec![app.config().llm.model.clone()],
             },
         )
         .await?;
@@ -449,7 +449,7 @@ pub async fn rotate_key(
     token: String,
 ) -> anyhow::Result<()> {
     let socket_name = Path::new(
-        app.config
+        app.config()
             .llm
             .unix_socket
             .as_ref()
@@ -573,7 +573,7 @@ pub async fn sync_events(
 
 /// Whether Chat workspaces are checkpointed: configured, with storage to keep them in.
 pub fn chat_checkpoints(app: &App) -> bool {
-    app.config.sandbox.chat_checkpoints && !app.config.work.storage_root.is_empty()
+    app.config().sandbox.chat_checkpoints && !app.config().work.storage_root.is_empty()
 }
 
 /// Whether the conversation's workspace may have changed since its last checkpoint: a run
@@ -630,7 +630,7 @@ pub async fn cleanup(app: &App, lease: &Lease, reusing: bool) -> anyhow::Result<
         )
         .bind(lease.org_id)
         .bind(lease.conversation_id)
-        .bind(app.config.sandbox.chat_idle_secs as i64)
+        .bind(app.config().sandbox.chat_idle_secs as i64)
         .fetch_all(&mut *tx)
         .await?;
         let expired = sqlx::query_scalar(
@@ -690,7 +690,8 @@ pub async fn reclaim(app: App, worker: sqlx::PgPool) -> anyhow::Result<()> {
 }
 
 pub async fn reclaim_once(app: &App, worker: &sqlx::PgPool) -> anyhow::Result<()> {
-    let config = &app.config.sandbox;
+    let snapshot = app.config();
+    let config = &snapshot.sandbox;
     // A stopped sandbox is never used again: resuming, restoring and recovering a Work
     // workspace all start a new one from a checkpoint, and a Chat run only reuses a running
     // one. With no writer left to fence out, it is destroyed under the last epoch: fences the
@@ -751,7 +752,7 @@ async fn image_references(
     app: &App,
     worker: &sqlx::PgPool,
 ) -> anyhow::Result<(Vec<String>, Vec<String>)> {
-    let config = &app.config.sandbox;
+    let config = &app.config().sandbox;
     let configured = [&config.image, &config.deps]
         .into_iter()
         .filter(|image| !image.is_empty())
@@ -784,8 +785,8 @@ async fn image_references(
 /// sandbox there uses.
 pub async fn collect_images(app: &App, worker: &sqlx::PgPool) -> anyhow::Result<()> {
     let (current, used) = image_references(app, worker).await?;
-    let grace = app.config.sandbox.image_gc_after_secs as i64;
-    for node in app.config.sandbox.nodes() {
+    let grace = app.config().sandbox.image_gc_after_secs as i64;
+    for node in app.config().sandbox.nodes() {
         let Ok(listing) = host_on(app, &node.name, HostCommand::Images).await else {
             continue;
         };
@@ -852,7 +853,7 @@ pub async fn collect_images(app: &App, worker: &sqlx::PgPool) -> anyhow::Result<
 /// meanwhile, so no run places a sandbox between the check and the removal: a run that comes
 /// first keeps the workspace, one that comes after restores it.
 async fn evict_workspaces(app: &App, worker: &sqlx::PgPool) -> anyhow::Result<()> {
-    let idle = app.config.sandbox.workspace_evict_after_secs as i64;
+    let idle = app.config().sandbox.workspace_evict_after_secs as i64;
     let candidates: Vec<(Uuid, Uuid)> = sqlx::query_as(
         "SELECT h.org_id,h.conversation_id FROM workspace_heads h
          JOIN checkpoints c ON c.org_id=h.org_id AND c.id=h.checkpoint_id
@@ -1007,7 +1008,7 @@ pub async fn collect_egress(app: &App, node: &str) -> anyhow::Result<usize> {
 /// keeps leases alive.
 pub async fn heartbeat(app: App, worker: sqlx::PgPool) -> anyhow::Result<()> {
     loop {
-        for node in &app.config.sandbox.nodes() {
+        for node in &app.config().sandbox.nodes() {
             let Ok(status) = host_on(&app, &node.name, HostCommand::Status).await else {
                 continue;
             };

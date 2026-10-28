@@ -142,7 +142,7 @@ impl Harness {
         h.serve(unix_listener, gateway::router(app.clone()));
         h.serve(api_listener, router(app.clone()));
         // Work sandboxes keep their node lease as long as a worker role runs.
-        if app.config.work.enabled {
+        if app.config().work.enabled {
             let worker = PgPool::connect(&h.worker_url).await?;
             h.tasks.push(tokio::spawn(async move {
                 let _ = ryzhub_server::sandbox::heartbeat(app, worker).await;
@@ -189,7 +189,7 @@ impl Harness {
         project: Option<Uuid>,
     ) -> anyhow::Result<Conversation> {
         let mut tx = self.app.store.tx(ctx.org_id).await?;
-        let config = &self.app.config;
+        let config = &self.app.config();
         let created = create_in(
             &mut tx,
             ctx,
@@ -293,10 +293,10 @@ impl Harness {
     }
 
     pub async fn close(self) -> anyhow::Result<()> {
-        if self.app.config.sandbox.enabled {
-            release(&self.db, Path::new(&self.app.config.sandbox.host_socket)).await;
+        if self.app.config().sandbox.enabled {
+            release(&self.db, Path::new(&self.app.config().sandbox.host_socket)).await;
         }
-        if let Some(path) = &self.app.config.llm.unix_socket {
+        if let Some(path) = &self.app.config().llm.unix_socket {
             let _ = std::fs::remove_file(path);
         }
         for task in self.tasks {
@@ -325,6 +325,13 @@ pub fn work(config: &mut Config) {
     config.work.model = "gpt-5.4".into();
     let secondary = Path::new(&config.work.storage_root).with_file_name("secondary");
     config.work.secondary_root = Some(secondary.display().to_string());
+}
+
+/// Change the configuration `app`, and every clone of it, runs with.
+pub fn reconfigure(app: &App, change: impl FnOnce(&mut Config)) {
+    let mut config = (*app.config()).clone();
+    change(&mut config);
+    app.set_config(config);
 }
 
 pub fn id(value: &Value, key: &str) -> Uuid {

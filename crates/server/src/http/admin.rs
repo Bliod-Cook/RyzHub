@@ -71,7 +71,7 @@ pub async fn audit(
 /// `GET /admin/settings`: the effective instance configuration.
 async fn settings(State(app): State<App>, headers: HeaderMap) -> ApiResult<Json<Value>> {
     admin(&app, &headers).await?;
-    let config = &app.config;
+    let config = &app.config();
     let isolation = match (config.sandbox.enabled, config.sandbox.runtime.as_str()) {
         (false, _) => "none",
         (true, "runsc") => "user_kernel",

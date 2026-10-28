@@ -119,8 +119,8 @@ pub async fn open(
         .execute(&app.store.pool)
         .await?;
     Ok(Json(json!({
-        "url": format!("{}/apps/{token}", app.config.plugins.content_origin.trim_end_matches('/')),
-        "origin": app.config.plugins.content_origin.trim_end_matches('/'),
+        "url": format!("{}/apps/{token}", app.config().plugins.content_origin.trim_end_matches('/')),
+        "origin": app.config().plugins.content_origin.trim_end_matches('/'),
         "tool": tool.name,
         "plugin": tool.plugin,
         "tools": names,
@@ -148,7 +148,7 @@ fn policy(app: &App, declared: &Value) -> String {
     };
     let connect = domains("connectDomains");
     let resources = domains("resourceDomains");
-    let ancestors = app.config.allowed_origins.join(" ");
+    let ancestors = app.config().allowed_origins.join(" ");
     format!(
         "default-src 'none'; script-src 'unsafe-inline' {resources}; style-src 'unsafe-inline' {resources}; \
          img-src data: blob: {resources}; font-src data: {resources}; media-src data: blob: {resources}; \
@@ -227,7 +227,7 @@ pub async fn call(
         .into_iter()
         .find(|tool| tool.name == request.tool)
         .context(Code::ToolDenied)?;
-    let policy = crate::store::effective_policy(&mut tx, &app.config.policy, org).await?;
+    let policy = crate::store::effective_policy(&mut tx, &app.config().policy, org).await?;
     tx.commit().await?;
     require!(
         !policy

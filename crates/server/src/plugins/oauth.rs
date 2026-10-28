@@ -32,14 +32,14 @@ const MAX_ANSWER: usize = 256 * 1024;
 fn callback_url(app: &App) -> String {
     format!(
         "{}/plugins/oauth/callback",
-        app.config.public_url.trim_end_matches('/')
+        app.config().public_url.trim_end_matches('/')
     )
 }
 
 fn document_url(app: &App) -> String {
     format!(
         "{}/plugins/oauth/client.json",
-        app.config.public_url.trim_end_matches('/')
+        app.config().public_url.trim_end_matches('/')
     )
 }
 
@@ -49,7 +49,7 @@ pub async fn client_document(State(app): State<App>) -> Json<Value> {
     Json(json!({
         "client_id": document_url(&app),
         "client_name": "RyzHub",
-        "client_uri": app.config.plugins.client_url,
+        "client_uri": app.config().plugins.client_url,
         "redirect_uris": [callback_url(&app)],
         "grant_types": ["authorization_code", "refresh_token"],
         "response_types": ["code"],
@@ -270,7 +270,8 @@ pub struct Returned {
 /// `GET /plugins/oauth/callback`: the browser back from the authorization server.
 pub async fn callback(State(app): State<App>, Query(returned): Query<Returned>) -> Response {
     let outcome = finish(&app, returned).await;
-    let base = app.config.plugins.client_url.trim_end_matches('/');
+    let config = app.config();
+    let base = config.plugins.client_url.trim_end_matches('/');
     let target = match outcome {
         Ok(installation) => format!("{base}/#/plugins?connected={installation}"),
         Err(error) => {
@@ -410,7 +411,7 @@ async fn store(
     let purpose = format!("plugin-oauth:{installation}:{server}");
     let secret = crate::vault::put(
         &mut tx,
-        &app.config.llm,
+        &app.config().llm,
         org,
         &purpose,
         kept.to_string().as_bytes(),
@@ -472,7 +473,7 @@ pub async fn token(
     };
     let purpose = format!("plugin-oauth:{installation}:{server}");
     let kept: Value = serde_json::from_slice(
-        &crate::vault::get(&mut tx, &app.config.llm, org, secret, &purpose).await?,
+        &crate::vault::get(&mut tx, &app.config().llm, org, secret, &purpose).await?,
     )?;
     tx.commit().await?;
     let fresh = expires.is_none_or(|at| at > chrono::Utc::now() + chrono::Duration::seconds(60));

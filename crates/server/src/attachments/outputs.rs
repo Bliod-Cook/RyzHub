@@ -283,7 +283,7 @@ async fn owner(app: &App, lease: &Lease) -> anyhow::Result<Owner> {
             .bind(lease.conversation_id)
             .fetch_one(&mut *tx)
             .await?;
-    let policy = effective_policy(&mut tx, &app.config.policy, lease.org_id).await?;
+    let policy = effective_policy(&mut tx, &app.config().policy, lease.org_id).await?;
     tx.commit().await?;
     Ok(Owner {
         user,

@@ -110,7 +110,7 @@ pub async fn create(
     manifest["thread_id"] = json!(thread);
     manifest["harness"] = json!(settings.harness);
     manifest["harness_version"] = json!(crate::run_config::harness_version(
-        &app.config,
+        &app.config(),
         &settings.harness
     ));
     publish(app, lease, sandbox_id, artifact, manifest, Some(gseq)).await?;

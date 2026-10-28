@@ -71,7 +71,7 @@ pub async fn put(
         Code::InvalidInput
     );
     let mut tx = app.store.tx(org).await?;
-    let policy = effective_policy(&mut tx, &app.config.policy, org).await?;
+    let policy = effective_policy(&mut tx, &app.config().policy, org).await?;
     require!(
         input.organization || policy.allow_personal_credentials != Some(false),
         Code::Forbidden
@@ -80,7 +80,7 @@ pub async fn put(
     let owner = (!input.organization).then_some(ctx.user_id);
     let secret = vault::put(
         &mut tx,
-        &app.config.llm,
+        &app.config().llm,
         org,
         &purpose(id, owner),
         input.api_key.as_bytes(),
@@ -217,6 +217,6 @@ pub async fn member_key(
         return Ok(None);
     };
     let secret = secret.context(Code::CredentialUnavailable)?;
-    let key = vault::get(tx, &app.config.llm, org, secret, &purpose(id, owner)).await?;
+    let key = vault::get(tx, &app.config().llm, org, secret, &purpose(id, owner)).await?;
     Ok(Some((id, String::from_utf8(key)?)))
 }

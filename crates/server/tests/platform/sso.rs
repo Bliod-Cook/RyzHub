@@ -408,7 +408,7 @@ async fn closing_registration_lets_members_in_and_keeps_newcomers_out() -> anyho
     // The same instance with sign-up closed.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let base = format!("http://{}", listener.local_addr()?);
-    let mut config = (*h.app.config).clone();
+    let mut config = (*h.app.config()).clone();
     config.public_url = base.clone();
     config.auth.registration = false;
     let closed = App::new(h.app.store.clone(), h.app.nats.clone(), config)?;

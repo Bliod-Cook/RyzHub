@@ -54,7 +54,7 @@ pub async fn policy(
     Path(org): Path<Uuid>,
 ) -> ApiResult<Json<ryzhub_domain::Policy>> {
     let (_, mut tx) = crate::http::member_tx(&app, &headers, org).await?;
-    let policy = effective_policy(&mut tx, &app.config.policy, org).await?;
+    let policy = effective_policy(&mut tx, &app.config().policy, org).await?;
     tx.commit().await?;
     Ok(Json(policy))
 }
@@ -67,9 +67,9 @@ pub async fn models(
     Path(org): Path<Uuid>,
 ) -> ApiResult<Json<Value>> {
     let (_, mut tx) = crate::http::member_tx(&app, &headers, org).await?;
-    let policy = effective_policy(&mut tx, &app.config.policy, org).await?;
+    let policy = effective_policy(&mut tx, &app.config().policy, org).await?;
     tx.commit().await?;
-    let config = &app.config;
+    let config = &app.config();
     let catalog = run_config::catalog(config);
     let list = |harness: &str| -> Vec<Value> {
         let default = match (harness, run_config::acp(config, harness)) {

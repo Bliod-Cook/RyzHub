@@ -51,7 +51,7 @@ async fn owned(
 
 /// The organization's policy, which must allow projects.
 async fn allowed(app: &App, tx: &mut Tx<'_>, org: Uuid) -> anyhow::Result<ryzhub_domain::Policy> {
-    let policy = effective_policy(tx, &app.config.policy, org).await?;
+    let policy = effective_policy(tx, &app.config().policy, org).await?;
     ensure!(policy.allow_projects != Some(false), Code::PolicyDenied);
     Ok(policy)
 }
@@ -148,8 +148,8 @@ async fn validate_defaults(
         .context(Code::InvalidDefaults)?
         .remove("mode")
         .unwrap_or(json!("chat"));
-    let c = RunConfig::resolve(v, mode.as_str().context(Code::InvalidMode)?, &app.config)?;
-    c.validate(tx, org, &app.config).await?;
+    let c = RunConfig::resolve(v, mode.as_str().context(Code::InvalidMode)?, &app.config())?;
+    c.validate(tx, org, &app.config()).await?;
     Ok(())
 }
 
@@ -550,7 +550,7 @@ pub async fn mount(app: &App, lease: &Lease, run: Uuid, sandbox: Uuid) -> anyhow
     let (files, instructions) = {
         let mut tx = app.store.fenced(lease).await?;
         let files = run_files(&mut tx, lease.org_id, run).await?;
-        let instructions = harness_instructions(&mut tx, lease, run, &app.config).await?;
+        let instructions = harness_instructions(&mut tx, lease, run, &app.config()).await?;
         tx.commit().await?;
         (files, instructions)
     };

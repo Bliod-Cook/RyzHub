@@ -87,7 +87,7 @@ pub async fn run(app: App, worker: sqlx::PgPool) -> anyhow::Result<()> {
                 }
             }
             _ = reconcile.tick() => {
-                for (org, conv) in active_conversations(&worker, &app.config).await? {
+                for (org, conv) in active_conversations(&worker, &app.config()).await? {
                     if !actors.contains_key(&conv) {
                         claims.start(&app, owner, org, conv);
                     }

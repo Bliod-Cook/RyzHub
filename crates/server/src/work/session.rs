@@ -241,9 +241,9 @@ pub async fn ensure_work(app: &App, lease: &Lease, run: Uuid) -> anyhow::Result<
             harness: settings.harness.clone(),
             model: settings.model.clone(),
             // What the gateway serves: memory tools and the run's plugin tools.
-            mcp: app.config.search.enabled || app.config.plugins.enabled,
-            acp: crate::run_config::acp(&app.config, &settings.harness).cloned(),
-            models: crate::run_config::models(&app.config, &settings.harness, &settings.protocol),
+            mcp: app.config().search.enabled || app.config().plugins.enabled,
+            acp: crate::run_config::acp(&app.config(), &settings.harness).cloned(),
+            models: crate::run_config::models(&app.config(), &settings.harness, &settings.protocol),
         },
     )
     .await?;

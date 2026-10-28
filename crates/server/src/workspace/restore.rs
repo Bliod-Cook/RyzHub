@@ -142,7 +142,7 @@ pub async fn restore_into(
         Code::CheckpointIncompatible
     );
     ensure!(
-        compatible(&app.config, manifest),
+        compatible(&app.config(), manifest),
         Code::CheckpointIncompatible
     );
     let (org, artifact) = (lease.org_id, spec.id);
@@ -211,7 +211,7 @@ pub async fn restore(app: &App, lease: &Lease, job: Uuid, link: &OwnerLink) -> a
             .await?,
         };
         ensure!(
-            compatible(&app.config, &manifest),
+            compatible(&app.config(), &manifest),
             Code::CheckpointIncompatible
         );
         sqlx::query("INSERT INTO restore_pins(id,org_id,checkpoint_id) VALUES($1,$2,$3) ON CONFLICT DO NOTHING")

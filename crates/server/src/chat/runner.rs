@@ -190,7 +190,7 @@ async fn prepare(
                 Value::Null,
                 compact,
                 !open,
-                app.config.sandbox.enabled,
+                app.config().sandbox.enabled,
             )
             .await?;
             (next, messages, 0)
@@ -207,7 +207,7 @@ async fn prepare(
                 row.get("seed_messages"),
                 compact,
                 true,
-                app.config.sandbox.enabled,
+                app.config().sandbox.enabled,
             )
             .await?;
             (0, messages, 0)
@@ -258,7 +258,7 @@ async fn prepare(
     .bind(item_id)
     .execute(&mut *tx)
     .await?;
-    let instructions = crate::projects::instructions(&mut tx, lease, run, &app.config).await?;
+    let instructions = crate::projects::instructions(&mut tx, lease, run, &app.config()).await?;
     let plugin_tools = crate::plugins::run_tools(app, &mut tx, org, run).await?;
     let skills = crate::plugins::run_skills(&mut tx, org, run).await?;
     tx.commit().await?;
@@ -400,7 +400,7 @@ async fn plan(
 }
 
 fn request_body(app: &App, step: &Step) -> Value {
-    let files = if app.config.sandbox.enabled {
+    let files = if app.config().sandbox.enabled {
         format!(" {}", outputs::INSTRUCTIONS)
     } else {
         String::new()
@@ -431,7 +431,7 @@ fn request_body(app: &App, step: &Step) -> Value {
                "include":["reasoning.encrypted_content","web_search_call.action.sources"],
                "reasoning":reasoning})
     } else {
-        json!({"model":step.config.model,"max_tokens":app.config.llm.max_tokens,"stream":true,
+        json!({"model":step.config.model,"max_tokens":app.config().llm.max_tokens,"stream":true,
                "messages":step.messages,"system":system})
     };
     if !step.read_only && !step.compact {
@@ -442,9 +442,9 @@ fn request_body(app: &App, step: &Step) -> Value {
         }
         // Many plugin tools are found by search rather than read up front.
         let defer = !responses
-            && step.plugin_tools.len() > app.config.plugins.defer_tools_above
+            && step.plugin_tools.len() > app.config().plugins.defer_tools_above
             && app
-                .config
+                .config()
                 .llm
                 .tool_search_models
                 .iter()
@@ -492,21 +492,21 @@ fn request_body(app: &App, step: &Step) -> Value {
         // The provider summarizes the context itself once it grows past the trigger.
         body["context_management"] = json!({"edits": [{
             "type": "compact_20260112",
-            "trigger": {"type": "input_tokens", "value": app.config.llm.compaction_trigger_tokens},
+            "trigger": {"type": "input_tokens", "value": app.config().llm.compaction_trigger_tokens},
         }]});
     }
     let context = if responses { "input" } else { "messages" };
     protocol::offload(
         &step.config.protocol,
         &mut body[context],
-        app.config.llm.context_budget_tokens as usize,
+        app.config().llm.context_budget_tokens as usize,
     );
     body
 }
 
 /// Whether an Anthropic model compacts its own context.
 fn compacts(app: &App, model: &str) -> bool {
-    app.config
+    app.config()
         .llm
         .compaction_models
         .iter()
@@ -539,7 +539,7 @@ async fn gateway_request(
         .gateway
         .post(format!(
             "{}/v1/{path}",
-            app.config.llm.gateway_url.trim_end_matches('/')
+            app.config().llm.gateway_url.trim_end_matches('/')
         ))
         .bearer_auth(key)
         .header("anthropic-version", "2023-06-01");
@@ -885,8 +885,8 @@ async fn model(
     let mut body = request_body(app, step);
     let options = media::Options {
         media: !step.compact,
-        accepts: crate::run_config::inputs(&app.config, &step.config.model),
-        sandbox: app.config.sandbox.enabled,
+        accepts: crate::run_config::inputs(&app.config(), &step.config.model),
+        sandbox: app.config().sandbox.enabled,
     };
     media::inline(
         app,

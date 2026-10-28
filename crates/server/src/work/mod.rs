@@ -39,7 +39,7 @@ pub(crate) async fn run_settings(app: &App, lease: &Lease, run: Uuid) -> anyhow:
         .fetch_one(&mut *tx)
         .await?;
     tx.commit().await?;
-    RunConfig::resolve(value, "work", &app.config)
+    RunConfig::resolve(value, "work", &app.config())
 }
 
 /// Send a harness request and wait for its normalized result.
@@ -157,7 +157,7 @@ async fn open_thread(
     let instructions = {
         let mut tx = app.store.fenced(lease).await?;
         let instructions =
-            crate::projects::harness_instructions(&mut tx, lease, run, &app.config).await?;
+            crate::projects::harness_instructions(&mut tx, lease, run, &app.config()).await?;
         tx.commit().await?;
         instructions
     };

@@ -138,7 +138,7 @@ impl Harness {
     async fn memory(&self, user: &Value, conv: Uuid) -> anyhow::Result<String> {
         let (org, owner) = (id(user, "org_id"), id(user, "user_id"));
         let mut tx = self.app.store.tx(org).await?;
-        let context = memory::context(&mut tx, &self.app.config, org, conv, owner).await?;
+        let context = memory::context(&mut tx, &self.app.config(), org, conv, owner).await?;
         tx.commit().await?;
         Ok(context.text)
     }
@@ -815,7 +815,7 @@ async fn work_saves_and_uses_memory_through_the_mcp_gateway() -> anyhow::Result<
     let mut tx = h.app.store.fenced(&lease).await?;
     memory::project(&mut tx, &lease).await?;
     let instructions =
-        ryzhub_server::projects::instructions(&mut tx, &lease, run, &h.app.config).await?;
+        ryzhub_server::projects::instructions(&mut tx, &lease, run, &h.app.config()).await?;
     ensure!(
         instructions.contains(content),
         "Work memory injection missing"

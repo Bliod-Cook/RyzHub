@@ -68,7 +68,7 @@ pub async fn upgrade_auth(
 ) -> Result<Auth, ApiError> {
     if let Some(origin) = headers.get("origin") {
         require!(
-            app.config
+            app.config()
                 .allowed_origins
                 .iter()
                 .any(|allowed| origin.as_bytes() == allowed.as_bytes()),

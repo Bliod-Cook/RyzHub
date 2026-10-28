@@ -1,11 +1,11 @@
 //! Real PostgreSQL, NATS and containerd; only the paid model upstream is a protocol fixture.
 mod common;
 use anyhow::{Context, ensure};
-use common::{Harness, guest_exec, id, message};
+use common::{Harness, guest_exec, id, message, reconfigure};
 use ryzhub_server::owner;
 use serde_json::{Value, json};
 use sqlx::PgPool;
-use std::{io::Write, sync::Arc, time::Duration};
+use std::{io::Write, time::Duration};
 use tokio::process::Command as Process;
 use uuid::Uuid;
 
@@ -27,7 +27,7 @@ impl Harness {
                 .json(&body)
                 .send()
         };
-        let url = format!("{}/mcp", self.app.config.llm.upstream_url);
+        let url = format!("{}/mcp", self.app.config().llm.upstream_url);
         let preview: Value = post(
             "/preview",
             json!({"source":{"kind":"mcp","url":url,"name":"notes"}}),
@@ -139,7 +139,8 @@ async fn actual_codex_native_turn_and_checkpoint_restore() -> anyhow::Result<()>
         .fetch_one(&h.db)
         .await?;
     wait_workspace_idle(&h, conv).await?;
-    let host = std::path::Path::new(&h.app.config.sandbox.host_socket);
+    let config = h.app.config();
+    let host = std::path::Path::new(&config.sandbox.host_socket);
     use ryzhub_execution::{ExecSpec, GuestCommand, GuestRequest, HostCommand};
     let exec = |cmd: &str, op: &str| HostCommand::Guest {
         request: GuestRequest {
@@ -222,7 +223,7 @@ async fn actual_codex_native_turn_and_checkpoint_restore() -> anyhow::Result<()>
     .fetch_one(&h.db)
     .await?;
     let key = manifest["sha256"].as_str().unwrap();
-    let blob_path = std::path::Path::new(&h.app.config.work.storage_root)
+    let blob_path = std::path::Path::new(&h.app.config().work.storage_root)
         .join(org.to_string())
         .join(key);
     let archive = std::fs::read(&blob_path)?;
@@ -415,7 +416,7 @@ async fn checkpoint_gc_spares_pins_heads_grace_periods_and_other_tenants() -> an
         .claim(org, conv, Uuid::now_v7(), 60_000)
         .await?
         .unwrap();
-    owner::process_with_config(&h.app.store, &lease, &h.app.config).await?;
+    owner::process_with_config(&h.app.store, &lease, &h.app.config()).await?;
     let run: Uuid = sqlx::query_scalar("SELECT id FROM runs WHERE conversation_id=$1")
         .bind(conv)
         .fetch_one(&h.db)
@@ -435,10 +436,11 @@ async fn checkpoint_gc_spares_pins_heads_grace_periods_and_other_tenants() -> an
     use sha2::{Digest, Sha256};
     let bytes = b"immutable archive fixture";
     let key = format!("{:x}", Sha256::digest(bytes));
-    let p = ryzhub_server::workspace::blob::BlobStore::configured(&h.app.config.work.storage_root)?
-        .scoped(org);
+    let p =
+        ryzhub_server::workspace::blob::BlobStore::configured(&h.app.config().work.storage_root)?
+            .scoped(org);
     let s = ryzhub_server::workspace::blob::BlobStore::configured(
-        h.app.config.work.secondary_root.as_deref().unwrap(),
+        h.app.config().work.secondary_root.as_deref().unwrap(),
     )?
     .scoped(org);
     p.put(&key, bytes).await?;
@@ -511,11 +513,11 @@ async fn checkpoint_gc_spares_pins_heads_grace_periods_and_other_tenants() -> an
     .bind(head)
     .execute(&h.db)
     .await?;
-    let mut app = h.app.clone();
-    Arc::make_mut(&mut app.config)
-        .work
-        .checkpoint_retention_days = 30;
-    Arc::make_mut(&mut app.config).work.checkpoint_gc_grace_secs = 60;
+    let app = h.app.clone();
+    reconfigure(&app, |config| {
+        config.work.checkpoint_retention_days = 30;
+        config.work.checkpoint_gc_grace_secs = 60;
+    });
     ryzhub_server::workspace::collect_org(&app, org).await?;
     let states: Vec<(Uuid, String)> =
         sqlx::query_as("SELECT id,state FROM checkpoints WHERE org_id=$1")
@@ -559,14 +561,14 @@ async fn checkpoint_gc_spares_pins_heads_grace_periods_and_other_tenants() -> an
         "the production collector must run in the Owner role"
     );
     let unrelated =
-        ryzhub_server::workspace::blob::BlobStore::configured(&app.config.work.storage_root)?
+        ryzhub_server::workspace::blob::BlobStore::configured(&app.config().work.storage_root)?
             .scoped(Uuid::now_v7());
     unrelated.put(&key, bytes).await?;
     sqlx::query("DELETE FROM workspace_heads WHERE org_id=$1")
         .bind(org)
         .execute(&h.db)
         .await?;
-    Arc::make_mut(&mut app.config).work.checkpoint_gc_grace_secs = 0;
+    reconfigure(&app, |config| config.work.checkpoint_gc_grace_secs = 0);
     ryzhub_server::workspace::collect_org(&app, org).await?;
     assert!(p.get(&key).await.is_err());
     assert!(s.get(&key).await.is_err());
@@ -635,7 +637,7 @@ async fn node_lease_expiry_restores_committed_rpo_and_invalidates_later_operatio
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     ryzhub_execution::call(
-        std::path::Path::new(&h.app.config.sandbox.host_socket),
+        std::path::Path::new(&h.app.config().sandbox.host_socket),
         &ryzhub_execution::HostCommand::Stop {
             sandbox_id: old,
             exec_epoch: epoch as u64,

@@ -146,7 +146,7 @@ async fn authorize_model(
     key: Option<&GatewayKey>,
     call: &Call,
 ) -> anyhow::Result<Policy> {
-    let policy = effective_policy(tx, &app.config.policy, org).await?;
+    let policy = effective_policy(tx, &app.config().policy, org).await?;
     ensure!(
         key.is_none_or(|key| key.models.contains(&call.model))
             && policy
@@ -180,7 +180,7 @@ async fn rate_limit(
             KeyKind::Loop => format!("run:{}", key.run_id),
             KeyKind::Sandbox => format!("key:{}", key.id),
         };
-        (scope, app.config.llm.requests_per_minute_key)
+        (scope, app.config().llm.requests_per_minute_key)
     });
     for (scope, limit) in
         std::iter::once(("org".to_owned(), REQUESTS_PER_MINUTE_ORG)).chain(per_key)
@@ -280,7 +280,7 @@ async fn list_models(State(app): State<App>, headers: HeaderMap) -> ApiResult<ax
     let key = keys::resolve(&app.store, bearer(&headers)?).await?;
     let mut tx = app.store.tx(key.org_id).await?;
     validate_key(&mut tx, &key, false).await?;
-    let policy = effective_policy(&mut tx, &app.config.policy, key.org_id).await?;
+    let policy = effective_policy(&mut tx, &app.config().policy, key.org_id).await?;
     tx.commit().await?;
     let models: Vec<&String> = key
         .models
@@ -426,7 +426,7 @@ async fn targets(
     policy: &Policy,
     call: &Call,
 ) -> anyhow::Result<(Option<Uuid>, Vec<Target>)> {
-    let llm = &app.config.llm;
+    let llm = &app.config().llm;
     let (default_url, default_env) = call.protocol.default_upstream(llm);
     let credential = call.protocol.credential();
     if let Some((id, secret)) =
@@ -515,7 +515,7 @@ const FORWARDED: [&str; 5] = [
 ];
 
 async fn proxy(app: App, headers: HeaderMap, body: Bytes, call: Call) -> anyhow::Result<Response> {
-    ensure!(app.config.llm.enabled, Code::ModelGatewayDisabled);
+    ensure!(app.config().llm.enabled, Code::ModelGatewayDisabled);
     let key = keys::resolve(&app.store, bearer(&headers)?).await?;
     let mut tx = app.store.tx(key.org_id).await?;
     validate_key(&mut tx, &key, false).await?;
@@ -668,7 +668,7 @@ pub async fn complete(
     protocol: &str,
     request: &Value,
 ) -> anyhow::Result<Value> {
-    ensure!(app.config.llm.enabled, Code::ModelGatewayDisabled);
+    ensure!(app.config().llm.enabled, Code::ModelGatewayDisabled);
     let (protocol, path) = match protocol {
         "responses" => (Protocol::Responses, "/v1/responses"),
         _ => (Protocol::Messages, "/v1/messages"),
@@ -981,7 +981,8 @@ impl Meter {
 
     async fn authorized(&self, tx: &mut Tx<'_>) -> anyhow::Result<()> {
         validate_key(tx, &self.key, true).await?;
-        let policy = effective_policy(tx, &self.ledger.app.config.policy, self.key.org_id).await?;
+        let policy =
+            effective_policy(tx, &self.ledger.app.config().policy, self.key.org_id).await?;
         ensure!(
             policy
                 .models

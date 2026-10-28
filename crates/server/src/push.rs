@@ -61,7 +61,7 @@ pub async fn register(
     headers: HeaderMap,
     Json(input): Json<Register>,
 ) -> ApiResult<Json<Value>> {
-    require!(app.config.push.enabled, Code::InvalidInput);
+    require!(app.config().push.enabled, Code::InvalidInput);
     require!(
         input.platform == "android"
             && !input.device.is_empty()
@@ -125,7 +125,7 @@ pub async fn unregister(
 
 /// Mark the user's `device` as connected now, or no longer.
 pub async fn online(app: &App, user: Uuid, device: &str, online: bool) {
-    if !app.config.push.enabled {
+    if !app.config().push.enabled {
         return;
     }
     let result = sqlx::query(
@@ -388,7 +388,7 @@ fn words(locale: &str, kind: &str, title: &str, summary: &str) -> (String, Strin
 }
 
 async fn deliver(app: &App, job: &Job) -> anyhow::Result<()> {
-    if !app.config.push.enabled {
+    if !app.config().push.enabled {
         return Ok(());
     }
     let user: Uuid = serde_json::from_value(job.payload["user"].clone())?;
@@ -432,7 +432,7 @@ async fn deliver(app: &App, job: &Job) -> anyhow::Result<()> {
     if devices.is_empty() {
         return Ok(());
     }
-    let fcm = Fcm::load(&app.config.push.fcm_credentials).await?;
+    let fcm = Fcm::load(&app.config().push.fcm_credentials).await?;
     let access = fcm.access_token(&app.http.identity).await?;
     let mut retry = None;
     for (device, token, locale) in devices {
@@ -450,7 +450,7 @@ async fn deliver(app: &App, job: &Job) -> anyhow::Result<()> {
             .identity
             .post(format!(
                 "{}/v1/projects/{}/messages:send",
-                app.config.push.fcm_endpoint.trim_end_matches('/'),
+                app.config().push.fcm_endpoint.trim_end_matches('/'),
                 fcm.project_id
             ))
             .bearer_auth(&access)

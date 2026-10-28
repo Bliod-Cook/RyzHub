@@ -55,7 +55,7 @@ pub async fn collector(app: App, worker: sqlx::PgPool) -> anyhow::Result<()> {
 }
 
 pub async fn sweep(app: &App, worker: &sqlx::PgPool) -> anyhow::Result<()> {
-    let instance = &app.config.policy;
+    let instance = &app.config().policy;
     let configured =
         instance.auto_archive_after_secs.is_some() || instance.archive_retention_secs.is_some();
     // An organization's own policy may set either even when the instance does not.
@@ -79,7 +79,7 @@ pub async fn sweep(app: &App, worker: &sqlx::PgPool) -> anyhow::Result<()> {
 pub async fn sweep_org(app: &App, org: Uuid) -> anyhow::Result<()> {
     let policy = {
         let mut tx = app.store.tx(org).await?;
-        let policy = effective_policy(&mut tx, &app.config.policy, org).await?;
+        let policy = effective_policy(&mut tx, &app.config().policy, org).await?;
         tx.commit().await?;
         policy
     };
@@ -166,7 +166,7 @@ async fn archive_idle(app: &App, org: Uuid, conv: Uuid, after: u64) -> anyhow::R
             .bind(conv)
             .fetch_one(&mut *tx)
             .await?;
-    if mode == "work" && live && app.config.work.enabled {
+    if mode == "work" && live && app.config().work.enabled {
         sqlx::query(
             "INSERT INTO workspace_jobs(id,org_id,conversation_id,kind) VALUES($1,$2,$3,'archive')
              ON CONFLICT DO NOTHING",

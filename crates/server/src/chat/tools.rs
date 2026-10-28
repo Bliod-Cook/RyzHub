@@ -310,8 +310,16 @@ async fn plugin_call(
             .take(4000)
             .collect();
             let mut tx = crate::runs::guarded(&app.store, lease, run).await?;
-            let mut action =
-                new_action(&mut tx, lease, run, "question", &summary, &[], &app.config).await?;
+            let mut action = new_action(
+                &mut tx,
+                lease,
+                run,
+                "question",
+                &summary,
+                &[],
+                &app.config(),
+            )
+            .await?;
             sqlx::query("UPDATE pending_actions SET form=$3 WHERE org_id=$1 AND id=$2")
                 .bind(lease.org_id)
                 .bind(action.id)
@@ -407,7 +415,7 @@ async fn ask(
         args["question"].as_str().unwrap_or("请提供更多信息")
     );
     ensure!(summary.len() <= 65_536, Code::InvalidToolArguments);
-    let action = new_action(tx, lease, run, "question", &summary, &[], &app.config).await?;
+    let action = new_action(tx, lease, run, "question", &summary, &[], &app.config()).await?;
     sqlx::query("UPDATE tool_calls SET action_id=$4 WHERE org_id=$1 AND run_id=$2 AND call_id=$3")
         .bind(lease.org_id)
         .bind(run)

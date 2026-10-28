@@ -20,7 +20,7 @@ pub async fn embed(
     user: Uuid,
     texts: Vec<String>,
 ) -> anyhow::Result<Vec<Vec<f32>>> {
-    if app.config.search.embedding_provider == "local" {
+    if app.config().search.embedding_provider == "local" {
         #[cfg(feature = "local-embedding")]
         return local(app, texts).await;
         #[cfg(not(feature = "local-embedding"))]
@@ -36,14 +36,15 @@ async fn remote(
     user: Uuid,
     texts: Vec<String>,
 ) -> anyhow::Result<Vec<Vec<f32>>> {
-    let cfg = &app.config.search;
+    let config = app.config();
+    let cfg = &config.search;
     ensure!(!cfg.embedding_url.is_empty(), Code::TemporarilyUnavailable);
     if texts.is_empty() {
         return Ok(vec![]);
     }
     let mut tx = app.store.tx(org).await?;
     context_in(&mut tx, user, org).await?;
-    let policy = effective_policy(&mut tx, &app.config.policy, org).await?;
+    let policy = effective_policy(&mut tx, &config.policy, org).await?;
     ensure!(
         policy
             .models
@@ -65,7 +66,7 @@ async fn remote(
                 Code::PlatformCredentialDenied
             );
             let env = if cfg.embedding_key_env.is_empty() {
-                &app.config.llm.responses_key_env
+                &config.llm.responses_key_env
             } else {
                 &cfg.embedding_key_env
             };
@@ -196,7 +197,7 @@ async fn local(app: &App, texts: Vec<String>) -> anyhow::Result<Vec<Vec<f32>>> {
     if texts.is_empty() {
         return Ok(vec![]);
     }
-    let name = app.config.search.local_embedding_model.clone();
+    let name = app.config().search.local_embedding_model.clone();
     let model = LOCAL_MODEL
         .get_or_try_init(|| async move {
             tokio::task::spawn_blocking(move || {

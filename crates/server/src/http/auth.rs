@@ -333,12 +333,27 @@ pub async fn refresh(State(app): State<App>, headers: HeaderMap) -> ApiResult<im
     let presented = cookie(&headers, REFRESH_COOKIE).ok_or(Code::Unauthorized)?;
     let hash = hash_token(&presented);
     let mut tx = app.store.pool.begin().await?;
+    // The account before the device, in the order disabling the account takes them.
+    let owner: Uuid = sqlx::query_scalar(
+        "SELECT user_id FROM auth_refresh WHERE refresh_hash=$1 OR previous_hash=$1",
+    )
+    .bind(&hash)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or(Code::Unauthorized)?;
+    if let Err(error) = crate::accounts::hold_active(&mut tx, owner).await {
+        let disabled = crate::error::is_code(&error, Code::AccountDisabled);
+        return Err(if disabled {
+            Code::Unauthorized.into()
+        } else {
+            error.into()
+        });
+    }
     let device: Option<(Uuid, Uuid, bool, bool)> = sqlx::query_as(
-        "SELECT r.id,r.user_id,r.refresh_hash=$1,r.rotated_at>now()-($2::bigint*interval '1 second')
-         FROM auth_refresh r JOIN users u ON u.id=r.user_id
-         WHERE (r.refresh_hash=$1 OR r.previous_hash=$1) AND r.revoked_at IS NULL
-           AND r.expires_at>now() AND u.status='active'
-         FOR UPDATE OF r FOR SHARE OF u",
+        "SELECT id,user_id,refresh_hash=$1,rotated_at>now()-($2::bigint*interval '1 second')
+         FROM auth_refresh
+         WHERE (refresh_hash=$1 OR previous_hash=$1) AND revoked_at IS NULL AND expires_at>now()
+         FOR UPDATE",
     )
     .bind(&hash)
     .bind(ROTATION_GRACE_SECS)

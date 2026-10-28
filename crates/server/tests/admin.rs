@@ -466,7 +466,7 @@ async fn a_deleted_account_restores_and_once_due_is_purged_to_tombstones() -> an
     // Due, it is anonymized at once and its organization emptied over rounds.
     accounts::expire(&h.app, &worker, user).await?;
     let (_, gone) = call(&h, &admin, Method::GET, &path, None).await?;
-    assert_eq!(gone["email"], format!("deleted+{user}@invalid"));
+    assert_eq!(gone["email"], format!("deleted:{user}"));
     assert_eq!(
         (gone["status"].clone(), gone["purging"].clone()),
         (json!("deleted"), json!(true))

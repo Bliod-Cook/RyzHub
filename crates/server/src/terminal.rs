@@ -182,6 +182,12 @@ impl Terminal<'_> {
                     }
                 }
                 _ = seen.tick() => {
+                    // A notice lost with the listener's connection is caught here.
+                    if app.store.session_revoked(self.auth.session_id).await? {
+                        write_frame(&mut host_write, &Frame::Close).await?;
+                        let _ = to_client.close().await;
+                        return Ok(());
+                    }
                     let mut tx = app.store.tx(org).await?;
                     sqlx::query("UPDATE sandboxes SET terminal_seen_at=now() WHERE org_id=$1 AND id=$2")
                         .bind(org)

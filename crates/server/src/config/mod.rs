@@ -556,6 +556,34 @@ impl Config {
                 );
             }
         }
+        // Whoever chooses an upstream receives its key, so a model key is never a secret of the
+        // vault's or of a sign-in provider's.
+        let llm = &self.llm;
+        let secrets: Vec<&String> = std::iter::once(&llm.vault_key_env)
+            .chain(llm.vault_retired_keys.values())
+            .chain(self.auth.oidc.iter().map(|p| &p.client_secret_env))
+            .chain(self.auth.github.iter().map(|g| &g.client_secret_env))
+            .collect();
+        let model_keys = [
+            &llm.platform_key_env,
+            &llm.responses_key_env,
+            &llm.chat_completions_key_env,
+            &llm.gemini_key_env,
+            &self.search.embedding_key_env,
+        ]
+        .into_iter()
+        .chain(
+            llm.models
+                .iter()
+                .flat_map(|m| &m.upstreams)
+                .map(|u| &u.key_env),
+        );
+        for key in model_keys.filter(|key| !key.is_empty()) {
+            ensure!(
+                !secrets.contains(&key),
+                "{key} holds a secret, not a model key"
+            );
+        }
         if self.work.enabled {
             ensure!(
                 self.llm.enabled
@@ -894,6 +922,20 @@ mod tests {
             let error = parse_toml::<Config>(text).unwrap_err().to_string();
             assert!(error.contains(key), "{text}: {error}");
         }
+    }
+
+    #[test]
+    fn model_keys_are_never_read_from_the_vaults_variables() {
+        let mut config = Config::default();
+        config.llm.models.push(ModelRoute {
+            upstreams: vec![Upstream {
+                key_env: "RYZHUB_VAULT_KEY".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("RYZHUB_VAULT_KEY"), "{error}");
     }
 
     #[test]

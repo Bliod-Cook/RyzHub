@@ -280,14 +280,18 @@ pub async fn callback(
         Ok(_) if link_user.is_some() => with_param(&return_to, "login_linked", &name),
         Ok(user) => {
             let code = new_token();
+            // A disable either finds the code and deletes it, or comes first and refuses it.
+            let mut tx = app.store.pool.begin().await?;
+            crate::accounts::hold_active(&mut tx, user).await?;
             sqlx::query(
                 "INSERT INTO login_codes(code_hash,user_id,expires_at) VALUES($1,$2,now()+($3::bigint*interval '1 second'))",
             )
             .bind(hash_token(&code))
             .bind(user)
             .bind(CODE_SECS)
-            .execute(&app.store.pool)
+            .execute(&mut *tx)
             .await?;
+            tx.commit().await?;
             with_param(&return_to, "login_code", &code)
         }
         Err(error) => {

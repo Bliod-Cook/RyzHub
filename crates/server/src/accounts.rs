@@ -91,9 +91,9 @@ pub async fn collector(app: App, worker: PgPool) -> anyhow::Result<()> {
     }
 }
 
-/// Anonymize `user` once their recovery window has ended: free the email, forget how they
-/// signed in and what they kept for themselves, leave other organizations, and start purging
-/// their personal one.
+/// Anonymize `user` once their recovery window has ended: free the email for one no sign-up
+/// can take (it has no `@`), forget how they signed in and what they kept for themselves,
+/// leave other organizations, and start purging their personal one.
 pub async fn expire(app: &App, worker: &PgPool, user: Uuid) -> anyhow::Result<()> {
     let orgs: Vec<(Uuid, bool)> = sqlx::query_as(
         "SELECT m.org_id,o.kind='personal' AND m.role='owner' FROM memberships m
@@ -104,7 +104,7 @@ pub async fn expire(app: &App, worker: &PgPool, user: Uuid) -> anyhow::Result<()
     .await?;
     let mut tx = app.store.pool.begin().await?;
     let anonymized = sqlx::query(
-        "UPDATE users SET email='deleted+'||id||'@invalid',display_name='',password_hash='!',
+        "UPDATE users SET email='deleted:'||id,display_name='',password_hash='!',
            status='deleted',delete_after=NULL
          WHERE id=$1 AND status='deletion_pending' AND delete_after<=now()",
     )

@@ -74,7 +74,9 @@ FROM toolchain AS web-build
 RUN apt-get update && apt-get install -y --no-install-recommends unzip xz-utils zip \
  && rm -rf /var/lib/apt/lists/*
 RUN git clone --depth 1 --branch 3.47.5 https://github.com/flutter/flutter.git /opt/flutter
-ENV PATH=/opt/flutter/bin:$PATH
+# Flutter's archives carry uids that rootless builders cannot chown to.
+ENV PATH=/opt/flutter/bin:$PATH \
+    TAR_OPTIONS=--no-same-owner
 RUN flutter config --no-analytics --no-cli-animations && flutter precache --web
 RUN rustup component add rustfmt \
  && rustup toolchain install nightly-2026-09-25 --profile minimal --component rust-src \
